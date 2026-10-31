@@ -260,6 +260,12 @@ public struct AgentConfig: Sendable {
     /// 32 / 64 / 128 / 256 / 512 / 768；其它模型沿用 128 / 256 / 512。
     public var ragMatryoshkaDim: Int = MatryoshkaDimensions.defaultValue
 
+    // 二值粗筛（两段式检索）
+    /// 检索是否先走二值向量粗筛；关闭只影响检索，入库仍维护签名。
+    public var ragBinaryCoarseEnabled: Bool = true
+    /// 第一阶段候选数：默认 200，加载时收口到 50...1000。
+    public var ragBinaryCoarseCandidates: Int = 200
+
     // ANN 向量索引（分块 IVF，见 VectorStoreANN.swift）
     /// 检索是否走 ANN 索引。索引不可用（未构建/维度不符/尾块超预算）时
     /// 自动回退精确检索；关闭则始终精确检索（大库上会超时被跳过）。
@@ -533,6 +539,8 @@ public struct AgentConfig: Sendable {
             ragMatryoshka = parsed
         }
         if let v = int("rag_matryoshka_dim") { ragMatryoshkaDim = v }
+        if let v = bool("rag_binary_coarse_enabled") { ragBinaryCoarseEnabled = v }
+        if let v = int("rag_binary_coarse_candidates") { ragBinaryCoarseCandidates = v }
 
         if let v = string("llm_provider") { llmProvider = v }
         if let v = string("local_llm_model") { localLLMModel = v }
@@ -633,6 +641,8 @@ public struct AgentConfig: Sendable {
 
     /// 旧版本配置迁移（docling/marker → ovis、旧 embedding/reranker 名）。
     public mutating func migrate() {
+        // 二值粗筛候选数：手改配置可能越界，统一收口到 50...1000。
+        ragBinaryCoarseCandidates = max(50, min(1_000, ragBinaryCoarseCandidates))
         // docling/marker 已移除：旧配置值统一由 PDFEngine(stored:) 归一化为 ovis。
         // 默认 embedding 迁移到 jina-embeddings-v5-text-nano（MLX int4）：
         // 上一版默认是 jina-v3，更早是 nomic MLX int8 / bge。
@@ -892,6 +902,8 @@ public struct AgentConfig: Sendable {
             "rag_vector_element_type": ragVectorElementType.rawValue,
             "rag_matryoshka": ragMatryoshka.rawValue,
             "rag_matryoshka_dim": ragMatryoshkaDim,
+            "rag_binary_coarse_enabled": ragBinaryCoarseEnabled,
+            "rag_binary_coarse_candidates": ragBinaryCoarseCandidates,
             "llm_provider": llmProvider,
             "local_llm_model": localLLMModel,
             "local_llm_backend": localLLMBackend,
