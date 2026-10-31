@@ -191,6 +191,27 @@ final class VectorStoreBinaryANNTests: XCTestCase {
         store.close()
     }
 
+    func testTailCountRefreshesAfterWrites() throws {
+        let store = try makeStore("tail-count")
+        try seed(store, count: 40)
+        _ = try store.buildBinaryANNIndex(clusters: 4, clusterSize: 16, iterations: 4)
+        XCTAssertEqual(store.binaryANNIndexStatus().tailRows, 0)
+
+        _ = try store.add(
+            chunks: [Chunk(text: "tail", source: "tail.md", chunkIndex: 0)],
+            vectors: [[1] + [Float](repeating: 0, count: dimension - 1)],
+            binarySignatures: [signature(bit: 0)])
+        XCTAssertEqual(store.binaryANNIndexStatus().tailRows, 1)
+        XCTAssertTrue(store.binaryANNIndexStatus().isUsable)
+
+        let rows = try store.db.query("SELECT rowid FROM chunks WHERE text = 'tail'")
+        let rowID = try XCTUnwrap(rows.first?["rowid"]?.intValue)
+        _ = try store.deleteRowIDs([rowID])
+        XCTAssertEqual(store.binaryANNIndexStatus().tailRows, 0)
+        XCTAssertTrue(store.binaryANNIndexStatus().isReady)
+        store.close()
+    }
+
     func testDeletedRowsAreExcludedFromBannResults() throws {
         let store = try makeStore("deleted")
         try seed(store, count: 20)

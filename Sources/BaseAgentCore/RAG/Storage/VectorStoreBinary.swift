@@ -205,6 +205,7 @@ extension VectorStore {
     /// 增量持久化 bin 行数；必须与所在事务一起提交/回滚。
     func persistBinaryCounterLocked() throws {
         guard binaryStorageEnabled else { return }
+        bannTailCountCache = nil
         try db.execute(
             "INSERT INTO meta(key, value) VALUES(?, ?) "
             + "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
@@ -212,6 +213,7 @@ extension VectorStore {
     }
 
     func writeBinaryMetaLocked() throws {
+        bannTailCountCache = nil
         let values: [(String, String)] = [
             (Self.binaryDimensionKey, String(binaryDimension)),
             (Self.binarySourceKey, binarySource),
@@ -227,6 +229,7 @@ extension VectorStore {
     }
 
     func deleteBinaryMetaLocked() throws {
+        bannTailCountCache = nil
         try db.execute("DELETE FROM meta WHERE key IN (?, ?, ?, ?)", [
             .text(Self.binaryRowsKey),
             .text(Self.binaryDimensionKey),

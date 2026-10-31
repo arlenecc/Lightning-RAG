@@ -82,6 +82,8 @@ public final class VectorStore: @unchecked Sendable {
     var annCentroidCache: ANNCentroidCache?
     /// 二值 ANN 簇心缓存（懒加载），由 `VectorStoreBinaryANN.swift` 读写。
     var bannCentroidCache: ANNCentroidCache?
+    /// 二值 ANN 尾块行数缓存，由 `VectorStoreBinaryANN.swift` 读写。
+    var bannTailCountCache: BANNTailCountCache?
     /// 二值签名位宽；0 表示 provider 不支持或主类型为 bin。
     let binaryDimension: Int
     /// 签名来源标识，用于 bin 表 meta 一致性校验。

@@ -14,6 +14,19 @@ struct BANNStoredMeta {
     var builtAt: Double = 0
 }
 
+/// bann 尾块行数缓存。
+///
+/// vec0 的 `rowid > watermark` 统计会退化为整表扫描（1M 行约 40ms），
+/// 不能放在每次检索上；这里按计数与水位缓存，bin 表写入后由
+/// `persistBinaryCounterLocked()` / meta 写入清空。
+struct BANNTailCountCache {
+    let lastRowID: Int64
+    let indexedRows: Int
+    let binaryRows: Int
+    let chunkRows: Int
+    let value: Int
+}
+
 /// 基于二值签名的分块 IVF 索引。
 ///
 /// 复用主 ANN 的 bits 块布局、k-means、打包与汉明打分，但使用独立的
@@ -71,6 +84,7 @@ extension VectorStore {
     /// 写索引 meta。`meta.rows` 是**本块新增行数**：`bann_rows` 在已有值上
     /// 累加（块数、水位、簇数等其余键直接覆盖），陈旧计数沿用已有值。
     func writeBANNMetaLocked(_ meta: BANNStoredMeta) throws {
+        bannTailCountCache = nil
         let stored = try bannStoredMetaLocked()
         let values: [(String, String)] = [
             ("bann_ver", String(meta.version)),
@@ -98,6 +112,7 @@ extension VectorStore {
         try db.execute("DELETE FROM \(Self.bannBlocksTable)")
         try db.execute("DELETE FROM meta WHERE key GLOB '\(bannMetaPrefix)*'")
         bannCentroidCache = nil
+        bannTailCountCache = nil
     }
 
     /// 丢弃索引表与元数据（释放占用，随时可重建）。
@@ -106,6 +121,7 @@ extension VectorStore {
         try db.execute("DROP TABLE IF EXISTS \(Self.bannBlocksTable)")
         try db.execute("DELETE FROM meta WHERE key GLOB '\(bannMetaPrefix)*'")
         bannCentroidCache = nil
+        bannTailCountCache = nil
     }
 
     public func dropBinaryANNIndex() throws {
@@ -143,6 +159,11 @@ extension VectorStore {
     /// 计数器在「按来源重同步」时会低估，因此再用 `rowid > watermark` 的
     /// 实际行数兜底；统计封顶在 cap + 1，避免大库上扫全表。
     func bannTailRowCountLocked(after rowID: Int64, indexedRows: Int) -> Int {
+        if let cache = bannTailCountCache,
+           cache.lastRowID == rowID, cache.indexedRows == indexedRows,
+           cache.binaryRows == binaryRows, cache.chunkRows == count {
+            return cache.value
+        }
         let byCount = max(0, binaryRows - indexedRows)
         let cap = bannTailScanRowCap()
         let counted = (try? db.scalar("""
@@ -150,7 +171,11 @@ extension VectorStore {
             SELECT 1 FROM \(Self.binaryVectorTable) WHERE rowid > ? LIMIT ?
         )
         """, [.int(rowID), .int(Int64(cap + 1))]).intValue).flatMap { Int($0) } ?? 0
-        return max(byCount, counted)
+        let value = max(byCount, counted)
+        bannTailCountCache = BANNTailCountCache(
+            lastRowID: rowID, indexedRows: indexedRows,
+            binaryRows: binaryRows, chunkRows: count, value: value)
+        return value
     }
 
     /// 建议重建的尾块规模：超过四分之一预算时提示（读取已明显变慢）。
