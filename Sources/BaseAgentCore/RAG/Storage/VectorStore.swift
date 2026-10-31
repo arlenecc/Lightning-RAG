@@ -58,7 +58,7 @@ public final class VectorStore: @unchecked Sendable {
     private let deleteBatchSize = 400
     private let insertBatchSize = 200
     /// sqlite-vec 的 KNN k 上限为 4096；分批/过滤不能越过该值。
-    private let maxVectorK = 4096
+    let maxVectorK = 4096
     /// 精确来源定向检索一次最多读取的向量行数。超过后回退全局路径，
     /// 避免单个超大来源把全部向量读进内存。
     private static let scopedExactRowLimit = 50_000
@@ -1415,6 +1415,7 @@ public final class VectorStore: @unchecked Sendable {
                              sourceFilter: String? = nil,
                              sourceContains: String? = nil,
                              rrfK: Int = 60, overfetch: Int = 2,
+                             binary: BinaryCoarseOptions? = nil,
                              ann: ANNQueryOptions? = nil,
                              deadline: Date? = nil) throws -> [SearchHit] {
         guard topK > 0 else { return [] }
@@ -1444,11 +1445,29 @@ public final class VectorStore: @unchecked Sendable {
         let inner = max(topK * max(1, overfetch), 20)
         let targeted = sourceContains != nil
         let candidateCount = targeted ? max(inner * 4, 20) : inner
-        let vectorCandidates: [(Int64, Double)] = vectorUsable
-            ? try vectorCandidatesLocked(vector: vector, topK: candidateCount,
-                                         sourceFilter: sourceFilter,
-                                         ann: ann, targeted: targeted)
-            : []
+        var binaryScores: [Int64: Double] = [:]
+        var vectorCandidates: [(Int64, Double)] = []
+        if vectorUsable {
+            if let binary, sourceFilter == nil, !targeted {
+                switch try binaryCoarseCandidatesLocked(
+                    vector: vector, signature: binary.signature,
+                    candidateLimit: binary.candidateLimit,
+                    candidateCount: candidateCount, targeted: false) {
+                case .used(let candidates, let scores):
+                    vectorCandidates = candidates
+                    binaryScores = scores
+                case .skipped(let reason):
+                    noteBinaryFallbackLocked(reason)
+                    vectorCandidates = try vectorCandidatesLocked(
+                        vector: vector, topK: candidateCount,
+                        sourceFilter: sourceFilter, ann: ann, targeted: targeted)
+                }
+            } else {
+                vectorCandidates = try vectorCandidatesLocked(
+                    vector: vector, topK: candidateCount,
+                    sourceFilter: sourceFilter, ann: ann, targeted: targeted)
+            }
+        }
 
         // 仍持有写入锁时开启读快照：确保 FTS 候选与 hydrate 落在同一个
         // 数据库版本；建立快照后即可解锁，让写入/删除并发提交。
@@ -1507,6 +1526,7 @@ public final class VectorStore: @unchecked Sendable {
                     copy.rrfScore = hit.score
                     copy.vectorScore = vectorScores[hit.rowID]
                     copy.ftsScore = ftsScores[hit.rowID]
+                    copy.binaryScore = binaryScores[hit.rowID]
                     return copy
                 }
             }

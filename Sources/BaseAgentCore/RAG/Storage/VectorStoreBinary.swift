@@ -40,6 +40,64 @@ public struct BinaryCoarseOptions: Sendable {
 }
 
 extension VectorStore {
+    enum BinaryCoarseQueryOutcome {
+        case used(candidates: [(Int64, Double)], scores: [Int64: Double])
+        case skipped(String)
+    }
+
+    /// stage 1 二值 KNN + stage 2 主向量余弦精排。不可用时返回跳过原因，
+    /// 由 `hybridSearch` 回退原向量通道。调用方需已持有 `lock`。
+    func binaryCoarseCandidatesLocked(
+        vector: [Float], signature: Data, candidateLimit: Int,
+        candidateCount: Int, targeted: Bool
+    ) throws -> BinaryCoarseQueryOutcome {
+        guard !targeted else { return .skipped("定向检索不参与二值粗筛") }
+        guard rebuildReason == nil else { return .skipped("向量库待重建") }
+        guard elementType != .bin else {
+            return .skipped("bin 主存储仅支持单阶段检索")
+        }
+        guard binaryStorageEnabled else {
+            return .skipped(binaryStorageReason ?? "bin 表不可用")
+        }
+        let expectedBytes = binaryDimension / 8
+        guard signature.count == expectedBytes else {
+            return .skipped("查询签名长度 \(signature.count) != \(expectedBytes)")
+        }
+        let chunkRows = count
+        guard chunkRows > 0 else { return .skipped("知识库为空") }
+        guard binaryRows == chunkRows else {
+            return .skipped("二值签名覆盖 \(binaryRows)/\(chunkRows)，请重新同步")
+        }
+
+        let k = min(maxVectorK, max(candidateLimit, candidateCount))
+        let rows = try db.query(
+            "SELECT rowid, distance FROM \(Self.binaryVectorTable) "
+            + "WHERE embedding MATCH vec_bit(?) AND k = ?",
+            [.blob(signature), .int(Int64(k))])
+        let hits = rows.compactMap { row -> (Int64, Double)? in
+            guard let rowID = row["rowid"]?.intValue else { return nil }
+            return (rowID, row["distance"]?.doubleValue ?? Double(binaryDimension))
+        }
+        guard !hits.isEmpty else { return .used(candidates: [], scores: [:]) }
+
+        let storedVectors = try exactVectorsLocked(rowIDs: hits.map(\.0))
+        var reranked: [(rowID: Int64, cosine: Double, binary: Double)] = []
+        reranked.reserveCapacity(hits.count)
+        for (rowID, distance) in hits {
+            guard let stored = storedVectors[rowID], stored.count == vector.count else {
+                continue
+            }
+            let cosine = VectorCodec.cosine(vector, stored)
+            let binaryScore = max(0, 1 - distance / Double(binaryDimension))
+            reranked.append((rowID, cosine, binaryScore))
+        }
+        reranked.sort { $0.cosine > $1.cosine }
+        let selected = Array(reranked.prefix(candidateCount))
+        return .used(
+            candidates: selected.map { ($0.rowID, $0.cosine) },
+            scores: Dictionary(uniqueKeysWithValues: selected.map { ($0.rowID, $0.binary) }))
+    }
+
     // MARK: - 打开库时对齐
 
     /// 按当前参数对齐 bin 表与 meta。派生数据不一致时直接丢弃重建。
@@ -174,5 +232,17 @@ extension VectorStore {
             coverage: coverage,
             isComplete: binaryStorageEnabled && chunkRows > 0 && binaryRows == chunkRows,
             reason: binaryStorageReason)
+    }
+
+    /// 同一原因 60 秒内只记一条，避免每次查询刷日志。
+    func noteBinaryFallbackLocked(_ reason: String) {
+        let now = Date()
+        if reason == lastBinaryFallbackReason,
+           now.timeIntervalSince(lastBinaryFallbackLog) < 60 {
+            return
+        }
+        lastBinaryFallbackReason = reason
+        lastBinaryFallbackLog = now
+        AgentLog.info("二值粗筛回退：\(reason)")
     }
 }

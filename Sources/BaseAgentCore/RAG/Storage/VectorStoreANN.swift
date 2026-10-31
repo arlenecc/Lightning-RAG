@@ -756,6 +756,7 @@ extension VectorStore {
     /// 调用方需已持有 `lock`。
     func annCandidatesLocked(vector: [Float], topK: Int, options: ANNQueryOptions,
                              targeted: Bool = false) throws -> [(Int64, Double)]? {
+        annQueryCount += 1
         guard let meta = try? annStoredMetaLocked(), meta.blocks > 0,
               meta.version == Self.annFormatVersion,
               meta.elementType == elementType,
