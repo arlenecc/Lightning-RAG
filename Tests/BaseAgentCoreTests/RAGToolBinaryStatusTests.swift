@@ -66,7 +66,8 @@ final class RAGToolBinaryStatusTests: XCTestCase {
     private func statusOutput(
         name: String,
         adjust: (inout AgentConfig) -> Void = { _ in },
-        embedding: EmbeddingProvider
+        embedding: EmbeddingProvider,
+        buildANN: Bool = false
     ) async throws -> String {
         let workspace = root.appendingPathComponent(name)
         let kb = workspace.appendingPathComponent("kb")
@@ -84,6 +85,7 @@ final class RAGToolBinaryStatusTests: XCTestCase {
         let engine = RAGEngine(config: config, knowledgeBase: kb.path,
                                embedding: embedding, reranker: nil)
         _ = await engine.ingest()
+        if buildANN { _ = engine.buildANNIndex() }
         _ = engine.status(sourceLimit: 0, maxAge: 0)
         let tool = RagStatusTool(config: engine.config, engine: engine)
         let result = try await tool.run([:])
@@ -96,9 +98,20 @@ final class RAGToolBinaryStatusTests: XCTestCase {
         let output = try await statusOutput(name: "ready",
                                             embedding: SigningEmbedding())
         XCTAssertTrue(
-            output.contains("二值粗筛: 可用（8 bit，覆盖 100%，本次取代 ANN）"),
+            output.contains("二值粗筛: 可用（sqlite-vec，8 bit，覆盖 100%，本次取代 ANN）"),
             output)
         XCTAssertTrue(output.contains("（本次由二值粗筛取代）"), output)
+        XCTAssertTrue(output.contains("二值 ANN: 未构建（本次回退 bin 表暴力汉明）"), output)
+    }
+
+    func testReadyBinaryANNOutputShowsBannBackend() async throws {
+        let output = try await statusOutput(name: "bann",
+                                            embedding: SigningEmbedding(),
+                                            buildANN: true)
+        XCTAssertTrue(
+            output.contains("二值粗筛: 可用（bann，8 bit，覆盖 100%，本次取代 ANN）"),
+            output)
+        XCTAssertTrue(output.contains("二值 ANN: 二值 ANN 索引"), output)
     }
 
     func testOffUnsupportedAndBypassedOutputs() async throws {

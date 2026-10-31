@@ -544,6 +544,8 @@ public final class RAGEngine {
     private var annBuildActive = false
     private var annBuildProgress: ANNBuildProgress?
     private var annBuildGeneration: UInt64 = 0
+    /// 最近一次构建的目标；仅用于状态展示（运行结束后不再有含义）。
+    private var annBuildTarget: ANNIndexTarget = .dense
 
     public static let supportedExtensions: Set<String> = [
         "pdf", "txt", "md", "markdown", "html", "htm", "xhtml",
@@ -1907,6 +1909,28 @@ public final class RAGEngine {
 
     // MARK: ANN 索引
 
+    /// 手动/自动构建的目标：二值签名覆盖完整时建 bann，否则建主 ANN。
+    public enum ANNIndexTarget: String, Sendable {
+        case dense
+        case binary
+    }
+
+    /// 当前配置下应构建哪种 ANN：二值粗筛开启且签名覆盖完整 → binary。
+    public func resolvedANNIndexTarget(timeout: Double? = nil) -> ANNIndexTarget {
+        guard config.ragBinaryCoarseEnabled,
+              effectiveVectorElementType != .bin,
+              binarySignatureDimension > 0 else { return .dense }
+        return (try? withStoreBounded(timeout: resolvedTimeout(timeout)) {
+            annIndexTarget(for: $0)
+        }) ?? .dense
+    }
+
+    private func annIndexTarget(for store: VectorStore) -> ANNIndexTarget {
+        guard config.ragBinaryCoarseEnabled, store.elementType != .bin else { return .dense }
+        let binary = store.binaryIndexStatus()
+        return binary.isComplete && binary.dimension > 0 ? .binary : .dense
+    }
+
     /// 当前生效的 ANN 检索参数；开关关闭时返回 nil（检索走精确路径）。
     var annQueryOptions: ANNQueryOptions? {
         guard config.ragANNEnabled else { return nil }
@@ -1918,6 +1942,13 @@ public final class RAGEngine {
     /// 可能数分钟，状态查询超时就返回 nil，不阻塞界面。
     public func annIndexStatus(timeout: Double? = nil) -> ANNIndexStatus? {
         try? withStoreBounded(timeout: resolvedTimeout(timeout)) { $0.annIndexStatus() }
+    }
+
+    /// 二值 ANN 索引状态。与主 ANN 一样走带超时的只读入口。
+    public func binaryANNIndexStatus(timeout: Double? = nil) -> ANNIndexStatus? {
+        try? withStoreBounded(timeout: resolvedTimeout(timeout)) {
+            $0.binaryANNIndexStatus()
+        }
     }
 
     /// 二值粗筛状态。与 ANN 一样走带超时的只读入口。
@@ -1975,21 +2006,33 @@ public final class RAGEngine {
         let clusterSize = max(1, config.ragANNClusterSize)
         do {
             let store = try ensureStore()
-            let result = try store.buildANNIndex(
-                clusters: clusters,
-                clusterSize: clusterSize,
-                progress: { [weak self] update in
-                    self?.recordANNBuildProgress(update)
-                    progress?(update)
-                    // 每块日志限流：块粒度是 6 位数的切片量，逐块打印会刷屏。
-                    guard Date().timeIntervalSince(lastLog) >= 10,
-                          update.stage == "blocks" else { return }
-                    lastLog = Date()
-                    logFn("RAG: \(update.message)")
-                },
-                isCancelled: { [weak self] in
-                    Task.isCancelled || (self?.isCancelled ?? true)
-                })
+            let target = annIndexTarget(for: store)
+            annBuildLock.lock()
+            annBuildTarget = target
+            annBuildLock.unlock()
+            let progressHandler: (ANNBuildProgress) -> Void = { [weak self] update in
+                self?.recordANNBuildProgress(update)
+                progress?(update)
+                // 每块日志限流：块粒度是 6 位数的切片量，逐块打印会刷屏。
+                guard Date().timeIntervalSince(lastLog) >= 10,
+                      update.stage == "blocks" else { return }
+                lastLog = Date()
+                logFn("RAG: \(update.message)")
+            }
+            let cancelled: () -> Bool = { [weak self] in
+                Task.isCancelled || (self?.isCancelled ?? true)
+            }
+            let result: ANNBuildResult
+            switch target {
+            case .binary:
+                result = try store.buildBinaryANNIndex(
+                    clusters: clusters, clusterSize: clusterSize,
+                    progress: progressHandler, isCancelled: cancelled)
+            case .dense:
+                result = try store.buildANNIndex(
+                    clusters: clusters, clusterSize: clusterSize,
+                    progress: progressHandler, isCancelled: cancelled)
+            }
             logFn("RAG: \(result.summary)")
             invalidateStatusCache()
             return result
@@ -2012,7 +2055,8 @@ public final class RAGEngine {
         }
         let store = try ensureStore()
         try store.dropANNIndex()
-        AgentLog.info("RAG: ANN 索引已删除，检索回退精确扫描")
+        try store.dropBinaryANNIndex()
+        AgentLog.info("RAG: ANN 与二值 ANN 索引已删除，检索回退精确扫描")
     }
 
     // MARK: ANN 后台自动构建
@@ -2059,7 +2103,8 @@ public final class RAGEngine {
     /// 同步收尾后调度后台构建。真正的「是否值得建」判断放在后台任务里，
     /// 避免把状态查询重新塞回同步返回路径。
     private func scheduleANNAutoBuild(log logFn: @escaping (String) -> Void) {
-        guard config.ragANNEnabled, config.ragANNAutoBuild else { return }
+        guard config.ragANNAutoBuild,
+              config.ragANNEnabled || config.ragBinaryCoarseEnabled else { return }
         annBuildLock.lock()
         guard annBuildTask == nil else {
             annBuildLock.unlock()
@@ -2092,11 +2137,16 @@ public final class RAGEngine {
 
     /// 后台自动构建：先判断是否值得建，再短暂占用 ingest 标志执行。
     private func runBackgroundANNAutoBuild(log logFn: @escaping (String) -> Void) {
-        guard config.ragANNEnabled, config.ragANNAutoBuild else { return }
-        let overview: (chunks: Int, status: ANNIndexStatus)?
+        guard config.ragANNAutoBuild,
+              config.ragANNEnabled || config.ragBinaryCoarseEnabled else { return }
+        let overview: (chunks: Int, target: ANNIndexTarget, status: ANNIndexStatus)?
         do {
             let store = try ensureStore()
-            overview = (store.count, store.annIndexStatus())
+            let target = annIndexTarget(for: store)
+            let status = target == .binary
+                ? store.binaryANNIndexStatus()
+                : store.annIndexStatus()
+            overview = (store.count, target, status)
         } catch {
             logFn("RAG: 自动构建 ANN 索引跳过：\(error.localizedDescription)")
             return
@@ -2104,6 +2154,7 @@ public final class RAGEngine {
         guard let overview, overview.chunks >= config.ragANNMinChunks else { return }
 
         let chunks = overview.chunks
+        let target = overview.target
         let status = overview.status
         let clusters = max(2, config.ragANNClusters)
         let clusterSize = max(1, config.ragANNClusterSize)
@@ -2112,18 +2163,19 @@ public final class RAGEngine {
         let staleNeedsRebuild = status.indexedRows > 0
             && Double(status.staleRows)
                 >= Double(status.indexedRows) * VectorStore.annStaleRebuildRatio
+        let label = target == .binary ? "二值 ANN 索引" : "ANN 索引"
         if status.blocks == 0 {
-            logFn("RAG: 自动构建 ANN 索引（\(chunks) 切片，\(clusters) 簇 × \(clusterSize) 行/块）")
+            logFn("RAG: 自动构建\(label)（\(chunks) 切片，\(clusters) 簇 × \(clusterSize) 行/块）")
         } else if staleNeedsRebuild {
-            logFn("RAG: 自动全量重建 ANN 索引（陈旧 \(status.staleRows)/\(status.indexedRows) 切片）")
+            logFn("RAG: 自动全量重建\(label)（陈旧 \(status.staleRows)/\(status.indexedRows) 切片）")
         } else if status.unindexedRows > 0 || status.tailRows >= threshold {
-            logFn("RAG: 自动续建 ANN 索引（尾块 \(status.tailRows) 切片）")
+            logFn("RAG: 自动续建\(label)（尾块 \(status.tailRows) 切片）")
         } else {
             return
         }
 
         guard tryBeginIngest() else {
-            logFn("RAG: 另一次同步/维护正在进行，跳过本次自动构建 ANN 索引")
+            logFn("RAG: 另一次同步/维护正在进行，跳过本次自动构建\(label)")
             return
         }
         defer {
@@ -2495,6 +2547,7 @@ public final class RAGEngine {
                 : manifestSources
             let ann = store.annIndexStatus()
             let binary = store.binaryIndexStatus()
+            let binaryANN = store.binaryANNIndexStatus()
             let binaryState: String
             let binaryNote: String
             if !config.ragBinaryCoarseEnabled {
@@ -2513,6 +2566,42 @@ public final class RAGEngine {
             } else {
                 binaryState = "ready"
                 binaryNote = ""
+            }
+            // 二值 ANN 只覆盖「签名完整」这一条路径；其余状态交给回退链。
+            let binaryANNState: String
+            let binaryANNNote: String
+            if !config.ragBinaryCoarseEnabled {
+                binaryANNState = "off"
+                binaryANNNote = "已关闭"
+            } else if store.elementType == .bin {
+                binaryANNState = "bypassed_bin"
+                binaryANNNote = "bin 主存储仅支持单阶段检索"
+            } else if binaryState == "unsupported" || binaryState == "incomplete" {
+                binaryANNState = "incomplete"
+                binaryANNNote = binaryNote
+            } else if binaryANN.blocks == 0 {
+                binaryANNState = "not_built"
+                binaryANNNote = "本次回退 bin 表暴力汉明"
+            } else if !binaryANN.isUsable {
+                binaryANNState = "unusable"
+                binaryANNNote = binaryANN.summary
+            } else if binaryANN.needsRebuild {
+                binaryANNState = "needs_rebuild"
+                binaryANNNote = binaryANN.summary
+            } else if binaryANN.tailRows > 0 {
+                binaryANNState = "tail"
+                binaryANNNote = binaryANN.summary
+            } else {
+                binaryANNState = "ready"
+                binaryANNNote = ""
+            }
+            let binaryBackend: String
+            if binaryANNState == "ready" || binaryANNState == "tail" {
+                binaryBackend = "bann"
+            } else if binary.storageEnabled {
+                binaryBackend = "sqlite-vec"
+            } else {
+                binaryBackend = "none"
             }
             return [
                 "knowledge_base": .string(knowledgeBase),
@@ -2536,9 +2625,16 @@ public final class RAGEngine {
                 "binary_dimension": .int(binary.dimension),
                 "binary_coverage": .double(binary.coverage),
                 "binary_rows": .int(binary.rows),
-                "binary_backend": .string(binary.storageEnabled ? "sqlite-vec" : "none"),
+                "binary_backend": .string(binaryBackend),
                 "binary_note": .string(binaryNote),
                 "ann_bypassed": .bool(binaryState == "ready"),
+                // 二值 ANN（自研分块 IVF）：未构建时回退 bin 表暴力汉明。
+                "binary_ann": .string(binaryANNState),
+                "binary_ann_index": .string(binaryANN.summary),
+                "binary_ann_note": .string(binaryANNNote),
+                // stage 2 主向量读取路径：rerank 镜像 / 部分镜像 / vec0 点查。
+                "rerank_rows": .int(binary.rerankRows),
+                "stage2_backend": .string(binary.stage2Backend),
                 // 向量落盘类型 / Matryoshka 截断维 / 待重建闸门。
                 "vector_element_type": .string(store.elementType.rawValue),
                 "matryoshka_dim": .int(effectiveMatryoshkaDimension),
@@ -2568,11 +2664,17 @@ public final class RAGEngine {
         annBuildLock.lock()
         let running = annBuildScheduled || annBuildActive
         let progress = annBuildProgress
+        let target = annBuildTarget
         annBuildLock.unlock()
         var output = snapshot
         output["ann_building"] = .bool(running)
         output["ann_build_progress"] = .double(progress?.fraction ?? 0)
         output["ann_build_message"] = .string(progress?.message ?? "")
+        output["ann_build_target"] = .string(running ? target.rawValue : "")
+        output["binary_ann_building"] = .bool(running && target == .binary)
+        if running && target == .binary {
+            output["binary_ann"] = .string("building")
+        }
         return output
     }
 

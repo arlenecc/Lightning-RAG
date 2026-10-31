@@ -274,6 +274,10 @@ public final class RagStatusTool: AgentTool {
         let binaryDimension = status["binary_dimension"]?.intValue ?? 0
         let binaryCoverage = status["binary_coverage"]?.doubleValue ?? 0
         let binaryNote = status["binary_note"]?.stringValue ?? ""
+        let binaryANN = status["binary_ann"]?.stringValue ?? ""
+        let binaryANNIndex = status["binary_ann_index"]?.stringValue ?? ""
+        let binaryANNNote = status["binary_ann_note"]?.stringValue ?? ""
+        let binaryBackend = status["binary_backend"]?.stringValue ?? ""
         let annBypassed = status["ann_bypassed"]?.boolValue ?? false
 
         var lines: [String] = ["知识库状态:"]
@@ -293,7 +297,8 @@ public final class RagStatusTool: AgentTool {
             switch binaryCoarse {
             case "ready":
                 let percent = Int((min(1, max(0, binaryCoverage)) * 100).rounded())
-                lines.append("  二值粗筛: 可用（\(binaryDimension) bit，覆盖 \(percent)%"
+                let backend = binaryBackend.isEmpty ? "" : "\(binaryBackend)，"
+                lines.append("  二值粗筛: 可用（\(backend)\(binaryDimension) bit，覆盖 \(percent)%"
                     + (annBypassed ? "，本次取代 ANN" : "") + "）")
             case "incomplete":
                 let percent = Int((min(1, max(0, binaryCoverage)) * 100).rounded())
@@ -308,6 +313,23 @@ public final class RagStatusTool: AgentTool {
             default:
                 lines.append("  二值粗筛: 不可用（"
                     + "\(binaryNote.isEmpty ? "原因未知" : binaryNote)）")
+            }
+        }
+        if !binaryANN.isEmpty {
+            switch binaryANN {
+            case "ready", "tail":
+                lines.append("  二值 ANN: \(binaryANNIndex)")
+            case "not_built":
+                lines.append("  二值 ANN: 未构建（本次回退 bin 表暴力汉明）")
+            case "building":
+                lines.append("  二值 ANN: 构建中")
+            case "needs_rebuild":
+                lines.append("  二值 ANN: 建议重建（\(binaryANNNote)）")
+            case "incomplete", "unusable":
+                lines.append("  二值 ANN: 不可用（"
+                    + "\(binaryANNNote.isEmpty ? "原因未知" : binaryANNNote)）")
+            default:
+                break
             }
         }
         if !annIndex.isEmpty {
