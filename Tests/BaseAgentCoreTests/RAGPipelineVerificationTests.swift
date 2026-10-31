@@ -105,9 +105,16 @@ final class RAGPipelineVerificationTests: XCTestCase {
             status["vector_index_fingerprint"]?.stringValue?.contains("dimension=128") == true,
             "索引维度应为 128：\(status["vector_index_fingerprint"]?.stringValue ?? "-")")
         XCTAssertEqual(status["source_count"]?.intValue, targets.count)
+        XCTAssertEqual(status["binary_coarse"]?.stringValue, "ready")
+        // 新入库的库必须把 stage 2 主向量镜像写全，检索走镜像而不是 vec0。
+        XCTAssertEqual(status["rerank_rows"]?.intValue, status["chunks_stored"]?.intValue)
+        XCTAssertEqual(status["stage2_backend"]?.stringValue, "rerank")
         print("[rag-verify] status chunks=\(status["chunks_stored"]?.intValue ?? -1) "
             + "backend=\(status["vector_backend"]?.stringValue ?? "-") "
-            + "element=\(status["vector_element_type"]?.stringValue ?? "-")")
+            + "element=\(status["vector_element_type"]?.stringValue ?? "-") "
+            + "binary=\(status["binary_coarse"]?.stringValue ?? "-") "
+            + "stage2=\(status["stage2_backend"]?.stringValue ?? "-") "
+            + "mirror=\(status["rerank_rows"]?.intValue ?? -1)")
 
         let db = try SQLiteDatabase(path: engine.indexDBPath, readOnly: true)
         defer { db.close() }
