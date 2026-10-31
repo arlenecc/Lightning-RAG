@@ -682,6 +682,19 @@ public final class RAGEngine {
             .requiredVectorElementType ?? config.ragVectorElementType
     }
 
+    /// 二值签名位宽；主存储为 bin 时不启用（bin 只有单阶段检索）。
+    public var binarySignatureDimension: Int {
+        guard effectiveVectorElementType != .bin else { return 0 }
+        return (embedding as? EmbeddingBinarySigning)?.binaryDimension ?? 0
+    }
+
+    /// 二值签名来源标识。Matryoshka 不改变签名来源，避免截断维变化误清空 bin 表。
+    public var binarySignatureSource: String {
+        guard binarySignatureDimension > 0, let embedding else { return "" }
+        return (embedding as? EmbeddingBinarySigning)?.binarySourceIdentifier
+            ?? embedding.identifier
+    }
+
     /// 索引指纹：向量语义 + 落盘布局（`embedding.identifier | dimension |
     /// matryoshkaDim | elementType`）。任一字段变化都必须显式重建。
     ///
@@ -707,6 +720,8 @@ public final class RAGEngine {
                                        dimension: embedding.dimension,
                                        enableSQLiteVec: config.ragSQLiteVecEnabled,
                                        elementType: effectiveVectorElementType,
+                                       binaryDimension: binarySignatureDimension,
+                                       binarySource: binarySignatureSource,
                                        indexFingerprint: vectorIndexFingerprint)
         if newStore.didResetForDimensionChange {
             // 空库按新维度/类型采纳配置后，缓存的 manifest 若不同步失效，
@@ -1091,6 +1106,8 @@ public final class RAGEngine {
                            initialTokenBudget: config.ragEmbeddingTokenBudgetInitial,
                            tokenBudgetStep: config.ragEmbeddingTokenBudgetStep),
             log: logFn)
+        let binarySignaturesEnabled = effectiveVectorElementType != .bin
+            && scheduler.binaryDimension != nil
         let jobs = uniqueFiles.enumerated().map { index, file in
             IngestJob(index: index, total: total, file: file,
                       label: "[\(index + 1)/\(total)] \(file.relativePath)")
@@ -1150,6 +1167,7 @@ public final class RAGEngine {
                                 job: job,
                                 force: force,
                                 config: configRef,
+                                binarySignaturesEnabled: binarySignaturesEnabled,
                                 registry: registry,
                                 contentRegistry: contentRegistry,
                                 store: storeRef,
@@ -1321,6 +1339,7 @@ public final class RAGEngine {
         job: IngestJob,
         force: Bool,
         config: AgentConfig,
+        binarySignaturesEnabled: Bool,
         registry: DocumentParserRegistry,
         contentRegistry: ContentDedupRegistry,
         store: VectorStore,
@@ -1558,21 +1577,40 @@ public final class RAGEngine {
             // 并按当前吞吐与进程内存自动调整子批大小。
             let embedStarted = Date()
             var lastEmbedLog = Date()
-            let vectors = try await embedding.embedDocuments(chunks.map(\.text)) { done, count in
+            let onEmbedProgress: (Int, Int) -> Void = { done, count in
                 let now = Date()
                 guard now.timeIntervalSince(lastEmbedLog) >= 60 else { return }
                 lastEmbedLog = now
                 log("RAG: \(job.label) 向量化中 \(done)/\(count)"
                     + "（已用 \(Self.elapsedText(embedStarted))）")
             }
+            let texts = chunks.map(\.text)
+            let signed: BinaryEmbeddingOutput?
+            if binarySignaturesEnabled {
+                signed = try await embedding.embedDocumentsWithSignatures(
+                    texts, progress: onEmbedProgress)
+            } else {
+                signed = nil
+            }
+            let vectors: [[Float]]
+            if let signed {
+                vectors = signed.vectors
+            } else {
+                vectors = try await embedding.embedDocuments(
+                    texts, progress: onEmbedProgress)
+            }
             guard vectors.count == chunks.count else {
                 throw AgentError.storage("embedding 数量与切片不一致")
+            }
+            if let signed, signed.signatures.count != chunks.count {
+                throw AgentError.storage("embedding 签名数量与切片不一致")
             }
             let embedSeconds = Date().timeIntervalSince(embedStarted)
             if isCancelled() || Task.isCancelled { throw AgentError.cancelled }
 
             let writeStarted = Date()
-            _ = try store.add(chunks: chunks, vectors: vectors)
+            _ = try store.add(chunks: chunks, vectors: vectors,
+                              binarySignatures: signed?.signatures)
             let writeSeconds = Date().timeIntervalSince(writeStarted)
             if isCancelled() || Task.isCancelled { throw AgentError.cancelled }
 
@@ -1882,6 +1920,11 @@ public final class RAGEngine {
         try? withStoreBounded(timeout: resolvedTimeout(timeout)) { $0.annIndexStatus() }
     }
 
+    /// 二值粗筛状态。与 ANN 一样走带超时的只读入口。
+    public func binaryIndexStatus(timeout: Double? = nil) -> BinaryIndexStatus? {
+        try? withStoreBounded(timeout: resolvedTimeout(timeout)) { $0.binaryIndexStatus() }
+    }
+
     /// 离线评测 ANN 召回质量：同一批查询分别走 ANN 与精确检索，
     /// 计算 recall@K / nDCG@K。不 hydrate 正文、不修改索引，
     /// 用于在真实知识库上验证 `ragANNProbe` / `ragANNRescore` 是否够用。
@@ -2131,7 +2174,21 @@ public final class RAGEngine {
         let requested = max(1, min(topK, 20))
         // 先做耗时的 embedQuery，再取 store：避免 await 期间 close/reload
         // 把已经取到的连接关掉，导致在途检索报「数据库已关闭」。
-        let queryVector = try await embedding.embedQuery(query)
+        let queryVector: [Float]
+        let binaryOptions: BinaryCoarseOptions?
+        if config.ragBinaryCoarseEnabled,
+           effectiveVectorElementType != .bin,
+           let signing = embedding as? EmbeddingBinarySigning,
+           signing.binaryDimension > 0 {
+            let signed = try await signing.embedQueryWithSignature(query)
+            queryVector = signed.vector
+            binaryOptions = BinaryCoarseOptions(
+                signature: signed.signature,
+                candidateLimit: config.ragBinaryCoarseCandidates)
+        } else {
+            queryVector = try await embedding.embedQuery(query)
+            binaryOptions = nil
+        }
         let rerankEnabled = config.ragRerankEnabled && reranker != nil
         // 开启重排序时，最终条数由设置里的 TopN 决定（候选池按它放大）；
         // 未开启时仍按调用方 top_k。两者都封顶 20。
@@ -2149,6 +2206,7 @@ public final class RAGEngine {
                     sourceFilter: sourceFilter, sourceContains: sourceContains,
                     rrfK: config.ragRRFK,
                     overfetch: config.ragVectorOverfetch,
+                    binary: binaryOptions,
                     // ANN 索引就绪时向量通道走分块 IVF；不可用（未构建/
                     // 尾块超预算/维度不符）时内部自动回退精确路径。
                     ann: annQueryOptions,
@@ -2436,6 +2494,26 @@ public final class RAGEngine {
                 ? store.listSources(limit: sourceLimit)
                 : manifestSources
             let ann = store.annIndexStatus()
+            let binary = store.binaryIndexStatus()
+            let binaryState: String
+            let binaryNote: String
+            if !config.ragBinaryCoarseEnabled {
+                binaryState = "off"
+                binaryNote = "已关闭"
+            } else if store.elementType == .bin {
+                binaryState = "bypassed_bin"
+                binaryNote = "bin 主存储仅支持单阶段检索"
+            } else if binarySignatureDimension == 0 || !binary.storageEnabled {
+                binaryState = "unsupported"
+                binaryNote = binary.reason ?? "embedding 不支持二值签名"
+            } else if !binary.isComplete {
+                binaryState = "incomplete"
+                let percent = Int((binary.coverage * 100).rounded())
+                binaryNote = "覆盖 \(percent)%，请重新同步"
+            } else {
+                binaryState = "ready"
+                binaryNote = ""
+            }
             return [
                 "knowledge_base": .string(knowledgeBase),
                 "rag_dir": .string(ragDir),
@@ -2452,6 +2530,15 @@ public final class RAGEngine {
                 // 陈旧行与实际有效覆盖率（删除/更新留下的旧 rowid）。
                 "ann_stale_rows": .int(ann.staleRows),
                 "ann_effective_coverage": .double(ann.effectiveCoverage),
+                // 二值粗筛：ready 时检索走「汉明粗筛 → 余弦精排」，
+                // ANN 查询被整体旁路（ann_bypassed）。
+                "binary_coarse": .string(binaryState),
+                "binary_dimension": .int(binary.dimension),
+                "binary_coverage": .double(binary.coverage),
+                "binary_rows": .int(binary.rows),
+                "binary_backend": .string(binary.storageEnabled ? "sqlite-vec" : "none"),
+                "binary_note": .string(binaryNote),
+                "ann_bypassed": .bool(binaryState == "ready"),
                 // 向量落盘类型 / Matryoshka 截断维 / 待重建闸门。
                 "vector_element_type": .string(store.elementType.rawValue),
                 "matryoshka_dim": .int(effectiveMatryoshkaDimension),
