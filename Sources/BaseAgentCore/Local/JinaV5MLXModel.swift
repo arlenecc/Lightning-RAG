@@ -252,14 +252,21 @@ final class JinaV5MLXModel: @unchecked Sendable {
 
     // MARK: - 推理
 
+    struct JinaV5MLXEncodeResult: Sendable {
+        let vectors: [[Float]]
+        let nativeVectors: [[Float]]
+    }
+
     /// 双向编码 + last-token pooling，返回前 `dimension` 维、已重新 L2 归一化的向量。
     ///
     /// - Parameters:
     ///   - inputIDs / attentionMask: 等长的 batch（右 padding）。
     ///   - dimension: Matryoshka 输出维度；大于原生维时按原生维处理。
     func encode(inputIDs: [[Int]], attentionMask: [[Int]],
-                dimension: Int) -> [[Float]] {
-        guard let first = inputIDs.first, !first.isEmpty else { return [] }
+                dimension: Int) -> JinaV5MLXEncodeResult {
+        guard let first = inputIDs.first, !first.isEmpty else {
+            return JinaV5MLXEncodeResult(vectors: [], nativeVectors: [])
+        }
         let batch = inputIDs.count
         let ids = MLXArray(inputIDs.map { row in row.map(Int32.init) })
         let mask = attentionMask.map { row in row.map { Int32($0 == 0 ? 0 : 1) } }
@@ -291,6 +298,8 @@ final class JinaV5MLXModel: @unchecked Sendable {
         let batchIndices = MLXArray((0 ..< batch).map { Int32($0) })
         let lengthIndices = MLXArray(lastIndices.map { Int32($0) })
         var pooled = hidden[batchIndices, lengthIndices]
+        // 二值签名只能从截断前的原生 768 维生成；归一化不改变符号。
+        let nativeVectors = pooled.map { $0.asArray(Float.self) }
 
         // Matryoshka 截断：取前 N 维后必须重新归一化（不是复用 768 维的范数）。
         let target = max(1, min(dimension, pooled.dim(-1)))
@@ -299,7 +308,9 @@ final class JinaV5MLXModel: @unchecked Sendable {
         }
         let normalized = pooled.l2Normalized(axis: -1, eps: 1e-12)
         normalized.eval()
-        return normalized.map { $0.asArray(Float.self) }
+        return JinaV5MLXEncodeResult(
+            vectors: normalized.map { $0.asArray(Float.self) },
+            nativeVectors: nativeVectors)
     }
 
     // MARK: - 权重装配

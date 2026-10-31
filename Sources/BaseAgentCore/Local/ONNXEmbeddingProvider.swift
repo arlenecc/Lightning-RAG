@@ -126,19 +126,54 @@ public final class ONNXEmbeddingProvider: EmbeddingProvider, EmbeddingTokenCount
         let prefixed = texts.map {
             prefixStrategy.apply($0, task: .retrievalDocument)
         }
-        return try await embed(prefixed, task: .retrievalDocument)
+        return try await embed(prefixed, task: .retrievalDocument).vectors
     }
 
     public func embedQuery(_ text: String) async throws -> [Float] {
         let result = try await embed([
             prefixStrategy.apply(text, task: .retrievalQuery)
         ], task: .retrievalQuery)
-        return result.first ?? []
+        return result.vectors.first ?? []
+    }
+
+    public var binaryDimension: Int {
+        isJinaV5 ? JinaV5Profile.nativeDimension : ((dimension + 7) / 8) * 8
+    }
+    public var binarySourceIdentifier: String { identifier }
+
+    public func embedDocumentsWithSignatures(_ texts: [String]) async throws
+        -> BinaryEmbeddingOutput {
+        guard !texts.isEmpty else {
+            return BinaryEmbeddingOutput(vectors: [], signatures: [])
+        }
+        let prefixed = texts.map { prefixStrategy.apply($0, task: .retrievalDocument) }
+        let pooled = try await embed(prefixed, task: .retrievalDocument)
+        return BinaryEmbeddingOutput(
+            vectors: pooled.vectors,
+            signatures: pooled.nativeVectors.map {
+                VectorEncoder.encodeSignature($0, bitDimension: binaryDimension)
+            })
+    }
+
+    public func embedQueryWithSignature(_ text: String) async throws
+        -> (vector: [Float], signature: Data) {
+        let pooled = try await embed([
+            prefixStrategy.apply(text, task: .retrievalQuery)
+        ], task: .retrievalQuery)
+        return (pooled.vectors.first ?? [], pooled.nativeVectors.first.map {
+            VectorEncoder.encodeSignature($0, bitDimension: binaryDimension)
+        } ?? Data())
     }
 
     // MARK: - 推理
 
-    private func embed(_ texts: [String], task: EmbeddingTask) async throws -> [[Float]] {
+    private struct PooledEmbeddings {
+        let vectors: [[Float]]
+        let nativeVectors: [[Float]]
+    }
+
+    private func embed(_ texts: [String], task: EmbeddingTask) async throws
+        -> PooledEmbeddings {
         if let preflightError { throw preflightError }
         guard let modelURL else {
             throw LocalModelError.runtime("Embedding 模型路径未解析：\(directory.path)")
@@ -149,8 +184,10 @@ public final class ONNXEmbeddingProvider: EmbeddingProvider, EmbeddingTokenCount
             directory: directory
         )
         let outputName = preferredOutputName(in: session)
-        var result: [[Float]] = []
-        result.reserveCapacity(texts.count)
+        var vectors: [[Float]] = []
+        var nativeVectors: [[Float]] = []
+        vectors.reserveCapacity(texts.count)
+        nativeVectors.reserveCapacity(texts.count)
 
         var start = 0
         while start < texts.count {
@@ -165,10 +202,12 @@ public final class ONNXEmbeddingProvider: EmbeddingProvider, EmbeddingTokenCount
                 throw ONNXRuntimeError.output("模型没有返回输出 \(outputName)")
             }
             let tensor = try output.floatTensor()
-            result.append(contentsOf: try pool(tensor, mask: encoded))
+            let pooled = try pool(tensor, mask: encoded)
+            vectors.append(contentsOf: pooled.vectors)
+            nativeVectors.append(contentsOf: pooled.nativeVectors)
             start = end
         }
-        return result
+        return PooledEmbeddings(vectors: vectors, nativeVectors: nativeVectors)
     }
 
     private func makeInputs(
@@ -213,7 +252,8 @@ public final class ONNXEmbeddingProvider: EmbeddingProvider, EmbeddingTokenCount
     }
 
     /// 池化 + L2 归一化：Jina v5 用图内 last-token 输出，其余模型做 mean pooling。
-    private func pool(_ tensor: OrtTensor, mask: TokenizedBatch) throws -> [[Float]] {
+    private func pool(_ tensor: OrtTensor, mask: TokenizedBatch) throws
+        -> PooledEmbeddings {
         let shape = tensor.shape
         if shape.count == 2 {
             let batch = shape[0]
@@ -224,18 +264,23 @@ public final class ONNXEmbeddingProvider: EmbeddingProvider, EmbeddingTokenCount
             if isJinaV5 {
                 // V5 图内已做 last-token pooling + L2；这里按配置维截断并重新归一化。
                 updateDimension(v5OutputDimension)
-                return (0..<batch).map { row in
-                    JinaV5Profile.truncateAndNormalize(
-                        Array(tensor.values[(row * hidden)..<((row + 1) * hidden)]),
-                        dimension: v5OutputDimension)
+                let rawRows = (0..<batch).map { row in
+                    Array(tensor.values[(row * hidden)..<((row + 1) * hidden)])
                 }
+                return PooledEmbeddings(
+                    vectors: rawRows.map {
+                        JinaV5Profile.truncateAndNormalize(
+                            $0, dimension: v5OutputDimension)
+                    },
+                    nativeVectors: rawRows)
             }
             updateDimension(hidden)
-            return (0..<batch).map { row in
+            let vectors = (0..<batch).map { row in
                 var vector = Array(tensor.values[(row * hidden)..<((row + 1) * hidden)])
                 Self.normalize(&vector)
                 return vector
             }
+            return PooledEmbeddings(vectors: vectors, nativeVectors: vectors)
         }
 
         guard shape.count == 3 else {
@@ -251,8 +296,10 @@ public final class ONNXEmbeddingProvider: EmbeddingProvider, EmbeddingTokenCount
         }
         updateDimension(isJinaV5 ? v5OutputDimension : hidden)
 
-        var result: [[Float]] = []
-        result.reserveCapacity(batch)
+        var vectors: [[Float]] = []
+        var nativeVectors: [[Float]] = []
+        vectors.reserveCapacity(batch)
+        nativeVectors.reserveCapacity(batch)
         for row in 0..<batch {
             if isJinaV5 {
                 // [B,T,H] 输出时按 V5 约定做 last-token pooling，再按配置维截断重归一化。
@@ -261,9 +308,10 @@ public final class ONNXEmbeddingProvider: EmbeddingProvider, EmbeddingTokenCount
                     lastToken = token
                 }
                 let offset = (row * length + lastToken) * hidden
-                result.append(JinaV5Profile.truncateAndNormalize(
-                    Array(tensor.values[offset..<(offset + hidden)]),
-                    dimension: v5OutputDimension))
+                let nativeRow = Array(tensor.values[offset..<(offset + hidden)])
+                vectors.append(JinaV5Profile.truncateAndNormalize(
+                    nativeRow, dimension: v5OutputDimension))
+                nativeVectors.append(nativeRow)
                 continue
             }
             var vector = [Float](repeating: 0, count: hidden)
@@ -282,9 +330,10 @@ public final class ONNXEmbeddingProvider: EmbeddingProvider, EmbeddingTokenCount
                 }
             }
             Self.normalize(&vector)
-            result.append(vector)
+            vectors.append(vector)
+            nativeVectors.append(vector)
         }
-        return result
+        return PooledEmbeddings(vectors: vectors, nativeVectors: nativeVectors)
     }
 
     private func preferredOutputName(in session: OrtSession) -> String {

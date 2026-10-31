@@ -7,6 +7,7 @@ import Foundation
 /// 外层 `MatryoshkaEmbedding` 不会再包装它。落盘元素类型由用户配置决定。
 final class JinaV5MLXEmbeddingProvider: EmbeddingProvider,
                                        EmbeddingTokenCounting,
+                                       EmbeddingBinarySigning,
                                        @unchecked Sendable {
     let identifier: String
     let modelName: String
@@ -34,27 +35,48 @@ final class JinaV5MLXEmbeddingProvider: EmbeddingProvider,
         self.dimension = JinaV5Profile.validDimension(dimension)
     }
 
+    var binaryDimension: Int { JinaV5Profile.nativeDimension }
+    var binarySourceIdentifier: String { identifier }
+
     func embedDocuments(_ texts: [String]) async throws -> [[Float]] {
-        guard !texts.isEmpty else { return [] }
+        try await embedDocumentsWithSignatures(texts).vectors
+    }
+
+    func embedDocumentsWithSignatures(_ texts: [String]) async throws
+        -> BinaryEmbeddingOutput {
+        guard !texts.isEmpty else {
+            return BinaryEmbeddingOutput(vectors: [], signatures: [])
+        }
         let prefixed = texts.map {
             prefixStrategy.apply($0, task: .retrievalDocument)
         }
-        return try await embed(prefixed)
+        return try await embedWithSignatures(prefixed)
     }
 
     func embedQuery(_ text: String) async throws -> [Float] {
-        let vectors = try await embed([
-            prefixStrategy.apply(text, task: .retrievalQuery),
-        ])
-        return vectors.first ?? []
+        try await embedQueryWithSignature(text).vector
     }
 
-    private func embed(_ texts: [String]) async throws -> [[Float]] {
+    func embedQueryWithSignature(_ text: String) async throws
+        -> (vector: [Float], signature: Data) {
+        let output = try await embedWithSignatures([
+            prefixStrategy.apply(text, task: .retrievalQuery),
+        ])
+        return (output.vectors.first ?? [], output.signatures.first ?? Data())
+    }
+
+    private func embedWithSignatures(_ texts: [String]) async throws
+        -> BinaryEmbeddingOutput {
         let (model, tokenizer) = try await state.handles(directory: directory)
         let batch = tokenizer.encodeBatch(texts, maxLength: maxLength)
-        return model.encode(
+        let result = model.encode(
             inputIDs: batch.inputIDs, attentionMask: batch.attentionMask,
             dimension: dimension)
+        return BinaryEmbeddingOutput(
+            vectors: result.vectors,
+            signatures: result.nativeVectors.map {
+                VectorEncoder.encodeSignature($0, bitDimension: binaryDimension)
+            })
     }
 
     /// 释放权重；provider 保留，下次 embed 时按需重载。

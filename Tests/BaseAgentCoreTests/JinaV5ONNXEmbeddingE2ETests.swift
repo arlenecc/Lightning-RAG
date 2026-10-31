@@ -75,6 +75,34 @@ final class JinaV5ONNXEmbeddingE2ETests: XCTestCase {
                           "Query: / Document: 前缀必须真正改变输入")
     }
 
+    func testOnnxSignaturesUseNative768Dimension() async throws {
+        let directory = try modelDirectory()
+        let narrow = ONNXEmbeddingProvider(
+            directory: directory, modelName: Self.modelName, v5Dimension: 128)
+        let wide = ONNXEmbeddingProvider(
+            directory: directory, modelName: Self.modelName, v5Dimension: 256)
+        addTeardownBlock {
+            await narrow.unload()
+            await wide.unload()
+        }
+
+        XCTAssertEqual(narrow.binaryDimension, 768)
+        XCTAssertEqual(narrow.binarySourceIdentifier, narrow.identifier)
+
+        let texts = ["苹果公司发布了新款智能手机。", "机器学习通过数据训练模型。"]
+        let narrowOutput = try await narrow.embedDocumentsWithSignatures(texts)
+        let wideOutput = try await wide.embedDocumentsWithSignatures(texts)
+        XCTAssertEqual(narrowOutput.vectors.map(\.count), [128, 128])
+        XCTAssertEqual(wideOutput.vectors.map(\.count), [256, 256])
+        XCTAssertEqual(narrowOutput.signatures.map(\.count), [96, 96])
+        XCTAssertEqual(narrowOutput.signatures, wideOutput.signatures,
+                       "ONNX v5 也必须在截断前取签名")
+
+        let query = try await narrow.embedQueryWithSignature("苹果发布了新手机")
+        XCTAssertEqual(query.vector.count, 128)
+        XCTAssertEqual(query.signature.count, 96)
+    }
+
     // MARK: - 工具
 
     private func cosine(_ a: [Float], _ b: [Float]) -> Float {

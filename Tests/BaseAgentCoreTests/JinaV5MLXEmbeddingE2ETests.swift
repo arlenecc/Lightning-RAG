@@ -79,6 +79,43 @@ final class JinaV5MLXEmbeddingE2ETests: XCTestCase {
                           "前缀必须真正改变输入，不能是空操作")
     }
 
+    func testSignaturesUseNative768DimensionNotTruncatedOutput() async throws {
+        let directory = EmbeddingBenchmarkTests.resolveModelsRoot()
+            .appendingPathComponent(Self.modelName)
+        try XCTSkipUnless(
+            JinaV5Profile.isJinaV5(directory: directory)
+                && JinaV5Profile.weightsURL(in: directory) != nil,
+            "模型缺失：\(directory.path)")
+
+        let narrow = JinaV5MLXEmbeddingProvider(
+            directory: directory, modelName: Self.modelName, dimension: 128)
+        let wide = JinaV5MLXEmbeddingProvider(
+            directory: directory, modelName: Self.modelName, dimension: 256)
+        addTeardownBlock {
+            await narrow.unload()
+            await wide.unload()
+        }
+
+        XCTAssertEqual(narrow.binaryDimension, 768)
+        XCTAssertEqual(narrow.binarySourceIdentifier, narrow.identifier)
+
+        let texts = ["苹果公司发布了新款智能手机。", "机器学习通过数据训练模型。"]
+        let narrowOutput = try await narrow.embedDocumentsWithSignatures(texts)
+        let wideOutput = try await wide.embedDocumentsWithSignatures(texts)
+
+        XCTAssertEqual(narrowOutput.vectors.map(\.count), [128, 128])
+        XCTAssertEqual(wideOutput.vectors.map(\.count), [256, 256])
+        XCTAssertEqual(narrowOutput.signatures.count, texts.count)
+        XCTAssertEqual(narrowOutput.signatures.map(\.count), [96, 96],
+                       "768 bit = 96 字节")
+        XCTAssertEqual(narrowOutput.signatures, wideOutput.signatures,
+                       "签名必须来自截断前的同一份原生输出")
+
+        let query = try await narrow.embedQueryWithSignature("苹果发布了新手机")
+        XCTAssertEqual(query.vector.count, 128)
+        XCTAssertEqual(query.signature.count, 96)
+    }
+
     // MARK: - 工具
 
     private func cosine(_ a: [Float], _ b: [Float]) -> Float {
