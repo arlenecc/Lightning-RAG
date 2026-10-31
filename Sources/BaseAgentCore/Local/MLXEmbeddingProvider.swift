@@ -7,7 +7,8 @@ import MLXLMCommon
 ///
 /// 与 ONNX 实现保持同样的接口：document/query 前缀、pooling + L2 归一化。
 /// 前缀按模型族统一处理（`EmbeddingPrefixStrategy`）。
-public final class MLXEmbeddingProvider: EmbeddingProvider, EmbeddingTokenCounting, @unchecked Sendable {
+public final class MLXEmbeddingProvider: EmbeddingProvider, EmbeddingTokenCounting,
+                                         EmbeddingBinarySigning, @unchecked Sendable {
     public static let bgeQueryInstruction = EmbeddingPrefixStrategy.bgeQueryInstruction
 
     public let identifier: String

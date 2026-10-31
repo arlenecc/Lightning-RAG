@@ -5,7 +5,9 @@ import Foundation
 /// 与其它 provider 保持同样的接口：document/query 前缀、原生长度池化 + L2
 /// 归一化；Matryoshka 截断与 int8 量化由外层统一处理。
 final class JinaV3MLXEmbeddingProvider: EmbeddingProvider,
-                                       EmbeddingTokenCounting, @unchecked Sendable {
+                                       EmbeddingTokenCounting,
+                                       EmbeddingBinarySigning,
+                                       @unchecked Sendable {
     let identifier: String
     let modelName: String
     let directory: URL

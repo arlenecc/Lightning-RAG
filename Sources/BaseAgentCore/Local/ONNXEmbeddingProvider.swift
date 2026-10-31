@@ -6,6 +6,7 @@ import Foundation
 /// - 输出做 attention-mask 加权 mean pooling，再 L2 归一化；
 /// - 按子批执行，避免长文本批量推理一次性占用过多内存。
 public final class ONNXEmbeddingProvider: EmbeddingProvider, EmbeddingTokenCounting,
+                                          EmbeddingBinarySigning,
                                           @unchecked Sendable {
     public let identifier: String
     public let modelName: String

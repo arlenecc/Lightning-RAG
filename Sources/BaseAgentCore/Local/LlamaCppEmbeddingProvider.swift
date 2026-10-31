@@ -4,6 +4,7 @@ import llama
 /// 进程内 GGUF Embedding：直接加载模型并用 llama.cpp 的 pooled embedding。
 public final class LlamaCppEmbeddingProvider: EmbeddingProvider,
                                              EmbeddingTokenCounting,
+                                             EmbeddingBinarySigning,
                                              @unchecked Sendable {
     /// 上下文窗口（与 `LlamaCppEmbeddingRuntime` 一致）：llama.cpp 侧只按
     /// 这个窗口解码，超出部分会被 `prefix()` 丢掉。声明出去后，切片环节
