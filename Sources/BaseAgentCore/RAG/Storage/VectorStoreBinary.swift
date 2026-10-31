@@ -158,6 +158,8 @@ extension VectorStore {
         try db.transaction {
             try db.execute("DROP TABLE IF EXISTS \(Self.binaryVectorTable)")
             try deleteBinaryMetaLocked()
+            // bin 表重建后旧签名 rowid 全部失效，二值 ANN 一起丢弃。
+            try dropBinaryANNIndexLocked()
             try db.execute("""
             CREATE VIRTUAL TABLE \(Self.binaryVectorTable)
             USING vec0(embedding bit[\(binaryDimension)])

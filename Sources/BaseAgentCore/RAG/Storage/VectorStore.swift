@@ -80,6 +80,8 @@ public final class VectorStore: @unchecked Sendable {
     /// ANN 簇心缓存（懒加载）。扩展无法新增存储属性，因此声明在这里，
     /// 由 `VectorStoreANN.swift` 读写。
     var annCentroidCache: ANNCentroidCache?
+    /// 二值 ANN 簇心缓存（懒加载），由 `VectorStoreBinaryANN.swift` 读写。
+    var bannCentroidCache: ANNCentroidCache?
     /// 二值签名位宽；0 表示 provider 不支持或主类型为 bin。
     let binaryDimension: Int
     /// 签名来源标识，用于 bin 表 meta 一致性校验。
@@ -386,6 +388,7 @@ public final class VectorStore: @unchecked Sendable {
             try db.execute("DROP TABLE IF EXISTS \(Self.annCellsTable)")
             try db.execute("DROP TABLE IF EXISTS \(Self.annBlocksTable)")
             try db.execute("DELETE FROM meta WHERE key GLOB 'ann_*'")
+            try dropBinaryANNIndexLocked()
             try dropRerankStorageLocked()
             try db.execute("DELETE FROM meta WHERE key IN (?, ?, ?)",
                            [.text(Self.dimensionKey), .text(Self.elementTypeKey),
@@ -588,6 +591,7 @@ public final class VectorStore: @unchecked Sendable {
             try db.execute("DROP TABLE IF EXISTS \(Self.vectorTable)")
             // 只在空库上重建，但旧维度的 ANN 索引同样必须丢弃。
             try? resetANNIndexLocked()
+            try? dropBinaryANNIndexLocked()
             try ensureVectorTable(dimension: resolved, useVec0: vectorEnabled)
             if binaryStorageEnabled {
                 try db.execute("DELETE FROM \(Self.binaryVectorTable)")
@@ -675,6 +679,7 @@ public final class VectorStore: @unchecked Sendable {
         // ANN 只追加：块内旧 rowid 不随删除回收，这里累计陈旧行。
         // 与删除同事务提交；超过阈值的整体重建由 buildANNIndex 处理。
         try recordANNStaleRowsLocked(rowIDs)
+        try recordBANNStaleRowsLocked(rowIDs)
         if let cachedChunkCount {
             self.cachedChunkCount = max(0, cachedChunkCount - rowIDs.count)
             try persistChunkCounterLocked()
@@ -825,6 +830,7 @@ public final class VectorStore: @unchecked Sendable {
                 try resetRerankStorageLocked()
                 // ANN 索引里的 rowid 与维度都失效，直接丢弃（表可能还没建）。
                 try? resetANNIndexLocked()
+                try? resetBANNIndexLocked()
                 self.cachedChunkCount = 0
                 try persistChunkCounterLocked()
                 if needsRecreate {
@@ -866,6 +872,7 @@ public final class VectorStore: @unchecked Sendable {
                 }
                 try resetRerankStorageLocked()
                 try? resetANNIndexLocked()
+                try? dropBinaryANNIndexLocked()
                 enabled = try recreateVectorTableLocked()
                 self.cachedChunkCount = 0
                 try persistChunkCounterLocked()

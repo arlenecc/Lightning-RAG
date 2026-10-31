@@ -1091,8 +1091,8 @@ extension VectorStore {
     }
 
     /// 初始簇心：块内均匀采样若干行（k-means 起点）。
-    private func annSeedCentroids(buffer: ANNBlockBuffer, dim: Int,
-                                  clusters: Int) -> [Float]? {
+    func annSeedCentroids(buffer: ANNBlockBuffer, dim: Int,
+                          clusters: Int) -> [Float]? {
         let rows = buffer.count
         guard rows > 0, clusters > 0 else { return nil }
         let sampleCount = min(rows, max(clusters * 4, 1024))
