@@ -55,13 +55,15 @@ public struct SearchHit: Sendable, Identifiable {
     public var vectorScore: Double?
     public var ftsScore: Double?
     public var rrfScore: Double?
+    /// stage 1 二值粗筛的汉明相似度；未走二值粗筛时为 nil。
+    public var binaryScore: Double?
 
     public var id: Int64 { rowID }
 
     public init(rowID: Int64, text: String, source: String, chunkIndex: Int,
                 heading: String = "", score: Double = 0,
                 vectorScore: Double? = nil, ftsScore: Double? = nil,
-                rrfScore: Double? = nil) {
+                rrfScore: Double? = nil, binaryScore: Double? = nil) {
         self.rowID = rowID
         self.text = text
         self.source = source
@@ -71,6 +73,7 @@ public struct SearchHit: Sendable, Identifiable {
         self.vectorScore = vectorScore
         self.ftsScore = ftsScore
         self.rrfScore = rrfScore
+        self.binaryScore = binaryScore
     }
 }
 
@@ -107,6 +110,50 @@ public protocol EmbeddingProvider: AnyObject, Sendable {
     /// 底层模型可安全并发推理的调用数：ONNX session.run 线程安全可并发；
     /// MLX 受全局 Metal 队列限制只能串行。调度器据此限流。
     var maxConcurrentRuns: Int { get }
+}
+
+/// 一次同时返回主向量与二值签名。签名必须来自原生输出（截断/量化之前）。
+public struct BinaryEmbeddingOutput: Sendable {
+    public var vectors: [[Float]]
+    public var signatures: [Data]
+
+    public init(vectors: [[Float]], signatures: [Data]) {
+        self.vectors = vectors
+        self.signatures = signatures
+    }
+}
+
+/// 能提供二值签名的 embedding。
+public protocol EmbeddingBinarySigning: AnyObject, Sendable {
+    /// 签名位宽，必须是 8 的倍数。
+    var binaryDimension: Int { get }
+    /// 签名来源标识，用于 bin 表 meta 一致性校验。
+    var binarySourceIdentifier: String { get }
+    func embedDocumentsWithSignatures(_ texts: [String]) async throws -> BinaryEmbeddingOutput
+    func embedQueryWithSignature(_ text: String) async throws
+        -> (vector: [Float], signature: Data)
+}
+
+public extension EmbeddingBinarySigning where Self: EmbeddingProvider {
+    var binaryDimension: Int { ((dimension + 7) / 8) * 8 }
+    var binarySourceIdentifier: String { identifier }
+
+    func embedDocumentsWithSignatures(_ texts: [String]) async throws -> BinaryEmbeddingOutput {
+        let vectors = try await embedDocuments(texts)
+        let bitDimension = binaryDimension
+        return BinaryEmbeddingOutput(
+            vectors: vectors,
+            signatures: vectors.map {
+                VectorEncoder.encodeSignature($0, bitDimension: bitDimension)
+            })
+    }
+
+    func embedQueryWithSignature(_ text: String) async throws
+        -> (vector: [Float], signature: Data) {
+        let vector = try await embedQuery(text)
+        return (vector,
+                VectorEncoder.encodeSignature(vector, bitDimension: binaryDimension))
+    }
 }
 
 /// 能提供精确 token 计数的 embedding：切片时改用模型真实分词器控长，
