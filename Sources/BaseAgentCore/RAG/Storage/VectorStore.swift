@@ -27,6 +27,8 @@ public final class VectorStore: @unchecked Sendable {
     public static let summaryRuntimeTable = "summary_runtime"
     /// 二值签名表。rowid 与 `chunks` 对齐，只存派生签名。
     public static let binaryVectorTable = "chunk_vectors_bin"
+    /// stage 2 精排的主向量镜像（普通表，按 rowid 点查）。
+    public static let rerankVectorTable = "chunk_vectors_rerank"
 
     public let db: SQLiteDatabase
     /// 数据库路径；检索用独立的只读连接打开 WAL 快照，不阻塞写入。
@@ -55,7 +57,7 @@ public final class VectorStore: @unchecked Sendable {
     /// 写入/删除/检索共用。ANN 实现（`VectorStoreANN.swift`）也在同一把锁内，
     /// 因此改为 internal。
     let lock = NSRecursiveLock()
-    private let deleteBatchSize = 400
+    let deleteBatchSize = 400
     private let insertBatchSize = 200
     /// sqlite-vec 的 KNN k 上限为 4096；分批/过滤不能越过该值。
     let maxVectorK = 4096
@@ -88,6 +90,12 @@ public final class VectorStore: @unchecked Sendable {
     var binaryRows: Int = 0
     /// 不可用原因（供 status 展示）。
     var binaryStorageReason: String?
+    /// rerank 镜像表是否可用（bin 主存储不需要镜像）。
+    var rerankStorageEnabled: Bool = false
+    /// 镜像表当前行数，O(1) 覆盖率计数器。
+    var rerankRows: Int = 0
+    /// 镜像不可用原因（供状态展示）。
+    var rerankStorageReason: String?
     /// 二值查询实际走 stage 1 的次数；供测试验证 ANN 旁路。
     var annQueryCount: Int = 0
     /// 最近一次二值回退原因与日志时间（60 秒节流）。
@@ -137,6 +145,13 @@ public final class VectorStore: @unchecked Sendable {
             self.vectorEnabled = enabled
         } else {
             try ensureVectorTable(dimension: self.dimension, useVec0: false)
+        }
+        do {
+            try setupRerankStorageLocked()
+        } catch {
+            AgentLog.warning("rerank 镜像初始化失败，stage 2 回退 vec0: \(error.localizedDescription)")
+            rerankStorageEnabled = false
+            rerankStorageReason = "初始化失败：\(error.localizedDescription)"
         }
         do {
             try setupBinaryIndexLocked()
@@ -371,6 +386,7 @@ public final class VectorStore: @unchecked Sendable {
             try db.execute("DROP TABLE IF EXISTS \(Self.annCellsTable)")
             try db.execute("DROP TABLE IF EXISTS \(Self.annBlocksTable)")
             try db.execute("DELETE FROM meta WHERE key GLOB 'ann_*'")
+            try dropRerankStorageLocked()
             try db.execute("DELETE FROM meta WHERE key IN (?, ?, ?)",
                            [.text(Self.dimensionKey), .text(Self.elementTypeKey),
                             .text(Self.fingerprintKey)])
@@ -555,6 +571,7 @@ public final class VectorStore: @unchecked Sendable {
                     binaryRows += insertedBinary
                     try persistBinaryCounterLocked()
                 }
+                try persistRerankCounterLocked()
             }
         }
         AgentLog.info("VectorStore: 写入 \(inserted) 个切片"
@@ -577,6 +594,7 @@ public final class VectorStore: @unchecked Sendable {
                 binaryRows = 0
                 try persistBinaryCounterLocked()
             }
+            try resetRerankStorageLocked()
             // 只在空库上重建；计数器同步归零，避免自增 rowid 残留造成虚高。
             try db.execute(
                 "INSERT INTO meta(key, value) VALUES('\(Self.chunkCountKey)', '0') "
@@ -587,6 +605,8 @@ public final class VectorStore: @unchecked Sendable {
         didResetForDimensionChange = true
         cachedChunkCount = 0
         try writeVectorMetaLocked()
+        // 镜像表已在事务内重置，这里用新维度刷新其 meta。
+        try writeRerankMetaLocked()
     }
 
     private func insertVector(rowID: Int64, vector: [Float]) throws {
@@ -603,6 +623,7 @@ public final class VectorStore: @unchecked Sendable {
                 "INSERT OR REPLACE INTO \(Self.vectorTable)(rowid, embedding) VALUES(?, \(expression))",
                 [.int(rowID), .blob(blob)])
         }
+        try insertRerankVector(rowID: rowID, blob: blob)
     }
 
     /// 删除一个 source 的全部切片。单事务、分批。
@@ -642,6 +663,7 @@ public final class VectorStore: @unchecked Sendable {
             try db.execute("DELETE FROM \(Self.chunksTable) WHERE rowid IN (\(placeholders))", args)
             try db.execute("DELETE FROM \(Self.ftsTable) WHERE rowid IN (\(placeholders))", args)
             try db.execute("DELETE FROM \(Self.vectorTable) WHERE rowid IN (\(placeholders))", args)
+            try deleteRerankRowsLocked(batch)
             if binaryStorageEnabled {
                 let removedBinary = try db.execute(
                     "DELETE FROM \(Self.binaryVectorTable) WHERE rowid IN (\(placeholders))",
@@ -658,6 +680,7 @@ public final class VectorStore: @unchecked Sendable {
             try persistChunkCounterLocked()
         }
         try persistBinaryCounterLocked()
+        try persistRerankCounterLocked()
         return rowIDs.count
     }
 
@@ -799,6 +822,7 @@ public final class VectorStore: @unchecked Sendable {
                     binaryRows = 0
                     try persistBinaryCounterLocked()
                 }
+                try resetRerankStorageLocked()
                 // ANN 索引里的 rowid 与维度都失效，直接丢弃（表可能还没建）。
                 try? resetANNIndexLocked()
                 self.cachedChunkCount = 0
@@ -840,6 +864,7 @@ public final class VectorStore: @unchecked Sendable {
                     binaryRows = 0
                     try persistBinaryCounterLocked()
                 }
+                try resetRerankStorageLocked()
                 try? resetANNIndexLocked()
                 enabled = try recreateVectorTableLocked()
                 self.cachedChunkCount = 0
@@ -857,6 +882,8 @@ public final class VectorStore: @unchecked Sendable {
     /// 丢弃旧向量表并按当前配置重建。返回 sqlite-vec 是否可用。
     private func recreateVectorTableLocked() throws -> Bool {
         try db.execute("DROP TABLE IF EXISTS \(Self.vectorTable)")
+        // 主表重建后镜像行全部失效，按当前配置重建空镜像。
+        try resetRerankStorageLocked()
         if sqliteVecAvailable, elementType.supportsVec0Index {
             do {
                 try ensureVectorTable(dimension: dimension, useVec0: true)
@@ -903,11 +930,13 @@ public final class VectorStore: @unchecked Sendable {
     private func withChunkCounterRollback<T>(_ body: () throws -> T) rethrows -> T {
         let chunksBefore = cachedChunkCount
         let binaryBefore = binaryRows
+        let rerankBefore = rerankRows
         do {
             return try body()
         } catch {
             cachedChunkCount = chunksBefore
             binaryRows = binaryBefore
+            rerankRows = rerankBefore
             throw error
         }
     }
