@@ -204,4 +204,181 @@ final class VectorStoreBinaryTests: XCTestCase {
         XCTAssertTrue(complete.isComplete)
         reopened.close()
     }
+
+    func testAddWritesBinaryRowsWithSameRowIDsAndPersistsCoverage() throws {
+        let path = dbPath("write")
+        let store = try VectorStore(
+            dbPath: path, dimension: dimension, elementType: .int8,
+            binaryDimension: binaryDimension, binarySource: "sig",
+            indexFingerprint: "fp")
+        let input = chunks(3)
+        let signatures = [UInt8(1), 2, 3].map(signature)
+        XCTAssertEqual(
+            try store.add(chunks: input,
+                          vectors: [oneHot(0), oneHot(1), oneHot(2)],
+                          binarySignatures: signatures), 3)
+
+        let status = store.binaryIndexStatus()
+        XCTAssertEqual(status.rows, 3)
+        XCTAssertEqual(status.chunkRows, 3)
+        XCTAssertEqual(status.coverage, 1)
+        XCTAssertTrue(status.isComplete)
+
+        let chunkIDs = try store.db.query("SELECT rowid FROM chunks ORDER BY rowid")
+            .compactMap { $0["rowid"]?.intValue }
+        let binIDs = try store.db.query(
+            "SELECT rowid FROM \(VectorStore.binaryVectorTable) ORDER BY rowid")
+            .compactMap { $0["rowid"]?.intValue }
+        XCTAssertEqual(binIDs, chunkIDs, "bin 行 rowid 必须与 chunks 严格一致")
+        XCTAssertEqual(try meta(store, VectorStore.binaryRowsKey), "3")
+        store.close()
+
+        let reopened = try VectorStore(
+            dbPath: path, dimension: dimension, elementType: .int8,
+            binaryDimension: binaryDimension, binarySource: "sig",
+            indexFingerprint: "fp")
+        XCTAssertTrue(reopened.binaryIndexStatus().isComplete,
+                      "覆盖率计数器必须跨重开保持")
+        reopened.close()
+    }
+
+    /// 没有签名时主向量照常写入，但覆盖率下降；补齐签名后同一 source
+    /// 会被 upsert 覆盖，覆盖率恢复完整。
+    func testAddWithoutSignaturesKeepsMainVectorsAndCoverageFalls() throws {
+        let store = try VectorStore(
+            dbPath: dbPath("partial"), dimension: dimension, elementType: .int8,
+            binaryDimension: binaryDimension, binarySource: "sig",
+            indexFingerprint: "fp")
+        XCTAssertEqual(
+            try store.add(chunks: chunks(2), vectors: [oneHot(0), oneHot(1)]), 2)
+        let partial = store.binaryIndexStatus()
+        XCTAssertEqual(partial.rows, 0)
+        XCTAssertEqual(partial.chunkRows, 2)
+        XCTAssertEqual(partial.coverage, 0)
+        XCTAssertFalse(partial.isComplete)
+        XCTAssertFalse(try store.search(vector: oneHot(0), topK: 1).isEmpty,
+                       "无签名不应影响主向量写入与检索")
+
+        XCTAssertEqual(
+            try store.add(chunks: chunks(2), vectors: [oneHot(0), oneHot(1)],
+                          binarySignatures: [signature(1), signature(2)]), 2)
+        XCTAssertTrue(store.binaryIndexStatus().isComplete, "重同步后覆盖率应恢复")
+        store.close()
+    }
+
+    func testSignatureCountMismatchRollsBackMainAndBinaryRows() throws {
+        let store = try VectorStore(
+            dbPath: dbPath("count-mismatch"), dimension: dimension, elementType: .int8,
+            binaryDimension: binaryDimension, binarySource: "sig",
+            indexFingerprint: "fp")
+        _ = try store.add(
+            chunks: [Chunk(text: "keep", source: "keep.md", chunkIndex: 0)],
+            vectors: [oneHot(0)], binarySignatures: [signature(1)])
+        XCTAssertEqual(store.count, 1)
+        XCTAssertEqual(store.binaryIndexStatus().rows, 1)
+
+        XCTAssertThrowsError(
+            try store.add(chunks: chunks(2), vectors: [oneHot(1), oneHot(2)],
+                          binarySignatures: [signature(2)])
+        ) { error in
+            XCTAssertTrue(error.localizedDescription.contains("签名数量"),
+                          error.localizedDescription)
+        }
+        XCTAssertEqual(store.count, 1, "失败必须回滚主向量")
+        XCTAssertEqual(store.binaryIndexStatus().rows, 1, "失败必须回滚 bin 计数")
+        XCTAssertEqual(try store.db.query("SELECT text FROM chunks").count, 1)
+        store.close()
+    }
+
+    func testSignatureLengthMismatchRollsBackWholeTransaction() throws {
+        let store = try VectorStore(
+            dbPath: dbPath("length-mismatch"), dimension: dimension, elementType: .int8,
+            binaryDimension: binaryDimension, binarySource: "sig",
+            indexFingerprint: "fp")
+        XCTAssertThrowsError(
+            try store.add(chunks: chunks(2), vectors: [oneHot(0), oneHot(1)],
+                          binarySignatures: [Data([0x01]), signature(2)])
+        ) { error in
+            XCTAssertTrue(error.localizedDescription.contains("字节数"),
+                          error.localizedDescription)
+        }
+        XCTAssertEqual(store.count, 0)
+        XCTAssertEqual(store.binaryIndexStatus().rows, 0)
+        XCTAssertEqual(
+            try store.db.scalar(
+                "SELECT COUNT(*) FROM \(VectorStore.binaryVectorTable)").intValue, 0)
+        store.close()
+    }
+
+    func testDeleteClearAndRebuildKeepBinaryCounterInSync() throws {
+        let store = try VectorStore(
+            dbPath: dbPath("lifecycle"), dimension: dimension, elementType: .int8,
+            binaryDimension: binaryDimension, binarySource: "sig",
+            indexFingerprint: "fp")
+        _ = try store.add(chunks: chunks(2), vectors: [oneHot(0), oneHot(1)],
+                          binarySignatures: [signature(1), signature(2)])
+        let ids = try store.db.query("SELECT rowid FROM chunks ORDER BY rowid")
+            .compactMap { $0["rowid"]?.intValue }
+        XCTAssertEqual(try store.deleteRowIDs([ids[0]]), 1)
+
+        let afterDelete = store.binaryIndexStatus()
+        XCTAssertEqual(afterDelete.rows, 1)
+        XCTAssertEqual(afterDelete.chunkRows, 1)
+        XCTAssertTrue(afterDelete.isComplete)
+        XCTAssertEqual(
+            try store.db.scalar(
+                "SELECT COUNT(*) FROM \(VectorStore.binaryVectorTable)").intValue, 1)
+
+        _ = try store.add(
+            chunks: [Chunk(text: "new", source: "new.md", chunkIndex: 0)],
+            vectors: [oneHot(2)], binarySignatures: [signature(3)])
+        XCTAssertEqual(store.binaryIndexStatus().rows, 2)
+
+        try store.clear()
+        let cleared = store.binaryIndexStatus()
+        XCTAssertEqual(cleared.rows, 0)
+        XCTAssertEqual(cleared.chunkRows, 0)
+        XCTAssertEqual(cleared.coverage, 0)
+        XCTAssertEqual(
+            try store.db.scalar(
+                "SELECT COUNT(*) FROM \(VectorStore.binaryVectorTable)").intValue, 0)
+
+        _ = try store.add(chunks: chunks(1), vectors: [oneHot(0)],
+                          binarySignatures: [signature(1)])
+        XCTAssertEqual(store.binaryIndexStatus().rows, 1)
+        _ = try store.rebuildForCurrentConfiguration()
+        let rebuilt = store.binaryIndexStatus()
+        XCTAssertEqual(rebuilt.rows, 0)
+        XCTAssertEqual(rebuilt.chunkRows, 0)
+        XCTAssertEqual(
+            try store.db.scalar(
+                "SELECT COUNT(*) FROM \(VectorStore.binaryVectorTable)").intValue, 0)
+        store.close()
+    }
+
+    /// 空库按真实维度重建主表时，残留的 bin 行也必须一并清掉。
+    func testDimensionRebuildClearsStaleBinaryRows() throws {
+        let store = try VectorStore(
+            dbPath: dbPath("dimension-rebuild"), dimension: dimension,
+            elementType: .int8, binaryDimension: binaryDimension,
+            binarySource: "sig", indexFingerprint: "fp")
+        try store.db.execute(
+            "INSERT INTO \(VectorStore.binaryVectorTable)(rowid, embedding) "
+            + "VALUES(1, vec_bit(?))", [.blob(signature(1))])
+        try store.db.execute(
+            "UPDATE meta SET value = '1' WHERE key = ?",
+            [.text(VectorStore.binaryRowsKey)])
+
+        let eightDimensions = [Float](repeating: 0, count: 8)
+        _ = try store.add(
+            chunks: [Chunk(text: "new", source: "new.md", chunkIndex: 0)],
+            vectors: [eightDimensions])
+
+        XCTAssertEqual(store.dimension, 8)
+        XCTAssertEqual(store.binaryIndexStatus().rows, 0)
+        XCTAssertEqual(
+            try store.db.scalar(
+                "SELECT COUNT(*) FROM \(VectorStore.binaryVectorTable)").intValue, 0)
+        store.close()
+    }
 }

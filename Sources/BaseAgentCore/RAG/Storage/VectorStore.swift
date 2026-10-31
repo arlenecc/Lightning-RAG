@@ -362,6 +362,12 @@ public final class VectorStore: @unchecked Sendable {
         didResetForDimensionChange = true
         try db.transaction {
             try db.execute("DROP TABLE IF EXISTS \(Self.vectorTable)")
+            if binaryStorageEnabled {
+                try db.execute("DROP TABLE IF EXISTS \(Self.binaryVectorTable)")
+                try deleteBinaryMetaLocked()
+                binaryRows = 0
+            }
+            binaryStorageEnabled = false
             try db.execute("DROP TABLE IF EXISTS \(Self.annCellsTable)")
             try db.execute("DROP TABLE IF EXISTS \(Self.annBlocksTable)")
             try db.execute("DELETE FROM meta WHERE key GLOB 'ann_*'")
@@ -443,9 +449,23 @@ public final class VectorStore: @unchecked Sendable {
     /// 所有 source 的全部改动都在**一个事务**内，任意失败整体回滚。
     @discardableResult
     public func add(chunks: [Chunk], vectors: [[Float]]) throws -> Int {
+        try add(chunks: chunks, vectors: vectors, binarySignatures: nil)
+    }
+
+    /// 批量写入（按 source upsert）。签名非 nil 时，主向量与 bin 行在同一
+    /// 事务内写入，rowid 严格一致；签名缺失时只写主向量，覆盖率随之下降。
+    @discardableResult
+    public func add(chunks: [Chunk], vectors: [[Float]],
+                    binarySignatures: [Data]?) throws -> Int {
         guard !chunks.isEmpty else { return 0 }
         guard chunks.count == vectors.count else {
-            throw AgentError.storage("chunks 与 vectors 数量不一致: \(chunks.count) vs \(vectors.count)")
+            throw AgentError.storage(
+                "chunks 与 vectors 数量不一致: \(chunks.count) vs \(vectors.count)")
+        }
+        if let binarySignatures, binarySignatures.count != chunks.count {
+            throw AgentError.storage(
+                "二值签名数量与切片数量不一致: "
+                + "\(binarySignatures.count) vs \(chunks.count)")
         }
         // FTS 预分词是纯 CPU 工作（实测约占单切片写入九成），放在写锁外批量并行完成：
         // 写事务只做插入，检索取向量候选时不会被整批分词阻塞。
@@ -470,15 +490,24 @@ public final class VectorStore: @unchecked Sendable {
             try rebuildDimensionLocked(first.count)
         }
 
+        if let binarySignatures, binaryStorageEnabled {
+            let expected = binaryDimension / 8
+            for signature in binarySignatures where signature.count != expected {
+                throw AgentError.storage(
+                    "二值签名字节数 \(signature.count) != \(expected)")
+            }
+        }
+
         let uniqueSources = Set(chunks.map(\.source))
         var inserted = 0
+        var insertedBinary = 0
         try withChunkCounterRollback {
             try db.transaction {
                 // 1) 删除这些 source 的旧数据（分批，事务内）。
                 for source in uniqueSources {
                     _ = try deleteBySourceLocked(source)
                 }
-                // 2) 分批插入正文 + FTS + 向量。
+                // 2) 分批插入正文 + FTS + 向量（以及可选 bin 行）。
                 var offset = 0
                 while offset < chunks.count {
                     let end = min(offset + insertBatchSize, chunks.count)
@@ -508,6 +537,11 @@ public final class VectorStore: @unchecked Sendable {
                              .text(Self.hashSource(chunk.source)), .int(Int64(chunk.chunkIndex))]
                         )
                         try insertVector(rowID: rowID, vector: vector)
+                        if binaryStorageEnabled, let binarySignatures {
+                            try insertBinarySignature(rowID: rowID,
+                                                      signature: binarySignatures[i])
+                            insertedBinary += 1
+                        }
                         inserted += 1
                     }
                     offset = end
@@ -517,9 +551,15 @@ public final class VectorStore: @unchecked Sendable {
                     self.cachedChunkCount = cachedChunkCount + inserted
                     try persistChunkCounterLocked()
                 }
+                if binaryStorageEnabled {
+                    binaryRows += insertedBinary
+                    try persistBinaryCounterLocked()
+                }
             }
         }
-        AgentLog.info("VectorStore: 写入 \(inserted) 个切片（\(uniqueSources.count) 个来源，单事务）")
+        AgentLog.info("VectorStore: 写入 \(inserted) 个切片"
+            + (insertedBinary > 0 ? "、\(insertedBinary) 条二值签名" : "")
+            + "（\(uniqueSources.count) 个来源，单事务）")
         return inserted
     }
 
@@ -532,6 +572,11 @@ public final class VectorStore: @unchecked Sendable {
             // 只在空库上重建，但旧维度的 ANN 索引同样必须丢弃。
             try? resetANNIndexLocked()
             try ensureVectorTable(dimension: resolved, useVec0: vectorEnabled)
+            if binaryStorageEnabled {
+                try db.execute("DELETE FROM \(Self.binaryVectorTable)")
+                binaryRows = 0
+                try persistBinaryCounterLocked()
+            }
             // 只在空库上重建；计数器同步归零，避免自增 rowid 残留造成虚高。
             try db.execute(
                 "INSERT INTO meta(key, value) VALUES('\(Self.chunkCountKey)', '0') "
@@ -597,6 +642,12 @@ public final class VectorStore: @unchecked Sendable {
             try db.execute("DELETE FROM \(Self.chunksTable) WHERE rowid IN (\(placeholders))", args)
             try db.execute("DELETE FROM \(Self.ftsTable) WHERE rowid IN (\(placeholders))", args)
             try db.execute("DELETE FROM \(Self.vectorTable) WHERE rowid IN (\(placeholders))", args)
+            if binaryStorageEnabled {
+                let removedBinary = try db.execute(
+                    "DELETE FROM \(Self.binaryVectorTable) WHERE rowid IN (\(placeholders))",
+                    args)
+                binaryRows = max(0, binaryRows - removedBinary)
+            }
             index += batch.count
         }
         // ANN 只追加：块内旧 rowid 不随删除回收，这里累计陈旧行。
@@ -606,6 +657,7 @@ public final class VectorStore: @unchecked Sendable {
             self.cachedChunkCount = max(0, cachedChunkCount - rowIDs.count)
             try persistChunkCounterLocked()
         }
+        try persistBinaryCounterLocked()
         return rowIDs.count
     }
 
@@ -742,6 +794,11 @@ public final class VectorStore: @unchecked Sendable {
                 try db.execute("DELETE FROM \(Self.bookSegmentsTable)")
                 try db.execute("DELETE FROM \(Self.summaryJobTable)")
                 try db.execute("DELETE FROM \(Self.summaryRuntimeTable)")
+                if binaryStorageEnabled {
+                    try db.execute("DELETE FROM \(Self.binaryVectorTable)")
+                    binaryRows = 0
+                    try persistBinaryCounterLocked()
+                }
                 // ANN 索引里的 rowid 与维度都失效，直接丢弃（表可能还没建）。
                 try? resetANNIndexLocked()
                 self.cachedChunkCount = 0
@@ -778,6 +835,11 @@ public final class VectorStore: @unchecked Sendable {
                 try db.execute("DELETE FROM \(Self.bookSegmentsTable)")
                 try db.execute("DELETE FROM \(Self.summaryJobTable)")
                 try db.execute("DELETE FROM \(Self.summaryRuntimeTable)")
+                if binaryStorageEnabled {
+                    try db.execute("DELETE FROM \(Self.binaryVectorTable)")
+                    binaryRows = 0
+                    try persistBinaryCounterLocked()
+                }
                 try? resetANNIndexLocked()
                 enabled = try recreateVectorTableLocked()
                 self.cachedChunkCount = 0
@@ -839,11 +901,13 @@ public final class VectorStore: @unchecked Sendable {
     /// 事务失败时恢复内存计数器：SQLite 已回滚磁盘写入，内存值也必须回滚，
     /// 否则后续 count/status 会与库内实际切片数不一致。
     private func withChunkCounterRollback<T>(_ body: () throws -> T) rethrows -> T {
-        let before = cachedChunkCount
+        let chunksBefore = cachedChunkCount
+        let binaryBefore = binaryRows
         do {
             return try body()
         } catch {
-            cachedChunkCount = before
+            cachedChunkCount = chunksBefore
+            binaryRows = binaryBefore
             throw error
         }
     }

@@ -112,6 +112,23 @@ extension VectorStore {
 
     // MARK: - Meta
 
+    /// 为指定 rowid 写入一条已校验长度的二值签名。
+    func insertBinarySignature(rowID: Int64, signature: Data) throws {
+        try db.execute(
+            "INSERT INTO \(Self.binaryVectorTable)(rowid, embedding) "
+            + "VALUES(?, vec_bit(?))",
+            [.int(rowID), .blob(signature)])
+    }
+
+    /// 增量持久化 bin 行数；必须与所在事务一起提交/回滚。
+    func persistBinaryCounterLocked() throws {
+        guard binaryStorageEnabled else { return }
+        try db.execute(
+            "INSERT INTO meta(key, value) VALUES(?, ?) "
+            + "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            [.text(Self.binaryRowsKey), .text(String(binaryRows))])
+    }
+
     func writeBinaryMetaLocked() throws {
         let values: [(String, String)] = [
             (Self.binaryDimensionKey, String(binaryDimension)),
