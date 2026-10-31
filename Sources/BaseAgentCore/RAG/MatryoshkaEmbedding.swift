@@ -142,3 +142,55 @@ public final class MatryoshkaEmbedding: EmbeddingProvider, EmbeddingTokenCountin
         return output
     }
 }
+
+// MARK: - EmbeddingBinarySigning
+
+extension MatryoshkaEmbedding: EmbeddingBinarySigning {
+    /// 签名位宽与截断维无关。
+    public var binaryDimension: Int {
+        if let signing = base as? EmbeddingBinarySigning {
+            return signing.binaryDimension
+        }
+        return ((base.dimension + 7) / 8) * 8
+    }
+
+    /// 签名来源不能带 `#mrl`：改截断维时 bin 表仍然有效。
+    public var binarySourceIdentifier: String {
+        (base as? EmbeddingBinarySigning)?.binarySourceIdentifier ?? base.identifier
+    }
+
+    public func embedDocumentsWithSignatures(_ texts: [String]) async throws
+        -> BinaryEmbeddingOutput {
+        if let signing = base as? EmbeddingBinarySigning {
+            let output = try await signing.embedDocumentsWithSignatures(texts)
+            return BinaryEmbeddingOutput(
+                vectors: output.vectors.map {
+                    Self.truncateAndNormalize($0, dimension: truncateDimension)
+                },
+                signatures: output.signatures)
+        }
+
+        let vectors = try await base.embedDocuments(texts)
+        let bitDimension = binaryDimension
+        return BinaryEmbeddingOutput(
+            vectors: vectors.map {
+                Self.truncateAndNormalize($0, dimension: truncateDimension)
+            },
+            signatures: vectors.map {
+                VectorEncoder.encodeSignature($0, bitDimension: bitDimension)
+            })
+    }
+
+    public func embedQueryWithSignature(_ text: String) async throws
+        -> (vector: [Float], signature: Data) {
+        if let signing = base as? EmbeddingBinarySigning {
+            let output = try await signing.embedQueryWithSignature(text)
+            return (Self.truncateAndNormalize(output.vector, dimension: truncateDimension),
+                    output.signature)
+        }
+
+        let vector = try await base.embedQuery(text)
+        return (Self.truncateAndNormalize(vector, dimension: truncateDimension),
+                VectorEncoder.encodeSignature(vector, bitDimension: binaryDimension))
+    }
+}

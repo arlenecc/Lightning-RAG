@@ -23,6 +23,43 @@ private final class MatryoshkaStubEmbedding: EmbeddingProvider,
     func embedQuery(_ text: String) async throws -> [Float] { source }
 }
 
+private final class MatryoshkaSigningStub: EmbeddingProvider,
+                                            EmbeddingBinarySigning,
+                                            @unchecked Sendable {
+    let identifier: String
+    let dimension: Int
+    let binaryDimension: Int
+    let vector: [Float]
+    let signature: Data
+
+    init(identifier: String, dimension: Int, binaryDimension: Int,
+         vector: [Float], signature: Data) {
+        self.identifier = identifier
+        self.dimension = dimension
+        self.binaryDimension = binaryDimension
+        self.vector = vector
+        self.signature = signature
+    }
+
+    var binarySourceIdentifier: String { identifier }
+
+    func embedDocuments(_ texts: [String]) async throws -> [[Float]] {
+        texts.map { _ in vector }
+    }
+
+    func embedQuery(_ text: String) async throws -> [Float] { vector }
+
+    func embedDocumentsWithSignatures(_ texts: [String]) async throws -> BinaryEmbeddingOutput {
+        BinaryEmbeddingOutput(vectors: texts.map { _ in vector },
+                              signatures: texts.map { _ in signature })
+    }
+
+    func embedQueryWithSignature(_ text: String) async throws
+        -> (vector: [Float], signature: Data) {
+        (vector, signature)
+    }
+}
+
 final class MatryoshkaEmbeddingTests: XCTestCase {
     /// 截断后必须重新归一化：不能复用原完整向量的归一化结果。
     func testTruncateAndNormalizeRefreshesNorm() {
@@ -91,5 +128,49 @@ final class MatryoshkaEmbeddingTests: XCTestCase {
         let query = try await wrapped.embedQuery("q")
         XCTAssertEqual(query, documents[0], "入库与查询必须共用同一套截断 + 归一化")
         XCTAssertEqual(wrapped.maxContentTokens, 8192, "token 上限应透传底层模型")
+    }
+
+    /// 截断只作用于主向量：底层签名必须原样透传，不能从截断后的向量重算。
+    func testSignaturesPassThroughWhileVectorsTruncate() async throws {
+        let base = MatryoshkaSigningStub(
+            identifier: "native-signing", dimension: 8, binaryDimension: 8,
+            vector: [3, 4, 0, 0, -1, 1, -1, 1],
+            signature: Data([0b0000_1111]))
+        let wrapped = MatryoshkaEmbedding(base: base, truncateDimension: 2)
+
+        let documents = try await wrapped.embedDocumentsWithSignatures(["a", "b"])
+        XCTAssertEqual(documents.vectors.count, 2)
+        XCTAssertEqual(documents.vectors[0], [0.6, 0.8])
+        XCTAssertEqual(documents.signatures,
+                       [Data([0b0000_1111]), Data([0b0000_1111])],
+                       "签名应来自底层原生输出，而不是 [3, 4] 截断后的向量")
+        XCTAssertEqual(wrapped.binaryDimension, 8)
+        XCTAssertEqual(wrapped.binarySourceIdentifier, "native-signing")
+        XCTAssertFalse(wrapped.binarySourceIdentifier.contains("#mrl"),
+                       "签名来源不能带截断维后缀")
+
+        let query = try await wrapped.embedQueryWithSignature("q")
+        XCTAssertEqual(query.vector, [0.6, 0.8])
+        XCTAssertEqual(query.signature, Data([0b0000_1111]))
+    }
+
+    /// 底层不会签名时，包装器必须从截断前的完整向量生成签名。
+    func testWrapperSignsFullVectorWhenBaseCannotSign() async throws {
+        let base = MatryoshkaStubEmbedding(
+            identifier: "nomic-test", dimension: 8,
+            source: [1, 0, 1, -1, 1, -1, 1, -1])
+        let wrapped = MatryoshkaEmbedding(base: base, truncateDimension: 2)
+
+        let documents = try await wrapped.embedDocumentsWithSignatures(["a", "b"])
+        XCTAssertEqual(documents.vectors[0], [1, 0])
+        XCTAssertEqual(documents.signatures,
+                       [Data([0b01010101]), Data([0b01010101])],
+                       "签名必须是完整 8 维的 0x55；从 [1, 0] 重算只会得到 0x01")
+        XCTAssertEqual(wrapped.binaryDimension, 8)
+        XCTAssertEqual(wrapped.binarySourceIdentifier, "nomic-test")
+
+        let query = try await wrapped.embedQueryWithSignature("q")
+        XCTAssertEqual(query.vector, [1, 0])
+        XCTAssertEqual(query.signature, Data([0b01010101]))
     }
 }
