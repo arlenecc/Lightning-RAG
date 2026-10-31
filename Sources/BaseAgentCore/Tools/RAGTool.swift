@@ -270,6 +270,11 @@ public final class RagStatusTool: AgentTool {
         let matryoshkaDim = status["matryoshka_dim"]?.intValue ?? 0
         let rebuildRequired = status["vector_rebuild_required"]?.boolValue ?? false
         let rebuildReason = status["rebuild_reason"]?.stringValue ?? ""
+        let binaryCoarse = status["binary_coarse"]?.stringValue ?? ""
+        let binaryDimension = status["binary_dimension"]?.intValue ?? 0
+        let binaryCoverage = status["binary_coverage"]?.doubleValue ?? 0
+        let binaryNote = status["binary_note"]?.stringValue ?? ""
+        let annBypassed = status["ann_bypassed"]?.boolValue ?? false
 
         var lines: [String] = ["知识库状态:"]
         lines.append("  知识库目录: \(knowledgeBase.isEmpty ? "（未设置）" : knowledgeBase)")
@@ -284,7 +289,31 @@ public final class RagStatusTool: AgentTool {
             lines.append("  向量库待重建: \(rebuildReason.isEmpty ? "配置已变化" : rebuildReason)")
             lines.append("    提示: 向量检索暂停（全文检索仍可用），请在设置中执行「重建向量库」")
         }
-        if !annIndex.isEmpty { lines.append("  ANN 索引: \(annIndex)") }
+        if !binaryCoarse.isEmpty {
+            switch binaryCoarse {
+            case "ready":
+                let percent = Int((min(1, max(0, binaryCoverage)) * 100).rounded())
+                lines.append("  二值粗筛: 可用（\(binaryDimension) bit，覆盖 \(percent)%"
+                    + (annBypassed ? "，本次取代 ANN" : "") + "）")
+            case "incomplete":
+                let percent = Int((min(1, max(0, binaryCoverage)) * 100).rounded())
+                let note = binaryNote.isEmpty
+                    ? "覆盖 \(percent)%，请重新同步"
+                    : binaryNote
+                lines.append("  二值粗筛: 不可用（\(note)）")
+            case "bypassed_bin":
+                lines.append("  二值粗筛: 停用（bin 主存储仅支持单阶段检索）")
+            case "off":
+                lines.append("  二值粗筛: 关闭")
+            default:
+                lines.append("  二值粗筛: 不可用（"
+                    + "\(binaryNote.isEmpty ? "原因未知" : binaryNote)）")
+            }
+        }
+        if !annIndex.isEmpty {
+            lines.append("  ANN 索引: \(annIndex)"
+                + (annBypassed ? "（本次由二值粗筛取代）" : ""))
+        }
         if annStaleRows > 0 {
             lines.append(String(format: "  ANN 陈旧切片: %ld（有效覆盖 %.1f%%）",
                                 annStaleRows, annEffectiveCoverage * 100))

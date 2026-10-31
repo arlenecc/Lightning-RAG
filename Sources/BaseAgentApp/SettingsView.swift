@@ -86,6 +86,9 @@ struct SettingsView: View {
     /// ANN 检索开关与同步后自动构建。
     @State private var annEnabled = true
     @State private var annAutoBuild = true
+    /// 二值粗筛开关与第一阶段候选数。
+    @State private var binaryCoarseEnabled = true
+    @State private var binaryCoarseCandidates = 200
     @State private var rerankEnabled = true
     @State private var rerankTopN = 5
     /// 重排分数过滤阈值。
@@ -549,6 +552,21 @@ struct SettingsView: View {
                             annButtons()
                         }
                     }
+                }
+                // 二值粗筛：开关关闭时候选数不可调；主存储为 BIN 时该项自动停用。
+                HStack(spacing: 8) {
+                    Toggle("二值粗筛", isOn: $binaryCoarseEnabled)
+                        .help("开启后先用二值向量召回候选，再按主向量余弦精排，"
+                            + "最后与全文检索 RRF 融合；可用时取代 ANN，不可用时"
+                            + "自动回退原流程。主存储为 BIN 时仅支持单阶段检索；"
+                            + "已有库需要重新同步后才会生效。")
+                    Stepper(value: $binaryCoarseCandidates, in: 50...1000, step: 50) {
+                        Text("候选 \(binaryCoarseCandidates)")
+                    }
+                    .disabled(!binaryCoarseEnabled)
+                    .help("第一阶段二值粗筛候选数：越大召回越稳、精排读取越多；"
+                        + "默认 200，允许 50...1000。")
+                    Spacer(minLength: 8)
                 }
                 // 闲时章节摘要：ANN 状态下方单独一行；文案已含「章节摘要：」前缀。
                 Text(model.bookSummaryStatusText)
@@ -1201,6 +1219,8 @@ struct SettingsView: View {
         mlxMemoryLimitMB = config.mlxMemoryLimitMB
         annEnabled = config.ragANNEnabled
         annAutoBuild = config.ragANNAutoBuild
+        binaryCoarseEnabled = config.ragBinaryCoarseEnabled
+        binaryCoarseCandidates = config.ragBinaryCoarseCandidates
         embeddingMinBatch = config.ragEmbeddingMinBatch
         embeddingMaxBatch = config.ragEmbeddingMaxBatch
         embeddingBatchStep = config.ragEmbeddingBatchStep
@@ -1515,6 +1535,8 @@ struct SettingsView: View {
             : MatryoshkaDimensions.defaultValue
         config.ragANNEnabled = annEnabled
         config.ragANNAutoBuild = annAutoBuild
+        config.ragBinaryCoarseEnabled = binaryCoarseEnabled
+        config.ragBinaryCoarseCandidates = min(max(50, binaryCoarseCandidates), 1000)
         config.ragEmbeddingMaxBatch = min(max(2, embeddingMaxBatch), 256)
         config.ragEmbeddingMinBatch = min(max(2, embeddingMinBatch), 64)
         config.ragEmbeddingMinBatch = min(config.ragEmbeddingMinBatch,
