@@ -180,6 +180,8 @@ final class AppViewModel: ObservableObject {
     @Published var isBuildingANN = false
     /// ANN 索引摘要（设置窗口显示，来自 RAG status 快照）。
     @Published var annStatusText = "ANN 索引未构建"
+    /// 二值 ANN 索引摘要（stage 1 自研 bann；未构建时显示回退提示）。
+    @Published var binaryANNStatusText = "二值 ANN 索引未构建"
     /// 闲时后台章节摘要的进度（设置窗口显示）。
     @Published var bookSummaryStatusText = "章节摘要：空闲"
     /// 当前索引与配置不匹配，需要用户显式重建。
@@ -1336,33 +1338,33 @@ final class AppViewModel: ObservableObject {
     /// 因此只允许在空闲时启动；已在跑的同步/去重/对话都要先结束。
     func requestANNIndexBuild() {
         guard let agent else {
-            showInfoAlert(title: "ANN 索引", message: "RAG 尚未就绪，请先在知识同步配置中应用配置。")
+            showInfoAlert(title: "向量索引", message: "RAG 尚未就绪，请先在知识同步配置中应用配置。")
             return
         }
         if isSyncing {
-            showInfoAlert(title: "暂不能构建 ANN 索引", message: "知识同步正在进行，请等同步结束后再试。")
+            showInfoAlert(title: "暂不能构建向量索引", message: "知识同步正在进行，请等同步结束后再试。")
             return
         }
         if isDeduplicating {
-            showInfoAlert(title: "暂不能构建 ANN 索引", message: "向量去重正在进行，请稍后再试。")
+            showInfoAlert(title: "暂不能构建向量索引", message: "向量去重正在进行，请稍后再试。")
             return
         }
         if isBuildingANN {
-            showInfoAlert(title: "ANN 索引构建中",
-                          message: "正在构建 ANN 索引。可点「停止构建」中断，已写完的块会保留，下次从断点续建。")
+            showInfoAlert(title: "向量索引构建中",
+                          message: "正在构建向量索引。可点「停止构建」中断，已写完的块会保留，下次从断点续建。")
             return
         }
         if isModelLoading || isWarmingUp {
-            showInfoAlert(title: "暂不能构建 ANN 索引", message: "模型正在加载或预热，请稍后再试。")
+            showInfoAlert(title: "暂不能构建向量索引", message: "模型正在加载或预热，请稍后再试。")
             return
         }
         if isRunning {
-            showInfoAlert(title: "暂不能构建 ANN 索引", message: "对话正在生成，请等本轮结束后再试。")
+            showInfoAlert(title: "暂不能构建向量索引", message: "对话正在生成，请等本轮结束后再试。")
             return
         }
         cancelIdleUnload()
         isBuildingANN = true
-        statusText = "正在读取 ANN 索引状态…"
+        statusText = "正在读取向量索引状态…"
         let target = ObjectIdentifier(agent)
         Task.detached(priority: .utility) { [weak self] in
             // 摘要会话会周期性借用辅助模型；先让它退出，避免构建期间还有
@@ -1386,7 +1388,11 @@ final class AppViewModel: ObservableObject {
                 }
                 return
             }
-            let status = agent.ragEngine.annIndexStatus()
+            // 目标随签名覆盖率而定：覆盖完整 → 二值 ANN（bann），否则主 ANN。
+            let indexTarget = agent.ragEngine.resolvedANNIndexTarget()
+            let status = indexTarget == .binary
+                ? agent.ragEngine.binaryANNIndexStatus()
+                : agent.ragEngine.annIndexStatus()
             await MainActor.run { [weak self] in
                 guard let self else { return }
                 guard let current = self.agent, ObjectIdentifier(current) == target else {
@@ -1396,34 +1402,42 @@ final class AppViewModel: ObservableObject {
                     return
                 }
                 if let status {
-                    self.annStatusText = status.summary
+                    if indexTarget == .binary {
+                        self.binaryANNStatusText = status.summary
+                    } else {
+                        self.annStatusText = status.summary
+                    }
                     // 已有索引：重建要丢弃现有索引并整库重跑，先确认。
-                    if status.blocks > 0, !self.confirmANNIndexRebuild(status) {
+                    if status.blocks > 0, !self.confirmANNIndexRebuild(status, target: indexTarget) {
                         self.isBuildingANN = false
                         self.statusText = "就绪"
-                        self.appendLog("[rag] 已取消 ANN 索引构建")
+                        self.appendLog("[rag] 已取消索引构建")
                         self.scheduleIdleUnload()
                         return
                     }
                 }
-                self.performANNIndexBuild(agent: agent, target: target)
+                self.performANNIndexBuild(agent: agent, target: target, indexTarget: indexTarget)
             }
         }
     }
 
     /// 用户确认后真正启动构建：进度写状态栏，逐块日志由引擎按 10s 限流输出。
-    private func performANNIndexBuild(agent: Agent, target: ObjectIdentifier) {
+    private func performANNIndexBuild(agent: Agent, target: ObjectIdentifier,
+                                      indexTarget: RAGEngine.ANNIndexTarget) {
         guard !isSyncing, !isDeduplicating, !isModelLoading, !isRunning, !isWarmingUp else {
             isBuildingANN = false
-            showInfoAlert(title: "暂不能构建 ANN 索引", message: "当前有任务正在进行，请稍后再试。")
+            showInfoAlert(title: "暂不能构建索引", message: "当前有任务正在进行，请稍后再试。")
             // 读取状态阶段已取消空闲计时；拒绝执行后恢复闲时摘要调度。
             scheduleIdleUnload()
             return
         }
+        let label = indexTarget == .binary ? "二值 ANN 索引" : "ANN 索引"
         cancelIdleUnload()
         isBuildingANN = true
-        statusText = "正在构建 ANN 索引…"
-        appendLog("[rag] 开始构建 ANN 索引：分块 IVF，块内 k-means + int8 量化；"
+        statusText = indexTarget == .binary
+            ? "正在构建二值 ANN 索引…"
+            : "正在构建 ANN 索引…"
+        appendLog("[rag] 开始构建\(label)：分块 IVF，块内 k-means + 量化；"
             + "构建期间知识检索与状态查询不受影响")
         Task.detached(priority: .utility) { [weak self] in
             // 确认重建弹窗可能停留很久；真正开跑前再等摘要退出并校验目标
@@ -1463,16 +1477,16 @@ final class AppViewModel: ObservableObject {
                 }
                 switch result {
                 case .none:
-                    self.appendLog("RAG: ANN 索引构建未执行（被拒绝或失败，详见日志）")
-                    self.statusText = "ANN 索引构建失败"
+                    self.appendLog("RAG: \(label)构建未执行（被拒绝或失败，详见日志）")
+                    self.statusText = "\(label)构建失败"
                     self.showInfoAlert(
-                        title: "ANN 索引构建失败",
+                        title: "\(label)构建失败",
                         message: "构建未执行或被中断，详情见日志。已写完的块会保留，可再次构建从断点续建。")
                 case .some(let build):
-                    self.appendLog("RAG: ANN 索引构建结束 — \(build.summary)")
-                    self.statusText = build.cancelled ? "ANN 索引构建已停止" : "ANN 索引构建完成"
+                    self.appendLog("RAG: \(label)构建结束 — \(build.summary)")
+                    self.statusText = build.cancelled ? "\(label)构建已停止" : "\(label)构建完成"
                     self.showInfoAlert(
-                        title: build.cancelled ? "ANN 索引构建已停止" : "ANN 索引构建完成",
+                        title: build.cancelled ? "\(label)构建已停止" : "\(label)构建完成",
                         message: build.summary + (build.cancelled ? "。已写完的块会保留，可再次构建续建。" : "。"))
                 }
                 self.scheduleIdleUnload()
@@ -1489,9 +1503,11 @@ final class AppViewModel: ObservableObject {
         agent?.ragEngine.cancel()
     }
 
-    private func confirmANNIndexRebuild(_ status: ANNIndexStatus) -> Bool {
+    private func confirmANNIndexRebuild(_ status: ANNIndexStatus,
+                                        target: RAGEngine.ANNIndexTarget) -> Bool {
+        let label = target == .binary ? "二值 ANN 索引" : "ANN 索引"
         let alert = NSAlert()
-        alert.messageText = "确认重建 ANN 索引"
+        alert.messageText = "确认重建\(label)"
         alert.informativeText = """
         当前索引：\(status.summary)。
         重建会先删除现有索引（含 \(status.indexedRows) 个已索引切片），再整库重新聚类写入；
@@ -1508,19 +1524,19 @@ final class AppViewModel: ObservableObject {
     /// 删除现有 ANN 索引，回到精确检索（不重跑构建）。
     func requestDropANNIndex() {
         guard let agent else {
-            showInfoAlert(title: "ANN 索引", message: "RAG 尚未就绪，请先在知识同步配置中应用配置。")
+            showInfoAlert(title: "向量索引", message: "RAG 尚未就绪，请先在知识同步配置中应用配置。")
             return
         }
         guard !isSyncing, !isBuildingANN, !isDeduplicating, !isRunning,
               !isModelLoading, !isWarmingUp else {
-            showInfoAlert(title: "暂不能删除 ANN 索引", message: "当前有任务正在进行，请稍后再试。")
+            showInfoAlert(title: "暂不能删除索引", message: "当前有任务正在进行，请稍后再试。")
             return
         }
         let target = ObjectIdentifier(agent)
         cancelIdleUnload()
         isBuildingANN = true
-        statusText = "正在删除 ANN 索引…"
-        appendLog("[rag] 开始删除 ANN 索引（删除后检索回退精确扫描）")
+        statusText = "正在删除向量索引…"
+        appendLog("[rag] 开始删除 ANN 与二值 ANN 索引（删除后检索回退精确扫描）")
         Task.detached(priority: .utility) { [weak self] in
             // 与构建/去重路径保持一致：先等摘要会话退出，再校验目标 Agent。
             await self?.stopSummaryIdleSession()
@@ -1557,12 +1573,12 @@ final class AppViewModel: ObservableObject {
                 }
                 switch result {
                 case .success:
-                    self.appendLog("RAG: ANN 索引已删除")
-                    self.statusText = "ANN 索引已删除"
+                    self.appendLog("RAG: ANN 与二值 ANN 索引已删除")
+                    self.statusText = "向量索引已删除"
                 case .failure(let error):
-                    self.appendLog("RAG: 删除 ANN 索引失败 — \(error.localizedDescription)")
-                    self.statusText = "删除 ANN 索引失败"
-                    self.showInfoAlert(title: "删除 ANN 索引失败",
+                    self.appendLog("RAG: 删除向量索引失败 — \(error.localizedDescription)")
+                    self.statusText = "删除向量索引失败"
+                    self.showInfoAlert(title: "删除向量索引失败",
                                        message: error.localizedDescription)
                 }
                 self.scheduleIdleUnload()
@@ -1889,6 +1905,7 @@ final class AppViewModel: ObservableObject {
             let sources = status["source_count"]?.intValue
                 ?? status["sources"]?.arrayValue?.count ?? 0
             let ann = status["ann_index"]?.stringValue ?? ""
+            let binaryANN = status["binary_ann_index"]?.stringValue ?? ""
             let rebuildRequired = status["vector_rebuild_required"]?.boolValue ?? false
             let rebuildReason = status["rebuild_reason"]?.stringValue ?? ""
             // 超时/不可用时 status 带 error：状态栏给可读提示，不显示误导性的 0 切片。
@@ -1905,6 +1922,7 @@ final class AppViewModel: ObservableObject {
                    ObjectIdentifier(current) == targetID {
                     self.ragStatusText = text
                     if !ann.isEmpty { self.annStatusText = ann }
+                    if !binaryANN.isEmpty { self.binaryANNStatusText = binaryANN }
                     self.vectorRebuildRequired = rebuildRequired
                     self.vectorRebuildReason = rebuildReason
                 } else {

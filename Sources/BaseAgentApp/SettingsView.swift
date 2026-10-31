@@ -553,6 +553,8 @@ struct SettingsView: View {
                         }
                     }
                 }
+                // 二值 ANN：stage 1 优先走自研 bann，未构建时回退 bin 表暴力汉明。
+                binaryANNStatusLabel
                 // 二值粗筛：开关关闭时候选数不可调；主存储为 BIN 时该项自动停用。
                 HStack(spacing: 8) {
                     Toggle("二值粗筛", isOn: $binaryCoarseEnabled)
@@ -902,19 +904,34 @@ struct SettingsView: View {
         }
     }
 
+    /// 二值 ANN（bann）状态：stage 1 的自研分块 IVF 摘要。
+    @ViewBuilder
+    private var binaryANNStatusLabel: some View {
+        HStack(spacing: 6) {
+            Text("二值 ANN").font(.caption)
+            Text(model.binaryANNStatusText)
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+                .lineLimit(2)
+                .help("二值签名的分块 IVF 索引：stage 1 优先走 bann，"
+                    + "未构建或不可用时回退 bin 表暴力汉明")
+        }
+    }
+
     @ViewBuilder
     private func annButtons() -> some View {
-        Button(model.isBuildingANN ? "索引维护中…" : "构建 ANN 索引") {
+        Button(model.isBuildingANN ? "索引维护中…" : "构建/续建向量索引") {
             model.requestANNIndexBuild()
         }
-        .help("构建/续建向量库的分块 IVF 索引（可中断，已写完的块保留）；"
-            + "构建期间知识检索与状态查询仍可正常使用")
+        .help("二值粗筛开启且签名覆盖完整时构建二值 ANN，否则构建主 ANN；"
+            + "构建可中断，已写完的块保留")
         .disabled(model.isBuildingANN || model.isSyncing || model.isDeduplicating
             || model.isModelLoading || model.isWarmingUp || model.isRunning)
         Button("停止构建") { model.stopANNIndexBuild() }
             .disabled(!model.isBuildingANN)
         Button("删除索引") { model.requestDropANNIndex() }
-            .help("删除 ANN 索引，检索回退到精确扫描（2100 万切片级别的大库上会明显变慢）")
+            .help("删除主 ANN 与二值 ANN 索引，检索回退到精确扫描"
+                + "（2100 万切片级别的大库上会明显变慢）")
             .disabled(model.isBuildingANN || model.isSyncing || model.isDeduplicating
                 || model.isRunning)
     }
@@ -985,15 +1002,15 @@ struct SettingsView: View {
             .help("开启后检索走分块 IVF 索引；索引未构建、维度不符或尾块超预算时"
                 + "自动回退精确检索。关闭后始终精确检索，大库上会明显变慢")
         Toggle("自动构建", isOn: $annAutoBuild)
-            .help("同步完成后切片数达到阈值（默认 2 万）时自动构建/续建 ANN 索引；"
-                + "关闭后只能手动点「构建 ANN 索引」")
+            .help("同步完成后切片数达到阈值（默认 2 万）时自动构建/续建向量索引；"
+                + "关闭后只能手动点「构建/续建向量索引」")
     }
 
     @ViewBuilder
     private func vectorRebuildButtons() -> some View {
         Button("重建向量库") { model.requestVectorRebuild() }
-            .help("按当前元素类型/Matryoshka 配置重建向量表：清空旧切片、全文索引与 ANN 索引后"
-                + "全量重新同步；可中断，知识库原始文件不受影响")
+            .help("按当前元素类型/Matryoshka 配置重建向量表：清空旧切片、全文索引、"
+                + "ANN 与二值 ANN 索引后全量重新同步；可中断，知识库原始文件不受影响")
             .disabled(model.isSyncing || model.isDeduplicating || model.isBuildingANN
                 || model.isModelLoading || model.isWarmingUp || model.isRunning)
     }
