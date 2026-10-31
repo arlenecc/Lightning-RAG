@@ -282,6 +282,13 @@ public final class AdaptiveEmbeddingScheduler: EmbeddingProvider, EmbeddingToken
     public var identifier: String { base.identifier }
     public var dimension: Int { base.dimension }
 
+    /// 底层 provider 的二值签名位宽；nil 表示不支持。
+    public var binaryDimension: Int? {
+        guard let signing = base as? EmbeddingBinarySigning,
+              signing.binaryDimension > 0 else { return nil }
+        return signing.binaryDimension
+    }
+
     /// 供完成日志展示最近一次实际子批的文本条数。
     public var currentBatchSize: Int {
         stateLock.lock()
@@ -344,7 +351,34 @@ public final class AdaptiveEmbeddingScheduler: EmbeddingProvider, EmbeddingToken
         _ texts: [String],
         progress: ((Int, Int) -> Void)?
     ) async throws -> [[Float]] {
-        guard !texts.isEmpty else { return [] }
+        try await runEmbedding(texts, progress: progress,
+                               includeSignatures: false).vectors
+    }
+
+    /// 入库用：底层支持二值时一次返回主向量与签名；不支持时返回 nil。
+    public func embedDocumentsWithSignatures(
+        _ texts: [String],
+        progress: ((Int, Int) -> Void)? = nil
+    ) async throws -> BinaryEmbeddingOutput? {
+        guard binaryDimension != nil else { return nil }
+        return try await runEmbedding(texts,
+                                      progress: progress,
+                                      includeSignatures: true)
+    }
+
+    /// 向量与签名的唯一调度路径。
+    ///
+    /// `includeSignatures == false` 时只走底层 `embedDocuments`，保持原有
+    /// 行为；为 true 时走底层签名接口。两条路径共用同一套 token 计数、
+    /// 全局排序、窗口切分与自适应组批，避免维护第二套调度算法。
+    private func runEmbedding(
+        _ texts: [String],
+        progress: ((Int, Int) -> Void)?,
+        includeSignatures: Bool
+    ) async throws -> BinaryEmbeddingOutput {
+        guard !texts.isEmpty else {
+            return BinaryEmbeddingOutput(vectors: [], signatures: [])
+        }
 
         // 全篇只创建一次计数器、只计数一次。分词器初始化开销大，按窗口
         // 重复创建会反复初始化；计数期间持有信号量，避免与 embedding
@@ -368,7 +402,11 @@ public final class AdaptiveEmbeddingScheduler: EmbeddingProvider, EmbeddingToken
         }
 
         let window = max(1, options.windowTexts)
-        var result = [[Float]](repeating: [], count: texts.count)
+        var result = BinaryEmbeddingOutput(
+            vectors: [[Float]](repeating: [], count: texts.count),
+            signatures: includeSignatures
+                ? [Data](repeating: Data(), count: texts.count)
+                : [])
         var processed = 0
         var start = 0
         while start < order.count {
@@ -376,14 +414,18 @@ public final class AdaptiveEmbeddingScheduler: EmbeddingProvider, EmbeddingToken
             let end = min(start + window, order.count)
             let slice = Array(order[start..<end])
             let completed = processed
-            let vectors = try await embedWindow(
+            let output = try await embedWindow(
                 slice,
                 texts: texts,
                 tokenCounts: tokenCounts,
                 progress: { done, _ in progress?(completed + done, texts.count) },
-                total: texts.count)
+                total: texts.count,
+                includeSignatures: includeSignatures)
             for (offset, index) in slice.enumerated() {
-                result[index] = vectors[offset]
+                result.vectors[index] = output.vectors[offset]
+                if includeSignatures {
+                    result.signatures[index] = output.signatures[offset]
+                }
             }
             processed += slice.count
             start = end
@@ -406,10 +448,15 @@ public final class AdaptiveEmbeddingScheduler: EmbeddingProvider, EmbeddingToken
         texts: [String],
         tokenCounts: [Int],
         progress: ((Int, Int) -> Void)?,
-        total: Int
-    ) async throws -> [[Float]] {
+        total: Int,
+        includeSignatures: Bool
+    ) async throws -> BinaryEmbeddingOutput {
         try await semaphore.withPermit {
-            var result = [[Float]](repeating: [], count: indices.count)
+            var result = BinaryEmbeddingOutput(
+                vectors: [[Float]](repeating: [], count: indices.count),
+                signatures: includeSignatures
+                    ? [Data](repeating: Data(), count: indices.count)
+                    : [])
             // pending 使用窗口内位置，避免全局下标与局部下标的映射开销。
             var pending = Array(indices.indices)
             var processed = 0
@@ -444,14 +491,32 @@ public final class AdaptiveEmbeddingScheduler: EmbeddingProvider, EmbeddingToken
                 processed += selected.count
                 let batch = selected.map { texts[indices[$0]] }
                 let batchStarted = Date()
-                let vectors = try await base.embedDocuments(batch)
+                let output: BinaryEmbeddingOutput
+                if includeSignatures {
+                    guard let signing = base as? EmbeddingBinarySigning else {
+                        throw AgentError.storage("底层 embedding 不支持二值签名")
+                    }
+                    output = try await signing.embedDocumentsWithSignatures(batch)
+                    guard output.signatures.count == batch.count else {
+                        throw AgentError.storage(
+                            "embedding 子批二值签名数量异常: "
+                            + "\(output.signatures.count) != \(batch.count)")
+                    }
+                } else {
+                    output = BinaryEmbeddingOutput(
+                        vectors: try await base.embedDocuments(batch),
+                        signatures: [])
+                }
                 let seconds = Date().timeIntervalSince(batchStarted)
-                guard vectors.count == batch.count else {
+                guard output.vectors.count == batch.count else {
                     throw AgentError.storage(
-                        "embedding 子批返回数量异常: \(vectors.count) != \(batch.count)")
+                        "embedding 子批返回数量异常: \(output.vectors.count) != \(batch.count)")
                 }
                 for (offset, position) in selected.enumerated() {
-                    result[position] = vectors[offset]
+                    result.vectors[position] = output.vectors[offset]
+                    if includeSignatures {
+                        result.signatures[position] = output.signatures[offset]
+                    }
                 }
                 record(texts: batch.count, tokens: tokens, seconds: seconds)
                 progress?(processed, total)
