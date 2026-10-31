@@ -189,13 +189,19 @@ final class RAGPipelineVerificationTests: XCTestCase {
         XCTAssertLessThanOrEqual(strictHits.count, strictConfig.ragRerankTopN)
         print("[rag-verify] strict-threshold fallback count=\(strictHits.count)")
 
-        // ANN 索引构建与检索。
+        // ANN 索引构建与检索。二值签名覆盖完整时构建目标为二值 ANN，
+        // 否则回退主 ANN；这里按当前解析目标校验对应索引。
+        let indexTarget = engine.resolvedANNIndexTarget()
         let build = try XCTUnwrap(engine.buildANNIndex(), "ANN 索引构建被拒绝")
         XCTAssertFalse(build.cancelled)
         XCTAssertGreaterThan(build.indexedRows, 0)
-        let annStatus = try XCTUnwrap(engine.annIndexStatus(), "ANN 状态不可用")
-        XCTAssertTrue(annStatus.isReady, annStatus.summary)
-        print("[rag-verify] ann \(annStatus.summary)")
+        let indexStatus = try XCTUnwrap(
+            indexTarget == .binary
+                ? engine.binaryANNIndexStatus()
+                : engine.annIndexStatus(),
+            "ANN 状态不可用")
+        XCTAssertTrue(indexStatus.isReady, indexStatus.summary)
+        print("[rag-verify] \(indexTarget.rawValue) ann \(indexStatus.summary)")
 
         let annHits = try await engine.search(query: targets[2].query, topK: 3)
         let annSources = annHits.map { ($0.source as NSString).lastPathComponent }
