@@ -424,4 +424,163 @@ extension VectorStore {
         AgentLog.info(summary)
         return result
     }
+
+    // MARK: - 查询
+
+    private func bannCentroidCacheLocked(blocks: Int, clusters: Int,
+                                         dim: Int) throws -> ANNCentroidCache {
+        if let cache = bannCentroidCache, cache.blocks == blocks,
+           cache.clusters == clusters, cache.dim == dim { return cache }
+        var codes = [Int8](repeating: 0, count: blocks * clusters * dim)
+        var scales = [Float](repeating: 0, count: blocks * clusters)
+        for block in 0..<blocks {
+            let rows = try db.query(
+                "SELECT clusters, payload FROM \(Self.bannBlocksTable) WHERE block_id = ?",
+                [.int(Int64(block))])
+            guard let row = rows.first,
+                  let payload = row["payload"]?.dataValue,
+                  let storedClusters = row["clusters"]?.intValue,
+                  storedClusters > 0 else {
+                throw AgentError.storage("二值 ANN 索引块 \(block) 缺失，需要重建")
+            }
+            try decodeBANNCentroidPayload(
+                payload, activeClusters: min(clusters, Int(storedClusters)),
+                clusters: clusters, dim: dim, block: block,
+                codes: &codes, scales: &scales)
+        }
+        let cache = ANNCentroidCache(blocks: blocks, clusters: clusters,
+                                     dim: dim, codes: codes, scales: scales)
+        bannCentroidCache = cache
+        return cache
+    }
+
+    /// 解码块头 + 簇心。末块簇数可能少于配置值；空缺簇复制首个有效簇心，
+    /// 这样探测列表即使带重复项也不会浪费 probe 名额（重复读取同一 cell）。
+    private func decodeBANNCentroidPayload(
+        _ payload: Data, activeClusters: Int, clusters: Int, dim: Int, block: Int,
+        codes: inout [Int8], scales: inout [Float]
+    ) throws {
+        let headerBytes = 12
+        let entryBytes = 8 + dim
+        guard activeClusters > 0, activeClusters <= clusters, dim > 0,
+              payload.count >= headerBytes + activeClusters * entryBytes,
+              codes.count >= (block + 1) * clusters * dim,
+              scales.count >= (block + 1) * clusters else {
+            throw AgentError.storage("二值 ANN 块 \(block) 数据损坏（长度 \(payload.count)）")
+        }
+        payload.withUnsafeBytes { raw in
+            guard let base = raw.baseAddress else { return }
+            var offset = headerBytes
+            for cluster in 0..<activeClusters {
+                let scale = raw.loadUnaligned(fromByteOffset: offset + 4, as: Float.self)
+                let codeBase = base.advanced(by: offset + 8).assumingMemoryBound(to: Int8.self)
+                let destination = block * clusters * dim + cluster * dim
+                for i in 0..<dim { codes[destination + i] = codeBase[i] }
+                scales[block * clusters + cluster] = scale
+                offset += entryBytes
+            }
+            guard activeClusters < clusters else { return }
+            let sourceOffset = block * clusters * dim
+            let sourceScale = scales[block * clusters]
+            for cluster in activeClusters..<clusters {
+                let destination = block * clusters * dim + cluster * dim
+                for i in 0..<dim { codes[destination + i] = codes[sourceOffset + i] }
+                scales[block * clusters + cluster] = sourceScale
+            }
+        }
+    }
+
+    private func scoreBANNCellsLocked(block: Int, clusters: [Int], dim: Int,
+                                      queryBits: [UInt8],
+                                      pool: inout ANNTopKCollector) throws {
+        guard !clusters.isEmpty else { return }
+        let placeholders = Array(repeating: "?", count: clusters.count).joined(separator: ",")
+        var bindings: [SQLValue] = [.int(Int64(block))]
+        bindings.append(contentsOf: clusters.map { .int(Int64($0)) })
+        let rows = try db.query("""
+        SELECT payload FROM \(Self.bannCellsTable)
+        WHERE block_id = ? AND cluster_id IN (\(placeholders))
+        ORDER BY cluster_id, seq
+        """, bindings)
+        let bitBytes = VectorElementType.bin.blobSize(dimension: dim)
+        let rowBytes = 8 + bitBytes
+        for row in rows {
+            guard let payload = row["payload"]?.dataValue else { continue }
+            let count = payload.count / rowBytes
+            guard count > 0 else { continue }
+            payload.withUnsafeBytes { raw in
+                guard let base = raw.baseAddress else { return }
+                for index in 0..<count {
+                    let offset = index * rowBytes
+                    let rowID = raw.loadUnaligned(fromByteOffset: offset, as: Int64.self)
+                    let hamming = VectorEncoder.hamming(
+                        pointer: UnsafeRawPointer(base.advanced(by: offset + 8)),
+                        bytes: queryBits, count: bitBytes)
+                    pool.offer(rowid: rowID, score: 1 - Double(hamming) / Double(dim))
+                }
+            }
+        }
+    }
+
+    private func scanBANTailLocked(signature: Data, after rowID: Int64, dim: Int,
+                                   rowLimit: Int, pool: inout ANNTopKCollector) throws {
+        let queryBits = [UInt8](signature)
+        var scanned = 0
+        try streamBinarySignatures(from: rowID, dim: dim) { hitRowID, pointer in
+            let hamming = VectorEncoder.hamming(pointer: pointer, bytes: queryBits,
+                                                count: dim / 8)
+            pool.offer(rowid: hitRowID, score: 1 - Double(hamming) / Double(dim))
+            scanned += 1
+            return scanned < rowLimit
+        }
+    }
+
+    /// 二值 ANN 候选；返回 nil 表示不可用，调用方回退 vec0 bin KNN。
+    func bannCandidatesLocked(signature: Data, topK: Int,
+                              probeOverride: Int? = nil) throws -> [(Int64, Double)]? {
+        guard topK > 0, binaryStorageEnabled, binaryDimension > 0,
+              signature.count == binaryDimension / 8,
+              binaryRows == count, count > 0 else { return nil }
+        guard let meta = try? bannStoredMetaLocked(), meta.blocks > 0,
+              meta.version == Self.bannFormatVersion,
+              meta.dim == binaryDimension, meta.source == binarySource else { return nil }
+        let cap = bannTailScanRowCap()
+        let tailRows = bannTailRowCountLocked(after: meta.lastRowID, indexedRows: meta.rows)
+        guard tailRows <= cap else { return nil }
+
+        let rowsPerCluster = max(1, meta.blockRows / max(1, meta.clusters))
+        let baseProbe = 2 + (topK + rowsPerCluster - 1) / rowsPerCluster
+        let probe = probeOverride ?? min(16, max(4, baseProbe) + (meta.blocks <= 2 ? 4 : 0))
+        let queryVector = VectorCodec.normalize(
+            VectorEncoder.dequantizeBits(signature, dimension: meta.dim))
+        let queryBits = [UInt8](signature)
+        let capacity = min(4096, max(topK * 4, 512))
+        var pool = ANNTopKCollector(capacity: capacity)
+        let centroids = try bannCentroidCacheLocked(blocks: meta.blocks,
+                                                    clusters: meta.clusters, dim: meta.dim)
+        var scratch: [Float] = []
+        try queryVector.withUnsafeBufferPointer { pointer in
+            guard let base = pointer.baseAddress else { return }
+            for block in 0..<meta.blocks {
+                let probes = centroids.nearest(query: base, block: block,
+                                               nprobe: probe, scratch: &scratch)
+                try scoreBANNCellsLocked(block: block, clusters: probes, dim: meta.dim,
+                                         queryBits: queryBits, pool: &pool)
+            }
+        }
+        if tailRows > 0 {
+            try scanBANTailLocked(signature: signature, after: meta.lastRowID,
+                                  dim: meta.dim, rowLimit: tailRows, pool: &pool)
+        }
+        var candidates = pool.sortedItems()
+        // 精确检索在等距时按 rowid 升序返回；这里显式加同分排序，保证
+        // full-probe 下与 vec0 的结果顺序一致（也便于基准复现）。
+        candidates.sort { left, right in
+            if left.1 == right.1 { return left.0 < right.0 }
+            return left.1 > right.1
+        }
+        guard !candidates.isEmpty else { return nil }
+        bannQueryCount += 1
+        return Array(candidates.prefix(topK))
+    }
 }

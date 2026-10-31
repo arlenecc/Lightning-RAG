@@ -10,6 +10,10 @@ public struct BinaryIndexStatus: Sendable {
     public var coverage: Double
     public var isComplete: Bool
     public var reason: String?
+    /// stage 2 可用的主向量镜像行数。
+    public var rerankRows: Int
+    /// stage 2 实际读取路径：`rerank` / `partial` / `vec0`。
+    public var stage2Backend: String
 
     public init(storageEnabled: Bool = false,
                 dimension: Int = 0,
@@ -17,7 +21,9 @@ public struct BinaryIndexStatus: Sendable {
                 chunkRows: Int = 0,
                 coverage: Double = 0,
                 isComplete: Bool = false,
-                reason: String? = nil) {
+                reason: String? = nil,
+                rerankRows: Int = 0,
+                stage2Backend: String = "vec0") {
         self.storageEnabled = storageEnabled
         self.dimension = dimension
         self.rows = rows
@@ -25,6 +31,8 @@ public struct BinaryIndexStatus: Sendable {
         self.coverage = coverage
         self.isComplete = isComplete
         self.reason = reason
+        self.rerankRows = rerankRows
+        self.stage2Backend = stage2Backend
     }
 }
 
@@ -70,26 +78,40 @@ extension VectorStore {
         }
 
         let k = min(maxVectorK, max(candidateLimit, candidateCount))
-        let rows = try db.query(
-            "SELECT rowid, distance FROM \(Self.binaryVectorTable) "
-            + "WHERE embedding MATCH vec_bit(?) AND k = ?",
-            [.blob(signature), .int(Int64(k))])
-        let hits = rows.compactMap { row -> (Int64, Double)? in
-            guard let rowID = row["rowid"]?.intValue else { return nil }
-            return (rowID, row["distance"]?.doubleValue ?? Double(binaryDimension))
-        }
-        guard !hits.isEmpty else { return .used(candidates: [], scores: [:]) }
-
-        let storedVectors = try exactVectorsLocked(rowIDs: hits.map(\.0))
-        var reranked: [(rowID: Int64, cosine: Double, binary: Double)] = []
-        reranked.reserveCapacity(hits.count)
-        for (rowID, distance) in hits {
-            guard let stored = storedVectors[rowID], stored.count == vector.count else {
-                continue
+        func vec0Hits() throws -> [(Int64, Double)] {
+            binaryVecQueryCount += 1
+            let rows = try db.query(
+                "SELECT rowid, distance FROM \(Self.binaryVectorTable) "
+                + "WHERE embedding MATCH vec_bit(?) AND k = ?",
+                [.blob(signature), .int(Int64(k))])
+            return rows.compactMap { row -> (Int64, Double)? in
+                guard let rowID = row["rowid"]?.intValue else { return nil }
+                let distance = row["distance"]?.doubleValue ?? Double(binaryDimension)
+                return (rowID, max(0, 1 - distance / Double(binaryDimension)))
             }
-            let cosine = VectorCodec.cosine(vector, stored)
-            let binaryScore = max(0, 1 - distance / Double(binaryDimension))
-            reranked.append((rowID, cosine, binaryScore))
+        }
+
+        let bannHits = try? bannCandidatesLocked(signature: signature, topK: k)
+        let hits = try bannHits ?? vec0Hits()
+        guard !hits.isEmpty else { return .skipped("二值粗筛无候选") }
+
+        func rerank(_ hits: [(Int64, Double)]) throws -> [(rowID: Int64, cosine: Double,
+                                                             binary: Double)] {
+            let stored = try exactVectorsLocked(rowIDs: hits.map(\.0))
+            var output: [(rowID: Int64, cosine: Double, binary: Double)] = []
+            output.reserveCapacity(hits.count)
+            for (rowID, binaryScore) in hits {
+                guard let stored = stored[rowID], stored.count == vector.count else { continue }
+                output.append((rowID, VectorCodec.cosine(vector, stored), binaryScore))
+            }
+            return output
+        }
+
+        var reranked = try rerank(hits)
+        // bann 候选可能全部是已删除的陈旧 rowid：再回退一次 vec0，避免
+        // 陈旧行把本次二值结果挤空。
+        if reranked.isEmpty, bannHits != nil {
+            reranked = try rerank(try vec0Hits())
         }
         reranked.sort { $0.cosine > $1.cosine }
         let selected = Array(reranked.prefix(candidateCount))
@@ -226,6 +248,14 @@ extension VectorStore {
         let coverage = chunkRows > 0
             ? min(1.0, Double(binaryRows) / Double(chunkRows))
             : 0
+        let backend: String
+        if chunkRows > 0, rerankStorageEnabled, rerankRows == chunkRows {
+            backend = "rerank"
+        } else if rerankStorageEnabled, rerankRows > 0 {
+            backend = "partial"
+        } else {
+            backend = "vec0"
+        }
         return BinaryIndexStatus(
             storageEnabled: binaryStorageEnabled,
             dimension: binaryDimension,
@@ -233,7 +263,9 @@ extension VectorStore {
             chunkRows: chunkRows,
             coverage: coverage,
             isComplete: binaryStorageEnabled && chunkRows > 0 && binaryRows == chunkRows,
-            reason: binaryStorageReason)
+            reason: binaryStorageReason,
+            rerankRows: rerankRows,
+            stage2Backend: backend)
     }
 
     /// 同一原因 60 秒内只记一条，避免每次查询刷日志。

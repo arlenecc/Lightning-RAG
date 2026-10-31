@@ -112,4 +112,103 @@ final class VectorStoreBinaryANNTests: XCTestCase {
         XCTAssertEqual(status.effectiveCoverage, 39.0 / 40.0, accuracy: 0.0001)
         store.close()
     }
+
+    func testBannQueryMatchesBruteForceWithFullProbe() throws {
+        let store = try makeStore("query")
+        try seed(store, count: 40)
+        _ = try store.buildBinaryANNIndex(clusters: 4, clusterSize: 16, iterations: 4)
+        let query = signature(bit: 7)
+        let bann = try XCTUnwrap(
+            try store.bannCandidatesLocked(signature: query, topK: 5, probeOverride: 4))
+        XCTAssertEqual(bann.count, 5)
+        // 暴力汉明基准。sqlite-vec 对同分候选的返回顺序未定义（实测为 rowid
+        // 降序），因此这里用确定性的 (分数降序, rowid 升序) 与 bann 比对，
+        // 仍保持「全簇探测 == 暴力检索」的语义。
+        let rows = try store.db.query(
+            "SELECT rowid, embedding FROM \(VectorStore.binaryVectorTable) ORDER BY rowid")
+        var expected: [(Int64, Double)] = []
+        for row in rows {
+            guard let rowID = row["rowid"]?.intValue,
+                  let data = row["embedding"]?.dataValue else { continue }
+            let distance = VectorEncoder.hamming(data, query)
+            expected.append((rowID, 1 - Double(distance) / Double(binaryDimension)))
+        }
+        expected.sort { left, right in
+            if left.1 == right.1 { return left.0 < right.0 }
+            return left.1 > right.1
+        }
+        XCTAssertEqual(bann.map(\.0), Array(expected.prefix(5).map(\.0)))
+        XCTAssertEqual(bann.map(\.1), Array(expected.prefix(5).map(\.1)))
+        store.close()
+    }
+
+    func testSearchUsesBannAndSkipsANN() throws {
+        let store = try makeStore("use-bann")
+        try seed(store, count: 40)
+        _ = try store.buildBinaryANNIndex(clusters: 4, clusterSize: 16, iterations: 4)
+        let query = signature(bit: 3)
+        let hits = try store.hybridSearch(
+            vector: [1] + [Float](repeating: 0, count: dimension - 1),
+            query: "zzz", topK: 3,
+            binary: BinaryCoarseOptions(signature: query, candidateLimit: 20),
+            ann: ANNQueryOptions(nprobe: 4, rescore: 0))
+        XCTAssertFalse(hits.isEmpty)
+        XCTAssertGreaterThan(store.bannQueryCount, 0)
+        XCTAssertEqual(store.annQueryCount, 0)
+        XCTAssertEqual(store.binaryVecQueryCount, 0)
+        store.close()
+    }
+
+    func testSearchFallsBackToVec0WhenBannNotBuilt() throws {
+        let store = try makeStore("vec-fallback")
+        try seed(store, count: 40)
+        let query = signature(bit: 1)
+        _ = try store.hybridSearch(
+            vector: [1] + [Float](repeating: 0, count: dimension - 1),
+            query: "zzz", topK: 3,
+            binary: BinaryCoarseOptions(signature: query, candidateLimit: 20),
+            ann: ANNQueryOptions(nprobe: 4, rescore: 0))
+        XCTAssertEqual(store.bannQueryCount, 0)
+        XCTAssertGreaterThan(store.binaryVecQueryCount, 0)
+        XCTAssertEqual(store.annQueryCount, 0)
+        store.close()
+    }
+
+    func testTailIsSearchableAfterBuild() throws {
+        let store = try makeStore("tail")
+        try seed(store, count: 32)
+        _ = try store.buildBinaryANNIndex(clusters: 4, clusterSize: 16, iterations: 4)
+        _ = try store.add(
+            chunks: [Chunk(text: "tail", source: "tail.md", chunkIndex: 0)],
+            vectors: [[Float](repeating: 0, count: dimension)],
+            binarySignatures: [Data(repeating: 0xFF, count: binaryDimension / 8)])
+        let hits = try store.hybridSearch(
+            vector: [1] + [Float](repeating: 0, count: dimension - 1),
+            query: "tail", topK: 5, binary: BinaryCoarseOptions(
+                signature: Data(repeating: 0xFF, count: binaryDimension / 8),
+                candidateLimit: 20))
+        XCTAssertTrue(hits.contains { $0.text == "tail" })
+        store.close()
+    }
+
+    func testDeletedRowsAreExcludedFromBannResults() throws {
+        let store = try makeStore("deleted")
+        try seed(store, count: 20)
+        _ = try store.buildBinaryANNIndex(clusters: 4, clusterSize: 16, iterations: 4)
+        _ = try store.deleteBySource("s3.md")
+        let hits = try store.hybridSearch(
+            vector: [1] + [Float](repeating: 0, count: dimension - 1),
+            query: "zzz", topK: 5,
+            binary: BinaryCoarseOptions(signature: signature(bit: 3), candidateLimit: 20))
+        XCTAssertFalse(hits.contains { $0.source == "s3.md" })
+        store.close()
+    }
+
+    func testStageTwoUsesRerankMirror() throws {
+        let store = try makeStore("rerank-stage2")
+        try seed(store, count: 20)
+        _ = try store.buildBinaryANNIndex(clusters: 4, clusterSize: 16, iterations: 4)
+        XCTAssertEqual(store.binaryIndexStatus().stage2Backend, "rerank")
+        store.close()
+    }
 }

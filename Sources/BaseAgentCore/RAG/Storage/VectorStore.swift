@@ -100,6 +100,10 @@ public final class VectorStore: @unchecked Sendable {
     var rerankStorageReason: String?
     /// 二值查询实际走 stage 1 的次数；供测试验证 ANN 旁路。
     var annQueryCount: Int = 0
+    /// 二值 stage 1 走自研 bann 的次数。
+    var bannQueryCount: Int = 0
+    /// 二值 stage 1 回退 vec0 bin KNN 的次数。
+    var binaryVecQueryCount: Int = 0
     /// 最近一次二值回退原因与日志时间（60 秒节流）。
     var lastBinaryFallbackReason: String?
     var lastBinaryFallbackLog: Date = .distantPast
