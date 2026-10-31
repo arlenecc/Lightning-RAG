@@ -215,6 +215,20 @@ public enum VectorEncoder {
 
     // MARK: bin
 
+    /// 固定位宽签名：x > 0 置 1，LSB-first；不足补零、超出截断。
+    /// 查询签名与字段签名必须使用同一 `bitDimension`，否则末字节多余位
+    /// 会进入汉明距离，造成与真实余弦排序不一致的抖动。
+    public static func encodeSignature(_ vector: [Float], bitDimension: Int) -> Data {
+        guard bitDimension > 0 else { return Data() }
+        let byteCount = (bitDimension + 7) / 8
+        var bytes = [UInt8](repeating: 0, count: byteCount)
+        for (index, value) in vector.enumerated()
+            where index < bitDimension && value > 0 {
+            bytes[index / 8] |= UInt8(1 << (index % 8))
+        }
+        return Data(bytes)
+    }
+
     /// 符号位量化：`bit = x > 0`，低位在前（与 sqlite-vec 的
     /// `vec_quantize_binary` 一致，两者产出的 blob 可以互相比较）。
     public static func encodeBits(_ vector: [Float]) -> Data {
