@@ -25,6 +25,8 @@ public final class VectorStore: @unchecked Sendable {
     public static let bookSegmentsTable = "book_summary_segments"
     public static let summaryJobTable = "summary_job_state"
     public static let summaryRuntimeTable = "summary_runtime"
+    /// 二值签名表。rowid 与 `chunks` 对齐，只存派生签名。
+    public static let binaryVectorTable = "chunk_vectors_bin"
 
     public let db: SQLiteDatabase
     /// 数据库路径；检索用独立的只读连接打开 WAL 快照，不阻塞写入。
@@ -49,7 +51,7 @@ public final class VectorStore: @unchecked Sendable {
     public private(set) var didResetForDimensionChange = false
     /// sqlite-vec 扩展是否可用（与 `vectorEnabled` 区分：待重建时后者为 false，
     /// 但清空/重建仍应优先建 vec0 表）。
-    private let sqliteVecAvailable: Bool
+    let sqliteVecAvailable: Bool
     /// 写入/删除/检索共用。ANN 实现（`VectorStoreANN.swift`）也在同一把锁内，
     /// 因此改为 internal。
     let lock = NSRecursiveLock()
@@ -68,21 +70,49 @@ public final class VectorStore: @unchecked Sendable {
     private static let dimensionKey = "embedding_dim"
     private static let elementTypeKey = "vector_element_type"
     private static let fingerprintKey = "vector_index_fingerprint"
+    static let binaryRowsKey = "binary_rows"
+    static let binaryDimensionKey = "binary_dimension"
+    static let binarySourceKey = "binary_source"
+    static let binaryQuantizerVersionKey = "binary_quantizer_version"
+    static let binaryQuantizerVersion = 1
     /// ANN 簇心缓存（懒加载）。扩展无法新增存储属性，因此声明在这里，
     /// 由 `VectorStoreANN.swift` 读写。
     var annCentroidCache: ANNCentroidCache?
+    /// 二值签名位宽；0 表示 provider 不支持或主类型为 bin。
+    let binaryDimension: Int
+    /// 签名来源标识，用于 bin 表 meta 一致性校验。
+    let binarySource: String
+    /// bin 表是否可读写（sqlite-vec + 表存在 + 维度/来源有效）。
+    var binaryStorageEnabled: Bool = false
+    /// bin 表当前行数，O(1) 覆盖率计数器。
+    var binaryRows: Int = 0
+    /// 不可用原因（供 status 展示）。
+    var binaryStorageReason: String?
+    /// 二值查询实际走 stage 1 的次数；供测试验证 ANN 旁路。
+    var annQueryCount: Int = 0
+    /// 最近一次二值回退原因与日志时间（60 秒节流）。
+    var lastBinaryFallbackReason: String?
+    var lastBinaryFallbackLog: Date = .distantPast
 
     public init(dbPath: String, dimension: Int, enableSQLiteVec: Bool = true,
                 elementType: VectorElementType = .fp32,
+                binaryDimension: Int = 0, binarySource: String = "",
                 indexFingerprint: String = "") throws {
         let resolvedDimension = max(1, dimension)
         // 非法维度（如 bin 维度不是 8 的倍数）在打开库之前就报错，
         // 避免先建出一张错误的表再回滚。
         try elementType.validate(dimension: resolvedDimension)
+        let resolvedBinaryDimension = max(0, binaryDimension)
+        guard resolvedBinaryDimension == 0 || resolvedBinaryDimension % 8 == 0 else {
+            throw AgentError.storage(
+                "二值签名维度 \(resolvedBinaryDimension) 必须是 8 的倍数")
+        }
         self.dimension = resolvedDimension
         self.elementType = elementType
         self.indexFingerprint = indexFingerprint
         self.dbPath = dbPath
+        self.binaryDimension = resolvedBinaryDimension
+        self.binarySource = binarySource
         try FileManager.default.createDirectory(
             atPath: (dbPath as NSString).deletingLastPathComponent,
             withIntermediateDirectories: true
@@ -107,6 +137,13 @@ public final class VectorStore: @unchecked Sendable {
             self.vectorEnabled = enabled
         } else {
             try ensureVectorTable(dimension: self.dimension, useVec0: false)
+        }
+        do {
+            try setupBinaryIndexLocked()
+        } catch {
+            AgentLog.warning("二值索引初始化失败，已停用: \(error.localizedDescription)")
+            binaryStorageEnabled = false
+            binaryStorageReason = "初始化失败：\(error.localizedDescription)"
         }
     }
 
@@ -820,7 +857,7 @@ public final class VectorStore: @unchecked Sendable {
             [.text(Self.chunkCountKey), .text(String(cachedChunkCount))])
     }
 
-    private static func readStoredCount(_ db: SQLiteDatabase, key: String) -> Int? {
+    static func readStoredCount(_ db: SQLiteDatabase, key: String) -> Int? {
         guard let value = try? db.scalar(
             "SELECT value FROM meta WHERE key = ?", [.text(key)]).stringValue,
             let count = Int(value) else { return nil }
