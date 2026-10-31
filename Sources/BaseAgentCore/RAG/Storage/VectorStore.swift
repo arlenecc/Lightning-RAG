@@ -1157,23 +1157,47 @@ public final class VectorStore: @unchecked Sendable {
         return candidates.filter { allowed.contains($0.0) }
     }
 
-    /// vec0 点查精确向量（供 ANN 重打分使用）；非 vec0 库走普通表的按 rowid 查询。
+    /// 供 stage 2 与 ANN 重打分使用：优先读 rerank 镜像，缺失行回退主向量表。
+    /// rowid 升序 + 256 条一批，降低 B-tree 随机跳转与 prepare/step 次数。
     func exactVectorsLocked(rowIDs: [Int64]) throws -> [Int64: [Float]] {
         guard !rowIDs.isEmpty else { return [:] }
+        let ordered = rowIDs.sorted()
+        let batchSize = 256
         var output: [Int64: [Float]] = [:]
-        output.reserveCapacity(rowIDs.count)
+        output.reserveCapacity(ordered.count)
         var index = 0
-        while index < rowIDs.count {
-            let batch = Array(rowIDs[index..<min(index + deleteBatchSize, rowIDs.count)])
-            let placeholders = Array(repeating: "?", count: batch.count).joined(separator: ",")
-            let rows = try db.query(
-                "SELECT rowid, embedding FROM \(Self.vectorTable) WHERE rowid IN (\(placeholders))",
-                batch.map { SQLValue.int($0) })
-            for row in rows {
-                guard let rowID = row["rowid"]?.intValue,
-                      let data = row["embedding"]?.dataValue else { continue }
-                output[rowID] = VectorEncoder.decode(data, as: elementType,
-                                                     dimension: dimension)
+        while index < ordered.count {
+            let batch = Array(ordered[index..<min(index + batchSize, ordered.count)])
+            var missing = batch
+            if rerankStorageEnabled, rerankRows > 0 {
+                let placeholders = Array(repeating: "?", count: batch.count)
+                    .joined(separator: ",")
+                let rows = try db.query(
+                    "SELECT rowid, embedding FROM \(Self.rerankVectorTable) "
+                    + "WHERE rowid IN (\(placeholders))",
+                    batch.map { SQLValue.int($0) })
+                for row in rows {
+                    guard let rowID = row["rowid"]?.intValue,
+                          let data = row["embedding"]?.dataValue else { continue }
+                    output[rowID] = VectorEncoder.decode(data, as: elementType,
+                                                         dimension: dimension)
+                }
+                let found = Set(output.keys)
+                missing = batch.filter { !found.contains($0) }
+            }
+            if !missing.isEmpty {
+                let placeholders = Array(repeating: "?", count: missing.count)
+                    .joined(separator: ",")
+                let rows = try db.query(
+                    "SELECT rowid, embedding FROM \(Self.vectorTable) "
+                    + "WHERE rowid IN (\(placeholders))",
+                    missing.map { SQLValue.int($0) })
+                for row in rows {
+                    guard let rowID = row["rowid"]?.intValue,
+                          let data = row["embedding"]?.dataValue else { continue }
+                    output[rowID] = VectorEncoder.decode(data, as: elementType,
+                                                         dimension: dimension)
+                }
             }
             index += batch.count
         }

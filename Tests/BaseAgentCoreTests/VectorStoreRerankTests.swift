@@ -82,4 +82,51 @@ final class VectorStoreRerankTests: XCTestCase {
         XCTAssertEqual(store.rerankRows, 0)
         store.close()
     }
+
+    func testExactVectorsPrefersRerankWhenMainRowIsDeleted() throws {
+        let store = try makeStore("prefer-rerank")
+        _ = try store.add(
+            chunks: [Chunk(text: "alpha", source: "a.md", chunkIndex: 0)],
+            vectors: [vector(0)], binarySignatures: [Data([0xFF, 0x00])])
+        let rowID = try XCTUnwrap(try store.rowIDs(source: "a.md").first)
+        try store.db.execute("DELETE FROM \(VectorStore.vectorTable) WHERE rowid = ?",
+                             [.int(rowID)])
+        let decoded = try store.exactVectorsLocked(rowIDs: [rowID])
+        XCTAssertEqual(decoded[rowID]?.count, dimension)
+        XCTAssertEqual(Double(decoded[rowID]?[0] ?? 0), 1, accuracy: 0.02)
+        store.close()
+    }
+
+    func testExactVectorsFallsBackForMissingRerankRows() throws {
+        let store = try makeStore("fallback-rerank")
+        _ = try store.add(
+            chunks: [Chunk(text: "alpha", source: "a.md", chunkIndex: 0),
+                     Chunk(text: "beta", source: "b.md", chunkIndex: 0)],
+            vectors: [vector(0), vector(1)],
+            binarySignatures: [Data([0xFF, 0x00]), Data([0x00, 0xFF])])
+        let ids = try store.rowIDs(source: "a.md") + store.rowIDs(source: "b.md")
+        try store.db.execute("DELETE FROM \(VectorStore.rerankVectorTable) WHERE rowid = ?",
+                             [.int(ids[0])])
+        let decoded = try store.exactVectorsLocked(rowIDs: ids)
+        XCTAssertEqual(decoded.count, 2)
+        XCTAssertEqual(decoded[ids[0]]?.count, dimension)
+        store.close()
+    }
+
+    func testExactVectorsReadsMoreThanOneBatch() throws {
+        let store = try makeStore("batches")
+        var chunks: [Chunk] = []
+        var vectors: [[Float]] = []
+        var signatures: [Data] = []
+        for index in 0..<300 {
+            chunks.append(Chunk(text: "chunk \(index)", source: "s\(index).md", chunkIndex: 0))
+            vectors.append(vector(index))
+            signatures.append(Data(repeating: UInt8(index % 255), count: dimension / 8))
+        }
+        _ = try store.add(chunks: chunks, vectors: vectors, binarySignatures: signatures)
+        let ids = try store.db.query("SELECT rowid FROM chunks").compactMap { $0["rowid"]?.intValue }
+        let decoded = try store.exactVectorsLocked(rowIDs: Array(ids.reversed()))
+        XCTAssertEqual(decoded.count, 300)
+        store.close()
+    }
 }
