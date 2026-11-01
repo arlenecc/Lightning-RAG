@@ -17,6 +17,9 @@ public final class LlamaCppLLMService: LLMService, PreloadableLLMService,
     private let repetitionPenalty: Double
     private let enableThinking: Bool
     private let gpuLayers: Int
+    /// 多模态投影文件（mmproj）。非空时以 mtmd 加载视觉能力，
+    /// 聊天消息携带图像时走多模态 prefill。
+    private let mmprojPath: String?
     /// 跨轮 KV/前缀复用开关（llm_kv_reuse）。关闭时每轮全量重建，
     /// 与 MLX 后端对齐。
     private let kvReuse: Bool
@@ -39,6 +42,7 @@ public final class LlamaCppLLMService: LLMService, PreloadableLLMService,
          repetitionPenalty: Double,
          enableThinking: Bool,
          gpuLayers: Int,
+         mmprojPath: String? = nil,
          kvReuse: Bool = true,
          kvInt8: Bool = true) {
         self.modelPath = modelPath
@@ -51,6 +55,7 @@ public final class LlamaCppLLMService: LLMService, PreloadableLLMService,
         self.repetitionPenalty = repetitionPenalty
         self.enableThinking = enableThinking
         self.gpuLayers = gpuLayers
+        self.mmprojPath = mmprojPath
         self.kvReuse = kvReuse
         self.kvInt8 = kvInt8
     }
@@ -131,6 +136,7 @@ public final class LlamaCppLLMService: LLMService, PreloadableLLMService,
             let value = try Loaded(modelPath: modelPath,
                                    contextWindow: contextWindow,
                                    gpuLayers: gpuLayers,
+                                   mmprojPath: mmprojPath,
                                    kvInt8: kvInt8)
             loaded = value
             return value
@@ -213,6 +219,20 @@ public final class LlamaCppLLMService: LLMService, PreloadableLLMService,
 
             let loaded = try ensureLoadedLocked()
             let model = loaded.model
+
+            // 多模态分支：消息携带图像且模型已加载 mmproj 时，走 mtmd 多模态 prefill。
+            let hasImages = messages.contains { ($0.images?.isEmpty ?? true) == false }
+            if hasImages {
+                guard let vision = loaded.vision else {
+                    throw LlamaCppError.unsupported(
+                        "聊天消息包含图像，但 \(modelPath) 未配置 mmproj，无法处理视觉输入")
+                }
+                try runMultimodal(loaded: loaded, vision: vision, messages: messages,
+                                  tools: tools, enableThinking: enableThinking,
+                                  temperature: temperature, continuation: continuation)
+                return
+            }
+
             let basePrompt = try LlamaCppPromptRenderer.render(
                 template: model.chatTemplate,
                 model: model,
@@ -276,86 +296,25 @@ public final class LlamaCppLLMService: LLMService, PreloadableLLMService,
             let cachedPromptTokens = common
 
             let generationBudget = max(1, min(maxTokens, contextWindow - tokens.count - 8))
-            let sampling = LlamaCppSampling(
-                temperature: temperature,
-                topK: topK,
-                topP: topP,
-                minP: minP,
-                repetitionPenalty: repetitionPenalty)
-            let sampler = LlamaCppSampler(vocabSize: model.vocabSize, config: sampling)
             let startInThink = prompt
                 .trimmingCharacters(in: .whitespacesAndNewlines)
                 .hasSuffix("<think>")
-            var thinkSplitter = ThinkSplitter(startInThink: startInThink)
-            var toolSplitter = ToolTagSplitter()
-            var decoder = LlamaCppUTF8StreamDecoder()
-            var rawContent = generationPrefix
-            var generated: [llama_token] = []
-            var nPast = tokens.count
             let allowedToolNames = Set(tools.compactMap {
                 $0["function"]?["name"]?.stringValue
             })
-            let generationStart = Date()
-
-            func emit(_ text: String) {
-                rawContent += text
-                for piece in thinkSplitter.feed(text) {
-                    if piece.reasoning {
-                        if !piece.text.isEmpty {
-                            continuation.yield(LLMStreamEvent(
-                                kind: .reasoning, content: piece.text))
-                        }
-                    } else {
-                        for visible in toolSplitter.feed(piece.text) where !visible.isEmpty {
-                            continuation.yield(LLMStreamEvent(
-                                kind: .content, content: visible))
-                        }
-                    }
-                }
-            }
-
+            let (rawContent, generated): (String, [llama_token])
             do {
-                while generated.count < generationBudget {
-                    try Task.checkCancellation()
-                    if nPast >= contextWindow { break }
-                    let token = sampler.sample(context: loaded.context)
-                    sampler.accept(token)
-                    generated.append(token)
-                    try LlamaCppContext.decode(token: token, context: loaded.context)
-                    nPast += 1
-                    if model.isEndOfGeneration(token) { break }
-
-                    let bytes = model.pieceBytes(token)
-                    if !bytes.isEmpty {
-                        let text = decoder.feed(bytes)
-                        if !text.isEmpty { emit(text) }
-                    }
-                }
-
-                let tail = decoder.flush()
-                if !tail.isEmpty { emit(tail) }
-                for piece in thinkSplitter.flush() {
-                    if piece.reasoning {
-                        if !piece.text.isEmpty {
-                            continuation.yield(LLMStreamEvent(
-                                kind: .reasoning, content: piece.text))
-                        }
-                    } else {
-                        for visible in toolSplitter.feed(piece.text) where !visible.isEmpty {
-                            continuation.yield(LLMStreamEvent(
-                                kind: .content, content: visible))
-                        }
-                    }
-                }
-                for visible in toolSplitter.flush() where !visible.isEmpty {
-                    continuation.yield(LLMStreamEvent(kind: .content, content: visible))
-                }
+                (rawContent, generated) = try generateLoop(
+                    context: loaded.context, model: model,
+                    temperature: temperature, startPast: llama_pos(tokens.count),
+                    budget: generationBudget, startInThink: startInThink,
+                    allowedToolNames: allowedToolNames, continuation: continuation)
             } catch {
-                llama_memory_clear(loaded.memory, true)
                 cachedTokens = []
                 cachedToolsKey = nil
                 throw error
             }
+            let generationStart = Date()
 
             let toolCalls = LocalToolCallParser.extract(
                 raw: rawContent, allowedNames: allowedToolNames)
@@ -383,6 +342,186 @@ public final class LlamaCppLLMService: LLMService, PreloadableLLMService,
         }
     }
 
+    // MARK: - 生成 / 多模态
+
+    /// 自回归生成循环（文本与多模态 prefill 之后共用）。
+    /// 从 `startPast` 位置继续 decode，返回拼接后的原文与生成的 token 序列。
+    private func generateLoop(
+        context: OpaquePointer,
+        model: LlamaCppModel,
+        temperature: Double,
+        startPast: llama_pos,
+        budget: Int,
+        startInThink: Bool,
+        allowedToolNames: Set<String>,
+        continuation: AsyncThrowingStream<LLMStreamEvent, Error>.Continuation
+    ) throws -> (rawContent: String, generated: [llama_token]) {
+        let sampling = LlamaCppSampling(
+            temperature: temperature, topK: topK, topP: topP,
+            minP: minP, repetitionPenalty: repetitionPenalty)
+        let sampler = LlamaCppSampler(vocabSize: model.vocabSize, config: sampling)
+        var thinkSplitter = ThinkSplitter(startInThink: startInThink)
+        var toolSplitter = ToolTagSplitter()
+        var decoder = LlamaCppUTF8StreamDecoder()
+        var rawContent = ""
+        var generated: [llama_token] = []
+        var nPast = startPast
+
+        func emit(_ text: String) {
+            rawContent += text
+            for piece in thinkSplitter.feed(text) {
+                if piece.reasoning {
+                    if !piece.text.isEmpty {
+                        continuation.yield(LLMStreamEvent(
+                            kind: .reasoning, content: piece.text))
+                    }
+                } else {
+                    for visible in toolSplitter.feed(piece.text) where !visible.isEmpty {
+                        continuation.yield(LLMStreamEvent(
+                            kind: .content, content: visible))
+                    }
+                }
+            }
+        }
+
+        do {
+            while generated.count < budget {
+                try Task.checkCancellation()
+                if Int(nPast) >= contextWindow { break }
+                let token = sampler.sample(context: context)
+                sampler.accept(token)
+                generated.append(token)
+                try LlamaCppContext.decode(token: token, context: context)
+                nPast += 1
+                if model.isEndOfGeneration(token) { break }
+
+                let bytes = model.pieceBytes(token)
+                if !bytes.isEmpty {
+                    let text = decoder.feed(bytes)
+                    if !text.isEmpty { emit(text) }
+                }
+            }
+
+            let tail = decoder.flush()
+            if !tail.isEmpty { emit(tail) }
+            for piece in thinkSplitter.flush() {
+                if piece.reasoning {
+                    if !piece.text.isEmpty {
+                        continuation.yield(LLMStreamEvent(
+                            kind: .reasoning, content: piece.text))
+                    }
+                } else {
+                    for visible in toolSplitter.feed(piece.text) where !visible.isEmpty {
+                        continuation.yield(LLMStreamEvent(
+                            kind: .content, content: visible))
+                    }
+                }
+            }
+            for visible in toolSplitter.flush() where !visible.isEmpty {
+                continuation.yield(LLMStreamEvent(kind: .content, content: visible))
+            }
+        } catch {
+            llama_memory_clear(llama_get_memory(context), true)
+            throw error
+        }
+        return (rawContent, generated)
+    }
+
+    /// 多模态 prefill：把带图消息里的图像占位符经 mtmd 注入视觉特征，
+    /// 再用 mtmd 分词 + 评估写入 KV，之后交给通用生成循环续写。
+    /// 多模态请求禁用跨轮 KV 复用（mtmd 的视觉 prefill 与纯文本缓存不兼容）。
+    private func runMultimodal(
+        loaded: Loaded,
+        vision: OpaquePointer,
+        messages: [ChatMessage],
+        tools: [JSONValue],
+        enableThinking: Bool,
+        temperature: Double,
+        continuation: AsyncThrowingStream<LLMStreamEvent, Error>.Continuation
+    ) throws {
+        let model = loaded.model
+        let marker = String(cString: mtmd_default_marker())
+
+        // 在每条带图用户消息前插入与图像数量一致的占位符，并记录 bitmap。
+        var bitmaps: [OpaquePointer] = []
+        defer { for bitmap in bitmaps { mtmd_bitmap_free(bitmap) } }
+        let injected = messages.map { message -> ChatMessage in
+            guard let images = message.images, !images.isEmpty else { return message }
+            var copy = message
+            copy.content = String(repeating: marker + "\n", count: images.count) + message.content
+            for data in images {
+                let bitmap = data.withUnsafeBytes { buffer -> OpaquePointer? in
+                    guard let base = buffer.bindMemory(to: UInt8.self).baseAddress else { return nil }
+                    let opt = mtmd_helper_init_opt_default()
+                    return mtmd_helper_bitmap_init_from_buf(
+                        vision, base, buffer.count, false, opt).bitmap
+                }
+                if let bitmap { bitmaps.append(bitmap) }
+            }
+            return copy
+        }
+        guard !bitmaps.isEmpty else {
+            throw LlamaCppError.decode("图像解码失败（mtmd 未生成 bitmap）")
+        }
+
+        let formatted = try LlamaCppPromptRenderer.render(
+            template: model.chatTemplate, model: model, messages: injected,
+            tools: tools, enableThinking: enableThinking, addGenerationPrompt: true)
+        guard formatted.contains(marker) else {
+            throw LlamaCppError.template("chat template 丢失了媒体占位符 \(marker)")
+        }
+
+        llama_memory_clear(loaded.memory, true)
+        guard let chunks = mtmd_input_chunks_init() else {
+            throw LlamaCppError.decode("mtmd_input_chunks_init 失败")
+        }
+        defer { mtmd_input_chunks_free(chunks) }
+
+        var text = mtmd_input_text(text: nil, text_len: 0, add_special: true, parse_special: true)
+        var bitmapsArray = bitmaps.map { $0 as OpaquePointer? }
+        let tokenizeResult: Int32 = formatted.withCString { pointer in
+            text.text = pointer
+            text.text_len = formatted.utf8.count
+            return bitmapsArray.withUnsafeBufferPointer { buffer in
+                mtmd_tokenize(vision, chunks, &text, buffer.baseAddress!, bitmapsArray.count)
+            }
+        }
+        guard tokenizeResult == 0 else {
+            throw LlamaCppError.decode("mtmd_tokenize 返回 \(tokenizeResult)")
+        }
+
+        var nPast: llama_pos = 0
+        let evalResult = mtmd_helper_eval_chunks(
+            vision, loaded.context, chunks, 0, 0, Int32(loaded.batchSize), true, &nPast)
+        guard evalResult == 0 else {
+            throw LlamaCppError.decode("mtmd 图像编码失败（\(evalResult)）")
+        }
+
+        let budget = max(1, min(maxTokens, contextWindow - Int(nPast) - 8))
+        let allowedToolNames = Set(tools.compactMap {
+            $0["function"]?["name"]?.stringValue
+        })
+        let generationStart = Date()
+        let (rawContent, generated) = try generateLoop(
+            context: loaded.context, model: model, temperature: temperature,
+            startPast: nPast, budget: budget, startInThink: false,
+            allowedToolNames: allowedToolNames, continuation: continuation)
+
+        let toolCalls = LocalToolCallParser.extract(
+            raw: rawContent, allowedNames: allowedToolNames)
+        let elapsed = max(0.001, Date().timeIntervalSince(generationStart))
+        let usage: [String: Int] = [
+            "prompt_tokens": Int(nPast),
+            "completion_tokens": generated.count,
+            "total_tokens": Int(nPast) + generated.count,
+            "tokens_per_second": Int(Double(generated.count) / elapsed),
+            "cached_prompt_tokens": 0,
+        ]
+        AgentLog.info("[gguf-vlm] prefill=\(nPast) generated=\(generated.count)")
+        continuation.yield(LLMStreamEvent(
+            kind: .done, toolCalls: toolCalls, usage: usage, rawContent: rawContent))
+    }
+
     // MARK: - 状态
 
     private final class Loaded {
@@ -390,8 +529,11 @@ public final class LlamaCppLLMService: LLMService, PreloadableLLMService,
         let context: OpaquePointer
         let memory: OpaquePointer?
         let batchSize: Int
+        /// mtmd 多模态上下文（mmproj 投影）。无 mmproj 时为 nil。
+        let vision: OpaquePointer?
 
-        init(modelPath: String, contextWindow: Int, gpuLayers: Int, kvInt8: Bool) throws {
+        init(modelPath: String, contextWindow: Int, gpuLayers: Int,
+             mmprojPath: String?, kvInt8: Bool) throws {
             model = try LlamaCppModel(path: modelPath, gpuLayers: gpuLayers)
             batchSize = min(2_048, max(64, contextWindow))
             context = try LlamaCppContext.make(
@@ -401,9 +543,30 @@ public final class LlamaCppLLMService: LLMService, PreloadableLLMService,
                 embeddings: false,
                 kvInt8: kvInt8)
             memory = llama_get_memory(context)
+            let modelPointer = model.raw
+
+            if let mmprojPath, !mmprojPath.isEmpty {
+                var params = mtmd_context_params_default()
+                params.use_gpu = llama_supports_gpu_offload()
+                params.print_timings = false
+                params.warmup = false
+                params.n_threads = Int32(max(4, min(8,
+                    ProcessInfo.processInfo.activeProcessorCount - 2)))
+                guard let created = mmprojPath.withCString({ path in
+                    mtmd_init_from_file(path, modelPointer, params)
+                }) else {
+                    llama_free(context)
+                    throw LlamaCppError.mmproj(
+                        "mtmd_init_from_file 返回空：\(mmprojPath)")
+                }
+                vision = created
+            } else {
+                vision = nil
+            }
         }
 
         deinit {
+            if let vision { mtmd_free(vision) }
             llama_free(context)
         }
     }

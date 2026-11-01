@@ -266,7 +266,8 @@ public final class KernelLoop {
     public func run(_ userInput: String,
                     resume: Bool = false,
                     emitFinished: Bool = true,
-                    toolsEnabled: Bool = true) async -> KernelResult {
+                    toolsEnabled: Bool = true,
+                    images: [Data] = []) async -> KernelResult {
         let session = self.session
         state = .think
         emptyRetry = 0
@@ -308,6 +309,9 @@ public final class KernelLoop {
         var pending = userInput
         var finalText = ""
         var exitReason: ExitReason = .maxTurns
+        // 多模态图像只挂到「本次 run 的第一条用户消息」（即触发本轮的用户输入），
+        // 不重复挂到后续的工具有/续跑轮次。resume（自动续跑）由 Agent 显式传空。
+        var attachImages: [Data]? = images.isEmpty ? nil : images
 
         while turnsUsed < maxTurns {
             if cancelled() {
@@ -351,7 +355,8 @@ public final class KernelLoop {
             if !dynamic.isEmpty {
                 userText += "\n\n" + dynamic
             }
-            let rec = session.startTurn(prompt: userText)
+            let rec = session.startTurn(prompt: userText, images: attachImages)
+            attachImages = nil
             turnsUsed += 1
             let messages = session.buildMessages(systemPrompt: systemPrompt(), userText: userText)
             _ = schemas()

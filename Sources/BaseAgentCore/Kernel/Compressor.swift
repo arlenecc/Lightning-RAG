@@ -189,15 +189,22 @@ public func hasSummaryTag(_ content: String) -> Bool {
 ///
 /// 模型可能把标签拆到多个 chunk 里，因此保留跨 chunk 缓冲；正文仍按原样
 /// 即时输出，最多只暂存可能是标签前缀的尾部字符。
+///
+/// 块被剥离后，其前后换行若原样进正文，几十个块叠加就会在气泡里留下
+/// 大段空白。因此这里用「空白悬挂」：每段正文的尾部空白先挂起，等下一个
+/// 可见字符到来时收敛为最多一个空行（两个换行）再输出；若随后又是一个
+/// summary 块或流结束，则整段丢弃。
 public struct SummaryStreamFilter {
     private var pending = ""
     private var inSummary = false
+    private var whitespaceHold = ""
 
     public init() {}
 
     public mutating func reset() {
         pending = ""
         inSummary = false
+        whitespaceHold = ""
     }
 
     /// 输入一个流式 chunk，返回可展示的正文与摘要。
@@ -226,15 +233,20 @@ public struct SummaryStreamFilter {
                     // 暂存可能是 "<summary>" 前缀的尾部，避免标签被拆到两个 chunk。
                     let hold = Self.heldSuffixLength(pending)
                     if hold > 0 {
-                        content += String(pending.dropLast(hold))
+                        Self.route(String(pending.dropLast(hold)),
+                                   into: &content, hold: &whitespaceHold)
                         pending = String(pending.suffix(hold))
                     } else {
-                        content += pending
+                        Self.route(pending, into: &content, hold: &whitespaceHold)
                         pending = ""
                     }
                     break
                 }
-                content += String(pending[..<range.lowerBound])
+                // summary 块对正文不可见：块前空白整段丢弃，块前正文的尾部
+                // 悬挂空白也一并丢弃，只保留可见文字。
+                let before = String(pending[..<range.lowerBound])
+                Self.route(before, into: &content, hold: &whitespaceHold)
+                whitespaceHold = ""
                 pending = String(pending[range.upperBound...])
                 inSummary = true
             }
@@ -243,7 +255,8 @@ public struct SummaryStreamFilter {
         return (content, summary)
     }
 
-    /// 流结束：未闭合的摘要按思考内容输出，其余按正文输出。
+    /// 流结束：未闭合的摘要按思考内容输出，其余按正文输出（不含尾部空白，
+    /// 避免气泡末尾残留空行）。
     public mutating func finish() -> (content: String, summary: String) {
         var content = ""
         var summary = ""
@@ -254,11 +267,26 @@ public struct SummaryStreamFilter {
                 if !summary.hasSuffix("\n") { summary += "\n" }
             }
         } else {
-            content = pending
+            content = pending.trimmingCharacters(in: .whitespacesAndNewlines)
         }
         pending = ""
         inSummary = false
+        whitespaceHold = ""
         return (content, summary)
+    }
+
+    /// 把一段正文并入输出：尾部空白挂起；此前悬挂的空白在下一个可见字符
+    /// 到来时收敛为最多两个换行后一并输出。
+    static func route(_ text: String, into content: inout String, hold: inout String) {
+        guard !text.isEmpty else { return }
+        var visible = Substring(text)
+        while let last = visible.last, last.isWhitespace { visible = visible.dropLast() }
+        if visible.isEmpty {
+            hold += text
+            return
+        }
+        content += String(hold.filter { $0 == "\n" }.prefix(2)) + visible
+        hold = String(text.suffix(text.count - visible.count))
     }
 
     private static func heldSuffixLength(_ text: String) -> Int {

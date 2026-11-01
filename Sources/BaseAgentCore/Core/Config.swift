@@ -186,7 +186,7 @@ public struct AgentConfig: Sendable {
     public var ragOCRModelPath: String = "models/OvisOCR3-MLX-4bit-mixed46"
     /// GGUF 视觉模型的多模态投影文件；留空时自动查找模型同目录的 mmproj*.gguf。
     public var ragOCRMMProjPath: String = ""
-    /// 预留：OCR ONNX 模型的 tokenizer 目录（ONNX VLM 尚未接入）。
+    /// OCR ONNX 模型的 tokenizer 目录（自定义 OCR 选 ONNX 后端时必填）。
     public var ragOCRTokenizerPath: String = ""
     /// 预留：主模型 GGUF 的 mmproj 路径（当前主/辅 LLM 为纯文本，未接入视觉输入）。
     public var llmMmprojPath: String = ""

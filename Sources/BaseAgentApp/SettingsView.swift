@@ -1,5 +1,6 @@
 import SwiftUI
 import AppKit
+import UniformTypeIdentifiers
 import BaseAgentCore
 
 struct SettingsView: View {
@@ -56,6 +57,10 @@ struct SettingsView: View {
     @State private var auxThinking = false
     @State private var auxKVReuse = false
     @State private var auxKVInt8Enabled = true
+    /// 主模型 GGUF 的多模态投影文件（mmproj），可选；需要多模态能力时必须设置。
+    @State private var mainMmprojPath = ""
+    /// 辅助模型 GGUF 的多模态投影文件（mmproj），可选；需要多模态能力时必须设置。
+    @State private var auxMmprojPath = ""
 
     // MARK: 知识同步
 
@@ -68,12 +73,14 @@ struct SettingsView: View {
     /// 当前 Embedding 后端下「切片实际生效值」的 token 上限（nil = 无精确换算）。
     @State private var embeddingContentLimit: Int?
 
-    // MARK: 高级 RAG
+    // MARK: 高级设置
 
     @State private var pdfEngine: PDFEngine = .vision
     @State private var epubOCREngine: PDFEngine = .vision
     @State private var ocrModelPath = ""
     @State private var ocrMMProjPath = ""
+    /// 自定义 OCR 选 ONNX 时必填的 tokenizer 文件（或含 tokenizer.json 的目录）。
+    @State private var ocrTokenizerPath = ""
     @State private var vlmBackend = "mlx"
     @State private var ocrPreprocess = true
     @State private var ocrBinarize = true
@@ -159,6 +166,10 @@ struct SettingsView: View {
                     .foregroundStyle(.secondary)
                     .lineLimit(2)
                 Spacer()
+                Button("应用配置") { applyAllConfig() }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(model.isSyncing || model.isDeduplicating || model.isBuildingANN
+                        || model.isModelLoading || model.isRunning || model.isWarmingUp)
                 Button("关闭") { dismissWindow() }
                     .keyboardShortcut(.cancelAction)
             }
@@ -180,11 +191,34 @@ struct SettingsView: View {
                 auxModelBlock
                 Divider()
                 runParametersRow
+                mlxResourceRow
             }
             .padding(8)
         } label: {
             Text("Agent 模型配置").font(.headline)
         }
+    }
+
+    /// MLX 运行时资源参数（从高级设置区移入，紧随「运行参数」行）。
+    private var mlxResourceRow: some View {
+        HStack(spacing: 14) {
+            Text("MLX 资源")
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.secondary)
+            Stepper("MLX 缓存：\(mlxCacheLimitMB)MB",
+                    value: $mlxCacheLimitMB,
+                    in: 256...2_048, step: 128)
+                .help("MLX 可复用 buffer 的上限，默认 1024MB；"
+                    + "运行时夹在 256...2048，只影响空闲缓存，不含模型权重与 KV。"
+                    + "实测 1GB 让 decode 快 5–8% 且接近 embedding 工作集，2GB 基本没有额外提速")
+            Stepper("MLX 上限：\(mlxMemoryLimitText)",
+                    value: $mlxMemoryLimitMB,
+                    in: 0...32_768, step: 512)
+                .help("MLX 全局内存硬上限（含权重/KV/buffer）；"
+                    + "0 = 自动取 min(物理内存 65%, 9.6GB)。误配可能导致 OOM")
+            Spacer(minLength: 8)
+        }
+        .font(.caption)
     }
 
     private var mainModelBlock: some View {
@@ -212,6 +246,7 @@ struct SettingsView: View {
                     path: $mainPath,
                     pathHint: "默认：models/qwen3.5-4b-agentic-coder-v4-4bit-mlx",
                     tokenizer: $mainTokenizer,
+                    mmproj: $mainMmprojPath,
                     context: $mainContext,
                     kvCap: $mainKVCache,
                     temperature: $mainTemperature,
@@ -309,6 +344,7 @@ struct SettingsView: View {
                 path: $auxPath,
                 pathHint: "默认：models/Qwen3.5-2B-MLX-4bit",
                 tokenizer: $auxTokenizer,
+                mmproj: $auxMmprojPath,
                 context: $auxContext,
                 kvCap: $auxKVCache,
                 temperature: $auxTemperature,
@@ -353,6 +389,10 @@ struct SettingsView: View {
                     value: $maxIterations, in: 1...50)
                 .help("单次任务允许的最大工具调用轮数，默认 15；"
                     + "调大能处理更长的任务，也会增加耗时与 API 费用")
+            Stepper("查询超时：\(String(format: "%.0f", queryTimeoutSeconds))s",
+                    value: $queryTimeoutSeconds, in: 0...60, step: 1)
+                .help("知识库只读查询（打开库 / 状态 / 检索）的超时秒数，默认 5s，0 = 关闭。"
+                    + "大库或上次同步中断后 SQLite 恢复 WAL 较慢时，可适当调大")
             Spacer(minLength: 8)
             Button("应用配置") { applyAPIConfig() }
                 .disabled(model.isSyncing || model.isDeduplicating || model.isBuildingANN
@@ -367,6 +407,7 @@ struct SettingsView: View {
         path: Binding<String>,
         pathHint: String,
         tokenizer: Binding<String>? = nil,
+        mmproj: Binding<String>? = nil,
         context: Binding<Int>,
         kvCap: Binding<Int>,
         temperature: Binding<Double>,
@@ -394,7 +435,11 @@ struct SettingsView: View {
                 Text("本地路径").font(.caption)
                 TextField(pathHint, text: path)
                     .textFieldStyle(.roundedBorder)
-                Button("选择…") { chooseDirectory(path, title: "选择模型目录") }
+                Button("选择…") {
+                    chooseModelPath(path, backend: backend.wrappedValue,
+                                    dirTitle: "选择模型目录",
+                                    fileTitle: "选择 GGUF 模型文件")
+                }
             }
             if let tokenizer, backend.wrappedValue == "onnx" {
                 HStack(spacing: 8) {
@@ -405,6 +450,17 @@ struct SettingsView: View {
                     Button("选择…") {
                         chooseDirectory(tokenizer, title: "选择 tokenizer 目录")
                     }
+                }
+            }
+
+            // GGUF 多模态投影文件（mmproj）：可选；需要多模态能力时必须设置。
+            if let mmproj, backend.wrappedValue == "gguf" {
+                HStack(spacing: 8) {
+                    Text("mmproj路径").font(.caption)
+                    TextField("可选：多模态投影文件，留空自动查找模型同目录的 mmproj*.gguf",
+                              text: mmproj)
+                        .textFieldStyle(.roundedBorder)
+                    Button("选择…") { chooseFile(mmproj, title: "选择 mmproj 文件") }
                 }
             }
 
@@ -512,7 +568,7 @@ struct SettingsView: View {
                 }
 
                 // Reranker 行：模型类型 / 本地路径之后是「启用重排序 + TopN +
-                // 候选池 + 阈值」，同样按可用宽度自动折行。
+                // 候选池 + 阈值 + 二值粗筛 + 候选」，同样按可用宽度自动折行。
                 ViewThatFits(in: .horizontal) {
                     HStack(spacing: 8) {
                         rerankerPathControls
@@ -531,42 +587,36 @@ struct SettingsView: View {
                     }
                 }
 
-                // 二值粗筛：紧跟 Reranker 配置行；开关关闭时候选数不可调，
-                // 主存储为 BIN 时该项自动停用。
-                HStack(spacing: 8) {
-                    Toggle("二值粗筛", isOn: $binaryCoarseEnabled)
-                        .help("开启后先用二值向量召回候选，再按主向量余弦精排，"
-                            + "最后与全文检索 RRF 融合；可用时取代 ANN，不可用时"
-                            + "自动回退原流程。主存储为 BIN 时仅支持单阶段检索；"
-                            + "已有库需要重新同步后才会生效。")
-                    Stepper(value: $binaryCoarseCandidates, in: 50...1000, step: 50) {
-                        Text("候选 \(binaryCoarseCandidates)")
-                    }
-                    .disabled(!binaryCoarseEnabled)
-                    .help("第一阶段二值粗筛候选数：越大召回越稳、精排读取越多；"
-                        + "默认 200，允许 50...1000。")
-                    Spacer(minLength: 8)
-                }
-
-                // 向量库与 ANN 索引合并为一行：元素类型 / Matryoshka /
-                // ANN 检索与自动构建 / ANN 索引摘要与维护 / 显式重建。
-                // 窗口较窄时整组换行，仍归属同一组设置。
+                // 向量库行：元素类型 / Matryoshka / ANN 检索与自动构建 / 显式重建。
+                // 索引状态与维护按钮并入下一行「二值 ANN」之后；
+                // 窗口较窄时各自整组换行，仍归属同一组设置。
                 ViewThatFits(in: .horizontal) {
                     HStack(spacing: 8) {
                         vectorStorageControls
                         annToggles()
-                        annStatusLabel
                         Spacer(minLength: 8)
-                        annButtons()
                         vectorRebuildButtons()
                     }
                     VStack(alignment: .leading, spacing: 6) {
+                        vectorStorageControls
                         HStack(spacing: 8) {
-                            vectorStorageControls
                             annToggles()
                             Spacer(minLength: 8)
                             vectorRebuildButtons()
                         }
+                    }
+                }
+                // 二值 ANN：stage 1 优先走自研 bann，未构建时回退 bin 表暴力汉明。
+                // 后接主 ANN 索引摘要与维护按钮（构建/续建、停止、删除）。
+                ViewThatFits(in: .horizontal) {
+                    HStack(spacing: 8) {
+                        binaryANNStatusLabel
+                        annStatusLabel
+                        Spacer(minLength: 8)
+                        annButtons()
+                    }
+                    VStack(alignment: .leading, spacing: 6) {
+                        binaryANNStatusLabel
                         HStack(spacing: 8) {
                             annStatusLabel
                             Spacer(minLength: 8)
@@ -574,8 +624,6 @@ struct SettingsView: View {
                         }
                     }
                 }
-                // 二值 ANN：stage 1 优先走自研 bann，未构建时回退 bin 表暴力汉明。
-                binaryANNStatusLabel
                 // 闲时章节摘要：ANN 状态下方单独一行；文案已含「章节摘要：」前缀。
                 Text(model.bookSummaryStatusText)
                     .font(.caption2)
@@ -595,30 +643,42 @@ struct SettingsView: View {
                     .foregroundStyle(.red)
                 }
 
-                DisclosureGroup("高级 RAG / OCR 设置", isExpanded: $showAdvanced) {
+                DisclosureGroup("高级设置", isExpanded: $showAdvanced) {
                     VStack(alignment: .leading, spacing: 10) {
                         HStack(spacing: 8) {
                             Text("自定义OCR模型").font(.caption)
                             Picker("", selection: $vlmBackend) {
                                 Text("MLX").tag("mlx")
                                 Text("GGUF").tag("gguf")
+                                Text("ONNX").tag("onnx")
                             }
                             .labelsHidden()
                             .frame(width: 80)
-                            TextField("模型路径（MLX 填目录，GGUF 填文件）", text: $ocrModelPath)
-                                .textFieldStyle(.roundedBorder)
-                                .frame(minWidth: 160)
+                            TextField(
+                                vlmBackend == "mlx"
+                                    ? "模型路径（MLX 填目录）"
+                                    : vlmBackend == "onnx"
+                                        ? "ONNX 模型文件（或含权重的目录）"
+                                        : "GGUF 模型文件路径",
+                                text: $ocrModelPath
+                            )
+                            .textFieldStyle(.roundedBorder)
+                            .frame(minWidth: 160)
                             Button("选择…") {
-                                if vlmBackend == "mlx" {
+                                switch vlmBackend {
+                                case "mlx":
                                     chooseDirectory($ocrModelPath, title: "选择 OCR 模型目录")
-                                } else {
+                                case "onnx":
+                                    chooseONNX($ocrModelPath,
+                                               title: "选择 ONNX 模型文件或目录")
+                                default:
                                     chooseFile($ocrModelPath, title: "选择 OCR 模型文件")
                                 }
                             }
                             Button("保存设置") { saveAdvancedSettings() }
                                 .disabled(model.isSyncing || model.isDeduplicating
                                     || model.isBuildingANN)
-                                .help("保存并应用高级 RAG / OCR 设置")
+                                .help("保存并应用高级设置")
                             Button("识别测试") { openOCRLab() }
                                 .disabled(model.isSyncing || model.isDeduplicating
                                     || model.isBuildingANN)
@@ -631,6 +691,16 @@ struct SettingsView: View {
                                           text: $ocrMMProjPath)
                                     .textFieldStyle(.roundedBorder)
                                 Button("选择…") { chooseFile($ocrMMProjPath, title: "选择 mmproj 文件") }
+                                Spacer(minLength: 8)
+                            }
+                        }
+                        if vlmBackend == "onnx" {
+                            HStack(spacing: 8) {
+                                Text("tokenizer路径").font(.caption)
+                                TextField("必填：tokenizer.json 文件，或含它的目录",
+                                          text: $ocrTokenizerPath)
+                                    .textFieldStyle(.roundedBorder)
+                                Button("选择…") { chooseFile($ocrTokenizerPath, title: "选择 tokenizer 文件") }
                                 Spacer(minLength: 8)
                             }
                         }
@@ -661,15 +731,6 @@ struct SettingsView: View {
                             Button("转换工具") { openConverter() }
                                 .help("打开转换工具窗口：把 PDF/EPUB/Office/HTML/图片/文本等批量转换为 Markdown，"
                                     + "沿用这里的 OCR 与切片前的解析设置")
-                        }
-                        HStack(spacing: 14) {
-                            Text("RAG 参数设置")
-                                .font(.caption.weight(.semibold))
-                                .foregroundStyle(.secondary)
-                            Stepper("查询超时：\(String(format: "%.0f", queryTimeoutSeconds))s",
-                                    value: $queryTimeoutSeconds, in: 0...60, step: 1)
-                                .help("知识库只读查询（打开库 / 状态 / 检索）的超时秒数，默认 5s，0 = 关闭。"
-                                    + "大库或上次同步中断后 SQLite 恢复 WAL 较慢时，可适当调大")
                         }
                         ViewThatFits(in: .horizontal) {
                             HStack(spacing: 14) {
@@ -795,7 +856,11 @@ struct SettingsView: View {
             .textFieldStyle(.roundedBorder)
             .frame(minWidth: 140)
             .help("留空时使用应用内置的默认模型；仅在需要自定义模型时填写路径")
-        Button("选择…") { chooseDirectory(path, title: chooseTitle) }
+        Button("选择…") {
+            chooseModelPath(path, backend: backend.wrappedValue,
+                            dirTitle: chooseTitle,
+                            fileTitle: "选择 \(title) GGUF 文件")
+        }
     }
 
     /// 切片设置：语义切片开关 + 切片大小（含模型窗口收口提示）+ overlap。
@@ -839,6 +904,19 @@ struct SettingsView: View {
                 value: $rerankThreshold, in: 0...1, step: 0.05)
             .help("重排分数过滤阈值（0-1），默认 0.45 适配 jina；低于阈值的片段会被过滤，"
                 + "全部低于阈值时回退原排序。换 bge 等 reranker 时通常需要上调")
+        // 二值粗筛：并入重排序配置行末尾；开关关闭时候选数不可调，
+        // 主存储为 BIN 时该项自动停用。
+        Toggle("二值粗筛", isOn: $binaryCoarseEnabled)
+            .help("开启后先用二值向量召回候选，再按主向量余弦精排，"
+                + "最后与全文检索 RRF 融合；可用时取代 ANN，不可用时"
+                + "自动回退原流程。主存储为 BIN 时仅支持单阶段检索；"
+                + "已有库需要重新同步后才会生效。")
+        Stepper(value: $binaryCoarseCandidates, in: 50...1000, step: 50) {
+            Text("候选 \(binaryCoarseCandidates)")
+        }
+        .disabled(!binaryCoarseEnabled)
+        .help("第一阶段二值粗筛候选数：越大召回越稳、精排读取越多；"
+            + "默认 200，允许 50...1000。")
     }
 
     @ViewBuilder
@@ -848,8 +926,8 @@ struct SettingsView: View {
             .foregroundStyle(.secondary)
     }
 
-    /// 同步并发 / OCR 并发 / MLX 内存：与「同步参数设置」同组，
-    /// 优先与标题、自动同步开关排在同一行。
+    /// 同步并发 / OCR 并发：与「同步参数设置」同组，
+    /// 优先与标题、自动同步开关排在同一行。MLX 内存参数已移至「Agent 模型配置」区。
     @ViewBuilder
     private func syncResourceControls() -> some View {
         Stepper("同步并发：\(ingestConcurrency)",
@@ -860,17 +938,6 @@ struct SettingsView: View {
                 value: $visionConcurrency, in: 1...8)
             .help("Apple Vision OCR 的全局并发闸门，默认 4；"
                 + "实测 4 路已接近吞吐拐点，再多不一定更快")
-        Stepper("MLX 缓存：\(mlxCacheLimitMB)MB",
-                value: $mlxCacheLimitMB,
-                in: 256...2_048, step: 128)
-            .help("MLX 可复用 buffer 的上限，默认 1024MB；"
-                + "运行时夹在 256...2048，只影响空闲缓存，不含模型权重与 KV。"
-                + "实测 1GB 让 decode 快 5–8% 且接近 embedding 工作集，2GB 基本没有额外提速")
-        Stepper("MLX 上限：\(mlxMemoryLimitText)",
-                value: $mlxMemoryLimitMB,
-                in: 0...32_768, step: 512)
-            .help("MLX 全局内存硬上限（含权重/KV/buffer）；"
-                + "0 = 自动取 min(物理内存 65%, 9.6GB)。误配可能导致 OOM")
         Toggle("校验内容指纹", isOn: $verifyFingerprint)
             .help("默认信任文件 mtime + 大小，未变化文件不再读盘采样内容指纹。"
                 + "开启后每次增量同步都为同尺寸文件重新计算指纹，"
@@ -1186,6 +1253,7 @@ struct SettingsView: View {
         mainTopK = config.topK
         mainRepetitionPenalty = config.repetitionPenalty
         mainTimeout = config.requestTimeout
+        mainMmprojPath = config.llmMmprojPath
         maxIterations = config.maxIterations
         mainPromptBatch = config.promptBatchSize
         mainThinking = config.localLLMEnableThinking
@@ -1213,6 +1281,7 @@ struct SettingsView: View {
         auxThinking = config.auxLocalLLMEnableThinking
         auxKVReuse = config.auxKvReuse
         auxKVInt8Enabled = config.auxKvCacheInt8
+        auxMmprojPath = config.auxMmprojPath
 
         workspace = config.workspace
         knowledgeBase = config.knowledgeBase
@@ -1229,7 +1298,9 @@ struct SettingsView: View {
         epubOCREngine = (!hasCustomOCR && config.ragEPUBOCREngine == .custom)
             ? .vision : config.ragEPUBOCREngine
         ocrMMProjPath = config.ragOCRMMProjPath
-        vlmBackend = config.localVLMBackend.lowercased() == "gguf" ? "gguf" : "mlx"
+        ocrTokenizerPath = config.ragOCRTokenizerPath
+        vlmBackend = config.localVLMBackend.lowercased() == "gguf" ? "gguf"
+            : config.localVLMBackend.lowercased() == "onnx" ? "onnx" : "mlx"
         ocrPreprocess = config.ragOCRPreprocess
         ocrBinarize = config.ragOCRBinarize
         chunkSize = config.ragChunkSize
@@ -1320,6 +1391,14 @@ struct SettingsView: View {
         model.applyConfig(config)
     }
 
+    /// 窗口底部统一的「应用配置」：保存窗口内全部设置并重建 Agent。
+    /// 校验失败时 `buildConfig()` 已在 `statusMessage` 写入原因，这里无需额外处理。
+    private func applyAllConfig() {
+        guard let config = buildConfig() else { return }
+        statusMessage = "全部设置已保存并应用"
+        model.applyConfig(config)
+    }
+
     private func applyKnowledgeConfig() {
         guard !model.isSyncing, !model.isDeduplicating, !model.isBuildingANN else {
             statusMessage = "知识同步/索引构建/向量去重进行中，暂不能应用配置"
@@ -1365,7 +1444,7 @@ struct SettingsView: View {
         backend == "mlx-lm" || backend == "gguf"
     }
 
-    /// 保存并应用高级 RAG / OCR 设置（包含自定义 OCR 模型、PDF/EPUB OCR 引擎等）。
+    /// 保存并应用高级设置（包含自定义 OCR 模型、PDF/EPUB OCR 引擎等）。
     private func saveAdvancedSettings() {
         guard !model.isSyncing, !model.isDeduplicating, !model.isBuildingANN else {
             statusMessage = "知识同步/索引构建/向量去重进行中，暂不能保存设置"
@@ -1376,7 +1455,7 @@ struct SettingsView: View {
             if epubOCREngine == .custom { epubOCREngine = .vision }
         }
         guard let config = buildConfig() else { return }
-        statusMessage = "高级 RAG / OCR 设置已保存并应用"
+        statusMessage = "高级设置已保存并应用"
         model.applyConfig(config)
     }
 
@@ -1389,6 +1468,7 @@ struct SettingsView: View {
         }
         config.ragOCRModelPath = path
         config.ragOCRMMProjPath = ocrMMProjPath.trimmingCharacters(in: .whitespacesAndNewlines)
+        config.ragOCRTokenizerPath = ocrTokenizerPath.trimmingCharacters(in: .whitespacesAndNewlines)
         config.localVLMBackend = vlmBackend
         config.ragOCRPreprocess = ocrPreprocess
         config.ragOCRBinarize = ocrBinarize
@@ -1408,6 +1488,7 @@ struct SettingsView: View {
         }
         config.ragOCRModelPath = path
         config.ragOCRMMProjPath = ocrMMProjPath.trimmingCharacters(in: .whitespacesAndNewlines)
+        config.ragOCRTokenizerPath = ocrTokenizerPath.trimmingCharacters(in: .whitespacesAndNewlines)
         config.localVLMBackend = vlmBackend
         config.ragOCRPreprocess = ocrPreprocess
         config.ragOCRBinarize = ocrBinarize
@@ -1470,6 +1551,7 @@ struct SettingsView: View {
         config.localLLMBackend = AgentConfig.normalizeLLMBackend(mainBackend)
         config.localLLMModel = mainPath.trimmingCharacters(in: .whitespacesAndNewlines)
         config.llmTokenizerPath = mainTokenizer.trimmingCharacters(in: .whitespacesAndNewlines)
+        config.llmMmprojPath = mainMmprojPath.trimmingCharacters(in: .whitespacesAndNewlines)
         config.maxContextTokens = max(8192, mainContext)
         config.kvCacheMaxTokens = max(0, mainKVCache)
         config.kvCacheInt8 = kvInt8Enabled
@@ -1498,6 +1580,7 @@ struct SettingsView: View {
         config.auxLocalLLMBackend = AgentConfig.normalizeLLMBackend(auxBackend)
         config.auxLocalLLMModel = auxPath.trimmingCharacters(in: .whitespacesAndNewlines)
         config.auxTokenizerPath = auxTokenizer.trimmingCharacters(in: .whitespacesAndNewlines)
+        config.auxMmprojPath = auxMmprojPath.trimmingCharacters(in: .whitespacesAndNewlines)
         config.auxMaxContextTokens = max(8192, auxContext)
         config.auxKvCacheMaxTokens = max(0, auxKVCache)
         config.auxTemperature = clamp(auxTemperature, 0, 2)
@@ -1546,6 +1629,7 @@ struct SettingsView: View {
         }
         config.ragOCRModelPath = ocrPath
         config.ragOCRMMProjPath = ocrMMProjPath.trimmingCharacters(in: .whitespacesAndNewlines)
+        config.ragOCRTokenizerPath = ocrTokenizerPath.trimmingCharacters(in: .whitespacesAndNewlines)
         config.localVLMBackend = vlmBackend
         config.ragOCRPreprocess = ocrPreprocess
         config.ragOCRBinarize = ocrBinarize
@@ -1668,6 +1752,67 @@ struct SettingsView: View {
         }
         if panel.runModal() == .OK, let path = panel.url?.path {
             binding.wrappedValue = path
+        }
+    }
+
+    /// GGUF 模型是单个文件：限制只能选 .gguf 文件。
+    private func chooseGGUF(_ binding: Binding<String>, title: String) {
+        let panel = NSOpenPanel()
+        panel.title = title
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = false
+        if #available(macOS 11.0, *) {
+            panel.allowedContentTypes = [UTType(filenameExtension: "gguf")]
+                .compactMap { $0 }
+        }
+        let current = binding.wrappedValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !current.isEmpty {
+            panel.directoryURL = URL(fileURLWithPath: (current as NSString).expandingTildeInPath)
+                .deletingLastPathComponent()
+        }
+        if panel.runModal() == .OK, let path = panel.url?.path {
+            binding.wrappedValue = path
+        }
+    }
+
+    /// ONNX 模型既可以是单个 `.onnx` 文件，也可以是含 onnx 权重的目录：
+    /// 允许用户二选一（优先选文件，选到目录则交给运行时按约定搜索）。
+    private func chooseONNX(_ binding: Binding<String>, title: String) {
+        let panel = NSOpenPanel()
+        panel.title = title
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = true
+        panel.allowsMultipleSelection = false
+        if #available(macOS 11.0, *) {
+            panel.allowedContentTypes = [UTType(filenameExtension: "onnx")]
+                .compactMap { $0 }
+        }
+        let current = binding.wrappedValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !current.isEmpty {
+            panel.directoryURL = URL(fileURLWithPath: (current as NSString).expandingTildeInPath)
+                .deletingLastPathComponent()
+        }
+        if panel.runModal() == .OK, let url = panel.url {
+            binding.wrappedValue = url.path
+        }
+    }
+
+    /// 按 backend 选择模型路径：
+    /// - GGUF 是单个文件；
+    /// - ONNX 既可是文件也可是目录（优先选文件，选目录则运行时按约定搜索）；
+    /// - 其它（MLX / MLX-VLM / FastEmbed）是目录。
+    private func chooseModelPath(_ binding: Binding<String>,
+                                 backend: String,
+                                 dirTitle: String,
+                                 fileTitle: String) {
+        switch backend {
+        case "gguf":
+            chooseGGUF(binding, title: fileTitle)
+        case "onnx":
+            chooseONNX(binding, title: "选择 ONNX 模型文件或目录")
+        default:
+            chooseDirectory(binding, title: dirTitle)
         }
     }
 

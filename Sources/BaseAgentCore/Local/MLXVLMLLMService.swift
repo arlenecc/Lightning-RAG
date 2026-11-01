@@ -2,6 +2,8 @@ import Foundation
 import MLX
 import MLXVLM
 import MLXLMCommon
+import CoreImage
+import ImageIO
 
 /// 用 MLX-VLM 容器承载主/辅 LLM。
 ///
@@ -95,11 +97,17 @@ public final class MLXVLMLLMService: LLMService, PreloadableLLMService,
                 do {
                     try await gate.withLock {
                         let container = try await state.container(directory: directory)
-                        let mlxMessages = MLXLLMService.makeChatMessages(messages)
+                        let mlxMessages = makeVLMMessages(messages)
                         let toolSpecs = MLXLLMService.makeToolSpecs(tools)
                         let context: [String: any Sendable] = [
                             "enable_thinking": enableThinking
                         ]
+                        let imageCount = messages.reduce(0) {
+                            $0 + (($1.images?.count) ?? 0)
+                        }
+                        if imageCount > 0 {
+                            AgentLog.info("[mlx-vlm] 多模态请求：\(imageCount) 张图像")
+                        }
                         let input = try await container.prepare(input: UserInput(
                             chat: mlxMessages,
                             tools: toolSpecs,
@@ -165,5 +173,39 @@ public final class MLXVLMLLMService: LLMService, PreloadableLLMService,
                 }
             }
         }
+    }
+
+    // MARK: - 多模态消息转换
+
+    /// 把聊天消息映射为 MLXVLM 的 `Chat.Message`，并在带图的用户消息上挂载图像。
+    /// 结构与 `MLXLLMService.makeChatMessages` 完全一致（直接复用），仅把携带图像
+    /// 的用户消息替换为 `.user(content, images:)`：图像按出现顺序与对话模板里的
+    /// `<image>` 占位符一一对应（交由 MLXVLM 的 prepare 处理）。
+    private func makeVLMMessages(_ messages: [ChatMessage]) -> [Chat.Message] {
+        let base = MLXLLMService.makeChatMessages(messages)
+        return zip(messages, base).map { message, mlx in
+            guard message.role == .user,
+                  let images = message.images, !images.isEmpty,
+                  let vlmImages = vlmImages(from: images) else {
+                return mlx
+            }
+            return .user(message.content, images: vlmImages)
+        }
+    }
+
+    /// 把 JPEG/PNG 字节转为 MLXVLM 可消费的图像；解码失败的字节被跳过。
+    /// 全部失败（或没有可解码的）时返回 nil，调用方回落为纯文本消息。
+    private func vlmImages(from dataList: [Data]) -> [UserInput.Image]? {
+        var result: [UserInput.Image] = []
+        for data in dataList {
+            guard let cgImage = cgImage(from: data) else { continue }
+            result.append(.ciImage(CIImage(cgImage: cgImage)))
+        }
+        return result.isEmpty ? nil : result
+    }
+
+    private func cgImage(from data: Data) -> CGImage? {
+        guard let source = CGImageSourceCreateWithData(data as CFData, nil) else { return nil }
+        return CGImageSourceCreateImageAtIndex(source, 0, nil)
     }
 }

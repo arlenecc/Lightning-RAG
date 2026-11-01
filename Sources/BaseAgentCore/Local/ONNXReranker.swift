@@ -16,15 +16,8 @@ public final class ONNXReranker: RerankProvider, @unchecked Sendable {
     private let state = RerankerLoadState()
 
     public init(directory: URL, modelName: String, batchSize: Int = 8) {
-        self.directory = directory
         self.modelName = modelName
         self.identifier = "local:onnx:\(modelName)"
-        // XLM-R 系 ONNX 图内自算 position id（cumsum + padding_idx=1），
-        // 有效长度是 tokenizer 声明的 model_max_length（如 base 为 512），
-        // 直接用 config 的 max_position_embeddings（514）会在长 pair 上 Gather 越界。
-        self.maxLength = min(
-            LocalModelRegistry.resolveMaxSequenceLength(directory: directory, defaultValue: 8192),
-            LocalModelRegistry.tokenizerModelMaxLength(directory: directory) ?? 8_192)
         self.batchSize = max(1, batchSize)
 
         var resolved: URL?
@@ -36,6 +29,17 @@ public final class ONNXReranker: RerankProvider, @unchecked Sendable {
         }
         self.modelURL = resolved
         self.preflightError = loadError
+
+        // 若显式指定了 .onnx 文件，config / tokenizer 应去其所在目录读取。
+        let modelDir = resolved?.pathExtension.lowercased() == "onnx"
+            ? resolved!.deletingLastPathComponent() : directory
+        self.directory = modelDir
+        // XLM-R 系 ONNX 图内自算 position id（cumsum + padding_idx=1），
+        // 有效长度是 tokenizer 声明的 model_max_length（如 base 为 512），
+        // 直接用 config 的 max_position_embeddings（514）会在长 pair 上 Gather 越界。
+        self.maxLength = min(
+            LocalModelRegistry.resolveMaxSequenceLength(directory: modelDir, defaultValue: 8192),
+            LocalModelRegistry.tokenizerModelMaxLength(directory: modelDir) ?? 8_192)
     }
 
     // MARK: - RerankProvider

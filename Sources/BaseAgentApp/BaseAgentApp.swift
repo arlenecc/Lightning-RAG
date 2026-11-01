@@ -1,6 +1,7 @@
 import SwiftUI
 import AppKit
 import BaseAgentCore
+import UniformTypeIdentifiers
 
 /// 从终端直接运行裸可执行文件时，macOS 不会自动把窗口提到前台；
 /// 启动后显式激活，避免用户找不到窗口或以为程序没运行。
@@ -106,12 +107,23 @@ struct BaseAgentDesktopApp: App {
 
 // MARK: - 主窗口
 
+/// 聊天输入框待发送的附件（图片等多模态内容）。
+struct AttachmentItem: Identifiable {
+    let id = UUID()
+    let data: Data
+    let thumbnail: NSImage
+    let fileName: String
+}
+
 struct MainView: View {
     @ObservedObject var model: AppViewModel
     /// 退出收尾需要拿到当前 App 模型，由这里注入给 delegate。
     let delegate: BaseAgentAppDelegate
     @Environment(\.openWindow) private var openWindow
     @State private var input = ""
+    /// 待发送的图片等附件；随首条用户消息传给多模态后端。
+    @State private var attachments: [AttachmentItem] = []
+    @State private var showAttachmentPicker = false
 
     var body: some View {
         // 左侧 3/4：对话区从窗口顶部到底部，tokens 与输入区固定在底部；
@@ -127,6 +139,27 @@ struct MainView: View {
         .frame(minWidth: 1100, minHeight: 700)
         .toolbar {
             ToolbarItemGroup(placement: .primaryAction) {
+                // 与配置窗口内「开始同步」一致的快捷入口：目录已配置时无需进设置。
+                Button {
+                    model.syncKnowledgeBase(force: false)
+                } label: {
+                    Label("同步知识", systemImage: "arrow.triangle.2.circlepath")
+                        .labelStyle(.titleAndIcon)
+                }
+                .disabled(model.isRunning || model.isModelLoading
+                    || model.isWarmingUp || model.isSyncing || model.isBuildingANN)
+                .help("开始知识库同步（与配置窗口内「开始同步」一致）")
+
+                Button {
+                    model.stopSync()
+                } label: {
+                    Label(model.isStoppingSync ? "正在停止…" : "停止同步",
+                          systemImage: "stop.circle")
+                        .labelStyle(.titleAndIcon)
+                }
+                .disabled(!model.isSyncing || model.isStoppingSync)
+                .help(model.isStoppingSync ? "正在停止同步…" : "停止知识库同步")
+
                 Button {
                     openWindow(id: "settings")
                 } label: {
@@ -459,6 +492,39 @@ struct MainView: View {
                 .multilineTextAlignment(.center)
                 .padding(.top, 6)
 
+            // 待发送附件缩略图；用户可在发送前逐个移除。
+            if !attachments.isEmpty {
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 6) {
+                        ForEach(attachments) { att in
+                            ZStack(alignment: .topTrailing) {
+                                Image(nsImage: att.thumbnail)
+                                    .resizable()
+                                    .scaledToFit()
+                                    .frame(height: 44)
+                                    .cornerRadius(6)
+                                    .overlay(
+                                        RoundedRectangle(cornerRadius: 6)
+                                            .strokeBorder(Color.secondary.opacity(0.3),
+                                                          lineWidth: 1))
+                                Button {
+                                    attachments.removeAll { $0.id == att.id }
+                                } label: {
+                                    Image(systemName: "xmark.circle.fill")
+                                        .font(.system(size: 15))
+                                        .foregroundStyle(.white, Color.black.opacity(0.55))
+                                }
+                                .buttonStyle(.plain)
+                                .offset(x: 5, y: -5)
+                                .help("移除附件")
+                            }
+                        }
+                    }
+                    .padding(.horizontal, 10)
+                }
+                .frame(height: 52)
+            }
+
             HStack(alignment: .bottom, spacing: 8) {
                 TextField("输入消息，Enter 发送（Shift+Enter 换行）…",
                           text: $input, axis: .vertical)
@@ -489,6 +555,21 @@ struct MainView: View {
                         send()
                         return .handled
                     }
+                // 添加附件：图片等多模态内容随首条用户消息传给多模态后端。
+                Button {
+                    showAttachmentPicker = true
+                } label: {
+                    Image(systemName: "paperclip")
+                        .font(.system(size: 18))
+                        .foregroundStyle(attachments.isEmpty ? Color.secondary : Color.accentColor)
+                        .frame(width: 36, height: 46)
+                        .background(
+                            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                                .fill(Color.secondary.opacity(0.12)))
+                }
+                .buttonStyle(.plain)
+                .help("添加图片等附件（多模态）")
+                .disabled(model.isRunning || model.isModelLoading || model.isWarmingUp)
                 Button {
                     if model.isRunning {
                         model.cancel()
@@ -512,12 +593,43 @@ struct MainView: View {
             }
             .padding(10)
         }
+        .fileImporter(
+            isPresented: $showAttachmentPicker,
+            allowedContentTypes: [.image],
+            allowsMultipleSelection: true
+        ) { result in
+            guard let urls = try? result.get() else { return }
+            for url in urls {
+                guard url.startAccessingSecurityScopedResource() else { continue }
+                defer { url.stopAccessingSecurityScopedResource() }
+                guard let data = try? Data(contentsOf: url),
+                      let image = NSImage(contentsOf: url) else { continue }
+                let thumb = Self.makeThumbnail(from: image)
+                attachments.append(AttachmentItem(
+                    data: data, thumbnail: thumb, fileName: url.lastPathComponent))
+            }
+        }
     }
 
-    /// 发送按钮不可用：正在加载/预热/同步/构建索引，或输入为空。
+    /// 把附件图片缩小到适合气泡/预览的缩略图，避免大图占用内存。
+    private static func makeThumbnail(from image: NSImage, maxSize: CGFloat = 256) -> NSImage {
+        let size = image.size
+        guard size.width > 0, size.height > 0 else { return image }
+        let scale = min(1, maxSize / max(size.width, size.height))
+        let newSize = NSSize(width: size.width * scale, height: size.height * scale)
+        let thumb = NSImage(size: newSize)
+        thumb.lockFocus()
+        NSGraphicsContext.current?.imageInterpolation = .high
+        image.draw(in: NSRect(origin: .zero, size: newSize))
+        thumb.unlockFocus()
+        return thumb
+    }
+
+    /// 发送按钮不可用：正在加载/预热/同步/构建索引，且输入与附件都为空。
     private var sendBlocked: Bool {
         !model.isRunning
-            && (input.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            && ((input.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                 && attachments.isEmpty)
                 || model.isModelLoading || model.isWarmingUp || model.isSyncing
                 || model.isBuildingANN)
     }
@@ -533,12 +645,34 @@ struct MainView: View {
     private func chatBubble(_ item: ChatItem) -> some View {
         HStack {
             if item.role == .user { Spacer(minLength: 60) }
-            Text(item.content.isEmpty && item.role == .assistant ? "…" : item.content)
-                .textSelection(.enabled)
-                .padding(10)
-                .background(background(for: item.role))
-                .cornerRadius(10)
-                .frame(maxWidth: 760, alignment: .leading)
+            VStack(alignment: .leading, spacing: 8) {
+                if item.role == .user, let images = item.images, !images.isEmpty {
+                    ScrollView(.horizontal, showsIndicators: false) {
+                        HStack(spacing: 6) {
+                            ForEach(Array(images.enumerated()), id: \.offset) { _, data in
+                                if let image = NSImage(data: data) {
+                                    Image(nsImage: image)
+                                        .resizable()
+                                        .scaledToFit()
+                                        .frame(height: 120)
+                                        .cornerRadius(6)
+                                        .overlay(
+                                            RoundedRectangle(cornerRadius: 6)
+                                                .strokeBorder(Color.secondary.opacity(0.3),
+                                                              lineWidth: 1))
+                                }
+                            }
+                        }
+                    }
+                    .frame(maxHeight: 130)
+                }
+                Text(item.content.isEmpty && item.role == .assistant ? "…" : item.content)
+                    .textSelection(.enabled)
+            }
+            .padding(10)
+            .background(background(for: item.role))
+            .cornerRadius(10)
+            .frame(maxWidth: 760, alignment: .leading)
             if item.role == .assistant { Spacer(minLength: 160) }
         }
     }
@@ -557,9 +691,11 @@ struct MainView: View {
 
     private func send() {
         let text = input.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !text.isEmpty else { return }
+        guard !text.isEmpty || !attachments.isEmpty else { return }
+        let images = attachments.map(\.data)
         input = ""
-        model.send(text)
+        attachments.removeAll()
+        model.send(text, images: images)
     }
 
     private func scrollToBottom(_ proxy: ScrollViewProxy, animated: Bool) {

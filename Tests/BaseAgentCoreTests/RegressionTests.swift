@@ -259,6 +259,25 @@ final class RegressionTests: XCTestCase {
         XCTAssertTrue(tail.content.isEmpty)
     }
 
+    /// 回归：几十个 <summary> 块被剥离后，块间换行不得在正文里累积成大段空白。
+    func testSummaryStreamFilterCollapsesWhitespaceAroundSummaries() {
+        var filter = SummaryStreamFilter()
+        var content = ""
+        var summary = ""
+        let chunk = "概览。\n\n---\n\n"
+            + (1...30).map { "<summary>结构要点\($0)</summary>\n\n" }.joined()
+            + "---\n\n## 标题\n"
+        let out = filter.feed(chunk)
+        content += out.content
+        summary += out.summary
+        let tail = filter.finish()
+        content += tail.content
+        summary += tail.summary
+
+        XCTAssertEqual(content, "概览。\n\n---\n\n---\n\n## 标题")
+        XCTAssertEqual(summary.split(separator: "\n").count, 30)
+    }
+
     func testSkillRequestClassificationSkipsGreetingsAndSimpleQueries() {
         XCTAssertTrue(SkillManager.isTrivialRequest("你好"))
         XCTAssertTrue(SkillManager.isTrivialRequest("今天天气怎么样？"))

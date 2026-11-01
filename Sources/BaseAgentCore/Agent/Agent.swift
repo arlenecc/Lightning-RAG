@@ -514,7 +514,7 @@ public final class Agent: @unchecked Sendable {
     // MARK: 主入口
 
     @discardableResult
-    public func run(_ userInput: String) async -> String {
+    public func run(_ userInput: String, images: [Data] = []) async -> String {
         // 前台请求优先：上一轮的后台摘要/事实抽取还在跑时，先取消并等它退出，
         // 否则 2B 辅助模型会和主模型抢 GPU（实测主模型会从 ~15 tps 掉到 ~5 tps）。
         await cancelBackgroundWork()
@@ -576,7 +576,8 @@ public final class Agent: @unchecked Sendable {
         let planRevisionBefore = session.planRevision
         kernel.maxTurns = isGreeting ? 2 : maxIterations
         var result = await kernel.run(userInput, resume: false,
-                                      emitFinished: false, toolsEnabled: !isGreeting)
+                                      emitFinished: false, toolsEnabled: !isGreeting,
+                                      images: images)
         // distillRequested 是「本段内调用过 start_long_term_update」；
         // 自动续跑会重置它，因此必须在门面层跨段累计。
         var distillRequested = result.distilled

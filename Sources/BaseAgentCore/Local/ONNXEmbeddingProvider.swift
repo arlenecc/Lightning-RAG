@@ -57,31 +57,14 @@ public final class ONNXEmbeddingProvider: EmbeddingProvider, EmbeddingTokenCount
         let threads = intraOpThreads > 0
             ? max(1, min(32, intraOpThreads))
             : max(1, min(32, ProcessInfo.processInfo.activeProcessorCount))
-        self.directory = directory
         self.modelName = modelName
         self.identifier = "local:onnx:\(modelName)"
         self.maxConcurrentRuns = runs
         self.intraOpThreads = threads
         self.state = EmbeddingLoadState(intraOpThreads: threads)
-        // 模型窗口可能很大（jina-v3 8192），推理前统一压到 1024 token。
-        self.maxLength = EmbeddingInputLimits.cappedWindow(
-            LocalModelRegistry.resolveMaxSequenceLength(directory: directory, defaultValue: 8192))
         self.batchSize = max(1, batchSize)
-        let isJina = JinaV3Profile.isJinaV3(directory: directory)
-        let isV5 = JinaV5Profile.isJinaV5(directory: directory)
-        self.isJinaV3 = isJina
-        self.isJinaV5 = isV5
-        self.v5OutputDimension = JinaV5Profile.validDimension(v5Dimension)
-        // config 已认出 jina 时固定用模型族前缀，避免权重目录被改名后前缀退化。
-        if isV5 {
-            self.prefixStrategy = EmbeddingPrefixStrategy(family: .jinaV5)
-        } else if isJina {
-            self.prefixStrategy = EmbeddingPrefixStrategy(family: .jina)
-        } else {
-            self.prefixStrategy = EmbeddingPrefixStrategy(
-                modelName: modelName, modelPath: directory.lastPathComponent)
-        }
 
+        // 先解析权重文件：若显式选了 .onnx 文件则直接用，否则在目录内按约定搜索。
         var resolved: URL?
         var loadError: Error?
         do {
@@ -92,6 +75,30 @@ public final class ONNXEmbeddingProvider: EmbeddingProvider, EmbeddingTokenCount
         self.modelURL = resolved
         self.preflightError = loadError
 
+        // 权重文件的所在目录：显式选文件时取父目录，按目录解析时即目录本身。
+        // config / tokenizer 均从此目录读取。
+        let modelDir = resolved?.pathExtension.lowercased() == "onnx"
+            ? resolved!.deletingLastPathComponent() : directory
+        self.directory = modelDir
+
+        // 模型窗口可能很大（jina-v3 8192），推理前统一压到 1024 token。
+        self.maxLength = EmbeddingInputLimits.cappedWindow(
+            LocalModelRegistry.resolveMaxSequenceLength(directory: modelDir, defaultValue: 8192))
+        let isJina = JinaV3Profile.isJinaV3(directory: modelDir)
+        let isV5 = JinaV5Profile.isJinaV5(directory: modelDir)
+        self.isJinaV3 = isJina
+        self.isJinaV5 = isV5
+        self.v5OutputDimension = JinaV5Profile.validDimension(v5Dimension)
+        // config 已认出 jina 时固定用模型族前缀，避免权重目录被改名后前缀退化。
+        if isV5 {
+            self.prefixStrategy = EmbeddingPrefixStrategy(family: .jinaV5)
+        } else if isJina {
+            self.prefixStrategy = EmbeddingPrefixStrategy(family: .jina)
+        } else {
+            self.prefixStrategy = EmbeddingPrefixStrategy(
+                modelName: modelName, modelPath: modelDir.lastPathComponent)
+        }
+
         // 从 config.json 预读真实维度，避免非 768 模型建库时维度错配。
         // Jina v3 的 ONNX config 没有 hidden_size，按模型族固定 1024；
         // Jina v5 原生 768 维但按 Matryoshka 配置截断，不能被 hidden_size 覆盖。
@@ -100,7 +107,7 @@ public final class ONNXEmbeddingProvider: EmbeddingProvider, EmbeddingTokenCount
         } else if isJina {
             self.storedDimension = JinaV3Profile.nativeDimension
             if let data = FileManager.default.contents(
-                atPath: directory.appendingPathComponent("config.json").path),
+                atPath: modelDir.appendingPathComponent("config.json").path),
                let config = JSONValue.parse(String(decoding: data, as: UTF8.self))?.objectValue {
                 let hidden = config["hidden_size"]?.intValue
                     ?? config["text_config"]?.objectValue?["hidden_size"]?.intValue
@@ -109,7 +116,7 @@ public final class ONNXEmbeddingProvider: EmbeddingProvider, EmbeddingTokenCount
                 }
             }
         } else if let data = FileManager.default.contents(
-            atPath: directory.appendingPathComponent("config.json").path),
+            atPath: modelDir.appendingPathComponent("config.json").path),
            let config = JSONValue.parse(String(decoding: data, as: UTF8.self))?.objectValue {
             let hidden = config["hidden_size"]?.intValue
                 ?? config["text_config"]?.objectValue?["hidden_size"]?.intValue

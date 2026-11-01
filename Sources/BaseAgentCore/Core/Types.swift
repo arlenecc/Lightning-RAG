@@ -145,14 +145,19 @@ public struct ChatMessage: Codable, Sendable, Equatable {
     public var name: String?
     public var toolCallID: String?
     public var toolCalls: [ToolCall]?
+    /// 可选图像附件（JPEG/PNG 字节）。仅本地多模态后端（llama.cpp + mmproj）
+    /// 消费；其它后端与 transcript/wire 序列化忽略此字段。
+    public var images: [Data]?
 
     public init(role: Role, content: String, name: String? = nil,
-                toolCallID: String? = nil, toolCalls: [ToolCall]? = nil) {
+                toolCallID: String? = nil, toolCalls: [ToolCall]? = nil,
+                images: [Data]? = nil) {
         self.role = role
         self.content = content
         self.name = name
         self.toolCallID = toolCallID
         self.toolCalls = toolCalls
+        self.images = images
     }
 
     enum CodingKeys: String, CodingKey {

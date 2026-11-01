@@ -189,7 +189,7 @@ public final class LocalModelFactory: @unchecked Sendable {
                     LlamaCppEmbeddingProvider(modelPath: file.path, modelName: value)
                 }
             }
-            directory = try LocalModelRegistry.resolveDirectory(
+            directory = try LocalModelRegistry.resolveONNXDirectory(
                 kind: .embedding,
                 value: value,
                 config: config,
@@ -279,7 +279,7 @@ public final class LocalModelFactory: @unchecked Sendable {
                         kind: .reranker, value: value, config: config)
                     return LlamaCppReranker(modelPath: file.path)
                 }
-                let directory = try LocalModelRegistry.resolveDirectory(
+                let directory = try LocalModelRegistry.resolveONNXDirectory(
                     kind: .reranker,
                     value: value,
                     config: config
@@ -341,7 +341,7 @@ public final class LocalModelFactory: @unchecked Sendable {
                 + "\(config.maxTokens):\(tokenizerPath)"
             return llms.value(for: key) {
                 do {
-                    let directory = try LocalModelRegistry.resolveDirectory(
+                    let directory = try LocalModelRegistry.resolveONNXDirectory(
                         kind: .llm, value: factor, config: config)
                     return ONNXLLMService(
                         directory: directory,
@@ -406,6 +406,10 @@ public final class LocalModelFactory: @unchecked Sendable {
                         repetitionPenalty: config.repetitionPenalty,
                         enableThinking: config.localLLMEnableThinking,
                         gpuLayers: config.llamaGpuLayers,
+                        mmprojPath: GGUFFileResolver.resolveMMProj(
+                            modelPath: file.path,
+                            explicit: config.llmMmprojPath.isEmpty
+                                ? nil : config.llmMmprojPath),
                         kvReuse: config.llmKVReuse,
                         kvInt8: config.kvCacheInt8
                     )
@@ -523,7 +527,7 @@ public final class LocalModelFactory: @unchecked Sendable {
                 + "\(config.auxMaxTokens):\(tokenizerPath)"
             return auxValue(key: key, sharedCache: sharedCache) {
                 do {
-                    let directory = try LocalModelRegistry.resolveDirectory(
+                    let directory = try LocalModelRegistry.resolveONNXDirectory(
                         kind: .aux, value: value, config: config)
                     return ONNXLLMService(
                         directory: directory,
@@ -588,6 +592,10 @@ public final class LocalModelFactory: @unchecked Sendable {
                         repetitionPenalty: config.auxRepetitionPenalty,
                         enableThinking: config.auxLocalLLMEnableThinking,
                         gpuLayers: config.llamaGpuLayers,
+                        mmprojPath: GGUFFileResolver.resolveMMProj(
+                            modelPath: file.path,
+                            explicit: config.auxMmprojPath.isEmpty
+                                ? nil : config.auxMmprojPath),
                         kvReuse: config.auxKvReuse,
                         kvInt8: config.auxKvCacheInt8
                     )
@@ -718,10 +726,22 @@ public final class LocalModelFactory: @unchecked Sendable {
                                              gpuLayers: config.llamaGpuLayers)
                 }
                 if looksONNX {
-                    // ONNX VLM 的视觉编码器/图像 token 布局因架构而异，
-                    // 没有通用 onnxruntime 实现；这里明确报错而不是偷偷降级。
-                    throw LocalModelError.invalidConfiguration(
-                        "当前版本 ONNX VLM 尚未接入通用图适配，请改用 MLX 或 GGUF VLM")
+                    let directory = try LocalModelRegistry.resolveONNXDirectory(
+                        kind: .vlm, value: value, config: config)
+                    // ONNX OCR 主力是 rapidocr 式（检测+识别）；单一合并 VLM 图作为罕见后备。
+                    if ONNXOCRService.isONNXOCRDirectory(directory) {
+                        return ONNXOCRService(modelDirectory: directory, modelName: value)
+                    }
+                    let tokenizerPath = config.ragOCRTokenizerPath
+                        .trimmingCharacters(in: .whitespacesAndNewlines)
+                    let tokenizerDirectory = tokenizerPath.isEmpty
+                        ? nil : URL(fileURLWithPath: tokenizerPath)
+                    return try ONNXVLMService(
+                        modelLocation: directory,
+                        tokenizerDirectory: tokenizerDirectory,
+                        modelName: value,
+                        contextWindow: config.effectiveMainContextTokens,
+                        defaultMaxTokens: 2_048)
                 }
                 let directory = try LocalModelRegistry.resolveDirectory(
                     kind: .vlm,

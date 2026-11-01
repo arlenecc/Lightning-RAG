@@ -141,9 +141,9 @@ public final class Session: @unchecked Sendable {
     public var currentTurn: Int { turnIndex }
 
     @discardableResult
-    public func startTurn(prompt: String = "") -> TurnRecord {
+    public func startTurn(prompt: String = "", images: [Data]? = nil) -> TurnRecord {
         turnIndex += 1
-        let rec = TurnRecord(index: turnIndex, prompt: prompt)
+        let rec = TurnRecord(index: turnIndex, prompt: prompt, images: images)
         turns.append(rec)
         return rec
     }
@@ -413,7 +413,8 @@ public final class Session: @unchecked Sendable {
         }
         var out: [ChatMessage] = []
         if !turn.prompt.isEmpty {
-            out.append(ChatMessage(role: .user, content: turn.prompt))
+            out.append(ChatMessage(role: .user, content: turn.prompt,
+                                   images: turn.images))
         }
         if turn.assistantText.isEmpty && turn.toolCalls.isEmpty {
             return out

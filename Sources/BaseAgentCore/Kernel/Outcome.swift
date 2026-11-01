@@ -147,11 +147,14 @@ public final class TurnRecord: @unchecked Sendable {
     public var summary: String
     /// 估算 token 数。
     public var tokens: Int
+    /// 可选图像附件（JPEG/PNG 字节），仅首条用户消息携带，用于多模态模型。
+    /// 文本/无多模态能力的后端忽略此字段。
+    public var images: [Data]?
 
     public init(index: Int = 0, prompt: String = "", assistantText: String = "",
                 rawContent: String = "", toolCalls: [ToolCall] = [],
                 toolResults: [ToolResultRecord] = [], summary: String = "",
-                tokens: Int = 0) {
+                tokens: Int = 0, images: [Data]? = nil) {
         self.index = index
         self.prompt = prompt
         self.assistantText = assistantText
@@ -160,6 +163,7 @@ public final class TurnRecord: @unchecked Sendable {
         self.toolResults = toolResults
         self.summary = summary
         self.tokens = tokens
+        self.images = images
     }
 
     /// L2/L3：本轮折叠成的一行摘要。

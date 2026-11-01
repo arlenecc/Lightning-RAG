@@ -228,24 +228,57 @@ public enum LocalModelRegistry {
         throw LocalModelError.notFound(kind, value: effective, searched: searched, hint: hint)
     }
 
+    /// 解析 ONNX 模型位置，供 LLM / Embedding / Reranker 的 ONNX 后端使用。
+    ///
+    /// - 若 `value` 显式指向一个存在的 `.onnx` 文件（用户在设置窗口选定了具体文件），
+    ///   直接返回该文件 URL——尊重用户的明确选择，不再在目录内搜索。
+    /// - 否则按目录语义调用 `resolveDirectory`（含 `models/` 锚定、相对路径、
+    ///   应用/workspace/HF 缓存等回退）。
+    ///
+    /// 返回的文件或目录随后交给 `resolveONNXModel(in:)` 进一步定位权重文件。
+    public static func resolveONNXDirectory(
+        kind: LocalModelKind,
+        value: String,
+        config: AgentConfig,
+        aliasFilter: ((String) -> Bool)? = nil
+    ) throws -> URL {
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmed.isEmpty, trimmed.lowercased().hasSuffix(".onnx") {
+            let url = URL(fileURLWithPath: expandPath(trimmed))
+            var isDir: ObjCBool = false
+            if FileManager.default.fileExists(atPath: url.path, isDirectory: &isDir),
+               !isDir.boolValue {
+                return url
+            }
+            // 是目录或不存在，落到下方目录解析（不存在时由 resolveDirectory 报错）。
+        }
+        return try resolveDirectory(
+            kind: kind, value: value, config: config, aliasFilter: aliasFilter)
+    }
+
     /// 按约定顺序发现 ONNX 权重文件。
-    /// 顺序：`model.onnx` → `model_quantized.onnx` → `onnx/model.onnx` → `model_int8.onnx`。
+    ///
+    /// 优先级（量化/小体积优先，因为 `model.onnx` 多为 FP16、体积大且不一定更快）：
+    /// `model_quantized.onnx` → `model_int8.onnx` → `model_int4.onnx` → `model.onnx`，
+    /// 先在当前目录查找，再在 `onnx/` 子目录查找。
+    ///
+    /// 若传入的路径本身就是一个存在的 `.onnx` 文件（用户在设置窗口显式选定），
+    /// 则直接采用该文件，不再搜索——尊重用户的明确选择。
     public static func resolveONNXModel(
         in directory: URL,
         kind: LocalModelKind = .embedding
     ) throws -> URL {
         let fm = FileManager.default
+        // 显式指向单个 .onnx 文件时直接采用，不再搜索。
         if directory.pathExtension.lowercased() == "onnx", fm.fileExists(atPath: directory.path) {
             return directory
         }
+        guard fm.fileExists(atPath: directory.path) else {
+            throw LocalModelError.missingONNXModel(
+                kind, directory: directory.path, expected: onnxCandidateNames)
+        }
 
-        let relativeCandidates = [
-            "model.onnx",
-            "model_quantized.onnx",
-            "onnx/model.onnx",
-            "model_int8.onnx",
-        ]
-        for relative in relativeCandidates {
+        for relative in onnxCandidateNames {
             let url = directory.appendingPathComponent(relative)
             if fm.fileExists(atPath: url.path) {
                 return url
@@ -253,11 +286,21 @@ public enum LocalModelRegistry {
         }
 
         throw LocalModelError.missingONNXModel(
-            kind,
-            directory: directory.path,
-            expected: relativeCandidates
-        )
+            kind, directory: directory.path, expected: onnxCandidateNames)
     }
+
+    /// ONNX 权重候选文件名（按优先级）：量化/int8 > int4 > 未量化(FP16)。
+    /// 先当前目录，再 `onnx/` 子目录。
+    private static let onnxCandidateNames: [String] = [
+        "model_quantized.onnx",
+        "model_int8.onnx",
+        "model_int4.onnx",
+        "model.onnx",
+        "onnx/model_quantized.onnx",
+        "onnx/model_int8.onnx",
+        "onnx/model_int4.onnx",
+        "onnx/model.onnx",
+    ]
 
     /// 从 config.json 推断最大序列长度，供 tokenizer 截断使用。
     public static func resolveMaxSequenceLength(directory: URL, defaultValue: Int = 8192) -> Int {

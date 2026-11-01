@@ -9,6 +9,8 @@ struct ChatItem: Identifiable, Equatable {
     let id = UUID()
     var role: Role
     var content: String
+    /// 用户消息携带的图像附件（JPEG/PNG 字节），仅用于 UI 缩略图展示。
+    var images: [Data]?
 }
 
 struct ToolEvent: Identifiable {
@@ -771,9 +773,10 @@ final class AppViewModel: ObservableObject {
 
     // MARK: 发送
 
-    func send(_ input: String) {
+    func send(_ input: String, images: [Data] = []) {
         let text = input.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !text.isEmpty, !isRunning, !isModelLoading, !isWarmingUp,
+        guard !text.isEmpty || !images.isEmpty,
+              !isRunning, !isModelLoading, !isWarmingUp,
               !isSyncing, !isDeduplicating, !isBuildingANN, let agent else { return }
         cancelIdleUnload()
         runGeneration += 1
@@ -781,7 +784,7 @@ final class AppViewModel: ObservableObject {
         // 长会话只保留最近 1000 条消息，避免 UI 数组与布局无限增长。
         if chatItems.count > 1_000 { chatItems.removeFirst(chatItems.count - 1_000) }
         clearStreamingState()
-        chatItems.append(ChatItem(role: .user, content: text))
+        chatItems.append(ChatItem(role: .user, content: text, images: images.isEmpty ? nil : images))
         let item = ChatItem(role: .assistant, content: "")
         chatItems.append(item)
         streamingID = item.id
@@ -804,7 +807,7 @@ final class AppViewModel: ObservableObject {
             if Task.isCancelled || self.runGeneration != generation {
                 answer = ""
             } else {
-                answer = await agent.run(text)
+                answer = await agent.run(text, images: images)
             }
             await MainActor.run {
                 guard self.runGeneration == generation else { return }

@@ -489,13 +489,16 @@ private final class ONNXLoaded: @unchecked Sendable {
                      tokenizerDirectory: URL?,
                      modelName: String) async throws -> ONNXLoaded {
         let modelURL = try LocalModelRegistry.resolveONNXModel(in: directory, kind: .llm)
+        // 若显式指定了 .onnx 文件，tokenizer / config 应去其所在目录读取。
+        let modelDir = modelURL.pathExtension.lowercased() == "onnx"
+            ? modelURL.deletingLastPathComponent() : directory
         let tokenizer = try await LocalTokenizer.load(
-            directory: tokenizerDirectory ?? directory)
+            directory: tokenizerDirectory ?? modelDir)
         let session = try OrtSession(modelPath: modelURL.path)
-        let graph = try ONNXDecoderGraph(session: session, directory: directory)
+        let graph = try ONNXDecoderGraph(session: session, directory: modelDir)
         var eos = Set<Int>()
         if let value = tokenizer.base.eosTokenId { eos.insert(value) }
-        if let data = try? Data(contentsOf: directory.appendingPathComponent("generation_config.json")),
+        if let data = try? Data(contentsOf: modelDir.appendingPathComponent("generation_config.json")),
            let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
             if let value = object["eos_token_id"] as? Int {
                 eos.insert(value)
