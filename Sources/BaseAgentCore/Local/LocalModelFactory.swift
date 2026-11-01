@@ -14,6 +14,11 @@ public final class LocalModelFactory: @unchecked Sendable {
     private let rerankers = ModelCache<RerankProvider>()
     private let llms = ModelCache<LLMService>()
     private let vlms = ModelCache<VLMService>()
+    /// 同步 / 转换 / OCR 测试共用的 OCR 任务计数；最后一个任务结束时释放权重。
+    /// 闭包只在真正结束时才访问单例，避免初始化期间递归访问 `shared`。
+    private let ocrLifecycle = OCRModelLifecycle {
+        await LocalModelFactory.shared.unloadOCRWeights()
+    }
 
     private init() {
         Self.configureMetallibPath()
@@ -105,24 +110,35 @@ public final class LocalModelFactory: @unchecked Sendable {
         synchronizeGPU()
     }
 
-    /// 空闲时释放按需使用的 Embedding / OCR 权重。
+    /// 释放全部 OCR VLM 权重。provider 对象保留，下次识别时按需重载。
     ///
-    /// 主模型、辅助模型与 Reranker 会持续使用，常驻不卸载；这里只处理
-    /// 仅在检索/OCR 时才会用到的模型。provider 实例仍被 RAGEngine 持有，
-    /// 只清空其内部 load state，下次调用按需重载。
-    public func unloadIdleRAGModelWeights() async {
-        let embeddingValues = embeddings.allValues()
+    /// 主模型、辅助模型、Embedding 与 Reranker 在启动预加载后常驻，不在这里
+    /// 卸载：Embedding 每次重建约 2.4s、Reranker ONNX session 约 10~15s，
+    /// 回收省下的内存会被下一次首问的加载延迟抵消。
+    public func unloadOCRWeights() async {
         let vlmValues = vlms.allValues()
-        for provider in embeddingValues {
-            await provider.unload()
-        }
         for service in vlmValues {
             await service.unload()
         }
         let activeMB = MLX.Memory.activeMemory / 1_024 / 1_024
         let cacheMB = MLX.Memory.cacheMemory / 1_024 / 1_024
-        AgentLog.info("[memory] 空闲释放 Embedding \(embeddingValues.count) / "
-            + "OCR \(vlmValues.count) 个模型，MLX active=\(activeMB)MB cache=\(cacheMB)MB")
+        AgentLog.info("[memory] 释放 OCR \(vlmValues.count) 个模型，"
+            + "MLX active=\(activeMB)MB cache=\(cacheMB)MB")
+    }
+
+    /// 空闲回收兜底：没有在途 OCR 任务时才释放，避免与同步/转换并发。
+    public func unloadIdleOCRWeights() async {
+        await ocrLifecycle.unloadIfIdle()
+    }
+
+    /// 标记一个 OCR 任务开始（同步 / Markdown 转换 / OCR 测试）。
+    public func beginOCRJob() async {
+        await ocrLifecycle.begin()
+    }
+
+    /// 标记任务结束；最后一个任务结束时立即释放两个 Ovis 实例的权重。
+    public func endOCRJob() async {
+        await ocrLifecycle.end()
     }
 
     // MARK: - Embedding

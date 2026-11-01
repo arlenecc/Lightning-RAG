@@ -52,27 +52,43 @@ public final class ONNXReranker: RerankProvider, @unchecked Sendable {
             directory: directory
         )
         let outputName = preferredOutputName(in: session)
-        var scores: [Double] = []
-        scores.reserveCapacity(documents.count)
 
-        var start = 0
-        while start < documents.count {
+        // 先整体编码再按 token 长度分桶：组内 pad 到组内最长，
+        // 避免一段混进长文档时其余短文档陪跑满宽；分数按原始索引写回。
+        let encodedPairs = documents.map {
+            tokenizer.encodePair(query: query, document: $0, maxLength: maxLength)
+        }
+        let batches = Self.lengthBucketedBatches(
+            lengths: encodedPairs.map(\.count), batchSize: batchSize)
+        var scores = [Double](repeating: 0, count: encodedPairs.count)
+
+        for indices in batches {
             try Task.checkCancellation()
-            let end = min(start + batchSize, documents.count)
-            let pairs = documents[start..<end].map {
-                tokenizer.encodePair(query: query, document: $0, maxLength: maxLength)
-            }
-            let encoded = tokenizer.pad(pairs)
+            let encoded = tokenizer.pad(indices.map { encodedPairs[$0] })
             let inputs = try makeInputs(encoded, inputNames: session.inputNames)
             let outputs = try session.run(inputs: inputs, outputNames: [outputName])
             guard let output = outputs[outputName] else {
                 throw ONNXRuntimeError.output("模型没有返回输出 \(outputName)")
             }
             let tensor = try output.floatTensor()
-            scores.append(contentsOf: try logitsToScores(tensor, batchSize: encoded.batchSize))
-            start = end
+            let batchScores = try logitsToScores(tensor, batchSize: encoded.batchSize)
+            for (offset, original) in indices.enumerated() {
+                scores[original] = batchScores[offset]
+            }
         }
         return scores
+    }
+
+    /// 长度分桶的批次规划：按 token 长度升序分组（同长度按原始索引稳定排序），
+    /// 每组内 pad 到组内最长，短文档不再陪跑段内最长文档。
+    static func lengthBucketedBatches(lengths: [Int], batchSize: Int) -> [[Int]] {
+        let size = max(1, batchSize)
+        let ordered = lengths.indices.sorted {
+            lengths[$0] == lengths[$1] ? $0 < $1 : lengths[$0] < lengths[$1]
+        }
+        return stride(from: 0, to: ordered.count, by: size).map { start in
+            Array(ordered[start..<min(start + size, ordered.count)])
+        }
     }
 
     // MARK: - 推理

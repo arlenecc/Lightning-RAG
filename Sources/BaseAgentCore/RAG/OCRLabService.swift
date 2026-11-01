@@ -79,6 +79,9 @@ public enum OCRLabService {
                            engine: OCRLabEngine,
                            config: AgentConfig,
                            progress: ((ParserProgress) -> Void)? = nil) async throws -> OCRLabResult {
+        // 单次 OCR 测试用完即释放 Ovis 权重，下一次测试再按需加载。
+        await LocalModelFactory.shared.beginOCRJob()
+        defer { Task { await LocalModelFactory.shared.endOCRJob() } }
         if isImage(url) {
             return try await runImage(url: url, engine: engine, config: config, progress: progress)
         }

@@ -120,16 +120,17 @@ public final class ContextBudget: @unchecked Sendable {
 
     /// L1：本轮每个工具结果可用的**字符**上限。
     ///
-    /// RAW 区剩余额度按并发调用数平分后换算成字符数（粗算 3 chars/token），
-    /// 再被 `maxChars` 钳住。
+    /// 按「硬上下文余量」而不是 raw 软配额分配：软配额只是建议值，
+    /// 用它做阈值会让 raw 超过 12k 后所有工具结果一律被压到 600 字符，
+    /// 模型读不到完整文件就只能反复重读，反而更慢。
     public func remainingForTool(_ nCalls: Int = 1, maxChars: Int = 8_000) -> Int {
         let n = max(1, nCalls)
-        let leftTokens = remainingForRaw()
-        if leftTokens <= 0 {
-            // 已经超预算：只给最小可诊断额度，逼内核立即折叠。
+        let hardLeft = total - quota.reserve - used()
+        if hardLeft <= 0 {
+            // 已经吃进输出预留：只给最小可诊断额度，逼内核立即折叠。
             return min(maxChars, 600)
         }
-        return max(600, min(maxChars, leftTokens * 3 / n))
+        return max(600, min(maxChars, hardLeft * 3 / n))
     }
 
     /// token → 字符的粗换算（用于给压缩器设置裁剪长度）。

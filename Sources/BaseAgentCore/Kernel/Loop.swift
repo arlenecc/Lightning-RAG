@@ -215,8 +215,10 @@ public final class KernelLoop {
 
         // 折叠会改写消息前缀并强制一次 KV 重建；至少 8 轮再折，
         // 避免每个用户回合都触发一次慢 prefill。
-        self.consolidateEvery = max(8,
+        // 但周期不能超过 raw 窗口：超出时窗口每轮都滑动，等于每轮都重建。
+        let configured = max(8,
             config.kernelConsolidateEvery == 0 ? 8 : config.kernelConsolidateEvery)
+        self.consolidateEvery = max(1, min(configured, max(1, resolved.rawTurns)))
         self.maxToolChars = config.kernelMaxToolChars == 0 ? 8_000 : config.kernelMaxToolChars
         let fallbackTurns = config.maxIterations == 0 ? 15 : config.maxIterations
         self.maxTurns = max(1, maxTurns == 0 ? fallbackTurns : maxTurns)
@@ -318,12 +320,12 @@ public final class KernelLoop {
             if needsConsolidate() {
                 state = .consolidate
                 lastConsolidatedTurn = session.currentTurn
-                let over = budget.rawOver
+                let over = budget.totalOver
                 let reason = over ? "预算告罄" : "每 \(consolidateEvery) 轮"
-                // 折叠量必须匹配原文窗口：只折 1/3 轮会让 turns 无界增长。
-                // 保留 raw_turns + 当前轮，其余全部折叠。
-                let keep = session.rawTurns + 1
-                let folded = session.forceFold(max(1, session.turns.count - keep))
+                // 一次折到只剩最近一轮：留满下一个周期的 raw 窗口。
+                // 只折「超出部分」时，折叠后窗口仍贴着上限，2~3 轮后又开始
+                // 每轮滑窗（`<earlier_context>` 变化 → KV 前缀失效 → 全量 prefill）。
+                let folded = session.foldForConsolidation()
                 if folded > 0 {
                     runtime.invalidateKV?()
                 }
@@ -641,7 +643,9 @@ public final class KernelLoop {
 
     private func needsConsolidate() -> Bool {
         let turn = session.currentTurn
-        if budget.rawOver { return true }
+        // 紧急折叠只看硬顶（是否侵入输出预留）。raw 软配额是建议值，
+        // 用 rawOver 判紧急会变成「每轮折 1 轮 + 每轮丢 KV + 每轮全量 prefill」。
+        if budget.totalOver { return true }
         if turn > 0 && turn % consolidateEvery == 0 && turn != lastConsolidatedTurn {
             return true
         }

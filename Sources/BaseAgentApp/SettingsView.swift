@@ -90,7 +90,9 @@ struct SettingsView: View {
     @State private var binaryCoarseEnabled = true
     @State private var binaryCoarseCandidates = 200
     @State private var rerankEnabled = true
-    @State private var rerankTopN = 5
+    @State private var rerankTopN = 3
+    /// reranker 候选池放大倍数（默认 3）：候选池 = max(top_k, TopN) × 它。
+    @State private var rerankCandidateMultiplier = 3
     /// 重排分数过滤阈值。
     @State private var rerankThreshold = 0.45
     /// 知识库只读查询超时（0 = 关闭）。
@@ -100,7 +102,7 @@ struct SettingsView: View {
     /// 同步并发、Vision OCR 并发与 MLX 内存上限。
     @State private var ingestConcurrency = 10
     @State private var visionConcurrency = 4
-    @State private var mlxCacheLimitMB = 512
+    @State private var mlxCacheLimitMB = 1_024
     @State private var mlxMemoryLimitMB = 0
     @State private var embeddingMinBatch = 2
     @State private var embeddingMaxBatch = 32
@@ -467,27 +469,35 @@ struct SettingsView: View {
                     Button("选择…") { chooseDirectory($knowledgeBase, title: "选择知识库目录") }
                 }
 
+                // 知识库操作按钮：紧跟工作目录配置行，依次为
+                // 应用配置 / 同步知识 / 停止同步 / 向量去重。
+                // 窗口较窄时拆成两行右对齐，避免按钮被裁剪。
+                ViewThatFits(in: .horizontal) {
+                    HStack(spacing: 8) {
+                        Spacer(minLength: 8)
+                        knowledgeButtons()
+                        stopAndDedupeButtons()
+                    }
+                    VStack(alignment: .leading, spacing: 6) {
+                        HStack(spacing: 8) {
+                            Spacer(minLength: 8)
+                            knowledgeButtons()
+                        }
+                        HStack(spacing: 8) {
+                            Spacer(minLength: 8)
+                            stopAndDedupeButtons()
+                        }
+                    }
+                }
+
                 // Embedding 行：模型类型 / 本地路径之后紧接切片设置（语义切片 +
-                // 切片大小 + overlap），再是「应用配置 / 同步知识」。优先单行；
-                // 放不下时先把按钮换到下一行（切片设置仍在 Embedding 这一行），
-                // 窗口极窄时再把切片设置换行，避免控件被裁剪。
+                // 切片大小 + overlap）。优先单行；窗口极窄时把切片设置换到下一行，
+                // 避免控件被裁剪。
                 ViewThatFits(in: .horizontal) {
                     HStack(spacing: 8) {
                         embeddingPathControls
                         chunkControls()
                         Spacer(minLength: 8)
-                        knowledgeButtons()
-                    }
-                    VStack(alignment: .leading, spacing: 6) {
-                        HStack(spacing: 8) {
-                            embeddingPathControls
-                            chunkControls()
-                            Spacer(minLength: 8)
-                        }
-                        HStack(spacing: 8) {
-                            Spacer(minLength: 8)
-                            knowledgeButtons()
-                        }
                     }
                     VStack(alignment: .leading, spacing: 6) {
                         HStack(spacing: 8) {
@@ -497,34 +507,45 @@ struct SettingsView: View {
                         HStack(spacing: 8) {
                             chunkControls()
                             Spacer(minLength: 8)
-                        }
-                        HStack(spacing: 8) {
-                            Spacer(minLength: 8)
-                            knowledgeButtons()
                         }
                     }
                 }
 
-                // Reranker 行：模型类型 / 本地路径之后是「启用重排序 + TopN」，
-                // 再是「向量去重 / 停止同步」，同样按可用宽度自动折行。
+                // Reranker 行：模型类型 / 本地路径之后是「启用重排序 + TopN +
+                // 候选池 + 阈值」，同样按可用宽度自动折行。
                 ViewThatFits(in: .horizontal) {
                     HStack(spacing: 8) {
                         rerankerPathControls
                         rerankControls()
                         Spacer(minLength: 8)
-                        dedupeButtons()
                     }
                     VStack(alignment: .leading, spacing: 6) {
                         HStack(spacing: 8) {
                             rerankerPathControls
-                            rerankControls()
                             Spacer(minLength: 8)
                         }
                         HStack(spacing: 8) {
+                            rerankControls()
                             Spacer(minLength: 8)
-                            dedupeButtons()
                         }
                     }
+                }
+
+                // 二值粗筛：紧跟 Reranker 配置行；开关关闭时候选数不可调，
+                // 主存储为 BIN 时该项自动停用。
+                HStack(spacing: 8) {
+                    Toggle("二值粗筛", isOn: $binaryCoarseEnabled)
+                        .help("开启后先用二值向量召回候选，再按主向量余弦精排，"
+                            + "最后与全文检索 RRF 融合；可用时取代 ANN，不可用时"
+                            + "自动回退原流程。主存储为 BIN 时仅支持单阶段检索；"
+                            + "已有库需要重新同步后才会生效。")
+                    Stepper(value: $binaryCoarseCandidates, in: 50...1000, step: 50) {
+                        Text("候选 \(binaryCoarseCandidates)")
+                    }
+                    .disabled(!binaryCoarseEnabled)
+                    .help("第一阶段二值粗筛候选数：越大召回越稳、精排读取越多；"
+                        + "默认 200，允许 50...1000。")
+                    Spacer(minLength: 8)
                 }
 
                 // 向量库与 ANN 索引合并为一行：元素类型 / Matryoshka /
@@ -555,21 +576,6 @@ struct SettingsView: View {
                 }
                 // 二值 ANN：stage 1 优先走自研 bann，未构建时回退 bin 表暴力汉明。
                 binaryANNStatusLabel
-                // 二值粗筛：开关关闭时候选数不可调；主存储为 BIN 时该项自动停用。
-                HStack(spacing: 8) {
-                    Toggle("二值粗筛", isOn: $binaryCoarseEnabled)
-                        .help("开启后先用二值向量召回候选，再按主向量余弦精排，"
-                            + "最后与全文检索 RRF 融合；可用时取代 ANN，不可用时"
-                            + "自动回退原流程。主存储为 BIN 时仅支持单阶段检索；"
-                            + "已有库需要重新同步后才会生效。")
-                    Stepper(value: $binaryCoarseCandidates, in: 50...1000, step: 50) {
-                        Text("候选 \(binaryCoarseCandidates)")
-                    }
-                    .disabled(!binaryCoarseEnabled)
-                    .help("第一阶段二值粗筛候选数：越大召回越稳、精排读取越多；"
-                        + "默认 200，允许 50...1000。")
-                    Spacer(minLength: 8)
-                }
                 // 闲时章节摘要：ANN 状态下方单独一行；文案已含「章节摘要：」前缀。
                 Text(model.bookSummaryStatusText)
                     .font(.caption2)
@@ -815,7 +821,7 @@ struct SettingsView: View {
             .help("占切片大小的 10%，计入总预算：正文按 chunk_size − overlap 切片")
     }
 
-    /// 重排序开关与 TopN：开启后最终返回分数最高的 TopN 条。
+    /// 重排序开关、TopN 与候选池倍数：开启后最终返回分数最高的 TopN 条。
     @ViewBuilder
     private func rerankControls() -> some View {
         Toggle("启用重排序", isOn: $rerankEnabled)
@@ -823,8 +829,12 @@ struct SettingsView: View {
                 + "按下面的 TopN 返回最终结果；关闭则直接用 RRF 排序结果。"
                 + "路径保持默认或留空时使用 App 内置 jina reranker")
         Stepper("TopN：\(rerankTopN)", value: $rerankTopN, in: 1...20)
-            .help("重排序之后保留的结果数量，默认 5；候选池会按它放大后再打乱重排。"
+            .help("重排序之后保留的结果数量，默认 3；候选池会按它放大后再打乱重排。"
                 + "关闭重排序时按检索调用方的 top_k 返回")
+        Stepper("候选池：\(rerankCandidateMultiplier)×", value: $rerankCandidateMultiplier, in: 1...5)
+            .help("候选池 = max(调用方 top_k, TopN) × 倍数，默认 3；"
+                + "调小可减少送进 reranker 的切片条数、降低延迟，"
+                + "调大召回更稳但重排更慢")
         Stepper("阈值：\(String(format: "%.2f", rerankThreshold))",
                 value: $rerankThreshold, in: 0...1, step: 0.05)
             .help("重排分数过滤阈值（0-1），默认 0.45 适配 jina；低于阈值的片段会被过滤，"
@@ -853,9 +863,9 @@ struct SettingsView: View {
         Stepper("MLX 缓存：\(mlxCacheLimitMB)MB",
                 value: $mlxCacheLimitMB,
                 in: 256...2_048, step: 128)
-            .help("MLX 可复用 buffer 的上限，默认 512MB；"
+            .help("MLX 可复用 buffer 的上限，默认 1024MB；"
                 + "运行时夹在 256...2048，只影响空闲缓存，不含模型权重与 KV。"
-                + "实测 1GB 已接近 embedding 工作集，2GB 基本没有额外提速")
+                + "实测 1GB 让 decode 快 5–8% 且接近 embedding 工作集，2GB 基本没有额外提速")
         Stepper("MLX 上限：\(mlxMemoryLimitText)",
                 value: $mlxMemoryLimitMB,
                 in: 0...32_768, step: 512)
@@ -879,14 +889,14 @@ struct SettingsView: View {
     }
 
     @ViewBuilder
-    private func dedupeButtons() -> some View {
+    private func stopAndDedupeButtons() -> some View {
+        Button("停止同步") { model.stopSync() }
+            .disabled(!model.isSyncing)
         Button(model.isDeduplicating ? "去重中…" : "向量去重") {
             model.requestVectorDedupe()
         }
         .help("排查并清理向量库内重复的向量，保留入库时间最早的一份")
         .disabled(model.isDeduplicating || model.isBuildingANN)
-        Button("停止同步") { model.stopSync() }
-            .disabled(!model.isSyncing)
     }
 
     /// ANN 索引状态：分块 IVF 摘要（未构建 / 已索引切片数 / 尾块 / 需重建）。
@@ -1108,6 +1118,9 @@ struct SettingsView: View {
                         .toggleStyle(.checkbox)
                         .font(.caption2)
                         .fixedSize()
+                        .help("开启后模型会先生成思考内容，显著增加延迟与 token；"
+                            + "主模型默认开启，辅助模型默认关闭；"
+                            + "后台摘要/事实抽取始终强制关闭")
                 }
                 if let kvReuse {
                     Toggle("KV复用", isOn: kvReuse)
@@ -1226,6 +1239,7 @@ struct SettingsView: View {
         matryoshkaDim = config.ragMatryoshkaDim
         rerankEnabled = config.ragRerankEnabled
         rerankTopN = config.ragRerankTopN
+        rerankCandidateMultiplier = config.ragRerankCandidateMultiplier
         rerankThreshold = config.ragRerankThreshold
         queryTimeoutSeconds = config.ragQueryTimeoutSeconds
         semanticChunking = config.ragSemanticChunking
@@ -1539,6 +1553,7 @@ struct SettingsView: View {
         config.ragChunkOverlap = min(max(0, chunkOverlap), config.ragChunkSize / 2)
         config.ragRerankEnabled = rerankEnabled
         config.ragRerankTopN = min(max(1, rerankTopN), 20)
+        config.ragRerankCandidateMultiplier = min(max(1, rerankCandidateMultiplier), 5)
         config.ragRerankThreshold = min(max(0, rerankThreshold), 1)
         config.ragQueryTimeoutSeconds = min(max(0, queryTimeoutSeconds), 300)
         config.ragSemanticChunking = semanticChunking

@@ -895,6 +895,42 @@ public final class RAGEngine {
         storeLock.unlock()
     }
 
+    /// 启动时把本地 Embedding / Reranker 权重加载好并保持常驻。
+    ///
+    /// 首次检索现场加载 ONNX session 实测要 10~15s；提前加载后首问只付检索时间。
+    /// 单个模型失败只记录到 `failures`，不影响另一个模型继续预加载。
+    @discardableResult
+    public func preloadAuxiliaryModels() async -> RAGPreloadOutcome {
+        var loaded: [String] = []
+        var failures: [String] = []
+        if let embedding {
+            do {
+                try await embedding.preload()
+                loaded.append(embedding.identifier)
+            } catch {
+                failures.append("Embedding(\(embedding.identifier)): "
+                    + error.localizedDescription)
+            }
+        }
+        // 关闭重排序时不必白占内存加载 reranker。
+        if config.ragRerankEnabled, let reranker {
+            do {
+                try await reranker.preload()
+                loaded.append(reranker.identifier)
+            } catch {
+                failures.append("Reranker(\(reranker.identifier)): "
+                    + error.localizedDescription)
+            }
+        }
+        if !loaded.isEmpty {
+            AgentLog.info("[rag] 预加载完成并常驻：\(loaded.joined(separator: "、"))")
+        }
+        for failure in failures {
+            AgentLog.warning("[rag] 预加载失败：\(failure)")
+        }
+        return RAGPreloadOutcome(loaded: loaded, failures: failures)
+    }
+
     /// 尝试占用 ingest 独占标志；已有 ingest/close/reload 时返回 false。
     private func tryBeginIngest() -> Bool {
         ingestFlagLock.lock(); defer { ingestFlagLock.unlock() }
@@ -958,6 +994,9 @@ public final class RAGEngine {
         let logFn: (String) -> Void = { message in
             if let log { log(message) } else { AgentLog.info(message) }
         }
+        // 同步期间允许两个 Ovis 实例并行识别；最后一个 OCR 任务结束时
+        // 由 OCRModelLifecycle 立即释放权重，不等 3 分钟空闲回收。
+        await LocalModelFactory.shared.beginOCRJob()
         var stats = IngestStats()
         var autoBuildRequested = false
         defer {
@@ -967,6 +1006,7 @@ public final class RAGEngine {
             if autoBuildRequested {
                 scheduleANNAutoBuild(log: logFn)
             }
+            Task { await LocalModelFactory.shared.endOCRJob() }
         }
         cancelLock.lock(); cancelRequested = false; cancelLock.unlock()
 
@@ -2191,6 +2231,30 @@ public final class RAGEngine {
 
     /// 多来源子串一次最多定向检索的来源数；超过时回退全局召回 + 过滤。
     private static let maxSourceGroups = 8
+    /// reranker 失败/超时降级时最多返回的条数：TopN 可能被调到 5+，
+    /// 但降级路径没有重排分数支撑，不能把整个 RRF 候选池塞给会话。
+    private static let rerankFallbackLimit = 3
+
+    /// rerank 墙钟超时：触发后立刻回退 RRF，不让整个检索被模型拖住。
+    private struct RerankTimeout: Error {}
+
+    /// 给可取消的异步操作加墙钟超时；0 表示不限制。
+    static func withTimeout<T: Sendable>(
+        _ seconds: Double,
+        _ operation: @escaping @Sendable () async throws -> T
+    ) async throws -> T {
+        guard seconds > 0 else { return try await operation() }
+        return try await withThrowingTaskGroup(of: T.self) { group in
+            group.addTask { try await operation() }
+            group.addTask {
+                try await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
+                throw RerankTimeout()
+            }
+            defer { group.cancelAll() }
+            guard let result = try await group.next() else { throw RerankTimeout() }
+            return result
+        }
+    }
 
     /// 跨来源融合：每个来源内部已经做过 RRF，这里按组内名次再做一次 RRF，
     /// 避免按来源顺序拼接导致后面的来源永远排最后。
@@ -2247,7 +2311,11 @@ public final class RAGEngine {
         let resultCount = rerankEnabled
             ? max(1, min(config.ragRerankTopN, 20))
             : requested
-        let candidateCount = max(requested, resultCount) * (rerankEnabled ? 4 : 1)
+        // 候选池 = max(调用方 top_k, TopN) × 面板里的倍数（默认 3）；
+        // 倍数越大召回越稳，但送进 ONNX 的切片也越多，需要按机器延迟权衡。
+        let candidateMultiplier = max(1, min(config.ragRerankCandidateMultiplier, 5))
+        let candidateCount = max(requested, resultCount)
+            * (rerankEnabled ? candidateMultiplier : 1)
 
         let fetched: [SearchHit]? = try withSnapshotStoreBounded(timeout: limit) {
             store, deadline in
@@ -2305,10 +2373,15 @@ public final class RAGEngine {
             return []
         }
 
+        // 正常返回 TopN；reranker 失败/超时降级时收紧到 3 条。
+        var resultLimit = resultCount
         if rerankEnabled, let reranker, !hits.isEmpty {
+            // 先抽出纯文本：闭包要跨任务边界，避免捕获整个 SearchHit 数组。
+            let documents = hits.map(\.text)
             do {
-                let scores = try await reranker.rerank(query: query,
-                                                       documents: hits.map(\.text))
+                let scores = try await Self.withTimeout(config.ragRerankTimeoutSeconds) {
+                    try await reranker.rerank(query: query, documents: documents)
+                }
                 if scores.count == hits.count {
                     for index in hits.indices {
                         hits[index].score = scores[index]
@@ -2324,10 +2397,22 @@ public final class RAGEngine {
                         : filtered
                 }
             } catch {
-                AgentLog.warning("RAG rerank 失败，使用 RRF 排序: \(error.localizedDescription)")
+                // 失败或超时：明确按 RRF 分排序（hybridSearch 融合时已写入 rrfScore），
+                // 保证降级结果与未开启重排序时的顺序一致。
+                hits.sort { ($0.rrfScore ?? $0.score) > ($1.rrfScore ?? $1.score) }
+                // 降级只用 RRF 分数，缺少 reranker 的相关性过滤；
+                // 只给会话前 3 条，避免 TopN 调大后把上下文塞爆。
+                resultLimit = min(resultLimit, Self.rerankFallbackLimit)
+                if error is RerankTimeout {
+                    AgentLog.warning("RAG rerank 超时（\(config.ragRerankTimeoutSeconds)s），"
+                        + "已回退 RRF 排序（最多 3 条）")
+                } else {
+                    AgentLog.warning("RAG rerank 失败，使用 RRF 排序（最多 3 条）: "
+                        + error.localizedDescription)
+                }
             }
         }
-        return Array(hits.prefix(resultCount))
+        return Array(hits.prefix(resultLimit))
     }
 
     public func searchFormatted(query: String, topK: Int = 3, source: String? = nil,

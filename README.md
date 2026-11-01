@@ -40,14 +40,26 @@ swift test --disable-sandbox
 
 ```bash
 swift build -c release --disable-sandbox
-scripts/package-app.sh release
-scripts/package-dmg.sh 1.2.5
+
+# 三种版本（VARIANT 默认 lite）
+VARIANT=clean      scripts/package-app.sh release && VARIANT=clean      scripts/package-dmg.sh
+VARIANT=lite       scripts/package-app.sh release && VARIANT=lite       scripts/package-dmg.sh
+VARIANT=all-in-one scripts/package-app.sh release && VARIANT=all-in-one scripts/package-dmg.sh
 ```
 
-产物为 `dist/Lightning-RAG.app` 与 `dist/Lightning-RAG-1.2.5.dmg`；版本号可通过
-`VERSION` 环境变量或 `package-dmg.sh` 的参数覆盖。
+| VARIANT | 内置模型 | DMG |
+|---|---|---|
+| `clean` | potion-multilingual-128M int4（语义切片） | `dist/Lightning-RAG-1.2.7-clean.dmg` |
+| `lite` | clean + jina embedding + jina reranker | `dist/Lightning-RAG-1.2.7-lite.dmg` |
+| `all-in-one` | lite + 主模型 + 辅助模型 + OvisOCR3 | `dist/Lightning-RAG-1.2.7-all-in-one.dmg` |
 
-测试覆盖（当前 604 个 XCTest；真实模型 E2E 在本地权重存在时随每次测试自动运行，缺少权重或需要外网/GGUF 等环境的用例会跳过）：sqlite-vec 事务写入/回滚、两段式 KNN、二值签名编码与 LSB-first 位打包、
+三种版本共用 `dist/Lightning-RAG.app`（应用本体与显示名不变，只有内置模型不同），
+因此需按「打包 App → 打包 DMG」的顺序逐个构建。clean / lite 不含主模型、辅助模型
+与 OCR，需要在配置中指定本地模型路径；all-in-one 的模型目录与 `ModelRegistry`
+默认名一致，开箱即用。版本号可通过 `VERSION` 环境变量或 `package-dmg.sh` 的参数
+覆盖；旧 `ALL_IN_ONE=1` 仍等价于 `VARIANT=all-in-one`。
+
+测试覆盖（当前 660 个 XCTest；真实模型 E2E 在本地权重存在时随每次测试自动运行，缺少权重或需要外网/GGUF 等环境的用例会跳过）：sqlite-vec 事务写入/回滚、两段式 KNN、二值签名编码与 LSB-first 位打包、
     bin 表同 rowid 写入与覆盖率计数器、两阶段粗筛精排与 ANN 旁路、
     FTS5 中文分词、RRF 混合检索、RAG 增量/删除清理、重排序 TopN 决定最终条数（关闭时回到调用方 top_k）、内置 reranker 的打包清单与默认配置解析（`localRerankerModel` / `localRerankerModelPath` 留空时仍回落到 App 内置 jina reranker）、EPUB/DOCX/HTML 解析、扫描版 EPUB 归一化 + OCR、PDF 文本层、Ovis 文本页快路径、NaturalLanguage 切片、切片参数一致性（模型窗口收口、检索呈现上限随切片放大、切片参数变化触发重建）、配置迁移与旧键兼容（含 `auto_preload_main` / `aux_enabled` 默认值、主/辅助 KV 复用与量化键的缺省跟随与读写往返）、Agent 工具循环、ask_user 续跑、checkpoint 同步、code_run 写护栏、L3 去重、大纲围栏，以及摘要溢出保留、代码围栏/中文换行/正文数字保留、技能索引入口回退、空库维度自愈、`models/` 相对路径解析，以及 KV 复用增量与完整 prompt 的逐 token 模板对齐、预热前缀对齐、清空对话时失效 KV cache；GGUF 模型路径/mmproj 解析、进程内 llama.cpp 框架加载、ONNX 缺少权重时的明确报错，合成 ONNX decoder 图的 past/present 管线，简单 HTML 表格转 Markdown、复杂表格保留 HTML、Markdown 语法/缩进保留、纯文本 HTML/实体/噪声清理、空行与空格密度压缩、跨目录副本与 content_hash 去重、手动向量去重保留最早入库切片并写副本 tombstone，以及切片缺失/旧版 manifest/失败页文件的增量重建。真实模型链路覆盖：jina-v5 的 `Query: `/`Document: ` 前缀 → 可配置 Matryoshka 维度（默认 128，可选 32/64/128/256/512/768）截断 → 重新 L2 归一化 → 用户选择的元素类型入库（默认 int8，128 维时 128B/行），同时从截断前原生
     768 维生成二值签名写入 `chunk_vectors_bin` → 查询 top1 与 `rag_search` 全链路；jina-v3 的切片 → embedding → 256 维 Matryoshka 截断 → 重新归一化 → int8 入库（256B/行）→ 查询 top1；nomic-int8 的 int8 + Matryoshka 512 召回与 fp32 全维（768）基线对比；以及内置 jina reranker 经 `LocalModelFactory` 加载 ONNX 后对相关段落打分（达到默认 0.45 阈值且高于强无关基线）；`RAGPipelineVerificationTests` 使用仓库 `models/`（可用 `EMBED_BENCH_MODELS_DIR` 指向 App 包模型）跑通 6 篇文档入库 → 22 切片 int8 → 混合检索 + RRF → 重排 → ANN → `rag_search` / `rag_outline` / `rag_status` 全链路。
@@ -62,12 +74,12 @@ HTML 与 Office 解析另有专项覆盖：HTML 保存页的本地 iframe / fram
 - **右上角按钮**：「配置」和「日志」各自打开独立窗口；日志窗口含日志/工具调用两个页签。
 - **配置窗口（Agent 模型配置）**：
   - 主模型：本地模式 / OpenAI 兼容接口二选一，默认本地模式。
-  - 本地模式：模型类型（MLX-LM / MLX-VLM / ONNX / GGUF）、本地路径与目录选择、`context`/`KV 上限`/`temp`/`top_p`/`min_p`/`top_k`/`repeat`/`batch`/超时/「思考」「KV复用」「KV量化」开关，以及「启动时预加载」复选框、「加载模型」「卸载」。`KV 上限` 对应 `kv_cache_max_tokens` / `aux_kv_cache_max_tokens`，设为 0 表示跟随 Context；`batch` 对应 `prompt_batch_size`（辅助模型为 `aux_prompt_batch_size`），控制 prefill 每次前向的 token 上限，`0` 表示使用 MLX 默认值。「思考」「KV复用」「KV量化」紧跟在参数后面同一行（窗口较窄时整组开关换到参数行下一行，仍同行显示），仅在消费它们的后端（MLX-LM / GGUF）出现：`KV复用` = `llm_kv_reuse`（辅助模型 `aux_llm_kv_reuse`），`KV量化` = `kv_cache_int8`（辅助模型 `aux_kv_cache_int8`）。主/辅助两套开关各自独立：主模型默认复用开、量化开；辅助模型默认复用关（后台摘要/事实抽取用后即清，避免长 KV 常驻）、量化跟随主模型。
+  - 本地模式：模型类型（MLX-LM / MLX-VLM / ONNX / GGUF）、本地路径与目录选择、`context`/`KV 上限`/`temp`/`top_p`/`min_p`/`top_k`/`repeat`/`batch`/超时/「思考」「KV复用」「KV量化」开关，以及「启动时预加载」复选框、「加载模型」「卸载」。`KV 上限` 对应 `kv_cache_max_tokens` / `aux_kv_cache_max_tokens`，设为 0 表示跟随 Context；`batch` 对应 `prompt_batch_size`（辅助模型为 `aux_prompt_batch_size`），控制 prefill 每次前向的 token 上限，`0` 表示使用 MLX 默认值。「思考」「KV复用」「KV量化」紧跟在参数后面同一行（窗口较窄时整组开关换到参数行下一行，仍同行显示），仅在消费它们的后端（MLX-LM / GGUF）出现：`KV复用` = `llm_kv_reuse`（辅助模型 `aux_llm_kv_reuse`），`KV量化` = `kv_cache_int8`（辅助模型 `aux_kv_cache_int8`）。主/辅助两套开关各自独立：主模型默认思考开、复用开、量化开；辅助模型默认思考关、复用关（后台摘要/事实抽取用后即清，避免长 KV 常驻）、量化跟随主模型。主模型思考模式是主引擎推理与工具决策的前提，不能为了降低工具路由延迟而默认关闭；后台摘要/事实抽取始终请求级强制关闭。
   - API 模式：Base URL、API Key、模型下拉与「获取模型」，同一组参数与「应用配置」。
   - 辅助模型：标题后带「启用」复选框（对应 `aux_enabled`，默认关闭）。本地模式同主模型布局（含独立的「KV复用」「KV量化」开关），默认 `models/Qwen3.5-2B-MLX-4bit`；未启用时「加载模型 / 重新加载」按钮禁用。
   - 启动时按 `auto_preload_main`（默认开启）预加载主模型；辅助模型仅在 `aux_enabled=true` 时加载。关闭主模型启动预加载后，需在配置窗口手动点「加载模型」；同步结束后的模型恢复不受影响。未指定模型时使用默认主模型 `models/qwen3.5-4b-agentic-coder-v4-4bit-mlx`。加载会真正把参数应用到新创建的模型实例。
   - Agent 区底部「运行参数」行：「最大迭代」（`max_iterations`，默认 15，1...50），修改后点该行「应用配置」保存。
-- **配置窗口（知识同步）**：工作目录与知识库目录；Embedding 行 = 类型（FastEmbed / ONNX / MLX / GGUF）+ 本地路径 + 选择… +「语义切片」开关 /「切片大小」/「overlap」（都在「应用配置」「同步知识」之前）；Reranker 行 = 同布局 +「启用重排序」开关 /「TopN」/「阈值」+「向量去重」（排查并清理向量库内重复的切片，保留入库时间最早的一份）+「停止同步」。两行都按可用宽度自动折行（放不下时优先把按钮换到下一行，切片 / 重排控件仍与模型选择同行）。「启用重排序」对应 `rag_rerank_enabled`（默认开启），「TopN」对应 `rag_rerank_top_n`（默认 5，1...20），「阈值」对应 `rag_rerank_threshold`（默认 0.45，0...1），表示 reranker 之后保留的结果数量与分数过滤下限。Reranker 行之后是向量库与 ANN 索引合并行：向量元素类型（默认 int8；可选 int8 / fp32 / fp16 / bin）/ Matryoshka 模式与截断维（jina-v5 六档 32 / 64 / 128 / 256 / 512 / 768，其它模型保留 128 / 256 / 512） /「ANN 检索」与「自动构建」开关 / ANN 索引摘要与「构建 ANN 索引 / 停止构建 / 删除索引」（放不下时整组折行），「重建向量库」按钮固定在该组行末。「ANN 检索」对应 `rag_ann_enabled`，「自动构建」对应 `rag_ann_auto_build`。紧跟在 ANN 开关之后是「二值粗筛」开关与候选数 Stepper：开关对应 `rag_binary_coarse_enabled`（默认开启），候选数对应 `rag_binary_coarse_candidates`（默认 200，50...1000，步进 50，关闭时禁用）。二值可用时全局检索由它取代 ANN，不可用或定向检索时自动回退原流程；主存储为 BIN 时该功能停用，旧库需重新同步后才会生效。高级区保留 PDF/EPUB OCR 引擎、OCR 模型（MLX / GGUF / ONNX）、mmproj、归一化/二值化，以及「RAG 参数设置」中的「查询超时」（`rag_query_timeout_seconds`，默认 5s，0 = 关闭）和「同步参数设置」中的「启动时自动同步」（`rag_auto_ingest`，默认关闭；开启后每次启动会自动增量扫描知识库，首次全量同步可能长时间占用 embedding 模型与磁盘 IO）、「同步并发」（`rag_ingest_concurrency`）、「OCR 并发」（`rag_vision_concurrency`）、「MLX 缓存」（`mlx_cache_limit_mb`）与「MLX 上限」（`mlx_memory_limit_mb`，0 = 自动）。向量库待重建时，红色提示显示在该合并行下方。
+- **配置窗口（知识同步）**：工作目录与知识库目录行之后紧跟操作按钮行：应用配置 / 同步知识 / 停止同步 / 向量去重（排查并清理向量库内重复的切片，保留入库时间最早的一份）。Embedding 行 = 类型（FastEmbed / ONNX / MLX / GGUF）+ 本地路径 + 选择… +「语义切片」开关 /「切片大小」/「overlap」；Reranker 行 = 同布局 +「启用重排序」开关 /「TopN」/「候选池」/「阈值」。按钮行与两行配置都按可用宽度自动折行，切片 / 重排控件放不下时换到模型选择下方。「启用重排序」对应 `rag_rerank_enabled`（默认开启），「TopN」对应 `rag_rerank_top_n`（默认 3，1...20），「候选池」对应 `rag_rerank_candidate_multiplier`（默认 3，1...5：候选池 = `max(调用方 top_k, TopN) × 倍数`），「阈值」对应 `rag_rerank_threshold`（默认 0.45，0...1），表示 reranker 之后保留的结果数量、候选池放大倍数与分数过滤下限；`rag_rerank_timeout_seconds`（默认 5s，0 = 不限制）控制 rerank 墙钟超时，超时回退 RRF 并只返回前 3 条。Reranker 行之后依次是「二值粗筛」开关与候选数 Stepper、向量库与 ANN 索引合并行：向量元素类型（默认 int8；可选 int8 / fp32 / fp16 / bin）/ Matryoshka 模式与截断维（jina-v5 六档 32 / 64 / 128 / 256 / 512 / 768，其它模型保留 128 / 256 / 512） /「ANN 检索」与「自动构建」开关 / ANN 索引摘要与「构建 ANN 索引 / 停止构建 / 删除索引」（放不下时整组折行），「重建向量库」按钮固定在该组行末。「ANN 检索」对应 `rag_ann_enabled`，「自动构建」对应 `rag_ann_auto_build`。「二值粗筛」开关对应 `rag_binary_coarse_enabled`（默认开启），候选数对应 `rag_binary_coarse_candidates`（默认 200，50...1000，步进 50，关闭时禁用）。二值可用时全局检索由它取代 ANN，不可用或定向检索时自动回退原流程；主存储为 BIN 时该功能停用，旧库需重新同步后才会生效。高级区保留 PDF/EPUB OCR 引擎、OCR 模型（MLX / GGUF / ONNX）、mmproj、归一化/二值化，以及「RAG 参数设置」中的「查询超时」（`rag_query_timeout_seconds`，默认 5s，0 = 关闭）和「同步参数设置」中的「启动时自动同步」（`rag_auto_ingest`，默认关闭；开启后每次启动会自动增量扫描知识库，首次全量同步可能长时间占用 embedding 模型与磁盘 IO）、「同步并发」（`rag_ingest_concurrency`）、「OCR 并发」（`rag_vision_concurrency`）、「MLX 缓存」（`mlx_cache_limit_mb`）与「MLX 上限」（`mlx_memory_limit_mb`，0 = 自动）。向量库待重建时，红色提示显示在该合并行下方。
   - 高级区的「PDF OCR 设置」行末提供「转换工具」按钮，打开独立窗口，把单个文件或整个目录批量转换为 Markdown。复用知识同步的解析器（PDF / EPUB / HTML / TXT / 图片，Office 支持现代格式 `.docx` / `.xlsx` / `.pptx` 与旧版 `.doc` / `.xls` / `.ppt`），沿用打开窗口时面板上的 OCR / PDF / 归一化设置快照；不写回 `config.json`，也不重建 Agent。目录递归时保留相对子目录结构，输出目录位于输入目录内会自动跳过；同批同名（如 `a.txt` 与 `a.html`）依次生成 `a-2.md`、`a-3.md`；单个文件失败不会中断整批。进度区显示当前文件、当前环节（解析 / 图片归一化 / 图片识别 / 清洗与 Markdown 转换）与总体进度，关闭窗口会取消仍在进行的转换。转换按文件体积分批并发：达到 32MB 的文件单独成批串行，其余文件按同步并发（最多 6）并行；PDF 解析按体积收紧页级 worker / 在途页并分批产图，内嵌大图先按目标尺寸降采样，超过 200MP 回退有界栅格化。转换只到写出 Markdown，不做切片、embedding 与入库。
 - 确认弹窗默认按钮为「拒绝」；`ask_user` 的回答作为工具结果继续同一轮推理。
 - RAG 状态在后台线程查询，不在主线程建库/COUNT；状态只读取来源总数与前 256 个来源名，大知识库不会把全部路径读入内存。连续应用配置只生效最后一次，旧同步完成后只重载它自己的引擎，不会影响新 Agent。
@@ -107,7 +119,7 @@ HTML 与 Office 解析另有专项覆盖：HTML 保存页的本地 iframe / fram
 - MCP stdio 客户端：启动串行化；`shutdown()` 后不会被 `callTool` 复活；接收缓冲有界；服务端 `tools/list_changed` 会同步更新工具注册表与 schema 缓存。
 - `AtomicFile` 使用同目录临时文件 + 原子替换，不再「先删旧再 move」。
 - 所有 `URLSession`（OpenAI/Web/MCP 之外的 HTTP 工具）在 Agent 关闭或配置切换时 `invalidateAndCancel`。
-- MLX 空闲 buffer cache 上限夹在 256MB...2GB（`mlx_cache_limit_mb`，默认 512MB）；实测 jina-v3 embedding 的复用 buffer 工作集约 1.27GB，1GB 已能覆盖，2GB 不会带来额外提速，只是多留空闲缓存。配置切换时清理模型实例缓存，避免旧权重常驻。卸载/切换路径不再同步调用 `MLX.Memory.clearCache()`，防止与仍在 GPU 线程执行的 `asyncEval` 并发释放 command encoder 导致 SIGSEGV。
+- MLX 空闲 buffer cache 上限夹在 256MB...2GB（`mlx_cache_limit_mb`，默认 1024MB）；实测 1GB 让 decode 快 5–8%，且仍接近 jina-v3 embedding 的复用 buffer 工作集（约 1.27GB），2GB 不会带来额外提速，只是多留空闲缓存。配置切换时清理模型实例缓存，避免旧权重常驻。卸载/切换路径不再同步调用 `MLX.Memory.clearCache()`，防止与仍在 GPU 线程执行的 `asyncEval` 并发释放 command encoder 导致 SIGSEGV。
 - SQLite 事务只在 COMMIT/RELEASE 成功后递减嵌套深度，提交失败也保持深度非负，避免后续事务被误判为 savepoint。
 - 流式回复每 50ms 合并一次；内容更新时滚动不再逐帧动画，日志窗口复用同一个 `DateFormatter`，长会话下重绘更稳定。
 - LLM 流带 200ms 取消看门狗：服务端静默时用户点「终止」也能立即退出，不必等到请求超时。
@@ -129,7 +141,7 @@ PDF 文本层对所有引擎共用一套有界提取（`PDFTextExtractor`）：�
 
 统一清洗（`DocumentCleaner`）会先暂存围栏代码块与行内代码（占位符使用私用区字符，不会被控制字符归一化破坏），再处理 Ovis OCR 输出的 HTML `<table>`：简单表格转成 GFM Markdown（兼容缺失闭合标签、`<br>`），而含 `colspan`/`rowspan` 合并单元格、嵌套表格、`caption`、多行表头或单元格内列表/图片/公式等无法无损表达的复杂表格会保留原始 HTML `<table>`，避免信息丢失。之后才清理标签/实体/噪声。HTML 解码会把 `&amp;`、`&nbsp;`、`&hellip;` 等还原为实际字符，而不是统一替换成空格；块级标签保留段落换行，内联标签直接删除；脚本/样式/SVG/iframe 等容器整块移除，属性与 CSS 残片单独清理。自动识别 Markdown 后，标题、列表、引用、链接、表格、分隔线、代码块与缩进都会被保留，纯文本则把链接压成文字并去掉 URL/邮箱。Unicode 层会删除 NBSP/零宽字符/软连字符/BOM/替换字符（U+FFFD）/变体选择符/私用区/非字符与孤立组合符；合并汉字之间的 OCR 空格（「新 中 新」→「新中新」）；把 `......` 归一为 `……`、压缩重复中文标点；连续装饰符号与符号密度过高的噪声行会丢弃，连续重复行只保留一条。中文硬换行在两侧都是 CJK 时不补空格；纯数字行只在页首/页尾 3 行内视为页码，正文中的年份/编号不会被误删。最后做密度压缩：去掉行尾空格，页标记、连续列表项、表格行、引用行之间不保留空行；短 OCR 行直接合并，长段落之间保留一个空行；标题、代码块与保留的 HTML 表格前后保留结构分隔。实测一本 2101 行的 OCR Markdown 从 1050 个空行压到 47 个。清洗规则变化会使 `pipeline_version` 递增，下一次同步会重建旧文件的索引。
 
-`rag_pdf_engine` 与 `rag_epub_ocr_engine` 接受 `ovis` / `vision` / `hybrid`；旧配置中的 `docling` / `marker` 自动归一化为 `ovis`。`hybrid` 是 PDF 的推荐模式：扫描页按 8 页一批渲染，批内非表格页并发走 Apple Vision OCR（跨文件总量受全局信号量限制到 CPU 核心数），只有检测到表格线框或 Vision 文本过少的页面才串行交给 OvisOCR2 保留表格结构；纯文本页仍走 PDFKit 文本层，文本页中的表格继续交给 Ovis。文件级由 `rag_ingest_concurrency` 控制（默认 6、上限 6），但纯 `ovis` 模式的 VLM 调用共享同一容器并串行执行，实际 OCR 并发为 1；`hybrid` 的 Vision 页可随文件 worker 并行。扫描版 EPUB 默认使用 `vision`（无需额外模型），选择 `ovis` 时需要可用的 OvisOCR2 权重；两条路径都会先做同一套图像归一化，`rag_ocr_preprocess` / `rag_ocr_binarize` 可分别关闭归一化与二值化。
+`rag_pdf_engine` 与 `rag_epub_ocr_engine` 接受 `ovis` / `vision` / `hybrid`；旧配置中的 `docling` / `marker` 自动归一化为 `ovis`。`hybrid` 是 PDF 的推荐模式：扫描页按 8 页一批渲染，批内非表格页并发走 Apple Vision OCR（跨文件总量受全局信号量限制到 CPU 核心数），只有检测到表格线框或 Vision 文本过少的页面才串行交给 OvisOCR2 保留表格结构；纯文本页仍走 PDFKit 文本层，文本页中的表格继续交给 Ovis。文件级由 `rag_ingest_concurrency` 控制（默认 6、上限 6）；纯 `ovis` 模式默认创建两个 Ovis 实例，实际 OCR 并发为 2；`hybrid` 的 Vision 页可随文件 worker 并行。扫描版 EPUB 默认使用 `vision`（无需额外模型），选择 `ovis` 时需要可用的 OvisOCR2 权重；两条路径都会先做同一套图像归一化，`rag_ocr_preprocess` / `rag_ocr_binarize` 可分别关闭归一化与二值化。
 
 OvisOCR2 的 MLX 权重使用 `model_type=qwen3_5`（Qwen3.5-0.8B 后训练），可直接复用 mlx-swift-lm 的 Qwen3.5 VLM 实现；真正未注册的 Ovis2 架构会明确报错。
 
@@ -144,9 +156,9 @@ OvisOCR2 的 MLX 权重使用 `model_type=qwen3_5`（Qwen3.5-0.8B 后训练）�
 
 默认 `chunk_size=800 token`、`overlap=80 token`（10%，含在 800 内）。同步时优先用模型自带 `tokenizer.json` 做精确计数（不含特殊 token），分词器不可用时退回标定过的保守估算器（`EmbeddingTokenEstimator`）：纯中文约 1 字 ≈ 1 token，中英混排约 1.8 字符/token，英文约 3.5 字符/token；因此 800 token 大致对应 800 字中文或 1000–1400 字混排。默认 jina-embeddings-v5（与 jina-v3 一样）声明窗口为 8192 token，但 embedding 推理前会统一压到 1024 token，默认 800 token 的切片完整计算、不会被截断；若把切片大小调到超过推理输入上限（1024 token，或改用 bge 等更小的 512 窗口模型），同步时会自动压到该上限，overlap 同步压到上限的 10%，设置面板会显示「实际生效：N token」。所有切分路径都在句子结束处断开；旧配置里的默认 500/50 会在加载时自动迁移到 800/80，自定义组合保持不变。
 
-切片参数（大小 / overlap / 语义切片开关）只有设置面板一个来源，控件就排在「知识同步配置」的 Embedding 行里（模型类型 / 本地路径之后、「应用配置」之前）：切片环节统一读 `RAGEngine.resolvedChunkingOptions`，检索呈现的单条上限取 `max(配置值, 切片 token × 1.5 + 64)`（不再固定 1500 字符截短），而切片参数、embedding 后端与目录都进 manifest 的 ingest 签名，改任一项都会逐文件重建；「加载主/辅助模型」按钮在白名单（仅 LLM 参数）之外的配置有变化时会走完整 `applyConfig` 重建 Agent 与 RAGEngine，不会出现面板改了切片、运行时仍按旧快照切片。中途停止后已完成的文件保留，下次从剩余文件继续。
+切片参数（大小 / overlap / 语义切片开关）只有设置面板一个来源，控件就排在「知识同步配置」的 Embedding 行里（模型类型 / 本地路径之后）：切片环节统一读 `RAGEngine.resolvedChunkingOptions`，检索呈现的单条上限取 `max(配置值, 切片 token × 1.5 + 64)`（不再固定 1500 字符截短），而切片参数、embedding 后端与目录都进 manifest 的 ingest 签名，改任一项都会逐文件重建；「加载主/辅助模型」按钮在白名单（仅 LLM 参数）之外的配置有变化时会走完整 `applyConfig` 重建 Agent 与 RAGEngine，不会出现面板改了切片、运行时仍按旧快照切片。中途停止后已完成的文件保留，下次从剩余文件继续。
 
-重排序开关、TopN 与阈值都在 Reranker 行（模型类型 / 本地路径之后、「向量去重」之前）：`rag_rerank_enabled` 默认开启，`rag_rerank_top_n` 默认 5（1...20）决定重排序后保留的结果数量，`rag_rerank_threshold` 默认 0.45（0...1，面板「阈值」）控制分数过滤下限——候选池按 `max(调用方 top_k, TopN) × 4` 取，reranker 重新打分、按 `rag_rerank_threshold` 过滤后只返回分数最高的 TopN 条；关闭重排序时仍按调用方的 `top_k` 返回。
+重排序开关、TopN、候选池与阈值都在 Reranker 行（模型类型 / 本地路径之后）：`rag_rerank_enabled` 默认开启，`rag_rerank_top_n` 默认 3（1...20）决定重排序后保留的结果数量，`rag_rerank_threshold` 默认 0.45（0...1，面板「阈值」）控制分数过滤下限——候选池按 `max(调用方 top_k, TopN) × rag_rerank_candidate_multiplier` 取（倍数默认 3，1...5，面板「候选池」），reranker 重新打分、按 `rag_rerank_threshold` 过滤后只返回分数最高的 TopN 条；`rag_rerank_timeout_seconds`（默认 5s，0 = 不限制）是 rerank 的墙钟超时，超时会取消模型调用并明确回退 RRF 排序，降级路径最多返回 RRF 前 3 条；关闭重排序时仍按调用方的 `top_k` 返回。
 
 多文件同步默认使用 6 个 worker（`rag_ingest_concurrency`，1...6）：解析/OCR 与其它文件的切片、embedding、入库流水线重叠。embedding 仍由共享调度器串行进入模型，子批从 `rag_embedding_initial_batch` 开始（默认 16，运行时夹到 [下限, 上限]），按 `rag_embedding_batch_step` 步进（默认 2，1...16），范围由 `rag_embedding_min_batch`（默认 2，2...64）到 `rag_embedding_max_batch`（默认 32，2...256）；每 `rag_embedding_probe_batches` 批（默认 2）或 `rag_embedding_probe_seconds` 秒（默认 2）根据吞吐和进程内存自动上探/下探，进程 footprint 超过 `rag_embedding_memory_limit_mb`（默认 6144MB）立即下调；吞吐变化小于 `rag_embedding_throughput_tolerance`（默认 0.03 = ±3%）视为测量噪声，不调整。实测 bge 477 token 长块在 batch 4–16 已到吞吐平台，默认 32 兼顾短块；同 batch 重复测量的噪声可达 ±20%，需要更稳时可把容差调到 0.08–0.10。这 8 个子批参数都可在设置窗口「知识同步配置」的高级区同一行调整（顺序：下限、上限、步进、启动预设、探测批次、探测窗口、内存阈值、吞吐容差）。日志只保留每本书的开始、每分钟进度和完成汇总（含各阶段耗时与最终子批大小）。
 
@@ -194,8 +206,8 @@ manifest 条目同时记录 `chunkCount` 与 `complete`：增量跳过前会校�
 - **重建前缀复用**：历史折叠、raw 窗口滑动、rollback 导致消息前缀变化时，从预热时保留的 system+tools 快照复制 KV cache，只 prefill 动态历史；system 前缀不再重复计算。实测 5471-token 重建从约 34s 降到 5.3s（805 token），另一次 626-token 重建约 4.1s。
 - **prefill 批量**：`prompt_batch_size` / `aux_prompt_batch_size`（默认 512，最小 64）映射到 `PrefillParameters.stepSize`，用于控制长 prompt prefill 每次前向的 token 数；调大通常能提高吞吐，但会占用更多内存。配置窗口的 `batch` 字段与 JSON 键一一对应。
 - **投机解码**：当前主/辅模型均为 Qwen3.5 hybrid（GDN/Mamba 层），`MambaCache.isTrimmable == false`，mlx-swift-lm 的 `SpeculativeTokenIterator` 会在初始化时直接拒绝；两个模型的实际权重中也没有 MTP 头（config 虽写 `mtp_num_hidden_layers=1`，safetensors 中 `mtp` key 为 0），因此无法复用辅助模型起草。若后续换成全注意力、缓存可裁剪且共享 tokenizer 的主/辅模型，可再接入该路径。
-- **内存上限**：`mlx_memory_limit_mb`（默认 0 = min(物理内存 65%, 9.6GB)）是 MLX 权重+KV+buffer 的总闸门；`mlx_cache_limit_mb`（默认 512，运行时夹在 256...2048）只限制 MLX 空闲 buffer；实测 8×784-token 的 jina-v3 embedding 批在 1GB 与 2GB 下耗时基本一致（cache 占用 995MB / 1266MB），512MB 则明显偏小。主模型 `kv_cache_max_tokens`（默认 32768，约 1GB KV）和辅助模型 `aux_kv_cache_max_tokens`（默认 8192，约 100MB）是 KV 硬上限，实际上下文取 `min(配置上下文, 上限)`，内核预算同步收紧。完整 prompt 超过预算时明确报错，不会继续分配 KV。辅助模型默认（`aux_llm_kv_reuse=false`）每次后台摘要/事实抽取后立即失效 KV，开启复用后改为保留前缀缓存跨调用复用；主模型 `llm_kv_reuse` 与辅助模型的复用/量化开关各自独立，量化默认都开（KV 内存约减半）。预热前缀快照只在 ≤8192 token 时保留。RAG 检索 `topK` 封顶 20，避免 reranker 批量被模型参数放大。
-- **模型常驻策略**：主模型与 Reranker 加载后常驻不自动卸载；辅助模型仅在 `aux_enabled=true` 时常驻，关闭时 Agent 的 `auxLLM` 保持 `nil`（RAG 精简跳过，后台记忆/总结回退主模型）；Embedding 与 OCR 只在检索/解析时使用，空闲 3 分钟后释放权重，下次按需重载。provider 对象保留，不影响任何工具调用。
+- **内存上限**：`mlx_memory_limit_mb`（默认 0 = min(物理内存 65%, 9.6GB)）是 MLX 权重+KV+buffer 的总闸门；`mlx_cache_limit_mb`（默认 1024，运行时夹在 256...2048）只限制 MLX 空闲 buffer；1GB 让 decode 快 5–8%，实测 8×784-token 的 jina-v3 embedding 批在 1GB 与 2GB 下耗时基本一致（cache 占用 995MB / 1266MB），512MB 则明显偏小。主模型 `kv_cache_max_tokens`（默认 32768，约 1GB KV）和辅助模型 `aux_kv_cache_max_tokens`（默认 8192，约 100MB）是 KV 硬上限，实际上下文取 `min(配置上下文, 上限)`，内核预算同步收紧。完整 prompt 超过预算时明确报错，不会继续分配 KV。辅助模型默认（`aux_llm_kv_reuse=false`）每次后台摘要/事实抽取后立即失效 KV，开启复用后改为保留前缀缓存跨调用复用；主模型 `llm_kv_reuse` 与辅助模型的复用/量化开关各自独立，量化默认都开（KV 内存约减半）。预热前缀快照只在 ≤8192 token 时保留。RAG 检索 `topK` 封顶 20，避免 reranker 批量被模型参数放大。
+- **模型常驻策略**：主模型与 Reranker 加载后常驻不自动卸载；启动时（以及切换配置后）同时预加载本地 Embedding 与 Reranker 并保持常驻，首问不再现场加载 ONNX session（实测 10~15s）；辅助模型仅在 `aux_enabled=true` 时常驻，关闭时 Agent 的 `auxLLM` 保持 `nil`（RAG 精简跳过，后台记忆/总结回退主模型）；OCR 只在解析/转换时使用（默认 2 个 Ovis 实例，同步期间并行识别）；同步、Markdown 转换或 OCR 测试结束时由 `OCRModelLifecycle` 立即卸载全部 Ovis 权重（两个实例一起释放），下次需要时再按需加载；`LocalModelFactory.unloadIdleOCRWeights()` 仅作为无在途 OCR 任务时的空闲兜底。闲时章节摘要使用更长的 10 分钟空闲窗口，避免与前台抢 GPU。provider 对象保留，不影响任何工具调用。
 - 为提升缓存命中，system prompt 只保留稳定前缀（`BASE_SYSTEM_PROMPT`），工作记忆、当天事实、checkpoint、技能与知识库状态等动态内容拼在 user 消息尾部；同一轮内的动态上下文做缓存，避免工具循环中反复变化。运行日志会输出 `[mlx-kv] reuse=… cached=… delta=…` 与 `[mlx] prompt=… cached=… generated=…`，可直接确认本轮复用了多少 token。
 - Embedding 输入前缀按模型族统一处理（`EmbeddingPrefixStrategy`，ONNX / MLX / GGUF 行为一致）：nomic 使用 `search_document: ` / `search_query: `；bge-zh 只在 query 侧加 `为这个句子生成表示以用于检索相关文章：`，document 不加，bge-en / bge-m3 不加；jina 使用 `passage: ` / `query: `，并保留 `clustering: ` / `classification: ` 任务前缀；E5 使用 `passage: ` / `query: `；其他模型原样。前缀在 provider 内幂等添加，调用方不要重复拼；切片预算会按 document 前缀预留 token。mean pooling + L2 归一化；MLX embedding 从 `config.json` 读取隐藏维度。
 - 模型查找顺序：配置显式路径 → `<workspace>/models/<name>` → `~/base-agent/models/<name>` → HuggingFace / FastEmbed 缓存。旧配置的 `models/<name>` 相对写法会自动去掉 `models/` 前缀后在这些根目录下查找。
@@ -242,7 +254,9 @@ PDF Ovis 引擎按 `rag_ocr_model_path` / `rag_ocr_model_name` 加载，不受 `
   "local_reranker_model": "jina-reranker-v2-base-multilingual-onnx",
   "local_reranker_model_path": "models/jina-reranker-v2-base-multilingual-onnx",
   "rag_rerank_enabled": true,
-  "rag_rerank_top_n": 5,
+  "rag_rerank_top_n": 3,
+  "rag_rerank_candidate_multiplier": 3,
+  "rag_rerank_timeout_seconds": 5,
   "rag_rerank_threshold": 0.45,
   "rag_pdf_engine": "ovis",
   "rag_epub_ocr_engine": "vision",

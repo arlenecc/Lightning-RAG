@@ -354,19 +354,35 @@ public final class Session: @unchecked Sendable {
         return folded
     }
 
+    /// CONSOLIDATE 的折叠策略：折到只剩最近一轮，给下一个周期留满 raw 窗口。
+    ///
+    /// 只折「超出 rawTurns 的部分」会让折叠后窗口仍然贴着上限，
+    /// 再跑 2~3 轮就又开始把最老轮滑进摘要区，KV 前缀再次失效。
+    /// 返回实际折叠的轮数。
+    @discardableResult
+    public func foldForConsolidation() -> Int {
+        guard turns.count > 1 else { return 0 }
+        return forceFold(turns.count - 1)
+    }
+
     // MARK: 组装消息
 
     /// 切分 `(old, raw)` —— L3 的核心。
     ///
     /// `raw` = 最近 `rawTurns` 个**已完成**的轮 + 当前进行中的轮。
     /// `old` = 其余全部，折叠成摘要行。
-    /// 预算紧张时自动收缩 `raw`（这就是「折叠」的自动触发点）。
+    ///
+    /// 只有真正逼近模型上下文硬顶（侵入 reserve）时才收缩 `raw`。
+    /// 早先用「raw 软配额 40%」做收缩阈值，会把 8 轮窗口压到 5~6 轮：
+    /// 每新增一轮就有旧轮滑进 `<earlier_context>`（消息索引 1），
+    /// 跨轮 KV 前缀每轮都失效、全量 prefill —— 这是「越聊越慢」的根因。
     func windows() -> (old: [TurnRecord], raw: [TurnRecord]) {
         guard let current = turns.last else { return ([], []) }
         let completed = Array(turns.dropLast())
         var keep = min(rawTurns, completed.count)
-        // 与越界判定同一口径：system / tools / earlier 的超支要从 raw 配额里扣掉。
-        let rawCeiling = max(0, budget.quota.raw - budget.overspent())
+        // 硬顶 = 总预算 − 输出预留 − 其它区实际占用；不再参考 raw 软配额。
+        let nonRaw = budget.used("system") + budget.used("earlier") + budget.used("tools")
+        let rawCeiling = max(0, budget.total - budget.quota.reserve - nonRaw)
         while keep > 0 {
             let slice = Array(completed.suffix(keep)) + [current]
             if TokenEstimator.estimate(Self.renderRaw(slice)) <= rawCeiling {

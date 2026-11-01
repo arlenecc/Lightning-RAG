@@ -64,6 +64,13 @@ public protocol LLMService: AnyObject {
                     tools: [JSONValue],
                     temperature: Double,
                     options: LLMRequestOptions) -> AsyncThrowingStream<LLMStreamEvent, Error>
+    /// 批量摘要生成（可选能力）。支持时把整批请求合成一次模型调用生成；
+    /// 返回 nil 表示不支持，调用方回退到逐条路径。结果按请求顺序对齐。
+    func generateSummariesBatch(
+        requests: [(system: String, prompt: String)],
+        temperature: Double,
+        maxTokensPerRow: Int
+    ) async throws -> [String]?
 }
 
 public extension LLMService {
@@ -76,6 +83,14 @@ public extension LLMService {
                     temperature: Double,
                     options: LLMRequestOptions) -> AsyncThrowingStream<LLMStreamEvent, Error> {
         chatStream(messages: messages, tools: tools, temperature: temperature)
+    }
+
+    func generateSummariesBatch(
+        requests: [(system: String, prompt: String)],
+        temperature: Double,
+        maxTokensPerRow: Int
+    ) async throws -> [String]? {
+        nil
     }
 }
 

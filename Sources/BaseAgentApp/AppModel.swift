@@ -199,8 +199,10 @@ final class AppViewModel: ObservableObject {
     private var pendingToolIndices: [String: [Int]] = [:]
     private var runTask: Task<Void, Never>?
     private var syncTask: Task<Void, Never>?
-    /// 空闲内存回收：无前台活动一段时间后释放 aux 权重与 Embedding/Reranker/OCR。
+    /// 空闲内存回收：无前台活动 3 分钟后释放可重建的 OCR 权重。
     private var idleUnloadTask: Task<Void, Never>?
+    /// 闲时摘要计时：需要比 OCR 回收更长的空闲窗口，避免和前台抢 GPU。
+    private var idleSummaryTask: Task<Void, Never>?
     /// 闲时章节摘要会话；只在该会话内使用辅助模型，结束后卸载临时模型。
     private var summarySessionTask: Task<Void, Never>?
     /// 当前会话的协调器。懒创建，避免启动时在同步路径上打开大向量库。
@@ -228,6 +230,12 @@ final class AppViewModel: ObservableObject {
     init() {
         config = AgentConfig.load(Self.configPath)
         config.ensureWorkspace()
+        // `AgentLog` 只写 stderr + sink；不接线的话 `[mlx-kv] rebuild/prefix-reuse`、
+        // `[mlx] prompt=... tps` 这类关键诊断在 UI 日志里永远看不到。
+        // 必须在 config 初始化之后：闭包捕获 self 前所有存储属性都要就绪。
+        AgentLog.sink = { [weak self] line in
+            Task { @MainActor [weak self] in self?.appendLog(line) }
+        }
         buildAgent()
         appendLog("base-agent 启动，workspace=\(config.workspace)")
         // 上次退出时未完成的计划不跨启动恢复：直接丢弃，避免开盘即自动续跑。
@@ -246,6 +254,10 @@ final class AppViewModel: ObservableObject {
         Task {
             await preloadModels(main: shouldPreloadMain,
                                 aux: config.auxEnabled)
+        }
+        // Embedding / Reranker 与主模型是否预加载无关：检索首问同样需要它们。
+        Task {
+            await preloadRAGModels()
         }
         // 即使无需预加载模型（API 模式/未启用辅助模型），也要让闲时摘要
         // 在启动后按空闲计时自动开始。
@@ -355,10 +367,13 @@ final class AppViewModel: ObservableObject {
                     // 否则同步期间模型又常驻内存，抵消资源释放。
                     self.pendingSyncRestore = (wasMainLoaded, wasAuxLoaded)
                     afterApply()
-                } else if wasMainLoaded || wasAuxLoaded {
-                    Task {
-                        await self.preloadModels(main: wasMainLoaded,
-                                                 aux: wasAuxLoaded)
+                } else {
+                    Task { await self.preloadRAGModels() }
+                    if wasMainLoaded || wasAuxLoaded {
+                        Task {
+                            await self.preloadModels(main: wasMainLoaded,
+                                                     aux: wasAuxLoaded)
+                        }
                     }
                 }
                 // 配置应用会先取消空闲计时；若本次不触发预加载/同步，也必须
@@ -602,6 +617,23 @@ final class AppViewModel: ObservableObject {
         if !isRunning { scheduleIdleUnload() }
     }
 
+    /// 启动/配置应用后把本地 Embedding / Reranker 权重拉起来并常驻。
+    ///
+    /// 首次检索现场加载 ONNX session 实测 10~15s；失败只记录日志，不阻塞启动，
+    /// 下次检索仍会按需加载并重试。
+    func preloadRAGModels() async {
+        guard let agent else { return }
+        let generation = configGeneration
+        let outcome = await agent.ragEngine.preloadAuxiliaryModels()
+        guard configGeneration == generation else { return }
+        if !outcome.loaded.isEmpty {
+            appendLog("[model] 已预加载并常驻：\(outcome.loaded.joined(separator: "、"))")
+        }
+        for failure in outcome.failures {
+            appendLog("[model] 预加载失败：\(failure)")
+        }
+    }
+
     /// 用稳定的 system prompt + 工具清单预热主模型 KV cache，并更新状态栏。
     private func warmupMainModel(_ service: WarmupLLMService,
                                  generation: Int? = nil) async {
@@ -812,13 +844,13 @@ final class AppViewModel: ObservableObject {
 
     // MARK: 空闲内存回收
 
-    /// 延迟 3 分钟无前台活动后，开启闲时章节摘要会话，并释放可重建的
-    /// Embedding/Reranker/OCR 权重。模型服务对象保留，下次使用自动重载。
-    private func scheduleIdleUnload(delay: UInt64 = 180_000_000_000) {
+    /// 延迟 3 分钟无前台活动后释放可重建的 OCR 权重。
+    /// Embedding / Reranker 启动预加载后常驻，模型服务对象保留。
+    private func scheduleIdleUnload() {
         idleUnloadTask?.cancel()
         idleUnloadTask = Task { [weak self] in
             guard let self else { return }
-            var wait = delay
+            var wait = IdleWorkPolicy.ocrUnloadDelayNanoseconds
             while !Task.isCancelled {
                 do {
                     try await Task.sleep(nanoseconds: wait)
@@ -832,10 +864,35 @@ final class AppViewModel: ObservableObject {
                     wait = 60_000_000_000
                     continue
                 }
-                // 摘要会话在独立 Task 里继续运行（内部按 15/5 分钟节流逐章处理），
-                // 这里只负责启动和回收按需权重。
+                await LocalModelFactory.shared.unloadIdleOCRWeights()
+                return
+            }
+        }
+        scheduleIdleSummary()
+    }
+
+    /// 空闲摘要使用更长的窗口（10 分钟）：会话一旦启动会持续占用辅助模型，
+    /// 用户只是短暂离开时不能和下一次前台请求抢 GPU。
+    private func scheduleIdleSummary(
+        delay: UInt64 = IdleWorkPolicy.summaryDelayNanoseconds
+    ) {
+        idleSummaryTask?.cancel()
+        idleSummaryTask = Task { [weak self] in
+            guard let self else { return }
+            var wait = delay
+            while !Task.isCancelled {
+                do {
+                    try await Task.sleep(nanoseconds: wait)
+                } catch {
+                    return
+                }
+                guard !Task.isCancelled else { return }
+                guard self.canStartIdleWork else {
+                    wait = 60_000_000_000
+                    continue
+                }
+                // 摘要会话在独立 Task 里继续运行（内部按 15/5 分钟节流逐章处理）。
                 self.startSummaryIdleSession()
-                await LocalModelFactory.shared.unloadIdleRAGModelWeights()
                 return
             }
         }
@@ -852,12 +909,14 @@ final class AppViewModel: ObservableObject {
     private func cancelIdleUnload() {
         idleUnloadTask?.cancel()
         idleUnloadTask = nil
+        idleSummaryTask?.cancel()
+        idleSummaryTask = nil
         requestSummaryStop()
     }
 
     // MARK: 闲时章节摘要
 
-    /// 3 分钟空闲后开启一个摘要会话；一次只处理一个章节/一次全书摘要。
+    /// 10 分钟空闲后开启一个摘要会话；一次只处理一个章节/一次全书摘要。
     /// 临时辅助模型由会话创建和卸载，常驻辅助模型只借用、不关闭。
     private func startSummaryIdleSession() {
         guard summarySessionTask == nil, summaryCoordinator == nil,
@@ -917,7 +976,7 @@ final class AppViewModel: ObservableObject {
                     guard let self, self.summarySessionToken == token else { return }
                     self.summarySessionTask = nil
                     self.bookSummaryStatusText = "章节摘要：稍后继续"
-                    self.scheduleIdleUnload(delay: 60_000_000_000)
+                    self.scheduleIdleSummary(delay: 60_000_000_000)
                 }
                 return
             case .ready:

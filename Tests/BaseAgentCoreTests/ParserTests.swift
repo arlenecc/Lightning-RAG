@@ -1151,9 +1151,9 @@ final class ParserTests: XCTestCase {
         XCTAssertFalse(ChunkingOptions(config: config).enableSemantic)
     }
 
-    /// MLX buffer cache 上限：默认 512MB，允许试到 2GB，超大值加载时压回 2GB。
+    /// MLX buffer cache 上限：默认 1GB，允许试到 2GB，超大值加载时压回 2GB。
     func testConfigClampsMLXCacheLimit() throws {
-        XCTAssertEqual(AgentConfig().mlxCacheLimitMB, 512)
+        XCTAssertEqual(AgentConfig().mlxCacheLimitMB, 1_024)
 
         let path = directory.appendingPathComponent("config-mlx-cache.json")
         try #"{"mlx_cache_limit_mb":2048,"mlx_memory_limit_mb":0}"#
@@ -1974,14 +1974,23 @@ private final class TableFakeVLM: VLMService {
 private final class FakeVLM: VLMService {
     let identifier = "fake-vlm"
     let isAvailable = true
-    var calls = 0
-    var lastImageWidth = 0
-    var lastImageHeight = 0
+    // EPUB 同一批内会并发识别多页，计数必须加锁；否则自增丢失会让
+    // 「N 页都应触发 OCR」的断言偶发少一（旧实现的真实 flake）。
+    private let lock = NSLock()
+    private var _calls = 0
+    private var _lastImageWidth = 0
+    private var _lastImageHeight = 0
+
+    var calls: Int { lock.lock(); defer { lock.unlock() }; return _calls }
+    var lastImageWidth: Int { lock.lock(); defer { lock.unlock() }; return _lastImageWidth }
+    var lastImageHeight: Int { lock.lock(); defer { lock.unlock() }; return _lastImageHeight }
 
     func recognize(image: CGImage, prompt: String, maxTokens: Int) async throws -> String {
-        calls += 1
-        lastImageWidth = image.width
-        lastImageHeight = image.height
+        lock.lock()
+        _calls += 1
+        _lastImageWidth = image.width
+        _lastImageHeight = image.height
+        lock.unlock()
         return "# Ovis page content\n\nFake VLM output."
     }
 }

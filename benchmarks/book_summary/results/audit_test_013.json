@@ -1,0 +1,157 @@
+{
+  "judge_model": "/Users/arlenecc/codebase/agent-app/models/qwen3.5-4b-agentic-coder-v4-4bit-mlx",
+  "reference_file": "reference_test_013.json",
+  "generated_at": "2026-10-30T07:41:05.100531+00:00",
+  "comparisons": [
+    {
+      "chapter_id": "index_split_013",
+      "chapter_title": "第一章 第四节 教理",
+      "A_tag": "0.8b",
+      "B_tag": "2b",
+      "audit": {
+        "point_status": {
+          "A": {
+            "1": "covered",
+            "2": "covered",
+            "3": "covered",
+            "4": "covered",
+            "5": "covered",
+            "6": "covered",
+            "7": "covered",
+            "8": "covered"
+          },
+          "B": {
+            "1": "covered",
+            "2": "covered",
+            "3": "covered",
+            "4": "covered",
+            "5": "covered",
+            "6": "covered",
+            "7": "covered",
+            "8": "covered"
+          }
+        },
+        "errors": {
+          "A": [],
+          "B": []
+        },
+        "structure": {
+          "A": 4,
+          "B": 4
+        },
+        "flags": {
+          "A": {
+            "repetition": false,
+            "truncation": false,
+            "extra_preamble": false
+          },
+          "B": {
+            "repetition": false,
+            "truncation": false,
+            "extra_preamble": false
+          }
+        },
+        "winner": "A",
+        "reason": "A 更明确地覆盖所有 8 个关键信息点，且结构清晰，层次分明，重点突出，而 B 虽然也覆盖所有点，但结构稍逊一筹，重点排布不够清晰。"
+      },
+      "meta": {
+        "seconds": 108.2499675831059,
+        "prompt_tokens": 10714,
+        "generation_tokens": 187,
+        "prefill_tps": 125.64234671746782,
+        "generation_tps": 8.172650728248371,
+        "peak_memory_gb": 4.796309046,
+        "finish_reason": "stop",
+        "raw": "{\"point_status\":{\"A\":{\"1\":\"covered\",\"2\":\"covered\",\"3\":\"covered\",\"4\":\"covered\",\"5\":\"covered\",\"6\":\"covered\",\"7\":\"covered\",\"8\":\"covered\"},\"B\":{\"1\":\"covered\",\"2\":\"covered\",\"3\":\"covered\",\"4\":\"covered\",\"5\":\"covered\",\"6\":\"covered\",\"7\":\"covered\",\"8\":\"covered\"}},\"errors\":{\"A\":[],\"B\":[]},\"structure\":{\"A\":4,\"B\":4},\"flags\":{\"A\":{\"repetition\":false,\"truncation\":false,\"extra_preamble\":false},\"B\":{\"repetition\":false,\"truncation\":false,\"extra_preamble\":false}},\"winner\":\"A\",\"reason\":\"A 更明确地覆盖所有 8 个关键信息点，且结构清晰，层次分明，重点突出，而 B 虽然也覆盖所有点，但结构稍逊一筹，重点排布不够清晰。\"}"
+      }
+    },
+    {
+      "chapter_id": "index_split_013",
+      "chapter_title": "第一章 第四节 教理",
+      "A_tag": "2b",
+      "B_tag": "0.8b",
+      "audit": {
+        "point_status": {
+          "A": {
+            "1": "covered",
+            "2": "covered",
+            "3": "covered",
+            "4": "covered",
+            "5": "covered",
+            "6": "covered",
+            "7": "covered",
+            "8": "covered"
+          },
+          "B": {
+            "1": "covered",
+            "2": "covered",
+            "3": "covered",
+            "4": "covered",
+            "5": "covered",
+            "6": "covered",
+            "7": "covered",
+            "8": "covered"
+          }
+        },
+        "errors": {
+          "A": [],
+          "B": [
+            {
+              "claim": "原始佛教将“法”定义为“缘起”的基础，认为“法”与“行”互为表里，二者共同构成“三法印”（诸法无我、诸行无常、一切行苦）。",
+              "type": "unsupported",
+              "reason": "原文中“法”是基础性存在，缘起是相依相关而成立，二者关系未如此表述，三法印的表述也不准确。"
+            },
+            {
+              "claim": "原始佛教通过“三十七道品”与“四向四果”（预流、一来、不还、阿罗汉）来描述修行者的进阶过程。",
+              "type": "unsupported",
+              "reason": "原文中三十七道品是修行道方面的重要部分，但并未直接作为进阶过程的描述框架，四向四果是修行阶段，但并非唯一描述进阶过程的方式。"
+            },
+            {
+              "claim": "原始佛教将“法”定义为“缘起”的基础，认为“法”与“行”互为表里，二者共同构成“三法印”（诸法无我、诸行无常、一切行苦）。",
+              "type": "unsupported",
+              "reason": "原文中“法”是基础性存在，缘起是相依相关而成立，二者关系未如此表述，三法印的表述也不准确。"
+            },
+            {
+              "claim": "原始佛教通过“三十七道品”与“四向四果”（预流、一来、不还、阿罗汉）来描述修行者的进阶过程。",
+              "type": "unsupported",
+              "reason": "原文中三十七道品是修行道方面的重要部分，但并未直接作为进阶过程的描述框架，四向四果是修行阶段，但并非唯一描述进阶过程的方式。"
+            },
+            {
+              "claim": "原始佛教将“法”定义为“缘起”的基础，认为“法”与“行”互为表里，二者共同构成“三法印”（诸法无我、诸行无常、一切行苦）。",
+              "type": "unsupported",
+              "reason": "原文中“法”是基础性存在，缘起是相依相关而成立，二者关系未如此表述，三法印的表述也不准确。"
+            }
+          ]
+        },
+        "structure": {
+          "A": 4,
+          "B": 4
+        },
+        "flags": {
+          "A": {
+            "repetition": false,
+            "truncation": false,
+            "extra_preamble": false
+          },
+          "B": {
+            "repetition": false,
+            "truncation": false,
+            "extra_preamble": false
+          }
+        },
+        "winner": "A",
+        "reason": "A 覆盖了所有 8 个关键信息点，且没有事实错误；B 虽然也覆盖了所有 8 个关键信息点，但存在多处 unsupported 的事实问题，且对三法印的表述不准确。因此 A 更优。"
+      },
+      "meta": {
+        "seconds": 184.57100995793007,
+        "prompt_tokens": 10714,
+        "generation_tokens": 623,
+        "prefill_tps": 96.64412985977121,
+        "generation_tps": 8.460325083753721,
+        "peak_memory_gb": 4.796849718,
+        "finish_reason": "stop",
+        "raw": "{\"point_status\":{\"A\":{\"1\":\"covered\",\"2\":\"covered\",\"3\":\"covered\",\"4\":\"covered\",\"5\":\"covered\",\"6\":\"covered\",\"7\":\"covered\",\"8\":\"covered\"},\"B\":{\"1\":\"covered\",\"2\":\"covered\",\"3\":\"covered\",\"4\":\"covered\",\"5\":\"covered\",\"6\":\"covered\",\"7\":\"covered\",\"8\":\"covered\"}},\"errors\":{\"A\":[],\"B\":[{\"claim\":\"原始佛教将“法”定义为“缘起”的基础，认为“法”与“行”互为表里，二者共同构成“三法印”（诸法无我、诸行无常、一切行苦）。\",\"type\":\"unsupported\",\"reason\":\"原文中“法”是基础性存在，缘起是相依相关而成立，二者关系未如此表述，三法印的表述也不准确。\"},{\"claim\":\"原始佛教通过“三十七道品”与“四向四果”（预流、一来、不还、阿罗汉）来描述修行者的进阶过程。\",\"type\":\"unsupported\",\"reason\":\"原文中三十七道品是修行道方面的重要部分，但并未直接作为进阶过程的描述框架，四向四果是修行阶段，但并非唯一描述进阶过程的方式。\"},{\"claim\":\"原始佛教将“法”定义为“缘起”的基础，认为“法”与“行”互为表里，二者共同构成“三法印”（诸法无我、诸行无常、一切行苦）。\",\"type\":\"unsupported\",\"reason\":\"原文中“法”是基础性存在，缘起是相依相关而成立，二者关系未如此表述，三法印的表述也不准确。\"},{\"claim\":\"原始佛教通过“三十七道品”与“四向四果”（预流、一来、不还、阿罗汉）来描述修行者的进阶过程。\",\"type\":\"unsupported\",\"reason\":\"原文中三十七道品是修行道方面的重要部分，但并未直接作为进阶过程的描述框架，四向四果是修行阶段，但并非唯一描述进阶过程的方式。\"},{\"claim\":\"原始佛教将“法”定义为“缘起”的基础，认为“法”与“行”互为表里，二者共同构成“三法印”（诸法无我、诸行无常、一切行苦）。\",\"type\":\"unsupported\",\"reason\":\"原文中“法”是基础性存在，缘起是相依相关而成立，二者关系未如此表述，三法印的表述也不准确。\"}]},\"structure\":{\"A\":4,\"B\":4},\"flags\":{\"A\":{\"repetition\":false,\"truncation\":false,\"extra_preamble\":false},\"B\":{\"repetition\":false,\"truncation\":false,\"extra_preamble\":false}},\"winner\":\"A\",\"reason\":\"A 覆盖了所有 8 个关键信息点，且没有事实错误；B 虽然也覆盖了所有 8 个关键信息点，但存在多处 unsupported 的事实问题，且对三法印的表述不准确。因此 A 更优。\"}"
+      }
+    }
+  ]
+}

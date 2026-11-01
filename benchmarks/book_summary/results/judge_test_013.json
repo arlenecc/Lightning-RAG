@@ -1,0 +1,78 @@
+{
+  "judge_model": "/Users/arlenecc/codebase/agent-app/models/qwen3.5-4b-agentic-coder-v4-4bit-mlx",
+  "generated_at": "2026-10-30T07:21:00.847803+00:00",
+  "comparisons": [
+    {
+      "chapter_id": "index_split_013",
+      "chapter_title": "第一章 第四节 教理",
+      "A_tag": "0.8b",
+      "B_tag": "2b",
+      "scores": {
+        "A": {
+          "accuracy": 5.0,
+          "coverage": 5.0,
+          "structure": 5.0,
+          "instruction": 5.0,
+          "overall": 5.0
+        },
+        "B": {
+          "accuracy": 5.0,
+          "coverage": 5.0,
+          "structure": 5.0,
+          "instruction": 5.0,
+          "overall": 5.0
+        },
+        "winner": "tie",
+        "reason": "两份摘要均高度忠实于原文，准确覆盖核心教理，结构清晰，指令遵循完美，无事实错误或遗漏。A 更侧重体系化总结，B 更侧重内容罗列，两者各有侧重，质量相当。",
+        "problems_A": "无",
+        "problems_B": "无"
+      },
+      "meta": {
+        "prompt_tokens": 9894,
+        "generation_tokens": 111,
+        "seconds": 100.35552562493831,
+        "prefill_tps": 111.92654508474364,
+        "generation_tps": 9.595528034145804,
+        "peak_memory_gb": 4.594982454,
+        "finish_reason": "stop",
+        "raw": "{\"A\":{\"accuracy\":5,\"coverage\":5,\"structure\":5,\"instruction\":5,\"overall\":5},\"B\":{\"accuracy\":5,\"coverage\":5,\"structure\":5,\"instruction\":5,\"overall\":5},\"winner\":\"tie\",\"reason\":\"两份摘要均高度忠实于原文，准确覆盖核心教理，结构清晰，指令遵循完美，无事实错误或遗漏。A 更侧重体系化总结，B 更侧重内容罗列，两者各有侧重，质量相当。\",\"problems_A\":\"无\",\"problems_B\":\"无\"}"
+      }
+    },
+    {
+      "chapter_id": "index_split_013",
+      "chapter_title": "第一章 第四节 教理",
+      "A_tag": "2b",
+      "B_tag": "0.8b",
+      "scores": {
+        "A": {
+          "accuracy": 5.0,
+          "coverage": 5.0,
+          "structure": 5.0,
+          "instruction": 5.0,
+          "overall": 5.0
+        },
+        "B": {
+          "accuracy": 5.0,
+          "coverage": 5.0,
+          "structure": 5.0,
+          "instruction": 5.0,
+          "overall": 5.0
+        },
+        "winner": "tie",
+        "reason": "两份摘要均准确、完整、结构清晰，严格遵循指令，无遗漏或编造，质量相当。",
+        "problems_A": "无明显问题",
+        "problems_B": "无明显问题"
+      },
+      "meta": {
+        "prompt_tokens": 9894,
+        "generation_tokens": 88,
+        "seconds": 95.82650495902635,
+        "prefill_tps": 111.1398021943752,
+        "generation_tps": 12.9950770573905,
+        "peak_memory_gb": 4.594998838,
+        "finish_reason": "stop",
+        "raw": "{\"A\":{\"accuracy\":5,\"coverage\":5,\"structure\":5,\"instruction\":5,\"overall\":5},\"B\":{\"accuracy\":5,\"coverage\":5,\"structure\":5,\"instruction\":5,\"overall\":5},\"winner\":\"tie\",\"reason\":\"两份摘要均准确、完整、结构清晰，严格遵循指令，无遗漏或编造，质量相当。\",\"problems_A\":\"无明显问题\",\"problems_B\":\"无明显问题\"}"
+      }
+    }
+  ]
+}

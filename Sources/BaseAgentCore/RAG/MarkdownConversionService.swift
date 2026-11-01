@@ -159,6 +159,10 @@ public actor MarkdownConversionService {
         onResult: ((MarkdownConversionResult) -> Void)? = nil
     ) async throws -> MarkdownConversionReport {
         let startedAt = Date()
+        // 转换工具复用 OCR 解析器：整批转换期间保持 Ovis 实例，批次结束
+        // 立即释放，避免转换完成后权重常驻。
+        await LocalModelFactory.shared.beginOCRJob()
+        defer { Task { await LocalModelFactory.shared.endOCRJob() } }
         let fm = FileManager.default
         let source = request.sourceURL.standardizedFileURL
         let output = request.outputDirectory.standardizedFileURL

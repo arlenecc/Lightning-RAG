@@ -1,0 +1,319 @@
+{
+  "models": {
+    "0.8b": {
+      "tag": "0.8b",
+      "model_path": "/Users/arlenecc/codebase/agent-app/models/Qwen3.5-0.8B-MLX-4bit",
+      "load_seconds": 1.8783414580393583,
+      "warmup_seconds": 0.6008352090138942,
+      "load_peak_memory_gb": 0.423938248,
+      "hardware": {
+        "platform": "macOS-27.0.1-arm64-arm-64bit-Mach-O",
+        "machine": "arm64",
+        "processor": "arm",
+        "python": "3.13.16",
+        "chip": "Apple M1",
+        "memory_bytes": 17179869184
+      },
+      "avg_prefill_tps": 482.3,
+      "avg_decode_tps": 37.6,
+      "avg_ttft_seconds": 27.0,
+      "total_generation_seconds": 126.1,
+      "total_with_load_seconds": 128.58,
+      "prompt_tokens_total": 38985,
+      "generation_tokens_total": 1691
+    },
+    "2b": {
+      "tag": "2b",
+      "model_path": "/Users/arlenecc/codebase/agent-app/models/Qwen3.5-2B-MLX-4bit",
+      "load_seconds": 1.816647124942392,
+      "warmup_seconds": 0.942874624975957,
+      "load_peak_memory_gb": 1.059315912,
+      "hardware": {
+        "platform": "macOS-27.0.1-arm64-arm-64bit-Mach-O",
+        "machine": "arm64",
+        "processor": "arm",
+        "python": "3.13.16",
+        "chip": "Apple M1",
+        "memory_bytes": 17179869184
+      },
+      "avg_prefill_tps": 238.2,
+      "avg_decode_tps": 20.2,
+      "avg_ttft_seconds": 54.85,
+      "total_generation_seconds": 228.49,
+      "total_with_load_seconds": 231.25,
+      "prompt_tokens_total": 38985,
+      "generation_tokens_total": 1288
+    }
+  },
+  "runs": [
+    {
+      "tag": "0.8b",
+      "chapter_id": "index_split_013",
+      "chapter_title": "第一章 第四节 教理",
+      "bucket": "medium",
+      "chapter_chars": 13086,
+      "prompt_tokens": 9018,
+      "generation_tokens": 372,
+      "ttft_seconds": 18.25027137505822,
+      "total_seconds": 27.19335225003306,
+      "prefill_tps": 494.15139905807257,
+      "generation_tps": 41.665681768783664,
+      "peak_memory_gb": 2.043259178,
+      "finish_reason": "stop",
+      "output_chars": 494,
+      "format": {
+        "sections": [
+          "一句话主旨",
+          "核心要点",
+          "关键词",
+          "本章结论"
+        ],
+        "section_count": 4,
+        "bullets": 5,
+        "keywords": 6,
+        "keyword_list": [
+          "原始佛教",
+          "四谛",
+          "八正道",
+          "十二缘起",
+          "三法印",
+          "三十七道品"
+        ],
+        "chars": 349,
+        "extra_preamble": false,
+        "repetition": {
+          "repeated_groups": 0,
+          "max_repeat": 1,
+          "repeated_chars": 0,
+          "sample": ""
+        },
+        "truncated": false,
+        "instruction_score": 3.86
+      }
+    },
+    {
+      "tag": "0.8b",
+      "chapter_id": "index_split_026",
+      "chapter_title": "第三章 第一节 阿育王以后的教团发展",
+      "bucket": "long",
+      "chapter_chars": 18040,
+      "prompt_tokens": 12976,
+      "generation_tokens": 1000,
+      "ttft_seconds": 27.840383791946806,
+      "total_seconds": 54.45469129201956,
+      "prefill_tps": 466.1092252277714,
+      "generation_tps": 37.59096331737584,
+      "peak_memory_gb": 2.378836266,
+      "finish_reason": "length",
+      "output_chars": 1309,
+      "format": {
+        "sections": [
+          "一句话主旨",
+          "核心要点"
+        ],
+        "section_count": 2,
+        "bullets": 20,
+        "keywords": 0,
+        "keyword_list": [],
+        "chars": 1002,
+        "extra_preamble": false,
+        "repetition": {
+          "repeated_groups": 1,
+          "max_repeat": 18,
+          "repeated_chars": 1044,
+          "sample": "佛塔建造者多为“贤胄部”成员，而“四方僧伽”主要居住于“僧院”中，两者在建筑规模、居住空间及社会地位上存在显著差异。"
+        },
+        "truncated": true,
+        "instruction_score": 2.14
+      }
+    },
+    {
+      "tag": "0.8b",
+      "chapter_id": "index_split_036",
+      "chapter_title": "第四章 第五节 唯识的教理",
+      "bucket": "xlong",
+      "chapter_chars": 23589,
+      "prompt_tokens": 16991,
+      "generation_tokens": 319,
+      "ttft_seconds": 34.9100413339911,
+      "total_seconds": 44.44736204191577,
+      "prefill_tps": 486.7278473094011,
+      "generation_tps": 33.53529162389416,
+      "peak_memory_gb": 2.714413354,
+      "finish_reason": "stop",
+      "output_chars": 406,
+      "format": {
+        "sections": [
+          "一句话主旨",
+          "核心要点",
+          "关键词",
+          "本章结论"
+        ],
+        "section_count": 4,
+        "bullets": 5,
+        "keywords": 6,
+        "keyword_list": [
+          "唯识",
+          "三性",
+          "转依",
+          "五重",
+          "四智",
+          "五重唯识"
+        ],
+        "chars": 284,
+        "extra_preamble": false,
+        "repetition": {
+          "repeated_groups": 0,
+          "max_repeat": 1,
+          "repeated_chars": 0,
+          "sample": ""
+        },
+        "truncated": false,
+        "instruction_score": 3.86
+      }
+    },
+    {
+      "tag": "2b",
+      "chapter_id": "index_split_013",
+      "chapter_title": "第一章 第四节 教理",
+      "bucket": "medium",
+      "chapter_chars": 13086,
+      "prompt_tokens": 9018,
+      "generation_tokens": 377,
+      "ttft_seconds": 36.90352024999447,
+      "total_seconds": 55.11165312502999,
+      "prefill_tps": 244.37435046362947,
+      "generation_tps": 20.754549111934715,
+      "peak_memory_gb": 2.550669558,
+      "finish_reason": "stop",
+      "output_chars": 475,
+      "format": {
+        "sections": [
+          "一句话主旨",
+          "核心要点",
+          "关键词"
+        ],
+        "section_count": 3,
+        "bullets": 6,
+        "keywords": 8,
+        "keyword_list": [
+          "原始佛教",
+          "四谛说",
+          "八圣道",
+          "中道",
+          "五蕴无我",
+          "十二缘起",
+          "法与缘起",
+          "八分教"
+        ],
+        "chars": 340,
+        "extra_preamble": false,
+        "repetition": {
+          "repeated_groups": 0,
+          "max_repeat": 1,
+          "repeated_chars": 0,
+          "sample": ""
+        },
+        "truncated": true,
+        "instruction_score": 3.0
+      }
+    },
+    {
+      "tag": "2b",
+      "chapter_id": "index_split_026",
+      "chapter_title": "第三章 第一节 阿育王以后的教团发展",
+      "bucket": "long",
+      "chapter_chars": 18040,
+      "prompt_tokens": 12976,
+      "generation_tokens": 494,
+      "ttft_seconds": 54.62189154198859,
+      "total_seconds": 79.32645225001033,
+      "prefill_tps": 237.56592871101515,
+      "generation_tps": 20.028532380475102,
+      "peak_memory_gb": 2.735235318,
+      "finish_reason": "stop",
+      "output_chars": 663,
+      "format": {
+        "sections": [
+          "一句话主旨",
+          "核心要点",
+          "关键词",
+          "本章结论"
+        ],
+        "section_count": 4,
+        "bullets": 5,
+        "keywords": 7,
+        "keyword_list": [
+          "阿育王",
+          "孔雀王朝",
+          "案达罗王朝",
+          "贵霜王朝",
+          "犍陀罗艺术",
+          "说一切有部",
+          "大乘佛教"
+        ],
+        "chars": 484,
+        "extra_preamble": false,
+        "repetition": {
+          "repeated_groups": 0,
+          "max_repeat": 1,
+          "repeated_chars": 0,
+          "sample": ""
+        },
+        "truncated": false,
+        "instruction_score": 4.43
+      }
+    },
+    {
+      "tag": "2b",
+      "chapter_id": "index_split_036",
+      "chapter_title": "第四章 第五节 唯识的教理",
+      "bucket": "xlong",
+      "chapter_chars": 23589,
+      "prompt_tokens": 16991,
+      "generation_tokens": 417,
+      "ttft_seconds": 73.01225841697305,
+      "total_seconds": 94.0523210830288,
+      "prefill_tps": 232.71891982816632,
+      "generation_tps": 19.857665106153185,
+      "peak_memory_gb": 2.919801078,
+      "finish_reason": "stop",
+      "output_chars": 504,
+      "format": {
+        "sections": [
+          "一句话主旨",
+          "核心要点",
+          "关键词",
+          "本章结论"
+        ],
+        "section_count": 4,
+        "bullets": 6,
+        "keywords": 6,
+        "keyword_list": [
+          "阿赖耶识",
+          "唯识观",
+          "三性说",
+          "四智",
+          "四涅槃",
+          "转依"
+        ],
+        "chars": 365,
+        "extra_preamble": false,
+        "repetition": {
+          "repeated_groups": 0,
+          "max_repeat": 1,
+          "repeated_chars": 0,
+          "sample": ""
+        },
+        "truncated": false,
+        "instruction_score": 3.86
+      }
+    }
+  ],
+  "ratios": {
+    "prefill_2b_over_0.8b": 0.49,
+    "decode_2b_over_0.8b": 0.54,
+    "ttft_2b_over_0.8b": 2.03,
+    "total_2b_over_0.8b": 1.8
+  }
+}

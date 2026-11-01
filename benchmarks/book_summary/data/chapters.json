@@ -1,0 +1,23 @@
+[
+  {
+    "id": "index_split_013",
+    "title": "第一章 第四节 教理",
+    "bucket": "medium",
+    "chars": 13086,
+    "source": "/Users/arlenecc/Downloads/test/印度佛教史.epub"
+  },
+  {
+    "id": "index_split_026",
+    "title": "第三章 第一节 阿育王以后的教团发展",
+    "bucket": "long",
+    "chars": 18040,
+    "source": "/Users/arlenecc/Downloads/test/印度佛教史.epub"
+  },
+  {
+    "id": "index_split_036",
+    "title": "第四章 第五节 唯识的教理",
+    "bucket": "xlong",
+    "chars": 23589,
+    "source": "/Users/arlenecc/Downloads/test/印度佛教史.epub"
+  }
+]

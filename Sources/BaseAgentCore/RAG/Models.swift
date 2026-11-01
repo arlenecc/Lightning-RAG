@@ -105,6 +105,8 @@ public protocol EmbeddingProvider: AnyObject, Sendable {
     var dimension: Int { get }
     func embedDocuments(_ texts: [String]) async throws -> [[Float]]
     func embedQuery(_ text: String) async throws -> [Float]
+    /// 预加载权重并做一次最小推理（分配 session / 编译图），让首次检索不再现加载。
+    func preload() async throws
     /// 释放模型权重，provider 本身保留；下次调用会按需重新加载。
     func unload() async
     /// 底层模型可安全并发推理的调用数：ONNX session.run 线程安全可并发；
@@ -175,6 +177,11 @@ public protocol EmbeddingVectorElementConstraining: Sendable {
 }
 
 public extension EmbeddingProvider {
+    /// 默认用一条极短查询把权重与推理路径拉起来；各后端无需单独实现。
+    func preload() async throws {
+        _ = try await embedQuery("warmup")
+    }
+
     func unload() async {}
     var maxConcurrentRuns: Int { 1 }
 }
@@ -183,12 +190,30 @@ public protocol RerankProvider: AnyObject, Sendable {
     var identifier: String { get }
     /// 返回与 candidates 等长的相关性分数（越大越相关）。
     func rerank(query: String, documents: [String]) async throws -> [Double]
+    /// 预加载权重并跑一次最小 pair，让首次检索不再现加载。
+    func preload() async throws
     /// 释放模型权重，provider 本身保留；下次调用会按需重新加载。
     func unload() async
 }
 
 public extension RerankProvider {
+    /// 默认用一条极短的 query/document 触发模型加载。
+    func preload() async throws {
+        _ = try await rerank(query: "warmup", documents: ["warmup"])
+    }
+
     func unload() async {}
+}
+
+/// 启动预加载结果：`loaded` 是已常驻的 provider 标识，`failures` 是失败描述。
+public struct RAGPreloadOutcome: Sendable, Equatable {
+    public var loaded: [String]
+    public var failures: [String]
+
+    public init(loaded: [String] = [], failures: [String] = []) {
+        self.loaded = loaded
+        self.failures = failures
+    }
 }
 
 // MARK: - 进度回调

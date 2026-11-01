@@ -648,10 +648,19 @@ public final class BookSummaryEngine: @unchecked Sendable {
 
     /// 并发执行一批 map 请求。每个请求都是关闭 thinking 的独立会话，
     /// 因此不会互相复用或污染 KV；`batchConcurrency` 限制同时占用的槽位。
+    ///
+    /// 后端支持批量生成时优先把整批请求合成一次模型调用（单线程 batched
+    /// prefill/decode，见 `BatchedMLXGenerator`），避免多路并发 generation
+    /// 撞上共享权重被 tracer 临时替换导致的崩溃；不支持或失败时回退到
+    /// 逐条 TaskGroup 路径。
     private func runSummaryBatch(_ requests: [SummaryRequest],
                                  llm: LLMService,
                                  cancellation: SummaryCancellation) async -> SummaryBatchResult {
         guard !requests.isEmpty else { return SummaryBatchResult() }
+        if let batchResult = await runBatchGeneration(
+            requests, llm: llm, cancellation: cancellation) {
+            return batchResult
+        }
         let llmBox = SummaryLLMBox(llm)
         // 串行后端（GGUF/VLM）不支持多请求并行，退化为逐条执行，
         // 避免并发任务堆在内部互斥锁前空等。
@@ -690,6 +699,46 @@ public final class BookSummaryEngine: @unchecked Sendable {
             }
         }
         return result
+    }
+
+    /// 批量生成路径：整批一次模型调用，任一行失败或为空时返回 nil 回退逐条。
+    private func runBatchGeneration(_ requests: [SummaryRequest],
+                                    llm: LLMService,
+                                    cancellation: SummaryCancellation) async -> SummaryBatchResult? {
+        guard requests.count > 1 else { return nil }
+        do {
+            try cancellation.check()
+            // 摘要上限按字符数；中文约 1 token/字，取 4 倍余量并封顶。
+            let maxTokensPerRow = max(
+                256, min(2048, (requests.map(\.maxLength).max() ?? 100) * 4))
+            let batchRequests = requests.map { (system: $0.system, prompt: $0.prompt) }
+            guard
+                let raw = try await llm.generateSummariesBatch(
+                    requests: batchRequests,
+                    temperature: 0.2,
+                    maxTokensPerRow: maxTokensPerRow)
+            else { return nil }
+
+            var result = SummaryBatchResult()
+            for (request, text) in zip(requests, raw) {
+                let summary = Self.normalizeSummary(
+                    text, maxLength: request.maxLength,
+                    preferredCut: request.preferredCut)
+                if summary.isEmpty { return nil }
+                result.summaries[request.index] = summary
+            }
+            return result
+        } catch {
+            // 取消（Task.cancel / 协调器闭包）不重跑逐条路径，直接按取消返回；
+            // 其它错误（不支持批量、生成异常）回退到逐条路径复跑。
+            if error is CancellationError || cancellation.isCancellation(error) {
+                var result = SummaryBatchResult()
+                result.failure = SummaryBatchFailure(
+                    isCancelled: true, message: "摘要生成已取消")
+                return result
+            }
+            return nil
+        }
     }
 
     private func executeSummaryRequest(_ request: SummaryRequest,

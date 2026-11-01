@@ -862,6 +862,14 @@ public final class Agent: @unchecked Sendable {
         // 阈值放宽到 6/8 字；纯寒暄在调用方已被过滤。
         guard user.count >= 6, text.count >= 8, !recent.isEmpty else { return }
 
+        // 主模型无法提供独立会话时，后台请求会清空并覆盖主会话 KV；
+        // 与其次次让下一句话全量 prefill，不如放弃这一轮事实抽取。
+        let service = auxLLM ?? llm
+        guard Self.backgroundRequestOptions(for: service, isMain: service === llm) != nil else {
+            log("[memory] 主模型不支持独立会话，跳过后台事实抽取/蒸馏")
+            return
+        }
+
         // 没有计划的简单对话不做技能/经验蒸馏；事实抽取仍然保留。
         let shouldDistill = substantive
             && ((distillRequested ?? kernel.distillRequested)
@@ -1068,12 +1076,33 @@ public final class Agent: @unchecked Sendable {
         return text
     }
 
+    /// 后台辅助请求的覆盖项。
+    ///
+    /// - 主模型 + 支持独立会话（MLX / ONNX / 远端 HTTP）：走 isolated 副本并关闭
+    ///   thinking。后台 prompt 与主会话完全不同，共用 KV 必然全量重建并覆盖主会话
+    ///   的 `rawCache/sessionTranscript`，下一次用户消息只能重新 prefill。
+    /// - 主模型 + 不支持独立会话（llama.cpp 的 isolated 会清共享缓存）：返回 nil，
+    ///   调用方直接跳过后台任务。
+    /// - 辅助模型：与主会话无关，按默认选项调用即可。
+    static func backgroundRequestOptions(for service: LLMService,
+                                         isMain: Bool) -> LLMRequestOptions? {
+        guard isMain else { return .default }
+        guard service.supportsConcurrentIsolatedRequests else { return nil }
+        return LLMRequestOptions(enableThinking: false, isolated: true)
+    }
+
     private func collectChat(_ messages: [ChatMessage], temperature: Double) async -> String {
         let service = auxLLM ?? llm
+        guard let options = Self.backgroundRequestOptions(for: service,
+                                                          isMain: service === llm) else {
+            log("[llm] 主模型不支持独立会话，跳过后台调用")
+            return ""
+        }
         var output = ""
         do {
             for try await event in service.chatStream(messages: messages, tools: [],
-                                                      temperature: temperature) {
+                                                      temperature: temperature,
+                                                      options: options) {
                 // AsyncThrowingStream 的迭代不会自动感知 Task 取消；主动退出后
                 // 流销毁会触发 onTermination，进而取消底层 MLX 生成。
                 if Task.isCancelled { break }

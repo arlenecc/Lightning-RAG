@@ -72,8 +72,9 @@ public struct AgentConfig: Sendable {
     /// prompt prefill 每次前向的 token 上限（0 = 使用 MLX 默认值）。
     public var promptBatchSize: Int = 1024
     /// MLX 空闲 buffer cache 上限（MB）。只限制可复用 buffer，不含模型权重与 KV；
-    /// 运行时夹在 256...2048，默认 512。
-    public var mlxCacheLimitMB: Int = 512
+    /// 运行时夹在 256...2048，默认 1024：实测 1GB 让 decode 快 5–8%，
+    /// 且仍未超过 embedding 的复用工作集。
+    public var mlxCacheLimitMB: Int = 1_024
     /// MLX 全局内存硬上限（MB，含权重/KV/buffer）；0 = 自动取
     /// min(物理内存 65%, 9.6GB)。
     public var mlxMemoryLimitMB: Int = 0
@@ -146,10 +147,17 @@ public struct AgentConfig: Sendable {
     /// 重排分数过滤阈值（0-1）。全部低于阈值时回退原排序，不会空结果。
     public var ragRerankThreshold: Double = 0.45
     public var ragRerankEnabled: Bool = true
-    /// 重排序后保留的结果数量（1...20，默认 5）。开启重排序时以此为准：
+    /// 重排序后保留的结果数量（1...20，默认 3）。开启重排序时以此为准：
     /// 候选池按它放大后交给 reranker，最终只取分数最高的 N 条；
     /// 关闭重排序时仍按调用方 `top_k` 返回。
-    public var ragRerankTopN: Int = 5
+    public var ragRerankTopN: Int = 3
+    /// 候选池放大倍数（1...5，默认 3）。候选池 =
+    /// max(调用方 top_k, TopN) × 倍数；越大召回越稳，但送进 reranker
+    /// 的条数也越多。配置面板放在 TopN 之后，可随时调小降低 rerank 延迟。
+    public var ragRerankCandidateMultiplier: Int = 3
+    /// rerank 的墙钟超时（秒）。超时立即回退 RRF 排序，不再等模型跑完；
+    /// 0 表示不限制（仅建议调试时使用）。
+    public var ragRerankTimeoutSeconds: Double = 5
     /// 检索结果格式化时单条片段的字符上限（超出截断加省略号）。
     public var ragSearchMaxCharsPerResult: Int = 1_500
     /// 检索结果总字符上限（超出截断）。
@@ -200,8 +208,9 @@ public struct AgentConfig: Sendable {
     /// 实测 4 路已接近吞吐拐点，再多不一定快甚至变慢；0 也按 4 处理，
     /// 保留覆盖入口便于实验。
     public var ragVisionConcurrency: Int = 4
-    /// OvisOCR3 并行实例数（1...2）。4bit 权重约 0.7GB，单实例运行约 1GB，
-    /// 第二实例懒加载（仅在真正并发时才占内存），可提高扫描页吞吐。
+    /// OvisOCR3 并行实例数（1...2）。4bit 权重约 0.7GB，单实例运行约 1GB；
+    /// 默认 2：同步期间双实例并行识别扫描页。权重仍按需懒加载，同步/转换/
+    /// OCR 测试结束后由 `OCRModelLifecycle` 立即释放两个实例，不常驻内存。
     public var ragOvisInstances: Int = 2
 
     // Embedding 子批自适应（AdaptiveEmbeddingScheduler）
@@ -292,6 +301,9 @@ public struct AgentConfig: Sendable {
     public var llmProvider: String = "local"
     public var localLLMModel: String = "models/qwen3.5-4b-agentic-coder-v4-4bit-mlx"
     public var localLLMBackend: String = "mlx-lm"
+    /// 主模型 thinking 默认开启：关闭会破坏主引擎的推理与工具决策质量。
+    /// 不能为了工具路由延迟而牺牲主模型默认值；低延迟轮次应在请求级关闭，
+    /// 或交给辅助模型。后台任务始终请求级强制关闭（见 Agent）。
     public var localLLMEnableThinking: Bool = true
     /// 启动时是否预加载主模型。默认开启；关闭后启动只创建 Agent，不加载权重，
     /// 需在配置窗口手动「加载模型」。不影响配置应用/同步结束后的模型恢复。
@@ -495,6 +507,8 @@ public struct AgentConfig: Sendable {
         if let v = string("rag_rerank_model") { ragRerankModel = v }
         if let v = bool("rag_rerank_enabled") { ragRerankEnabled = v }
         if let v = int("rag_rerank_top_n") { ragRerankTopN = v }
+        if let v = int("rag_rerank_candidate_multiplier") { ragRerankCandidateMultiplier = v }
+        if let v = double("rag_rerank_timeout_seconds"), v >= 0 { ragRerankTimeoutSeconds = v }
         if let v = double("rag_query_timeout_seconds"), v >= 0 { ragQueryTimeoutSeconds = v }
         if let v = bool("rag_ann_enabled") { ragANNEnabled = v }
         if let v = int("rag_ann_clusters") { ragANNClusters = v }
@@ -641,6 +655,9 @@ public struct AgentConfig: Sendable {
 
     /// 旧版本配置迁移（docling/marker → ovis、旧 embedding/reranker 名）。
     public mutating func migrate() {
+        // rerank 候选池倍数：手改配置可能越界，统一收口到 1...5，
+        // 避免一次把上百条切片送进 ONNX。
+        ragRerankCandidateMultiplier = max(1, min(5, ragRerankCandidateMultiplier))
         // 二值粗筛候选数：手改配置可能越界，统一收口到 50...1000。
         ragBinaryCoarseCandidates = max(50, min(1_000, ragBinaryCoarseCandidates))
         // docling/marker 已移除：旧配置值统一由 PDFEngine(stored:) 归一化为 ovis。
@@ -865,6 +882,8 @@ public struct AgentConfig: Sendable {
             "rag_rerank_model": ragRerankModel,
             "rag_rerank_enabled": ragRerankEnabled,
             "rag_rerank_top_n": ragRerankTopN,
+            "rag_rerank_candidate_multiplier": ragRerankCandidateMultiplier,
+            "rag_rerank_timeout_seconds": ragRerankTimeoutSeconds,
             "rag_query_timeout_seconds": ragQueryTimeoutSeconds,
             "rag_ann_enabled": ragANNEnabled,
             "rag_ann_clusters": ragANNClusters,

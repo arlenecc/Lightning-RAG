@@ -571,6 +571,88 @@ public final class MLXLLMService: LLMService, PreloadableLLMService,
         cachedToolsKey = nil
     }
 
+    // MARK: - 批量摘要
+
+    /// 把一组摘要请求合成单个 batch 生成，单线程跑 batched prefill + decode。
+    ///
+    /// 只支持 SSM 混合架构（newCache 产出 MambaCache 的 Qwen35 系）；
+    /// 其余架构返回 nil，调用方回退到逐条路径。与聊天路径一样假设由
+    /// Agent 串行调用，不与 chatStream 并发共享模型权重。
+    public func generateSummariesBatch(
+        requests: [(system: String, prompt: String)],
+        temperature: Double,
+        maxTokensPerRow: Int
+    ) async throws -> [String]? {
+        let container = try await state.container(directory: directory)
+        let model = await container.perform {
+            UncheckedSendableBox($0.model)
+        }.value
+        let tokenizer = await container.tokenizer
+        let configuration = await container.configuration
+
+        // 仅 Qwen35 类 SSM 混合模型：批量生成器依赖 MambaCache 的 leftPadding
+        // 掩码语义与注意力掩码替换，其它架构未验证。
+        guard try model.newCache(parameters: nil).contains(where: { $0 is MambaCache }) else {
+            return nil
+        }
+        // 停止集合与生产循环（buildStopTokenIds）一致：模型 config eos +
+        // tokenizer eos + extraEOSTokens；左 padding 用 eos 占位。
+        var stopTokenIds = configuration.eosTokenIds
+        if let id = tokenizer.eosTokenId {
+            stopTokenIds.insert(id)
+        }
+        for token in configuration.extraEOSTokens {
+            if let id = tokenizer.convertTokenToId(token) {
+                stopTokenIds.insert(id)
+            }
+        }
+        guard
+            let padToken = tokenizer.eosTokenId ?? configuration.eosTokenIds.first,
+            !stopTokenIds.isEmpty
+        else {
+            return nil
+        }
+
+        let thinkingContext: [String: any Sendable] = ["enable_thinking": false]
+        var rows: [[Int]] = []
+        rows.reserveCapacity(requests.count)
+        for request in requests {
+            let chat: [Chat.Message] = [.system(request.system), .user(request.prompt)]
+            let input = try await container.prepare(
+                input: UserInput(
+                    chat: chat,
+                    tools: nil,
+                    additionalContext: thinkingContext))
+            rows.append(input.text.tokens.asArray(Int.self))
+        }
+
+        guard
+            let plan = BatchGenerationPlan.leftPad(rows: rows, padToken: padToken)
+        else {
+            return []
+        }
+
+        let generated = try BatchedMLXGenerator.generate(
+            tokens: plan,
+            model: model,
+            stopTokenIds: stopTokenIds,
+            padToken: padToken,
+            maxTokensPerRow: maxTokensPerRow,
+            temperature: temperature > 0.02 ? Float(temperature) : nil)
+
+        var results: [String] = []
+        results.reserveCapacity(generated.count)
+        for tokens in generated {
+            if tokens.isEmpty {
+                results.append("")
+                continue
+            }
+            let text = await container.decode(tokenIds: tokens)
+            results.append(text.trimmingCharacters(in: .whitespacesAndNewlines))
+        }
+        return results
+    }
+
     // MARK: - 消息 / 工具 schema 转换
 
     static func makeChatMessages(_ messages: [ChatMessage]) -> [Chat.Message] {
@@ -835,7 +917,7 @@ public final class MLXLLMService: LLMService, PreloadableLLMService,
 // MARK: - 生成辅助
 
 /// 跨 actor 传递非 Sendable 的模型引用。
-private final class UncheckedSendableBox<T>: @unchecked Sendable {
+final class UncheckedSendableBox<T>: @unchecked Sendable {
     let value: T
     init(_ value: T) { self.value = value }
 }
