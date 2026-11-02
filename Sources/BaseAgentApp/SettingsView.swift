@@ -191,34 +191,11 @@ struct SettingsView: View {
                 auxModelBlock
                 Divider()
                 runParametersRow
-                mlxResourceRow
             }
             .padding(8)
         } label: {
             Text("Agent 模型配置").font(.headline)
         }
-    }
-
-    /// MLX 运行时资源参数（从高级设置区移入，紧随「运行参数」行）。
-    private var mlxResourceRow: some View {
-        HStack(spacing: 14) {
-            Text("MLX 资源")
-                .font(.caption.weight(.semibold))
-                .foregroundStyle(.secondary)
-            Stepper("MLX 缓存：\(mlxCacheLimitMB)MB",
-                    value: $mlxCacheLimitMB,
-                    in: 256...2_048, step: 128)
-                .help("MLX 可复用 buffer 的上限，默认 1024MB；"
-                    + "运行时夹在 256...2048，只影响空闲缓存，不含模型权重与 KV。"
-                    + "实测 1GB 让 decode 快 5–8% 且接近 embedding 工作集，2GB 基本没有额外提速")
-            Stepper("MLX 上限：\(mlxMemoryLimitText)",
-                    value: $mlxMemoryLimitMB,
-                    in: 0...32_768, step: 512)
-                .help("MLX 全局内存硬上限（含权重/KV/buffer）；"
-                    + "0 = 自动取 min(物理内存 65%, 9.6GB)。误配可能导致 OOM")
-            Spacer(minLength: 8)
-        }
-        .font(.caption)
     }
 
     private var mainModelBlock: some View {
@@ -379,7 +356,7 @@ struct SettingsView: View {
         }
     }
 
-    /// Agent 运行参数：单次任务的最大工具调用轮数。
+    /// Agent 运行参数：迭代轮数 / 查询超时 / MLX 缓存与内存上限。
     private var runParametersRow: some View {
         HStack(spacing: 14) {
             Text("运行参数")
@@ -393,6 +370,17 @@ struct SettingsView: View {
                     value: $queryTimeoutSeconds, in: 0...60, step: 1)
                 .help("知识库只读查询（打开库 / 状态 / 检索）的超时秒数，默认 5s，0 = 关闭。"
                     + "大库或上次同步中断后 SQLite 恢复 WAL 较慢时，可适当调大")
+            Stepper("MLX 缓存：\(mlxCacheLimitMB)MB",
+                    value: $mlxCacheLimitMB,
+                    in: 256...2_048, step: 128)
+                .help("MLX 可复用 buffer 的上限，默认 1024MB；"
+                    + "运行时夹在 256...2048，只影响空闲缓存，不含模型权重与 KV。"
+                    + "实测 1GB 让 decode 快 5–8% 且接近 embedding 工作集，2GB 基本没有额外提速")
+            Stepper("MLX 上限：\(mlxMemoryLimitText)",
+                    value: $mlxMemoryLimitMB,
+                    in: 0...32_768, step: 512)
+                .help("MLX 全局内存硬上限（含权重/KV/buffer）；"
+                    + "0 = 自动取 min(物理内存 65%, 9.6GB)。误配可能导致 OOM")
             Spacer(minLength: 8)
             Button("应用配置") { applyAPIConfig() }
                 .disabled(model.isSyncing || model.isDeduplicating || model.isBuildingANN
@@ -966,11 +954,12 @@ struct SettingsView: View {
         .disabled(model.isDeduplicating || model.isBuildingANN)
     }
 
-    /// ANN 索引状态：分块 IVF 摘要（未构建 / 已索引切片数 / 尾块 / 需重建）。
+    /// 向量 ANN 索引状态：分块 IVF 摘要（未构建 / 已索引切片数 / 尾块 / 需重建）。
+    /// 显示名用「向量ANN」与同行的「二值 ANN」区分。
     @ViewBuilder
     private var annStatusLabel: some View {
         HStack(spacing: 6) {
-            Text("ANN 索引").font(.caption)
+            Text("向量ANN").font(.caption)
             Text(model.annStatusText)
                 .font(.caption2)
                 .foregroundStyle(.secondary)

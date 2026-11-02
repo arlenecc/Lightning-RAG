@@ -152,9 +152,31 @@ public enum PDFPageRenderer {
                                                targetLongSide: targetLongSide) {
             return extracted
         }
-        return render(cgPage: cgPage, dpi: dpi,
-                      maxLongSide: targetLongSide,
-                      maxPixelCount: defaultMaxPixelCount)
+        let rendered = render(cgPage: cgPage, dpi: dpi,
+                              maxLongSide: targetLongSide,
+                              maxPixelCount: defaultMaxPixelCount)
+        // 渲染出白图但页面确实有图片 XObject：不是真空页，而是 CoreGraphics
+        // 拒绝解码该图片（书商扫描件的 JPEG 带特殊 APP 段时会发生，实测
+        // 「合同法 第6版」「海商法 第5版」全书渲染全白）。流级兜底：把页内
+        // 最大的 DCTDecode 图片直接交给 ImageIO 解码。
+        if rendered == nil || isNearlyBlank(rendered!) {
+            if PDFTextExtractor.imageObjectCount(for: cgPage) > 0,
+               let fallback = extractLargestEmbeddedJPEG(cgPage: cgPage,
+                                                         targetLongSide: targetLongSide) {
+                return fallback
+            }
+        }
+        return rendered
+    }
+
+    /// 兜底：提取页面内像素数最大的 DCTDecode 图片流，直接交给 ImageIO 解码。
+    /// 与 `extractEmbeddedJPEG` 的差异：不要求整页唯一图片流，且接受
+    /// CoreGraphics 报告 raw 但以 SOI 开头的 JPEG 字节（见 CPDFShim.h）。
+    static func extractLargestEmbeddedJPEG(cgPage: CGPDFPage,
+                                           targetLongSide: Int) -> CGImage? {
+        guard let jpeg = CPDFShimCopyLargestEmbeddedJPEG(cgPage) else { return nil }
+        let data = jpeg.takeRetainedValue() as Data
+        return decodeEmbeddedJPEG(data, targetLongSide: targetLongSide)
     }
 
     /// 提取页面唯一的大尺寸 JPEG（扫描件整页图）。C 级判断在 CPDFShim 中，

@@ -32,6 +32,10 @@ public final class LlamaCppLLMService: LLMService, PreloadableLLMService,
     private var loadFailure: Error?
     private var cachedTokens: [llama_token] = []
     private var cachedToolsKey: String?
+    /// `llama_memory_seq_rm` 是否可用。混合 SSM 等 KV 结构不支持按位置
+    /// 裁剪（返回 false）；首次失败后记住，后续直接全量重建，避免每轮
+    /// 白试一次。
+    private var seqRmSupported = true
 
     init(modelPath: String,
          contextWindow: Int,
@@ -273,13 +277,32 @@ public final class LlamaCppLLMService: LLMService, PreloadableLLMService,
             if common == tokens.count {
                 common = max(0, tokens.count - 1)
             }
-            AgentLog.info("[gguf-kv] common=\(common) cached=\(cachedTokens.count) "
-                + "prompt=\(tokens.count) tools_match=\(toolsMatch)")
-            if common > 0, common < cachedTokens.count, let memory = loaded.memory {
-                let removed = llama_memory_seq_rm(memory, 0, llama_pos(common), -1)
-                if !removed {
-                    // 混合 SSM 模型不支持按位置裁剪 KV；只能整段重建。
-                    AgentLog.warning("[gguf-kv] seq_rm(\(common)) 失败，重建缓存")
+            // 形态标注（对齐 [mlx-kv]）：
+            // append = 缓存是严格前缀（形态①）；trim = 裁到公共前缀
+            // （形态②新 prompt 更短 / ③中途分叉）；rebuild = 全量重建。
+            let mode: String
+            if common == 0 {
+                mode = "rebuild"
+            } else if common >= cachedTokens.count {
+                mode = "append"
+            } else {
+                mode = "trim"
+            }
+            AgentLog.info("[gguf-kv] mode=\(mode) common=\(common) "
+                + "cached=\(cachedTokens.count) prompt=\(tokens.count) "
+                + "tools_match=\(toolsMatch)")
+            if mode == "trim" {
+                if seqRmSupported, let memory = loaded.memory {
+                    let removed = llama_memory_seq_rm(memory, 0, llama_pos(common), -1)
+                    if !removed {
+                        // 混合 SSM 等结构不支持按位置裁剪 KV；记住能力，
+                        // 后续直接整段重建。
+                        AgentLog.warning("[gguf-kv] seq_rm(\(common)) 失败，"
+                            + "此后跳过裁剪尝试，整段重建")
+                        seqRmSupported = false
+                        common = 0
+                    }
+                } else {
                     common = 0
                 }
             }
@@ -310,6 +333,12 @@ public final class LlamaCppLLMService: LLMService, PreloadableLLMService,
                     budget: generationBudget, startInThink: startInThink,
                     allowedToolNames: allowedToolNames, continuation: continuation)
             } catch {
+                // prefill / 生成失败后缓存可能停在半截位置（生成循环内部已
+                // 清过一次），这里统一清内存并重置账目，避免残留 KV 占内存、
+                // 也避免下次前缀匹配撞上半截缓存。
+                if let memory = loaded.memory {
+                    llama_memory_clear(memory, true)
+                }
                 cachedTokens = []
                 cachedToolsKey = nil
                 throw error

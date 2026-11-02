@@ -40,6 +40,10 @@ public final class MLXLLMService: LLMService, PreloadableLLMService,
     /// 缓存中实际已处理的 token 数（含生成部分）；MambaCache 的 offset 不增长，
     /// 不能直接读 cache.first.offset。
     private var cachedTokenCount = 0
+    /// 缓存当前表示的完整 token 序列（prompt + 生成），用于下一轮 token 级
+    /// 严格前缀匹配。仅在缓存可裁剪（isTrimmable）时有意义；不可裁剪的
+    /// 混合缓存（Qwen3.5 MambaCache）走消息级匹配，此数组保持为空。
+    private var cachedTokens: [Int] = []
     /// 已经消费/生成的完整消息轨迹（含内核折叠掉的中间工具步）。
     private var sessionTranscript: [ChatMessage] = []
     /// 上一次生成是否产出了一个尚未在外部消息里消费的 assistant 消息。
@@ -148,8 +152,6 @@ public final class MLXLLMService: LLMService, PreloadableLLMService,
                         "enable_thinking": enableThinking
                     ]
 
-                    // 判断能否在已有 raw KV cache 上继续追加。只追加 user/tool
-                    // 消息：assistant 已经由上一轮生成并存在于缓存里。
                     var transcriptAfter: [ChatMessage] = []
                     var deltaMlx: [Chat.Message] = []
                     var hasDelta = false
@@ -157,6 +159,77 @@ public final class MLXLLMService: LLMService, PreloadableLLMService,
                     var rebuild = !kvReuse || rawCache == nil || sessionTranscript.isEmpty
                     var rebuildReason = !kvReuse ? "kv-reuse-disabled"
                         : rawCache == nil ? "no-cache" : "no-transcript"
+
+                    var prepared: LMInput?
+                    var totalPromptTokens = 0
+                    var cachedPromptTokens = 0
+                    var reuseCache = false
+                    var prefixReuse = false
+
+                    // ---- Token 级前缀匹配（可裁剪缓存：形态①②③统一） ----
+                    // 把新 prompt 渲染成完整 token 序列，与缓存当前表示的序列
+                    // （prompt + 生成）做严格前缀对比：缓存是新 prompt 的前缀 →
+                    // 只预填增量（①，常态多轮追加）；新 prompt 更短（回退/收缩
+                    // 重试）或中途分叉（动态上下文改写历史）→ 裁到公共前缀复用，
+                    // 只重算其后的一小段（②③）。相比消息级匹配，assistant 段
+                    // 逐 token 验证，不再依赖「生成内容已在缓存」的消息级假设。
+                    // 不可裁剪的混合缓存（Qwen3.5 MambaCache 等）走下方消息级匹配。
+                    var tokenReused = false
+                    var prerenderedInput: LMInput?
+                    var prerenderedTokens: [Int] = []
+                    // 提交缓存时记录「本轮实际喂入的完整 prompt token 序列」，
+                    // 供下一轮 token 级前缀匹配；消息级 delta 路径拿不到完整
+                    // 序列，置空（该路径只用于不可裁剪缓存，序列本来就不参与）。
+                    var promptTokensForCache: [Int]? = nil
+                    if kvReuse, rawState == nil,
+                       let existing = rawCache, !existing.isEmpty,
+                       cachedToolsKey == toolsKey, !cachedTokens.isEmpty,
+                       existing.allSatisfy({ $0.isTrimmable }) {
+                        do {
+                            let full = try await container.prepare(input: UserInput(
+                                chat: mlxMessages, tools: toolSpecs,
+                                additionalContext: thinkingContext))
+                            let tokens = full.text.tokens.asArray(Int.self)
+                            prerenderedInput = full
+                            prerenderedTokens = tokens
+                            let commonTokens = Self.commonTokenPrefix(tokens, cachedTokens)
+                            // 完全相等 = 没有新消息，放弃复用走重建（保持既有语义）。
+                            if commonTokens > 0, commonTokens < tokens.count {
+                                let stale = cachedTokens.count - commonTokens
+                                if stale > 0 { _ = existing.map { $0.trim(stale) } }
+                                let reuseLen = existing.first?.offset ?? 0
+                                // 裁剪结果与预期不符（窗口淘汰等）→ 弃用走重建。
+                                if reuseLen == commonTokens,
+                                   tokens.count <= contextWindow - 512 {
+                                    prepared = LMInput(tokens: full.text.tokens[reuseLen...])
+                                    totalPromptTokens = tokens.count
+                                    cachedPromptTokens = reuseLen
+                                    reuseCache = true
+                                    tokenReused = true
+                                    promptTokensForCache = tokens
+                                    // 轨迹与消息列表同步：回退消息级匹配时前缀
+                                    // 仍然成立，不会误判 unexpected-assistant。
+                                    transcriptAfter = messages
+                                    common = reuseLen
+                                    AgentLog.info("[mlx-kv] token-reuse cached=\(reuseLen) "
+                                        + "delta=\(tokens.count - reuseLen) "
+                                        + "stale=\(stale)")
+                                } else {
+                                    AgentLog.info("[mlx-kv] token-trim-rejected "
+                                        + "expect=\(commonTokens) offset=\(reuseLen)")
+                                }
+                            }
+                        } catch {
+                            // 渲染失败：回退消息级匹配/重建。
+                            prerenderedInput = nil
+                            prerenderedTokens = []
+                        }
+                    }
+
+                    // ---- 消息级匹配（不可裁剪缓存的形态①） ----
+                    // 判断能否在已有 raw KV cache 上继续追加。只追加 user/tool
+                    // 消息：assistant 已经由上一轮生成并存在于缓存里。
+                    if !tokenReused {
                     // 工具清单参与 template 的 system 前缀渲染；变化后不能复用旧缓存。
                     if !rebuild, let cachedToolsKey, cachedToolsKey != toolsKey {
                         rebuild = true
@@ -164,6 +237,14 @@ public final class MLXLLMService: LLMService, PreloadableLLMService,
                     }
                     if !rebuild {
                         common = Self.commonPrefixLength(messages, sessionTranscript)
+                        if common < min(messages.count, sessionTranscript.count) {
+                            // 前缀在轨迹中段分叉：本应走 delta 追加的调用被迫
+                            // 全量重建。输出分叉点两侧消息便于定位改写历史的调用方。
+                            let a = messages[common], b = sessionTranscript[common]
+                            AgentLog.warning("[mlx-kv] prefix-mismatch at \(common): "
+                                + "msg=\(a.role.rawValue)|\(String(a.content.prefix(120))) "
+                                + "vs cached=\(b.role.rawValue)|\(String(b.content.prefix(120)))")
+                        }
                         if common == 0 {
                             rebuild = true
                             rebuildReason = "no-common-prefix"
@@ -203,6 +284,7 @@ public final class MLXLLMService: LLMService, PreloadableLLMService,
                             }
                         }
                     }
+                    }
 
                     let model = await container.perform {
                         UncheckedSendableBox($0.model)
@@ -210,12 +292,7 @@ public final class MLXLLMService: LLMService, PreloadableLLMService,
                     let tokenizer = await container.tokenizer
                     let modelConfiguration = await container.configuration
 
-                    var prepared: LMInput?
-                    var totalPromptTokens = 0
-                    var cachedPromptTokens = 0
-                    var reuseCache = false
-                    var prefixReuse = false
-                    if !rebuild, hasDelta {
+                    if !rebuild, hasDelta, !tokenReused {
                         do {
                             let deltaInput = try await container.prepare(input: UserInput(
                                 chat: deltaMlx,
@@ -234,16 +311,24 @@ public final class MLXLLMService: LLMService, PreloadableLLMService,
                         }
                     }
                     if prepared == nil || !reuseCache {
-                        AgentLog.info("[mlx-kv] rebuild reason=\(rebuildReason) "
-                            + "messages=\(messages.count) common=\(common) "
-                            + "cached=\(cachedTokenCount) transcript=\(sessionTranscript.count)")
-                        let fullInput = try await container.prepare(input: UserInput(
-                            chat: mlxMessages,
-                            tools: toolSpecs,
-                            additionalContext: thinkingContext))
+                        // token 级匹配已渲染过完整输入时直接复用，避免二次渲染。
+                        let fullInput: LMInput
+                        let fullTokens: [Int]
+                        if let pre = prerenderedInput, !prerenderedTokens.isEmpty,
+                           pre.text.tokens.size == prerenderedTokens.count {
+                            fullInput = pre
+                            fullTokens = prerenderedTokens
+                        } else {
+                            let rendered = try await container.prepare(input: UserInput(
+                                chat: mlxMessages,
+                                tools: toolSpecs,
+                                additionalContext: thinkingContext))
+                            fullInput = rendered
+                            fullTokens = rendered.text.tokens.asArray(Int.self)
+                        }
                         transcriptAfter = messages
-                        let fullTokens = fullInput.text.tokens.asArray(Int.self)
                         totalPromptTokens = fullTokens.count
+                        promptTokensForCache = fullTokens
                         // 硬性上下文保护：宁可本轮明确报错，也不让 KV 无限增长。
                         guard fullTokens.count <= contextWindow - 512 else {
                             throw AgentError.llm(
@@ -265,6 +350,11 @@ public final class MLXLLMService: LLMService, PreloadableLLMService,
                                 + "delta=\(fullTokens.count - warmupTokens.count)")
                         } else {
                             prepared = fullInput
+                            // 真正的全量重建才报 rebuild；warmup 快照命中时只
+                            // 预填动态历史，不算重建。
+                            AgentLog.info("[mlx-kv] rebuild reason=\(rebuildReason) "
+                                + "messages=\(messages.count) common=\(common) "
+                                + "cached=\(cachedTokenCount) transcript=\(sessionTranscript.count)")
                         }
                     }
                     guard let input = prepared else {
@@ -289,7 +379,9 @@ public final class MLXLLMService: LLMService, PreloadableLLMService,
                         cache = existing
                         state = rawState
                     } else {
-                        cache = try model.newCache(parameters: parameters)
+                        cache = Self.stabilizeQuantizedCache(
+                            try model.newCache(parameters: parameters),
+                            kvInt8: kvInt8)
                         state = nil
                     }
 
@@ -417,6 +509,14 @@ public final class MLXLLMService: LLMService, PreloadableLLMService,
                         rawCache = cache
                         rawState = wrapped.state
                         cachedTokenCount = totalPromptTokens + wrapped.tokenCount
+                        // token 级前缀匹配需要「prompt + 生成」的完整 token 序列；
+                        // 拿不到完整序列（消息级 delta 路径）时置空，下一轮回退
+                        // 消息级匹配。
+                        if let promptTokens = promptTokensForCache {
+                            cachedTokens = promptTokens + wrapped.generatedTokens
+                        } else {
+                            cachedTokens = []
+                        }
                         sessionTranscript = transcriptAfter
                         pendingGeneratedAssistant = true
                         cachedToolsKey = toolsKey
@@ -436,6 +536,7 @@ public final class MLXLLMService: LLMService, PreloadableLLMService,
                     rawCache = nil
                     rawState = nil
                     cachedTokenCount = 0
+                    cachedTokens = []
                     sessionTranscript = []
                     pendingGeneratedAssistant = false
                     cachedToolsKey = nil
@@ -492,16 +593,7 @@ public final class MLXLLMService: LLMService, PreloadableLLMService,
         guard let bridge = tokenizer as? MLXTokenizerBridge else { return }
 
         let toolSpecs = Self.makeToolSpecs(tools)
-        let rawMessages = DefaultMessageGenerator().generate(
-            messages: [.system(systemPrompt)])
         let context: [String: any Sendable] = ["enable_thinking": enableThinking]
-        let tokens = try bridge.applyChatTemplate(
-            messages: rawMessages, tools: toolSpecs,
-            additionalContext: context, addGenerationPrompt: false)
-        guard tokens.count >= 32, tokens.count <= contextWindow - 1024 else {
-            AgentLog.warning("[mlx-warmup] 跳过：前缀 token 数 \(tokens.count) 不适合预热")
-            return
-        }
 
         let model = await container.perform {
             UncheckedSendableBox($0.model)
@@ -512,33 +604,91 @@ public final class MLXLLMService: LLMService, PreloadableLLMService,
             promptBatchSize: promptBatchSize,
             kvInt8: kvInt8)
         try Task.checkCancellation()
-        let cache = try model.newCache(parameters: parameters)
+        let cache = Self.stabilizeQuantizedCache(
+            try model.newCache(parameters: parameters),
+            kvInt8: kvInt8)
+
+        // system-only 渲染被模板拒绝（Qwen3.5 等要求消息里有 user）时，
+        // 改用两条不同占位 user 渲染并差分求出 system 段 token 边界；预填
+        // 含占位的序列后裁掉占位段，缓存与快照只保留 system 段 —— 与正式
+        // 请求的前缀逐 token 一致。差分要求缓存可裁剪，否则放弃预热。
+        var tokens: [Int]
+        var keepCount: Int
+        do {
+            let rawMessages = DefaultMessageGenerator().generate(
+                messages: [.system(systemPrompt)])
+            let rendered = try bridge.applyChatTemplate(
+                messages: rawMessages, tools: toolSpecs,
+                additionalContext: context, addGenerationPrompt: false)
+            tokens = rendered
+            keepCount = rendered.count
+        } catch {
+            guard cache.allSatisfy({ $0.isTrimmable }) else {
+                AgentLog.info("[mlx-warmup] 跳过：模板要求 user 消息且缓存不可裁剪")
+                return
+            }
+            func render(_ dummy: String) throws -> [Int] {
+                try bridge.applyChatTemplate(
+                    messages: DefaultMessageGenerator().generate(messages: [
+                        .system(systemPrompt), .user(dummy),
+                    ]),
+                    tools: toolSpecs, additionalContext: context,
+                    addGenerationPrompt: false)
+            }
+            let renderedA = try render("AA")
+            let renderedB = try render("BBBB BBBB BBBB")
+            tokens = renderedA
+            keepCount = Self.commonTokenPrefix(renderedA, renderedB)
+            if keepCount < renderedA.count {
+                AgentLog.info("[mlx-warmup] 模板需要 user 消息：占位差分 system 段 "
+                    + "\(keepCount)/\(renderedA.count) tokens")
+            }
+        }
+        guard keepCount >= 32, keepCount <= contextWindow - 1024 else {
+            AgentLog.warning("[mlx-warmup] 跳过：前缀 token 数 \(keepCount) 不适合预热")
+            return
+        }
+
         let iterator = try TokenIterator(
             input: LMInput(tokens: MLXArray(tokens)),
             model: model, cache: cache, state: nil, parameters: parameters)
         let wrapped = StatefulTokenIterator(iterator: iterator)
         try Task.checkCancellation()
 
+        // 裁掉占位 user 段：后续 KV 与快照都只保留与正式请求对齐的 system 段。
+        // 占位路径仅用于可裁剪缓存（上面已校验）；system-only 路径 drop=0。
+        let drop = tokens.count - keepCount
+        if drop > 0 {
+            let trimmed = cache.map { $0.trim(drop) }
+            guard trimmed.allSatisfy({ $0 == drop }) else {
+                AgentLog.info("[mlx-warmup] 占位段裁剪失败（期望 \(drop)，实际 "
+                    + "\(trimmed)），放弃预热")
+                return
+            }
+        }
+
         let toolsKey = Self.toolsKey(tools)
         // 保留一份未推进的前缀快照；历史折叠/滑窗需要重建时从它复制，
         // 只 prefill 动态历史，避免再次计算整段 system + tools。
         // 快照本身是常驻 KV：前缀过大时不再复制，避免内存直接翻倍。
-        if tokens.count <= 8_192 {
+        if keepCount <= 8_192 {
             warmupCacheSnapshot = cache.map { $0.copy() }
             warmupStateSnapshot = wrapped.state
-            warmupTokens = tokens
+            warmupTokens = Array(tokens.prefix(keepCount))
             warmupToolsKey = toolsKey
         } else {
-            AgentLog.info("[mlx-warmup] 前缀 \(tokens.count) tokens 超过快照上限，跳过副本")
+            AgentLog.info("[mlx-warmup] 前缀 \(keepCount) tokens 超过快照上限，跳过副本")
         }
 
         rawCache = cache
-        rawState = wrapped.state
-        cachedTokenCount = tokens.count
+        rawState = drop > 0 ? nil : wrapped.state
+        cachedTokenCount = keepCount
+        cachedTokens = Array(tokens.prefix(keepCount))
         sessionTranscript = [ChatMessage(role: .system, content: systemPrompt)]
         pendingGeneratedAssistant = false
         cachedToolsKey = toolsKey
-        AgentLog.info("[mlx-warmup] prefill tokens=\(tokens.count) tools=\(tools.count)")
+        AgentLog.info("[mlx-warmup] prefill tokens=\(tokens.count) kept=\(keepCount) "
+            + "tools=\(tools.count)")
     }
 
     /// 释放本地权重；实际释放发生在所有引用消失后，同时清空 MLX 缓存。
@@ -566,6 +716,7 @@ public final class MLXLLMService: LLMService, PreloadableLLMService,
         rawCache = nil
         rawState = nil
         cachedTokenCount = 0
+        cachedTokens = []
         sessionTranscript = []
         pendingGeneratedAssistant = false
         cachedToolsKey = nil
@@ -839,10 +990,40 @@ public final class MLXLLMService: LLMService, PreloadableLLMService,
         )
     }
 
+    /// 把标准 KV 缓存预转换成量化缓存（与 kvBits=8 / groupSize=64 配置一致）。
+    ///
+    /// 库的动态压缩设计是「prefill 用 fp16 存储、首个 decode 步压缩」，压缩
+    /// 会**替换缓存数组元素**——外部持有的引用从此过时，生成 token 的 KV 全部
+    /// 写进新对象，跨轮 KV 复用（token 级前缀匹配依赖 offset 与 trim）失效。
+    /// 预转换后压缩 plan 无对象可换（leaf 非 simple → no-op），引用全程有效。
+    /// MambaCache 等非 simple 缓存不受影响，原样保留。
+    private static func stabilizeQuantizedCache(
+        _ cache: [KVCache], kvInt8: Bool
+    ) -> [KVCache] {
+        guard kvInt8 else { return cache }
+        return cache.map { entry in
+            if let simple = entry as? KVCacheSimple {
+                return (try? simple.toQuantized(groupSize: 64, bits: 8)) ?? entry
+            }
+            return entry
+        }
+    }
+
     private static func commonPrefixLength(_ lhs: [ChatMessage],
                                            _ rhs: [ChatMessage]) -> Int {
         var index = 0
         while index < lhs.count, index < rhs.count, lhs[index] == rhs[index] {
+            index += 1
+        }
+        return index
+    }
+
+    /// 两个 token 序列的严格公共前缀长度（token 级前缀匹配用）。
+    /// internal：单元测试直接验证匹配语义。
+    static func commonTokenPrefix(_ lhs: [Int], _ rhs: [Int]) -> Int {
+        var index = 0
+        let limit = min(lhs.count, rhs.count)
+        while index < limit, lhs[index] == rhs[index] {
             index += 1
         }
         return index
@@ -950,8 +1131,11 @@ private final class InnerTaskBox: @unchecked Sendable {
 }
 
 /// `generateTask` 会消费 TokenIterator；用引用类型包一层，生成结束后仍能读到最终 state。
+/// 同时记录每个生成 token 的 id：跨轮 token 级前缀匹配需要「prompt + 生成」
+/// 的完整 token 序列才能与下一轮的模板渲染结果对齐。
 private final class StatefulTokenIterator: TokenIteratorProtocol {
     private var iterator: TokenIterator
+    private(set) var generatedTokens: [Int] = []
 
     init(iterator: TokenIterator) {
         self.iterator = iterator
@@ -964,9 +1148,18 @@ private final class StatefulTokenIterator: TokenIteratorProtocol {
 
     func makeIterator() -> StatefulTokenIterator { self }
 
-    func next() -> Int? { iterator.next() }
+    func next() -> Int? {
+        guard let token = iterator.next() else { return nil }
+        generatedTokens.append(token)
+        return token
+    }
 
-    func discardGeneratedToken() { iterator.discardGeneratedToken() }
+    func discardGeneratedToken() {
+        // 不移除 generatedTokens：stop token 在返回它的 next() 里已被 feed
+        // 进缓存（step 先于返回执行），下一轮渲染的 assistant 段同样含终止
+        // 符 —— 记录必须与缓存实际内容逐 token 一致。
+        iterator.discardGeneratedToken()
+    }
 }
 
 // MARK: - 流式标签切分

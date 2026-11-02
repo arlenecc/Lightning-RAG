@@ -58,7 +58,8 @@ public enum LocalModelError: LocalizedError, Sendable {
 ///
 /// 解析优先级：
 /// 1. 配置中显式填写的路径（绝对路径、`~` 或 `./` 开头）——不存在时直接报错；
-/// 2. `models/<name>` 固定解析到应用所在目录的 `models`，不回退到其他目录；
+/// 2. `models/<name>` 锚定应用所在目录的 `models`，随后回退到配置目录
+///    `~/.base-agent/models`（应用目录不可写时模型下载的落点）；
 /// 3. 应用目录 `models/<name>`、`<workspace>/models/<name>`、`~/base-agent/models/<name>`；
 /// 4. HuggingFace / FastEmbed 缓存目录（含 `models--org--name/snapshots/<rev>` 布局）。
 public enum LocalModelRegistry {
@@ -147,6 +148,52 @@ public enum LocalModelRegistry {
         return nil
     }
 
+    /// 配置文件目录（`~/.base-agent`）下的 `models` 子目录。
+    ///
+    /// App 安装到 `/Applications` 等位置时应用 models 目录（bundle 内）不可写，
+    /// 模型下载补全落到这里；加载侧在应用 models 目录之后回退查找，
+    /// 保证下载完成后的模型一定能被加载。
+    public static func configModelsDirectory() -> URL {
+        URL(fileURLWithPath: expandPath("~/.base-agent/models"), isDirectory: true)
+    }
+
+    /// 下载补全时模型应放置的目录：与 `resolveDirectory` 的加载锚点保持一致，
+    /// 保证下载完成后加载路径一定能找到它。
+    ///
+    /// - 显式路径（绝对 / `~` / `./`）：原样展开；
+    /// - `models/<name>`：应用 models 目录**可写**时放那里（App bundle /
+    ///   可执行文件旁，`BASE_AGENT_MODELS_DIR` 优先）；应用目录不存在或
+    ///   不可写（如安装到 `/Applications`）时放配置目录 `~/.base-agent/models`
+    ///   ——加载侧在同位置回退查找；
+    /// - 裸名：`<workspace>/models/<name>`（与裸名的候选搜索一致）。
+    public static func downloadDirectory(
+        kind: LocalModelKind,
+        value: String,
+        config: AgentConfig
+    ) -> URL {
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        let name = (trimmed as NSString).lastPathComponent
+        if isExplicitPath(trimmed) {
+            var url = URL(fileURLWithPath: expandPath(trimmed))
+            if url.pathExtension.lowercased() == "gguf" {
+                url = url.deletingLastPathComponent()
+            }
+            return url
+        }
+        if trimmed.hasPrefix("models/") {
+            let fm = FileManager.default
+            if let appModels = applicationModelsDirectory(),
+               fm.isWritableFile(atPath: appModels.path) {
+                return appModels.appendingPathComponent(name, isDirectory: true)
+            }
+            // 应用目录缺失或不可写（如装到 /Applications）：
+            // 落到配置文件目录的 models 子目录。
+            return configModelsDirectory().appendingPathComponent(name, isDirectory: true)
+        }
+        return URL(fileURLWithPath: config.modelsDirectory, isDirectory: true)
+            .appendingPathComponent(name, isDirectory: true)
+    }
+
     /// 解析模型目录。
     /// - Parameters:
     ///   - kind: 模型类别，仅用于错误提示与默认值。
@@ -184,11 +231,13 @@ public enum LocalModelRegistry {
             return try normalizedModelDirectory(url)
         }
 
-        // 2) `models/...` 一律锚定到应用所在目录的 models 目录，不回退到
-        //    workspace / 用户目录，避免实际加载到别处的同名模型。
+        // 2) `models/...` 锚定到应用所在目录的 models 目录（App bundle /
+        //    可执行文件旁 / BASE_AGENT_MODELS_DIR），不回退到 workspace；
+        //    随后回退到配置目录的 models（应用目录不可写时模型下载的落点），
+        //    保证下载补全的模型一定能被加载。
         if effective.hasPrefix("models/") {
-            let appModels = applicationModelsDirectory()
-            let roots = appModels.map { [$0] } ?? []
+            var roots = applicationModelsDirectory().map { [$0] } ?? []
+            roots.append(configModelsDirectory())
             var searched: [String] = []
             for candidate in candidateDirectories(
                 kind: kind, value: effective, config: config,
@@ -199,10 +248,12 @@ public enum LocalModelRegistry {
                     return resolved
                 }
             }
-            let rootPath = appModels?.path ?? "<应用目录>/models"
+            let rootPath = applicationModelsDirectory()?.path
+                ?? LocalModelRegistry.configModelsDirectory().path
             throw LocalModelError.notFound(
                 kind, value: effective, searched: searched,
-                hint: "请将模型放到应用所在目录的 models 目录：\(rootPath)/<name>。")
+                hint: "请将模型放到应用所在目录的 models 目录，或配置目录的 "
+                    + "models 子目录（\(LocalModelRegistry.configModelsDirectory().path)）：\(rootPath)/<name>。")
         }
 
         // 3) 相对路径 / 直接写目录名且当前工作目录下存在。

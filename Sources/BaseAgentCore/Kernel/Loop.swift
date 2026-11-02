@@ -412,7 +412,13 @@ public final class KernelLoop {
                     && planFinishNudge < finishNudgePlanMax
                     && !resume {
                     planFinishNudge += 1
-                    session.rollbackTurn()
+                    // 提交（而不是回滚）本轮：本地 LLM 的 KV cache 已包含这轮
+                    // 生成内容，回滚会让 Session 历史与 cache 前缀错位，下一轮
+                    // 只能全量 prefill（每轮卡顿的根因之一）。提交后提示作为
+                    // 新一轮 pending，模型仍能在历史里看到自己被拒的回复。
+                    session.finishTurn(rec, assistantText: resp.content,
+                                       summary: l2Summary(resp.content),
+                                       rawContent: resp.rawContent)
                     pending = planFinishHint
                     log("[kernel] 反思门：多步任务未写计划也未动手，强制要求先 create 并开工")
                     continue
@@ -430,7 +436,10 @@ public final class KernelLoop {
                     finishNudge += 1
                     let todo = openSteps.prefix(5)
                         .map { "\($0.id).\($0.title)" }.joined(separator: "; ")
-                    session.rollbackTurn()
+                    // 同上：提交本轮保持 KV cache 与 Session 历史前缀一致。
+                    session.finishTurn(rec, assistantText: resp.content,
+                                       summary: l2Summary(resp.content),
+                                       rawContent: resp.rawContent)
                     if failedTotal > 0, let failure = lastFail {
                         // 失败感知的提醒：把最近一次失败摆到模型眼前，并要求
                         //「依据失败信息自动解决」而不是停下来等用户发话。
@@ -466,7 +475,12 @@ public final class KernelLoop {
 
                 let event = noToolEvent(resp)
                 if event == "retry" {
-                    session.rollbackTurn()
+                    // 提交本轮（可能为空回复）：回滚会让下一轮消息前缀与
+                    // KV cache 错位（unexpected-assistant 全量重建）。空回复
+                    // 提交后 turnMessages 只含 user 消息，与 cache 追加对齐。
+                    session.finishTurn(rec, assistantText: resp.content,
+                                       summary: l2Summary(resp.content),
+                                       rawContent: resp.rawContent)
                     pending = resp.truncated
                         ? "[ERROR] 上一轮的工具调用被截断：参数还没输出完生成就结束了，工具没有执行。请重新生成，并把较大的写入内容拆成多次较小的工具调用，不要把长文件塞进一次调用。"
                         : "[ERROR] 上一轮回复为空或流被截断，请重新生成；如需操作必须显式调用工具。"
@@ -475,7 +489,10 @@ public final class KernelLoop {
                 if event == "reask" {
                     reaskGuard += 1
                     if reaskGuard <= 1 {
-                        session.rollbackTurn()
+                        // 同反思门：提交本轮，保持 KV 前缀与历史一致。
+                        session.finishTurn(rec, assistantText: resp.content,
+                                           summary: l2Summary(resp.content),
+                                           rawContent: resp.rawContent)
                         pending = """
                         [System] 检测到你上轮主要内容是大段代码却未调用工具。若这些代码需要执行/写入/分析，请显式调用 code_run / file_write / file_patch；若只是展示给用户的示例，请在回复中补充自然语言说明。
                         """
@@ -512,7 +529,11 @@ public final class KernelLoop {
                     && userInput.count <= 60
                     && !isMultistep(userInput)
                 if !simple {
-                    session.rollbackTurn()
+                    // 提交本轮（只收 assistant 正文，未执行的工具调用不进
+                    // 历史也不伪造结果）：回滚会造成 KV 前缀错位 → 全量重建。
+                    session.finishTurn(rec, assistantText: resp.content,
+                                       summary: l2Summary(resp.content),
+                                       rawContent: resp.rawContent)
                     pending = """
                     [System] 你准备执行实际工具，但还没有执行计划（Session 中 plan 为空）。请先用 update_plan(op='create', goal='一句话目标', steps=[...]) 把目标与 2~7 个可验证步骤规划好；创建后工具结果会指示『立即开始第一步』，不要停下来问用户是否开始。计划每轮回注，是后续多步任务跟踪的依据，必须先于执行写入。
                     """

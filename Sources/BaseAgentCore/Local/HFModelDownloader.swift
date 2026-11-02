@@ -103,12 +103,6 @@ public final class HFModelDownloader: @unchecked Sendable {
         }
     }
 
-    /// 权重文件扩展名：目录里存在任意一个即视为模型就绪。
-    public static func isWeightFile(_ name: String) -> Bool {
-        let ext = (name as NSString).pathExtension.lowercased()
-        return ext == "safetensors" || ext == "onnx" || ext == "gguf"
-    }
-
     // MARK: 单文件下载（断点续传）
 
     /// 下载仓库内的一个文件到 `directory/<path>`。
@@ -341,10 +335,21 @@ public enum RequiredModelCatalog {
     public static func models(for config: AgentConfig) -> [RequiredModel] {
         var seen = Set<String>()
         var out: [RequiredModel] = []
-        func add(kind: String, value: String) {
+        func add(kind: String, registryKind: LocalModelKind, value: String) {
             let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !trimmed.isEmpty else { return }
-            let dir = directory(for: trimmed, config: config)
+            // 与实际加载完全同源的目录解析：registry 能定位到（应用目录 /
+            // App bundle / workspace / 用户目录 / HF 缓存）就用它判定就绪，
+            // 避免「加载器找得到、判定却说缺失」的误报；全部缺失时下载
+            // 目标指向 registry 的加载锚点，保证下载完成后一定能被加载。
+            let dir: URL
+            if let resolved = try? LocalModelRegistry.resolveDirectory(
+                kind: registryKind, value: trimmed, config: config) {
+                dir = resolved
+            } else {
+                dir = LocalModelRegistry.downloadDirectory(
+                    kind: registryKind, value: trimmed, config: config)
+            }
             guard seen.insert(dir.standardizedFileURL.path).inserted else { return }
             let repoName: String
             if trimmed.hasSuffix(".gguf") {
@@ -360,23 +365,25 @@ public enum RequiredModelCatalog {
         }
 
         if config.llmProvider == "local" {
-            add(kind: "主模型", value: config.localLLMModel)
+            add(kind: "主模型", registryKind: .llm, value: config.localLLMModel)
         }
         if config.auxEnabled, config.auxLLMProvider == "local" {
-            add(kind: "辅助模型", value: config.auxLocalLLMModel)
+            add(kind: "辅助模型", registryKind: .aux, value: config.auxLocalLLMModel)
         }
         if config.embeddingProvider == "local" {
-            add(kind: "Embedding", value: embeddingValue(config))
+            add(kind: "Embedding", registryKind: .embedding,
+                value: embeddingValue(config))
         }
         if config.rerankerProvider == "local" {
-            add(kind: "Reranker", value: rerankerValue(config))
+            add(kind: "Reranker", registryKind: .reranker,
+                value: rerankerValue(config))
         }
         if config.ragOCREngine == "mlx-vlm" {
             let value = !config.ragOCRModelPath.isEmpty
                 ? config.ragOCRModelPath
                 : (!config.localVLMModel.isEmpty
                     ? config.localVLMModel : config.ragOCRModelName)
-            add(kind: "OCR", value: value)
+            add(kind: "OCR", registryKind: .vlm, value: value)
         }
         return out
     }
@@ -386,33 +393,37 @@ public enum RequiredModelCatalog {
         models(for: config).filter { !isComplete($0.directory) }
     }
 
-    /// 模型目录是否就绪：存在至少一个权重文件（safetensors / onnx / gguf）。
+    /// 模型目录是否就绪：存在至少一个可加载的权重文件。
+    ///
+    /// 必须覆盖用户自配模型的全部形态，否则会被永远判定缺失：
+    /// - registry 对显式选定的 `.onnx` / `.safetensors` / `.gguf` 文件
+    ///   直接返回**文件 URL** 而非目录；
+    /// - ONNX 权重可能位于 `onnx/` 子目录（registry 的候选搜索范围）；
+    /// - 分片权重为 `model-00001-of-0000N.safetensors`（按扩展名命中）。
     public static func isComplete(_ directory: URL) -> Bool {
-        let items = (try? FileManager.default.contentsOfDirectory(
-            atPath: directory.path)) ?? []
-        return items.contains { HFModelDownloader.isWeightFile($0) }
+        let fm = FileManager.default
+        var isDirectory: ObjCBool = false
+        guard fm.fileExists(atPath: directory.path, isDirectory: &isDirectory) else {
+            return false
+        }
+        // 用户显式指定的单个权重文件。
+        if !isDirectory.boolValue {
+            return isWeightPath(directory.path)
+        }
+        // 目录：顶层与 onnx/ 子目录（与 registry 的 ONNX 候选范围一致）。
+        let scopes = [directory, directory.appendingPathComponent("onnx", isDirectory: true)]
+        for scope in scopes {
+            let items = (try? fm.contentsOfDirectory(atPath: scope.path)) ?? []
+            if items.contains(where: { isWeightPath($0) }) {
+                return true
+            }
+        }
+        return false
     }
 
-    /// 配置值 → 本地目录。相对路径（"models/xxx" 或裸名）解析到
-    /// workspace/models 下；GGUF 单文件取其所在目录。
-    static func directory(for value: String, config: AgentConfig) -> URL {
-        if value.hasSuffix(".gguf") {
-            let dirPath = (value as NSString).deletingLastPathComponent
-            if dirPath.hasPrefix("/") {
-                return URL(fileURLWithPath: dirPath)
-            }
-            if dirPath.isEmpty {
-                return URL(fileURLWithPath: config.modelsDirectory)
-            }
-            return URL(fileURLWithPath: config.workspace)
-                .appendingPathComponent(dirPath)
-        }
-        if value.hasPrefix("/") {
-            return URL(fileURLWithPath: value)
-        }
-        let name = (value as NSString).lastPathComponent
-        return URL(fileURLWithPath: config.modelsDirectory)
-            .appendingPathComponent(name)
+    private static func isWeightPath(_ path: String) -> Bool {
+        let ext = (path as NSString).pathExtension.lowercased()
+        return ext == "safetensors" || ext == "onnx" || ext == "gguf" || ext == "npz"
     }
 
     static func embeddingValue(_ config: AgentConfig) -> String {
