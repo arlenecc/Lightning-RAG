@@ -14,8 +14,8 @@ macOS 原生自主 Agent。控制流是**三态自动机 + 五级上下文压缩
   - LLM：MLX-LM / MLX-VLM 模型目录、GGUF 文件、ONNX 解码器目录（`input_ids` + `logits`，可选 `past_key_values`）
   - OCR VLM：MLX 模型目录、GGUF + mmproj；ONNX VLM 暂无通用图适配
   - Embedding / Reranker：ONNX 模型目录（含 `tokenizer.json`）、MLX 模型目录或 GGUF 文件
-  - 默认 Embedding 为随 app 打包的 `jina-embeddings-v5-text-nano-mlx-int4`（EuroBERT-210M，int4），未配置时开箱可用；`jina-embeddings-v5-text-nano-onnx-int8` 为可选后端
-  - 默认 Reranker 为随 app 打包的 `jina-reranker-v2-base-multilingual-onnx`（XLM-R base，ONNX int8，`model_quantized.onnx` 约 267MB），配置留空时开箱可用；RAG 全链路（切片 / 向量 / 召回 / 重排）无需配置任何本地模型，只需配置主模型与辅助模型
+  - 默认 Embedding 为 lite 版内置（clean 版首次启动自动下载）的 `jina-embeddings-v5-text-nano-mlx-int4`（EuroBERT-210M，int4），未配置时开箱可用；`jina-embeddings-v5-text-nano-onnx-int8` 为可选后端
+  - 默认 Reranker 为 lite 版内置（clean 版首次启动自动下载）的 `jina-reranker-v2-base-multilingual-onnx`（XLM-R base，ONNX int8，`model_quantized.onnx` 约 267MB），配置留空时开箱可用；RAG 全链路（切片 / 向量 / 召回 / 重排）无需配置任何本地模型，只需配置主模型与辅助模型
   - 默认主模型 `models/qwen3.5-4b-agentic-coder-v4-4bit-mlx`；辅助模型默认 `models/Qwen3.5-2B-MLX-4bit`，但默认**不启用**，需要在配置窗口显式勾选「启用」
 - 运行时已随包内置：
   - GGUF：llama.cpp 官方 XCFramework，进程内直接加载模型，不再启动 `llama-server`
@@ -41,23 +41,23 @@ swift test --disable-sandbox
 ```bash
 swift build -c release --disable-sandbox
 
-# 三种版本（VARIANT 默认 lite）
-VARIANT=clean      scripts/package-app.sh release && VARIANT=clean      scripts/package-dmg.sh
-VARIANT=lite       scripts/package-app.sh release && VARIANT=lite       scripts/package-dmg.sh
-VARIANT=all-in-one scripts/package-app.sh release && VARIANT=all-in-one scripts/package-dmg.sh
+# 两种版本（VARIANT 默认 clean）
+VARIANT=clean scripts/package-app.sh release && VARIANT=clean scripts/package-dmg.sh
+VARIANT=lite  scripts/package-app.sh release && VARIANT=lite  scripts/package-dmg.sh
 ```
 
 | VARIANT | 内置模型 | DMG |
 |---|---|---|
-| `clean` | potion-multilingual-128M int4（语义切片） | `dist/Lightning-RAG-1.2.7-clean.dmg` |
-| `lite` | clean + jina embedding + jina reranker | `dist/Lightning-RAG-1.2.7-lite.dmg` |
-| `all-in-one` | lite + 主模型 + 辅助模型 + OvisOCR3 | `dist/Lightning-RAG-1.2.7-all-in-one.dmg` |
+| `clean`（默认） | 无；potion 语义切片 / jina embedding / jina reranker 均在首次启动时从 hf-mirror 自动下载 | `dist/Lightning-RAG-1.2.10-clean.dmg` |
+| `lite` | potion-multilingual-128M int4（语义切片）+ jina-embeddings-v5-text-nano-mlx-int4 + jina-reranker-v2-base-multilingual-onnx | `dist/Lightning-RAG-1.2.10-lite.dmg` |
 
-三种版本共用 `dist/Lightning-RAG.app`（应用本体与显示名不变，只有内置模型不同），
-因此需按「打包 App → 打包 DMG」的顺序逐个构建。clean / lite 不含主模型、辅助模型
-与 OCR，需要在配置中指定本地模型路径；all-in-one 的模型目录与 `ModelRegistry`
-默认名一致，开箱即用。版本号可通过 `VERSION` 环境变量或 `package-dmg.sh` 的参数
-覆盖；旧 `ALL_IN_ONE=1` 仍等价于 `VARIANT=all-in-one`。
+两个版本共用 `dist/Lightning-RAG.app`（应用本体与显示名不变，只有内置模型不同），
+因此需按「打包 App → 打包 DMG」的顺序逐个构建。两个版本都不含主模型、辅助模型
+与 OCR，需要在配置中指定本地模型路径。`clean` 把体积压到最小（DMG 约 37MB），
+适合网络良好的环境；`lite` 内置三个基础 RAG 模型（DMG 约 449MB），首次启动即可
+离线使用语义切片、Embedding 与重排。版本号可通过 `VERSION` 环境变量或
+`package-dmg.sh` 的参数覆盖；旧版的 `all-in-one`（主模型 / 辅助模型 / OCR 一并打包）
+已移除，相关模型改为在配置窗口指定或由启动下载流程补齐。
 
 测试覆盖（当前 660 个 XCTest；真实模型 E2E 在本地权重存在时随每次测试自动运行，缺少权重或需要外网/GGUF 等环境的用例会跳过）：sqlite-vec 事务写入/回滚、两段式 KNN、二值签名编码与 LSB-first 位打包、
     bin 表同 rowid 写入与覆盖率计数器、两阶段粗筛精排与 ANN 旁路、
@@ -79,7 +79,7 @@ HTML 与 Office 解析另有专项覆盖：HTML 保存页的本地 iframe / fram
   - 辅助模型：标题后带「启用」复选框（对应 `aux_enabled`，默认关闭）。本地模式同主模型布局（含独立的「KV复用」「KV量化」开关），默认 `models/Qwen3.5-2B-MLX-4bit`；未启用时「加载模型 / 重新加载」按钮禁用。
   - 启动时按 `auto_preload_main`（默认开启）预加载主模型；辅助模型仅在 `aux_enabled=true` 时加载。关闭主模型启动预加载后，需在配置窗口手动点「加载模型」；同步结束后的模型恢复不受影响。未指定模型时使用默认主模型 `models/qwen3.5-4b-agentic-coder-v4-4bit-mlx`。加载会真正把参数应用到新创建的模型实例。
   - Agent 区底部「运行参数」行：「最大迭代」（`max_iterations`，默认 15，1...50），修改后点该行「应用配置」保存。
-- **配置窗口（知识同步）**：工作目录与知识库目录行之后紧跟操作按钮行：应用配置 / 同步知识 / 停止同步 / 向量去重（排查并清理向量库内重复的切片，保留入库时间最早的一份）。Embedding 行 = 类型（FastEmbed / ONNX / MLX / GGUF）+ 本地路径 + 选择… +「语义切片」开关 /「切片大小」/「overlap」；Reranker 行 = 同布局 +「启用重排序」开关 /「TopN」/「候选池」/「阈值」。按钮行与两行配置都按可用宽度自动折行，切片 / 重排控件放不下时换到模型选择下方。「启用重排序」对应 `rag_rerank_enabled`（默认开启），「TopN」对应 `rag_rerank_top_n`（默认 3，1...20），「候选池」对应 `rag_rerank_candidate_multiplier`（默认 3，1...5：候选池 = `max(调用方 top_k, TopN) × 倍数`），「阈值」对应 `rag_rerank_threshold`（默认 0.45，0...1），表示 reranker 之后保留的结果数量、候选池放大倍数与分数过滤下限；`rag_rerank_timeout_seconds`（默认 5s，0 = 不限制）控制 rerank 墙钟超时，超时回退 RRF 并只返回前 3 条。Reranker 行之后依次是「二值粗筛」开关与候选数 Stepper、向量库与 ANN 索引合并行：向量元素类型（默认 int8；可选 int8 / fp32 / fp16 / bin）/ Matryoshka 模式与截断维（jina-v5 六档 32 / 64 / 128 / 256 / 512 / 768，其它模型保留 128 / 256 / 512） /「ANN 检索」与「自动构建」开关 / ANN 索引摘要与「构建 ANN 索引 / 停止构建 / 删除索引」（放不下时整组折行），「重建向量库」按钮固定在该组行末。「ANN 检索」对应 `rag_ann_enabled`，「自动构建」对应 `rag_ann_auto_build`。「二值粗筛」开关对应 `rag_binary_coarse_enabled`（默认开启），候选数对应 `rag_binary_coarse_candidates`（默认 200，50...1000，步进 50，关闭时禁用）。二值可用时全局检索由它取代 ANN，不可用或定向检索时自动回退原流程；主存储为 BIN 时该功能停用，旧库需重新同步后才会生效。高级区保留 PDF/EPUB OCR 引擎、OCR 模型（MLX / GGUF / ONNX）、mmproj、归一化/二值化，以及「RAG 参数设置」中的「查询超时」（`rag_query_timeout_seconds`，默认 5s，0 = 关闭）和「同步参数设置」中的「启动时自动同步」（`rag_auto_ingest`，默认关闭；开启后每次启动会自动增量扫描知识库，首次全量同步可能长时间占用 embedding 模型与磁盘 IO）、「同步并发」（`rag_ingest_concurrency`）、「OCR 并发」（`rag_vision_concurrency`）、「MLX 缓存」（`mlx_cache_limit_mb`）与「MLX 上限」（`mlx_memory_limit_mb`，0 = 自动）。向量库待重建时，红色提示显示在该合并行下方。
+- **配置窗口（知识同步）**：`工作目录` 单独一行；`源目录`（原「知识库目录」）行内紧跟四个操作按钮：应用配置 / 同步知识 / 停止同步 / 向量去重（排查并清理向量库内重复的切片，保留入库时间最早的一份），按钮与目录选择在同一行排列（窗口较窄时不拆分）。Embedding 行 = 类型（FastEmbed / ONNX / MLX / GGUF）+ 本地路径 + 选择… +「语义切片」开关 /「切片大小」/「overlap」；Reranker 行 = 同布局 +「启用重排序」开关 /「TopN」/「候选池」/「阈值」。「启用重排序」对应 `rag_rerank_enabled`（默认开启），「TopN」对应 `rag_rerank_top_n`（默认 3，1...20），「候选池」对应 `rag_rerank_candidate_multiplier`（默认 3，1...5：候选池 = `max(调用方 top_k, TopN) × 倍数`），「阈值」对应 `rag_rerank_threshold`（默认 0.45，0...1），表示 reranker 之后保留的结果数量、候选池放大倍数与分数过滤下限；`rag_rerank_timeout_seconds`（默认 5s，0 = 不限制）控制 rerank 墙钟超时，超时回退 RRF 并只返回前 3 条。Reranker 行之后依次是「二值粗筛」开关与候选数 Stepper、`ANN设置` 分组标签、向量库与 ANN 索引合并行：向量元素类型（默认 int8；可选 int8 / fp32 / fp16 / bin）/ Matryoshka 模式与截断维（jina-v5 六档 32 / 64 / 128 / 256 / 512 / 768，其它模型保留 128 / 256 / 512） /「ANN 检索」与「自动构建」开关 / ANN 索引摘要与「构建 ANN 索引 / 停止构建 / 删除索引」，「重建向量库」按钮固定在该组行末。「ANN 检索」对应 `rag_ann_enabled`，「自动构建」对应 `rag_ann_auto_build`。「二值粗筛」开关对应 `rag_binary_coarse_enabled`（默认开启），候选数对应 `rag_binary_coarse_candidates`（默认 200，50...1000，步进 50，关闭时禁用）。二值可用时全局检索由它取代 ANN，不可用或定向检索时自动回退原流程；主存储为 BIN 时该功能停用，旧库需重新同步后才会生效。高级区保留 PDF/EPUB OCR 引擎、OCR 模型（MLX / GGUF / ONNX）、mmproj、归一化/二值化，以及「RAG 参数设置」中的「查询超时」（`rag_query_timeout_seconds`，默认 5s，0 = 关闭）和「同步参数设置」中的「启动时自动同步」（`rag_auto_ingest`，默认关闭；开启后每次启动会自动增量扫描知识库，首次全量同步可能长时间占用 embedding 模型与磁盘 IO）、「同步并发」（`rag_ingest_concurrency`）、「OCR 并发」（`rag_vision_concurrency`）、「MLX 缓存」（`mlx_cache_limit_mb`）与「MLX 上限」（`mlx_memory_limit_mb`，0 = 自动）。向量库待重建时，红色提示显示在该合并行下方。
   - 高级区的「PDF OCR 设置」行末提供「转换工具」按钮，打开独立窗口，把单个文件或整个目录批量转换为 Markdown。复用知识同步的解析器（PDF / EPUB / HTML / TXT / 图片，Office 支持现代格式 `.docx` / `.xlsx` / `.pptx` 与旧版 `.doc` / `.xls` / `.ppt`），沿用打开窗口时面板上的 OCR / PDF / 归一化设置快照；不写回 `config.json`，也不重建 Agent。目录递归时保留相对子目录结构，输出目录位于输入目录内会自动跳过；同批同名（如 `a.txt` 与 `a.html`）依次生成 `a-2.md`、`a-3.md`；单个文件失败不会中断整批。进度区显示当前文件、当前环节（解析 / 图片归一化 / 图片识别 / 清洗与 Markdown 转换）与总体进度，关闭窗口会取消仍在进行的转换。转换按文件体积分批并发：达到 32MB 的文件单独成批串行，其余文件按同步并发（最多 6）并行；PDF 解析按体积收紧页级 worker / 在途页并分批产图，内嵌大图先按目标尺寸降采样，超过 200MP 回退有界栅格化。转换只到写出 Markdown，不做切片、embedding 与入库。
 - 确认弹窗默认按钮为「拒绝」；`ask_user` 的回答作为工具结果继续同一轮推理。
 - RAG 状态在后台线程查询，不在主线程建库/COUNT；状态只读取来源总数与前 256 个来源名，大知识库不会把全部路径读入内存。连续应用配置只生效最后一次，旧同步完成后只重载它自己的引擎，不会影响新 Agent。
