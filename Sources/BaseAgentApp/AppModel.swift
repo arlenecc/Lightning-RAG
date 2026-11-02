@@ -239,6 +239,7 @@ final class AppViewModel: ObservableObject {
             Task { @MainActor [weak self] in self?.appendLog(line) }
         }
         buildAgent()
+        checkDefaultModels()
         appendLog("base-agent 启动，workspace=\(config.workspace)")
         // 上次退出时未完成的计划不跨启动恢复：直接丢弃，避免开盘即自动续跑。
         if agent?.discardPersistedPlan() == true {
@@ -253,17 +254,192 @@ final class AppViewModel: ObservableObject {
         if !config.auxEnabled {
             appendLog("[model] 辅助模型未启用，启动时不加载")
         }
-        Task {
-            await preloadModels(main: shouldPreloadMain,
-                                aux: config.auxEnabled)
-        }
-        // Embedding / Reranker 与主模型是否预加载无关：检索首问同样需要它们。
-        Task {
-            await preloadRAGModels()
+        if missingDefaultModels.isEmpty {
+            Task {
+                await preloadModels(main: shouldPreloadMain,
+                                    aux: config.auxEnabled)
+            }
+            // Embedding / Reranker 与主模型是否预加载无关：检索首问同样需要它们。
+            Task {
+                await preloadRAGModels()
+            }
+        } else {
+            // 默认模型缺失：预加载必然失败，等下载补齐后由用户重新触发加载。
+            appendLog("[models] 默认模型缺失，已跳过预加载："
+                + missingDefaultModels.map(\.repo).joined(separator: ", "))
         }
         // 即使无需预加载模型（API 模式/未启用辅助模型），也要让闲时摘要
         // 在启动后按空闲计时自动开始。
         scheduleIdleUnload()
+    }
+
+    // MARK: 默认模型下载（hf-mirror）
+
+    /// 当前配置需要但本地尚未就绪的默认模型（arlenecc/<模型名>）。
+    @Published var missingDefaultModels: [RequiredModel] = []
+    @Published var isDownloadingModels = false
+    /// 0...1，按「已就绪字节 / 需下载总字节」聚合全部缺失模型。
+    @Published var modelDownloadProgress: Double = 0
+    @Published var modelDownloadStatusText = ""
+    private var modelDownloadTask: Task<Void, Never>?
+    private var downloadPromptShown = false
+    private let hfDownloader = HFModelDownloader()
+
+    /// 检查当前配置引用的本地模型是否就绪（目录含权重文件）。
+    func checkDefaultModels() {
+        missingDefaultModels = RequiredModelCatalog.missingModels(for: config)
+    }
+
+    /// 首启提醒：模型缺失时弹窗让用户选择「自动下载补全」或「自行下载指定」。
+    /// 选择自行下载指定后写入配置持久化，不再自动下载；未就绪前对话与同步
+    /// 仍不可用，直到用户在配置窗口指定好可用模型。
+    func promptModelDownloadIfNeeded() {
+        guard !missingDefaultModels.isEmpty, !isDownloadingModels,
+              config.autoDownloadMissingModels,
+              !downloadPromptShown else { return }
+        downloadPromptShown = true
+        let names = missingDefaultModels
+            .map { "\($0.kind)：\($0.repo)" }
+            .joined(separator: "\n")
+        let alert = NSAlert()
+        alert.messageText = "默认模型缺失，需要联网下载或自行指定"
+        alert.informativeText = "以下默认模型尚未就绪：\n\(names)\n\n"
+            + "· 自动下载补全：从 \(HFModelDownloader.defaultMirrorBase) 下载运行"
+            + "所需文件（支持断点续传，中断后可继续），完成后才能正常使用软件；\n"
+            + "· 自行下载指定：不再自动下载，由你自行获取模型并在配置窗口指定"
+            + "各阶段使用的模型，配置就绪后自动解除限制。"
+        alert.addButton(withTitle: "自动下载补全")
+        alert.addButton(withTitle: "自行下载指定")
+        alert.addButton(withTitle: "稍后再说")
+        NSApp.activate(ignoringOtherApps: true)
+        switch alert.runModal() {
+        case .alertFirstButtonReturn:
+            startModelDownload()
+        case .alertSecondButtonReturn:
+            config.autoDownloadMissingModels = false
+            do {
+                try config.save(Self.configPath)
+                appendLog("[models] 已选择自行下载指定模型（auto_download_missing_models=false），"
+                    + "跳过自动下载")
+            } catch {
+                appendLog("[models] 配置保存失败：\(error.localizedDescription)")
+            }
+        default:
+            // 稍后再说：本次启动不再提示，状态栏保留手动下载入口。
+            break
+        }
+    }
+
+    /// 开始补齐缺失的默认模型：REST API 列文件 → URLSession Range 续传。
+    func startModelDownload() {
+        guard !isDownloadingModels else { return }
+        checkDefaultModels()
+        guard !missingDefaultModels.isEmpty else { return }
+        isDownloadingModels = true
+        modelDownloadProgress = 0
+        modelDownloadStatusText = "正在获取模型文件列表…"
+        let missing = missingDefaultModels
+        modelDownloadTask = Task { [weak self] in
+            do {
+                try await self?.runModelDownload(missing: missing)
+            } catch is CancellationError {
+                await MainActor.run { [weak self] in
+                    guard let self else { return }
+                    self.isDownloadingModels = false
+                    self.statusText = "模型下载已停止"
+                    self.modelDownloadStatusText = "模型下载已停止（已下载部分保留，可续传）"
+                    self.appendLog("[models] 模型下载已停止")
+                }
+            } catch {
+                await MainActor.run { [weak self] in
+                    guard let self else { return }
+                    self.isDownloadingModels = false
+                    self.statusText = "模型下载失败"
+                    self.modelDownloadStatusText = "模型下载失败：\(error.localizedDescription)"
+                    self.appendLog("[models] 模型下载失败：\(error.localizedDescription)")
+                    self.showInfoAlert(title: "模型下载失败",
+                                       message: error.localizedDescription
+                                       + "\n\n已下载的部分会保留，可再次点击下载从断点继续。")
+                }
+            }
+        }
+    }
+
+    func cancelModelDownload() {
+        modelDownloadTask?.cancel()
+        hfDownloader.cancelCurrent()
+    }
+
+    @MainActor
+    private func runModelDownload(missing: [RequiredModel]) async throws {
+        // 先列全部缺失模型的文件清单，统计总字节，得到聚合进度基数。
+        var plan: [(model: RequiredModel, files: [HFModelDownloader.FileEntry])] = []
+        var totalBytes: Int64 = 0
+        for model in missing {
+            try Task.checkCancellation()
+            let files = try await hfDownloader.listNeededFiles(repo: model.repo)
+            let pending = files.filter { file in
+                HFModelDownloader.fileSize(at: model.directory
+                    .appendingPathComponent(file.path)) != file.size
+            }
+            plan.append((model, pending))
+            totalBytes += pending.reduce(0) { $0 + $1.size }
+        }
+        guard totalBytes > 0 else {
+            checkDefaultModels()
+            isDownloadingModels = false
+            statusText = "默认模型已就绪"
+            return
+        }
+
+        var completedBytes: Int64 = 0
+        for entry in plan {
+            for file in entry.files {
+                try Task.checkCancellation()
+                let base = completedBytes
+                let filePath = file.path
+                appendLog("[models] 下载 \(entry.model.repo)/\(filePath)")
+                try await hfDownloader.download(
+                    repo: entry.model.repo, file: file, into: entry.model.directory
+                ) { [weak self] received, total in
+                    Task { @MainActor [weak self] in
+                        guard let self else { return }
+                        let done = Double(base + received)
+                        self.modelDownloadProgress = min(1, done / Double(totalBytes))
+                        self.modelDownloadStatusText = String(
+                            format: "%@ · %@ %.0f%%",
+                            entry.model.repo, filePath,
+                            min(1, done / Double(totalBytes)) * 100)
+                    }
+                }
+                completedBytes += file.size
+                modelDownloadProgress = Double(completedBytes) / Double(totalBytes)
+            }
+            appendLog("[models] 已就绪：\(entry.model.repo)")
+        }
+
+        checkDefaultModels()
+        isDownloadingModels = false
+        statusText = "默认模型已就绪"
+        modelDownloadStatusText = ""
+        appendLog("[models] 默认模型下载完成")
+        showInfoAlert(title: "模型下载完成",
+                      message: "默认模型已就绪，软件可以正常使用了。")
+    }
+
+    /// 默认模型未就绪时的统一拦截提示（区分自动下载与自行指定两种模式）。
+    private func blockForMissingModels(_ operation: String) -> Bool {
+        guard !missingDefaultModels.isEmpty else { return false }
+        let models = missingDefaultModels.map(\.repo).joined(separator: "、")
+        let hint = config.autoDownloadMissingModels
+            ? "可点击状态栏「下载」从 hf-mirror.com 自动补全（支持断点续传），"
+                + "或在配置窗口指定已就绪的模型。"
+            : "你已选择自行下载指定模型：请自行获取后，在配置窗口为各阶段指定"
+                + "已就绪的模型并应用，配置就绪后自动解除限制。"
+        showInfoAlert(
+            title: "默认模型未就绪",
+            message: "\(operation)需要以下模型就绪：\(models)。\n\(hint)")
+        return true
     }
 
     // MARK: Agent 生命周期
@@ -340,6 +516,10 @@ final class AppViewModel: ObservableObject {
                 } catch {
                     self.appendLog("配置保存失败: \(error.localizedDescription)")
                 }
+                // 配置可能指向了用户自行准备好的模型：重检缺失清单并解除/
+                // 维持使用限制；仍缺且允许自动下载时允许再次弹出选择提示。
+                self.checkDefaultModels()
+                self.downloadPromptShown = false
                 // 取消旧知识库同步，避免旧 agent 的 ingest 在 close 时占着锁，
                 // 导致连接迟迟不释放（close 会在同步结束后补关）。
                 self.agent?.ragEngine.cancel()
@@ -469,6 +649,9 @@ final class AppViewModel: ObservableObject {
             } catch {
                 self.appendLog("配置保存失败: \(error.localizedDescription)")
             }
+            // 槽位切换同样可能指向用户自行准备好的模型：重检缺失清单。
+            self.checkDefaultModels()
+            self.downloadPromptShown = false
             // 温度等请求参数由 KernelLoop 读取 agent.config，必须同步。
             agent.config = newConfig
             self.pendingToolIndices.removeAll()
@@ -778,6 +961,7 @@ final class AppViewModel: ObservableObject {
         guard !text.isEmpty || !images.isEmpty,
               !isRunning, !isModelLoading, !isWarmingUp,
               !isSyncing, !isDeduplicating, !isBuildingANN, let agent else { return }
+        if blockForMissingModels("发送消息") { return }
         cancelIdleUnload()
         runGeneration += 1
         let generation = runGeneration
@@ -1722,6 +1906,7 @@ final class AppViewModel: ObservableObject {
         let restore = pendingSyncRestore
         pendingSyncRestore = nil
         guard let agent, !isSyncing, !isDeduplicating, !isBuildingANN else { return }
+        if blockForMissingModels("知识库同步") { return }
         cancelIdleUnload()
         if isRunning {
             appendLog("[rag] 对话进行中，跳过本次同步")

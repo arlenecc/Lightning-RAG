@@ -442,13 +442,15 @@ public final class LlamaCppLLMService: LLMService, PreloadableLLMService,
         let model = loaded.model
         let marker = String(cString: mtmd_default_marker())
 
-        // 在每条带图用户消息前插入与图像数量一致的占位符，并记录 bitmap。
+        // 在每条带图用户消息前插入与「成功解码的图像数」一致的占位符，并记录
+        // bitmap。解码失败的图像连同占位符一起跳过——mtmd_tokenize 要求
+        // 文本中的媒体标记数量与 bitmap 数组严格一致。
         var bitmaps: [OpaquePointer] = []
         defer { for bitmap in bitmaps { mtmd_bitmap_free(bitmap) } }
+        var decodeFailures = 0
         let injected = messages.map { message -> ChatMessage in
             guard let images = message.images, !images.isEmpty else { return message }
-            var copy = message
-            copy.content = String(repeating: marker + "\n", count: images.count) + message.content
+            var markers = ""
             for data in images {
                 let bitmap = data.withUnsafeBytes { buffer -> OpaquePointer? in
                     guard let base = buffer.bindMemory(to: UInt8.self).baseAddress else { return nil }
@@ -456,9 +458,20 @@ public final class LlamaCppLLMService: LLMService, PreloadableLLMService,
                     return mtmd_helper_bitmap_init_from_buf(
                         vision, base, buffer.count, false, opt).bitmap
                 }
-                if let bitmap { bitmaps.append(bitmap) }
+                if let bitmap {
+                    bitmaps.append(bitmap)
+                    markers += marker + "\n"
+                } else {
+                    decodeFailures += 1
+                }
             }
+            guard !markers.isEmpty else { return message }
+            var copy = message
+            copy.content = markers + message.content
             return copy
+        }
+        if decodeFailures > 0 {
+            AgentLog.warning("[gguf-vlm] \(decodeFailures) 张图像解码失败，已跳过")
         }
         guard !bitmaps.isEmpty else {
             throw LlamaCppError.decode("图像解码失败（mtmd 未生成 bitmap）")
@@ -501,10 +514,15 @@ public final class LlamaCppLLMService: LLMService, PreloadableLLMService,
         let allowedToolNames = Set(tools.compactMap {
             $0["function"]?["name"]?.stringValue
         })
+        // 与文本路径一致：thinking 模板的渲染结果以 <think> 结尾时，
+        // 生成内容从思考开始，避免推理内容漏进正文。
+        let startInThink = formatted
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .hasSuffix("<think>")
         let generationStart = Date()
         let (rawContent, generated) = try generateLoop(
             context: loaded.context, model: model, temperature: temperature,
-            startPast: nPast, budget: budget, startInThink: false,
+            startPast: nPast, budget: budget, startInThink: startInThink,
             allowedToolNames: allowedToolNames, continuation: continuation)
 
         let toolCalls = LocalToolCallParser.extract(
@@ -517,7 +535,8 @@ public final class LlamaCppLLMService: LLMService, PreloadableLLMService,
             "tokens_per_second": Int(Double(generated.count) / elapsed),
             "cached_prompt_tokens": 0,
         ]
-        AgentLog.info("[gguf-vlm] prefill=\(nPast) generated=\(generated.count)")
+        AgentLog.info("[gguf-vlm] prefill=\(nPast) images=\(bitmaps.count) "
+            + "think=\(startInThink) generated=\(generated.count)")
         continuation.yield(LLMStreamEvent(
             kind: .done, toolCalls: toolCalls, usage: usage, rawContent: rawContent))
     }

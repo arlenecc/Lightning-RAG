@@ -147,7 +147,8 @@ struct MainView: View {
                         .labelStyle(.titleAndIcon)
                 }
                 .disabled(model.isRunning || model.isModelLoading
-                    || model.isWarmingUp || model.isSyncing || model.isBuildingANN)
+                    || model.isWarmingUp || model.isSyncing || model.isBuildingANN
+                    || !model.missingDefaultModels.isEmpty)
                 .help("开始知识库同步（与配置窗口内「开始同步」一致）")
 
                 Button {
@@ -180,7 +181,9 @@ struct MainView: View {
         .onAppear {
             delegate.model = model
             model.refreshRAGStatus()
-            if model.config.ragAutoIngest {
+            // 首启提醒：默认模型缺失时弹窗引导联网下载（可稍后，状态栏保留入口）。
+            model.promptModelDownloadIfNeeded()
+            if model.config.ragAutoIngest, model.missingDefaultModels.isEmpty {
                 model.syncKnowledgeBase(force: false)
             }
         }
@@ -380,6 +383,9 @@ struct MainView: View {
 
     private var statusBar: some View {
         VStack(alignment: .leading, spacing: 3) {
+            if model.isDownloadingModels || !model.missingDefaultModels.isEmpty {
+                modelDownloadBar
+            }
             HStack(spacing: 6) {
                 Text(modelLabel)
                     .font(.caption2)
@@ -411,7 +417,8 @@ struct MainView: View {
                 }
                 .buttonStyle(.borderless)
                 .disabled(model.isRunning || model.isModelLoading
-                    || model.isWarmingUp || model.isSyncing || model.isBuildingANN)
+                    || model.isWarmingUp || model.isSyncing || model.isBuildingANN
+                    || !model.missingDefaultModels.isEmpty)
                 .help("增量同步知识库")
                 Button {
                     model.syncKnowledgeBase(force: true)
@@ -421,7 +428,8 @@ struct MainView: View {
                 }
                 .buttonStyle(.borderless)
                 .disabled(model.isRunning || model.isModelLoading
-                    || model.isWarmingUp || model.isSyncing || model.isBuildingANN)
+                    || model.isWarmingUp || model.isSyncing || model.isBuildingANN
+                    || !model.missingDefaultModels.isEmpty)
                 .help("强制全量同步（忽略增量缓存，全部重新解析入库）")
                 if model.isSyncing {
                     Button {
@@ -449,6 +457,76 @@ struct MainView: View {
         .padding(.horizontal, 8)
         .padding(.vertical, 6)
         .background(Color(nsColor: .controlBackgroundColor))
+    }
+
+    /// 默认模型下载：缺失时提示并可发起下载，下载中显示聚合进度。
+    /// 未就绪前对话与知识同步均被拦截（下载完成才能正常使用软件）。
+    @ViewBuilder
+    private var modelDownloadBar: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            if model.isDownloadingModels {
+                HStack(spacing: 6) {
+                    ProgressView().controlSize(.mini)
+                    Text(model.modelDownloadStatusText)
+                        .font(.caption2)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                        .help(model.modelDownloadStatusText)
+                    Spacer(minLength: 4)
+                    Button {
+                        model.cancelModelDownload()
+                    } label: {
+                        Image(systemName: "stop.circle").font(.caption)
+                    }
+                    .buttonStyle(.borderless)
+                    .help("停止下载（已下载部分保留，下次从断点续传）")
+                }
+                ProgressView(value: model.modelDownloadProgress)
+            } else if model.config.autoDownloadMissingModels {
+                HStack(spacing: 6) {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .font(.caption2)
+                        .foregroundStyle(.orange)
+                    Text("默认模型缺失，需联网下载后才能使用")
+                        .font(.caption2)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                    Spacer(minLength: 4)
+                    Button("下载") {
+                        model.startModelDownload()
+                    }
+                    .buttonStyle(.borderless)
+                    .controlSize(.small)
+                    .help("从 hf-mirror.com 下载默认模型（支持断点续传）")
+                }
+            } else {
+                // 自行下载指定模式：不自动下载，引导用户去配置窗口指定模型；
+                // 保留手动触发自动下载的入口（仅显式点击才会启动）。
+                HStack(spacing: 6) {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .font(.caption2)
+                        .foregroundStyle(.orange)
+                    Text("默认模型缺失（自行管理模式），请在配置中指定可用模型")
+                        .font(.caption2)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                    Spacer(minLength: 4)
+                    Button("打开配置") {
+                        openWindow(id: "settings")
+                    }
+                    .buttonStyle(.borderless)
+                    .controlSize(.small)
+                    .help("在配置窗口为各阶段指定自行准备好的模型")
+                    Button("自动下载") {
+                        model.startModelDownload()
+                    }
+                    .buttonStyle(.borderless)
+                    .controlSize(.small)
+                    .help("手动触发一次自动下载补全（已选择自行管理，不会自动启动）")
+                }
+            }
+        }
+        .padding(.vertical, 2)
     }
 
     private var modelLabel: String {
@@ -625,11 +703,13 @@ struct MainView: View {
         return thumb
     }
 
-    /// 发送按钮不可用：正在加载/预热/同步/构建索引，且输入与附件都为空。
+    /// 发送按钮不可用：默认模型未就绪，正在加载/预热/同步/构建索引，
+    /// 且输入与附件都为空。
     private var sendBlocked: Bool {
         !model.isRunning
             && ((input.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
                  && attachments.isEmpty)
+                || !model.missingDefaultModels.isEmpty
                 || model.isModelLoading || model.isWarmingUp || model.isSyncing
                 || model.isBuildingANN)
     }
