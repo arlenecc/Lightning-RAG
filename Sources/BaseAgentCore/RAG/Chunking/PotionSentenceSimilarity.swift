@@ -2,14 +2,17 @@ import Foundation
 import Hub
 import Tokenizers
 
-/// 语义切片的句子相似度：内置 potion-multilingual-128M（int4 ONNX，纯 CPU）。
+/// 语义切片的句子相似度：potion-multilingual-128M（int4 ONNX，纯 CPU）。
 ///
 /// potion 是 model2vec 静态词向量模型：每个 token 查表后做 mean-pool + L2
 /// 归一化，没有位置编码，因此不像 bge-small-zh 那样受 512 token 窗口限制，
 /// 长句与长切片都能完整参与相似度计算。
-/// 模型随 App 资源 bundle 分发，不联网、不写用户目录。
+/// lite 版随 App 资源 bundle 分发；clean 版不带，由启动时的模型自动下载
+/// 流程补齐（落点与 `modelDirectory()` 的回退查找一致）。
 struct PotionSentenceSimilarity {
     static let resourceName = "potion-multilingual-128M-int4"
+    /// SwiftPM 资源 bundle 名（potion 是该 bundle 的唯一资源）。
+    static let resourceBundleName = "BaseAgent_BaseAgentCore.bundle"
     static let modelFileName = "model.onnx"
     static let dimension = 256
     static let batchSize = 32
@@ -27,13 +30,69 @@ struct PotionSentenceSimilarity {
     private static let runtime = PotionRuntime()
 
     /// 资源目录；环境变量仅用于开发/基准替换模型。
+    ///
+    /// 查找顺序：环境变量覆盖 → App 资源 bundle（lite 版内置）→
+    /// 应用 models 目录 → 配置目录 `~/.base-agent/models`
+    /// （clean 版启动自动下载的落点）。
     static func modelDirectory() -> URL? {
         let override = ProcessInfo.processInfo.environment["BASE_AGENT_SEMANTIC_MODEL"] ?? ""
         if !override.isEmpty {
             let url = URL(fileURLWithPath: override).standardizedFileURL
             if FileManager.default.fileExists(atPath: url.path) { return url }
         }
-        return Bundle.module.url(forResource: resourceName, withExtension: nil)
+        if let bundled = bundledModelDirectory() { return bundled }
+        return downloadedModelCandidates().first {
+            FileManager.default.fileExists(
+                atPath: $0.appendingPathComponent(modelFileName).path)
+        }
+    }
+
+    /// 启动自动下载时模型应放置的目录：与 `modelDirectory()` 的回退查找
+    /// 保持一致，保证下载完成后一定能被找到。
+    static func downloadDirectory() -> URL {
+        let fm = FileManager.default
+        if let appModels = LocalModelRegistry.applicationModelsDirectory(),
+           fm.isWritableFile(atPath: appModels.path) {
+            return appModels.appendingPathComponent(resourceName, isDirectory: true)
+        }
+        return LocalModelRegistry.configModelsDirectory()
+            .appendingPathComponent(resourceName, isDirectory: true)
+    }
+
+    /// 下载模型的候选查找位置（应用 models 目录 → 配置目录）。
+    private static func downloadedModelCandidates() -> [URL] {
+        var urls: [URL] = []
+        if let appModels = LocalModelRegistry.applicationModelsDirectory() {
+            urls.append(appModels.appendingPathComponent(resourceName, isDirectory: true))
+        }
+        urls.append(LocalModelRegistry.configModelsDirectory()
+            .appendingPathComponent(resourceName, isDirectory: true))
+        return urls
+    }
+
+    /// 手动定位 SwiftPM 资源 bundle。
+    ///
+    /// 不能直接访问 `Bundle.module`：clean 分发版不带该 bundle，生成的
+    /// 访问器找不到时会 fatalError；这里按同一组候选路径探测，缺失时
+    /// 安全返回 nil（由启动下载补齐）。
+    private static func bundledModelDirectory() -> URL? {
+        let fm = FileManager.default
+        let anchor = Bundle(for: PotionRuntime.self)
+        var candidates: [URL] = []
+        if let resourceURL = Bundle.main.resourceURL {
+            candidates.append(resourceURL.appendingPathComponent(resourceBundleName))
+        }
+        candidates.append(Bundle.main.bundleURL.appendingPathComponent(resourceBundleName))
+        candidates.append(anchor.bundleURL.appendingPathComponent(resourceBundleName))
+        candidates.append(anchor.bundleURL.deletingLastPathComponent()
+            .appendingPathComponent(resourceBundleName))
+        for candidate in candidates where fm.fileExists(atPath: candidate.path) {
+            if let bundle = Bundle(url: candidate),
+               let url = bundle.url(forResource: resourceName, withExtension: nil) {
+                return url
+            }
+        }
+        return nil
     }
 
     /// HF `tokenizer.json` 编码结果（已丢弃 unk token）；供 golden 对齐测试使用。

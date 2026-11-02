@@ -316,17 +316,20 @@ private final class RangeDownloadSink: NSObject, URLSessionDataDelegate, @unchec
 /// 默认配置实际引用的本地模型（按当前配置解析目录与 HF 仓库名）。
 public struct RequiredModel: Sendable, Equatable, Identifiable {
     public var id: String { repo }
-    /// 用途显示名：主模型 / 辅助模型 / Embedding / Reranker / OCR。
+    /// 用途显示名：主模型 / 辅助模型 / Embedding / Reranker / OCR / 语义切片。
     public let kind: String
     /// HF 仓库名：arlenecc/<模型名>。
     public let repo: String
     /// 本地目标目录（缺失时从这里补齐）。
     public let directory: URL
+    /// 仓库内子目录：只下载该子目录下的文件并剥掉前缀（如 potion 的 `int4`）。
+    public let subpath: String?
 
-    public init(kind: String, repo: String, directory: URL) {
+    public init(kind: String, repo: String, directory: URL, subpath: String? = nil) {
         self.kind = kind
         self.repo = repo
         self.directory = directory
+        self.subpath = subpath
     }
 }
 
@@ -384,6 +387,41 @@ public enum RequiredModelCatalog {
                 : (!config.localVLMModel.isEmpty
                     ? config.localVLMModel : config.ragOCRModelName)
             add(kind: "OCR", registryKind: .vlm, value: value)
+        }
+        if config.ragSemanticChunking {
+            // 语义切片模型：lite 版随资源 bundle 内置（modelDirectory 直接
+            // 命中 bundle，isComplete 为真不触发下载）；clean 版不带，从
+            // 仓库 int4/ 子目录下载并剥前缀，落点与加载查找保持一致。
+            let dir = PotionSentenceSimilarity.modelDirectory()
+                ?? PotionSentenceSimilarity.downloadDirectory()
+            out.append(RequiredModel(
+                kind: "语义切片",
+                repo: "\(HFModelDownloader.repoOwner)/potion-multilingual-128M-onnx",
+                directory: dir,
+                subpath: "int4"))
+        }
+        return out
+    }
+
+    /// 按 model 的仓库子目录过滤文件并剥掉前缀（无子目录时原样返回）。
+    ///
+    /// potion 等多量化档仓库（fp16/int8/int4 平级）只取目标档位，
+    /// 避免把其它档位的数百 MB 权重一并拉下来。
+    public static func scopedFiles(
+        for model: RequiredModel,
+        in files: [HFModelDownloader.FileEntry]
+    ) -> [HFModelDownloader.FileEntry] {
+        guard let subpath = model.subpath?
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+            !subpath.isEmpty else { return files }
+        let prefix = subpath.hasSuffix("/") ? subpath : subpath + "/"
+        var out: [HFModelDownloader.FileEntry] = []
+        for file in files {
+            guard file.path.hasPrefix(prefix) else { continue }
+            let stripped = String(file.path.dropFirst(prefix.count))
+            guard !stripped.isEmpty,
+                  HFModelDownloader.isNeededFile(stripped) else { continue }
+            out.append(HFModelDownloader.FileEntry(path: stripped, size: file.size))
         }
         return out
     }

@@ -377,7 +377,8 @@ final class AppViewModel: ObservableObject {
         var totalBytes: Int64 = 0
         for model in missing {
             try Task.checkCancellation()
-            let files = try await hfDownloader.listNeededFiles(repo: model.repo)
+            let listed = try await hfDownloader.listNeededFiles(repo: model.repo)
+            let files = RequiredModelCatalog.scopedFiles(for: model, in: listed)
             let pending = files.filter { file in
                 HFModelDownloader.fileSize(at: model.directory
                     .appendingPathComponent(file.path)) != file.size

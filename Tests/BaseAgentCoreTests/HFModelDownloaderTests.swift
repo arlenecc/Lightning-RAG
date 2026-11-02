@@ -47,9 +47,15 @@ final class HFModelDownloaderTests: XCTestCase {
         // 辅助模型默认关闭，不应出现。
         XCTAssertFalse(repos.contains("arlenecc/Qwen3.5-2B-MLX-4bit"))
 
-        // 模型目录都为空 → 全部缺失。
+        // 其余模型目录都为空 → 全部缺失；语义切片模型在开发/测试环境可能
+        // 命中源码资源 bundle（视为就绪），按其就绪状态折算期望值。
+        let all = RequiredModelCatalog.models(for: config)
         let missing = RequiredModelCatalog.missingModels(for: config)
-        XCTAssertEqual(missing.count, RequiredModelCatalog.models(for: config).count)
+        let potion = try! XCTUnwrap(all.first { $0.kind == "语义切片" })
+        XCTAssertEqual(potion.repo, "arlenecc/potion-multilingual-128M-onnx")
+        XCTAssertEqual(potion.subpath, "int4")
+        let potionReady = RequiredModelCatalog.isComplete(potion.directory)
+        XCTAssertEqual(missing.count, all.count - (potionReady ? 1 : 0))
 
         // 目录里出现任一权重文件即视为就绪（与 registry 同源判定）。
         let embedding = try! XCTUnwrap(
@@ -217,6 +223,47 @@ final class HFModelDownloaderTests: XCTestCase {
         // 本地 Embedding / Reranker / OCR 仍需要。
         XCTAssertTrue(kinds.contains("Embedding"))
         XCTAssertTrue(kinds.contains("Reranker"))
+    }
+
+    /// clean 版语义切片模型走 arlenecc/potion-multilingual-128M-onnx 的
+    /// int4/ 子目录：scopedFiles 只取该档位并剥前缀，fp16/int8 不进清单。
+    func testPotionScopedFilesStripQuantumPrefix() {
+        let model = RequiredModel(
+            kind: "语义切片",
+            repo: "arlenecc/potion-multilingual-128M-onnx",
+            directory: URL(fileURLWithPath: "/tmp/potion"),
+            subpath: "int4")
+        let files: [HFModelDownloader.FileEntry] = [
+            .init(path: "int4/model.onnx", size: 80_066_323),
+            .init(path: "int4/tokenizer.json", size: 18_616_131),
+            .init(path: "int4/config.json", size: 922),
+            .init(path: "fp16/model.onnx", size: 256_182_971),
+            .init(path: "int8/model.onnx", size: 136_100_744),
+            .init(path: "int4/example.py", size: 8_393),
+            .init(path: "README.md", size: 11_937),
+        ]
+        let scoped = RequiredModelCatalog.scopedFiles(for: model, in: files)
+        XCTAssertEqual(scoped.map(\.path),
+                       ["model.onnx", "tokenizer.json", "config.json"])
+
+        // 无子目录的普通模型：原样返回，不做任何过滤。
+        let plain = RequiredModel(
+            kind: "Embedding", repo: "arlenecc/some-model",
+            directory: URL(fileURLWithPath: "/tmp/some"), subpath: nil)
+        XCTAssertEqual(
+            RequiredModelCatalog.scopedFiles(for: plain, in: files).count,
+            files.count)
+    }
+
+    /// 语义切片条目跟随 rag_semantic_chunking 开关：关闭时不出现在清单里。
+    func testCatalogOmitsPotionWhenSemanticChunkingDisabled() {
+        var config = AgentConfig()
+        config.workspace = NSTemporaryDirectory()
+            + "/hf-potion-off-\(UUID().uuidString)"
+        defer { try? FileManager.default.removeItem(atPath: config.workspace) }
+        config.ragSemanticChunking = false
+        XCTAssertFalse(RequiredModelCatalog.models(for: config)
+            .contains { $0.kind == "语义切片" })
     }
 
     /// 真实网络下载与镜像连通性验证：需要设置 HF_MIRROR_LIVE_TEST=1 才运行，

@@ -3,26 +3,22 @@
 #
 # 用法：scripts/package-app.sh [debug|release]（默认 release）
 # 版本：VERSION 环境变量可覆盖，默认 1.2.7
-# 版本形态：VARIANT=clean|lite|all-in-one（默认 lite；ALL_IN_ONE=1 等价于 all-in-one）
-#   clean     仅内置 potion-multilingual-128M int4（随 SwiftPM 资源 bundle 分发），
-#             不含 embedding / reranker / 主模型 / 辅助模型 / OCR
-#   lite      clean + jina embedding + jina reranker（三个基础模型），
-#             主模型、辅助模型与可能需要的 OCR 由用户自行指定
-#   all-in-one lite + 主模型 + 辅助模型 + OvisOCR3，开箱即用
+# 版本形态：VARIANT=clean|lite（默认 clean）
+#   clean     不包含任何依赖模型（potion 资源 bundle 也不打），应用启动时
+#             通过模型自动下载流程补齐（语义切片 / embedding / reranker 等）
+#   lite      clean + 内置 potion 语义切片（资源 bundle）
+#             + jina embedding + jina reranker（三个基础模型），
+#             主模型、辅助模型与可能需要的 OCR 由启动下载或用户自行指定
 # 产物：dist/Lightning-RAG.app（含 App 图标、资源 bundle 与 llama 框架）
 set -euo pipefail
 
 CONFIG="${1:-release}"
 VERSION="${VERSION:-1.2.7}"
-VARIANT="${VARIANT:-}"
-if [[ -z "$VARIANT" && "${ALL_IN_ONE:-0}" == "1" ]]; then
-  VARIANT="all-in-one"
-fi
-VARIANT="${VARIANT:-lite}"
+VARIANT="${VARIANT:-clean}"
 case "$VARIANT" in
-  clean|lite|all-in-one) ;;
+  clean|lite) ;;
   *)
-    echo "错误：VARIANT 必须是 clean、lite 或 all-in-one（当前：${VARIANT}）" >&2
+    echo "错误：VARIANT 必须是 clean 或 lite（当前：${VARIANT}）" >&2
     exit 1
     ;;
 esac
@@ -31,7 +27,7 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 PRODUCTS="$ROOT/.build/out/Products/$([[ "$CONFIG" == "release" ]] && echo Release || echo Debug)"
 BINARY="$PRODUCTS/Lightning-RAG"
 DIST="$ROOT/dist"
-# 三种版本的应用本体完全相同，只有内置模型不同；App 名保持统一。
+# 两个版本的应用本体完全相同，只有内置模型不同；App 名保持统一。
 APP="$DIST/Lightning-RAG.app"
 
 EMBEDDING_NAME="jina-embeddings-v5-text-nano-mlx-int4"
@@ -82,32 +78,6 @@ copy_reranker_model() {
   echo "已打包默认 reranker：$RERANKER_NAME"
 }
 
-# 主模型 / 辅助模型 / OCR：只复制推理运行时读取的文件。
-copy_runtime_model() {
-  local name="$1"
-  local src="$ROOT/models/$name"
-  local dst="$APP/Contents/Resources/models/$name"
-  if [[ ! -d "$src" ]]; then
-    echo "错误：VARIANT=all-in-one 但缺少模型目录 $src" >&2
-    exit 1
-  fi
-  mkdir -p "$dst"
-  local files=(config.json generation_config.json chat_template.jinja \
-    tokenizer.json tokenizer_config.json tokenizer.model special_tokens_map.json \
-    vocab.json merges.txt model.safetensors model.safetensors.index.json \
-    preprocessor_config.json processor_config.json video_preprocessor_config.json)
-  local file
-  for file in "${files[@]}"; do
-    if [[ -f "$src/$file" ]]; then
-      cp "$src/$file" "$dst/"
-    fi
-  done
-  if [[ ! -f "$dst/model.safetensors" ]]; then
-    echo "错误：模型缺少 model.safetensors：$src" >&2
-    exit 1
-  fi
-  echo "已打包模型：$name ($(du -sh "$dst" | awk '{print $1}'))"
-}
 
 if [[ ! -x "$BINARY" ]]; then
   echo "未找到可执行文件：$BINARY（先运行 swift build -c $CONFIG --disable-sandbox）" >&2
@@ -119,29 +89,26 @@ mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources" "$APP/Contents/Framewor
 
 cp "$BINARY" "$APP/Contents/MacOS/Lightning-RAG"
 
-# SwiftPM 资源 bundle：Bundle.module 会依次查找 Bundle.main.resourceURL
-# （即 Contents/Resources）与 Bundle.main.bundleURL，因此放在 Resources 下。
-# potion-multilingual-128M int4（语义切片）也在其中，三种版本都会带上。
+# 三种运行时第三方资源 bundle（Cmlx metallib / Hub / Crypto 等）两个版本都要；
+# BaseAgent_BaseAgentCore.bundle 只装 potion 语义切片模型，clean 版跳过，
+# 由启动时的模型自动下载流程补齐。
 for bundle in "$PRODUCTS"/*.bundle; do
   [[ -e "$bundle" ]] || continue
+  if [[ "$VARIANT" == "clean" && "$(basename "$bundle")" == "BaseAgent_BaseAgentCore.bundle" ]]; then
+    continue
+  fi
   cp -R "$bundle" "$APP/Contents/Resources/"
 done
 
 case "$VARIANT" in
-  lite|all-in-one)
+  lite)
     copy_embedding_model
     copy_reranker_model
     ;;
   clean)
-    echo "clean 版本仅内置 potion 语义切片模型；未打包 embedding / reranker / 主模型 / 辅助模型 / OCR"
+    echo "clean 版本不包含任何依赖模型；启动时通过自动下载流程补齐"
     ;;
 esac
-
-if [[ "$VARIANT" == "all-in-one" ]]; then
-  copy_runtime_model "qwen3.5-4b-agentic-coder-v4-4bit-mlx"
-  copy_runtime_model "Qwen3.5-2B-MLX-4bit"
-  copy_runtime_model "OvisOCR3-MLX-4bit-mixed46"
-fi
 
 # 动态框架：llama（GGUF 进程内推理）。onnxruntime 在本项目中静态链接，
 # 不需要单独拷贝。
