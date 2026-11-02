@@ -120,6 +120,10 @@ public struct AgentConfig: Sendable {
     /// L1 工具结果字符上限。与 RAG 输出总上限（ragSearchMaxTotalChars=12000）
     /// 取较小值生效：默认 8000 让 RAG 结果不会被内核二次静默截断。
     public var kernelMaxToolChars: Int = 8_000
+    /// RAG 工具结果「进历史 / KV 前缀」的额外收紧上限（字符）。0 表示不额外收紧，
+    /// 沿用 L1 的 `kernelMaxToolChars`。RAG 结果通常 bulky，单独收紧只保留最相关
+    /// 头部、丢弃尾部，避免几千字符的结果把历史 / KV 前缀撑大、拖慢后续每轮生成。
+    public var kernelRagHistoryChars: Int = 2_000
     public var kernelMaxDigestLines: Int = 40
 
     // RAG
@@ -482,6 +486,7 @@ public struct AgentConfig: Sendable {
         if let v = int("kernel_raw_turns") { kernelRawTurns = v }
         if let v = int("kernel_consolidate_every") { kernelConsolidateEvery = v }
         if let v = int("kernel_max_tool_chars") { kernelMaxToolChars = v }
+        if let v = int("kernel_rag_history_chars") { kernelRagHistoryChars = v }
         if let v = int("kernel_max_digest_lines") { kernelMaxDigestLines = v }
 
         if let v = int("rag_chunk_size") { ragChunkSize = v }
@@ -864,6 +869,7 @@ public struct AgentConfig: Sendable {
             "kernel_raw_turns": kernelRawTurns,
             "kernel_consolidate_every": kernelConsolidateEvery,
             "kernel_max_tool_chars": kernelMaxToolChars,
+            "kernel_rag_history_chars": kernelRagHistoryChars,
             "kernel_max_digest_lines": kernelMaxDigestLines,
             "rag_chunk_size": ragChunkSize, "rag_chunk_overlap": ragChunkOverlap,
             "rag_semantic_chunking": ragSemanticChunking,

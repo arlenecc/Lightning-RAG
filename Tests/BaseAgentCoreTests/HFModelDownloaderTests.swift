@@ -245,14 +245,18 @@ final class HFModelDownloaderTests: XCTestCase {
         let scoped = RequiredModelCatalog.scopedFiles(for: model, in: files)
         XCTAssertEqual(scoped.map(\.path),
                        ["model.onnx", "tokenizer.json", "config.json"])
+        // 远程路径必须保留子目录前缀，否则 resolve URL 会指向仓库根下
+        // 不存在的文件而 404（子目录模型永远下载不完）。
+        XCTAssertEqual(scoped.map(\.remotePath),
+                       ["int4/model.onnx", "int4/tokenizer.json", "int4/config.json"])
 
-        // 无子目录的普通模型：原样返回，不做任何过滤。
+        // 无子目录的普通模型：原样返回，不做任何过滤；远程路径等同本地路径。
         let plain = RequiredModel(
             kind: "Embedding", repo: "arlenecc/some-model",
             directory: URL(fileURLWithPath: "/tmp/some"), subpath: nil)
-        XCTAssertEqual(
-            RequiredModelCatalog.scopedFiles(for: plain, in: files).count,
-            files.count)
+        let plainScoped = RequiredModelCatalog.scopedFiles(for: plain, in: files)
+        XCTAssertEqual(plainScoped.count, files.count)
+        XCTAssertTrue(plainScoped.allSatisfy { $0.remotePath == $0.path })
     }
 
     /// 语义切片条目跟随 rag_semantic_chunking 开关：关闭时不出现在清单里。

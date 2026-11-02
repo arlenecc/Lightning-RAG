@@ -808,6 +808,17 @@ struct LogsWindowView: View {
 
                 Spacer(minLength: 8)
 
+                Button("复制全部") {
+                    let text = model.logs
+                        .map { "\(timeText($0.timestamp))  \($0.text)" }
+                        .joined(separator: "\n")
+                    let pb = NSPasteboard.general
+                    pb.clearContents()
+                    pb.setString(text, forType: .string)
+                }
+                .disabled(model.logs.isEmpty)
+                .help("复制全部日志到剪贴板")
+
                 Button("清空") {
                     model.clearLogs()
                 }

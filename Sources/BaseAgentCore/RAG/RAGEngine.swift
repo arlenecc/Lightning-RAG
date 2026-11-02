@@ -747,6 +747,23 @@ public final class RAGEngine {
         return try body(try ensureStore())
     }
 
+    /// 只读查询的安全封装：限时取锁/打开库/执行，失败（含超时）时打日志并返回 nil，
+    /// 避免 `withStore` 无超时导致的永久卡死，以及 `try?` 直接吞错导致的「静默失败」。
+    /// 用于 rag_outline / 文档列举等读路径。
+    private func withStoreSafe<T>(timeout: Double = RAGEngine.defaultReadTimeout,
+                                  _ body: (VectorStore) throws -> T) -> T? {
+        let budget = max(2, timeout)
+        do {
+            return try withStoreBounded(timeout: budget, body)
+        } catch {
+            AgentLog.warning("RAG: 只读查询失败（\(String(format: "%.0f", budget))s）："
+                + error.localizedDescription)
+            return nil
+        }
+    }
+
+    private static let defaultReadTimeout: Double = 5
+
     /// 供 UI/工具读取当前生效的查询超时秒数（0 = 关闭超时）。
     public var queryTimeoutSeconds: Double { config.ragQueryTimeoutSeconds }
 
@@ -2292,17 +2309,30 @@ public final class RAGEngine {
         // 把已经取到的连接关掉，导致在途检索报「数据库已关闭」。
         let queryVector: [Float]
         let binaryOptions: BinaryCoarseOptions?
+        // embedding 单独给宽裕预算：正常 query 向量化远小于 1s，但主模型生成、
+        // 后台摘要同抢 GPU 时可能被拖慢数秒；给足余量避免「慢」被误判成「超时」，
+        // 同时保底防止 MLX 卡死导致静默挂起。
+        let embedBudget = max(20, limit)
         if config.ragBinaryCoarseEnabled,
            effectiveVectorElementType != .bin,
            let signing = embedding as? EmbeddingBinarySigning,
            signing.binaryDimension > 0 {
-            let signed = try await signing.embedQueryWithSignature(query)
+            let signed = try await Self.withTimeout(embedBudget) {
+                try await signing.embedQueryWithSignature(query)
+            }
             queryVector = signed.vector
             binaryOptions = BinaryCoarseOptions(
                 signature: signed.signature,
                 candidateLimit: config.ragBinaryCoarseCandidates)
         } else {
-            queryVector = try await embedding.embedQuery(query)
+            do {
+                queryVector = try await Self.withTimeout(embedBudget) {
+                    try await embedding.embedQuery(query)
+                }
+            } catch is RerankTimeout {
+                throw AgentError.timeout("查询向量化超时（\(embedBudget)s），"
+                    + "请稍后重试，或检查 embedding 模型是否因内存压力卡住")
+            }
             binaryOptions = nil
         }
         let rerankEnabled = config.ragRerankEnabled && reranker != nil
@@ -2495,7 +2525,7 @@ public final class RAGEngine {
 
     /// SQL 限量列表：返回前 `limit` 个文档名与总条数。
     public func listDocuments(limit: Int) -> (names: [String], total: Int) {
-        let result = try? withStore { store -> ([String], Int) in
+        let result = withStoreSafe { store -> ([String], Int) in
             (try store.documentNames(limit: limit), try store.documentCount())
         }
         guard let result else { return ([], 0) }
@@ -2506,7 +2536,7 @@ public final class RAGEngine {
     public func lookupDocument(_ query: String) -> DocumentLookupResult {
         let target = query.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !target.isEmpty else { return .notFound }
-        let result = try? withStore { store -> DocumentLookupResult in
+        let result = withStoreSafe { store -> DocumentLookupResult in
             let candidates = try store.lookupDocuments(query: target, limit: 50)
             let lower = target.lowercased()
             let standardized = (target as NSString).standardizingPath
@@ -2544,7 +2574,7 @@ public final class RAGEngine {
     /// 产生歧义，也不会在两次查询之间被路径变化影响。
     public func getEnrichedOutline(for record: DocumentRecord) -> EnrichedDocumentOutline? {
         guard !record.docID.isEmpty else { return nil }
-        return try? withStore { store in
+        return withStoreSafe { store in
             // 以库内当前行为准；记录可能来自较早的查询。
             let current = try store.document(docID: record.docID) ?? record
             let chapters = try store.chapterSummaries(docID: current.docID)
@@ -2561,7 +2591,7 @@ public final class RAGEngine {
     }
 
     public func listDocuments() -> [String] {
-        (try? withStore { $0.listDocuments() }) ?? []
+        (withStoreSafe { $0.listDocuments() }) ?? []
     }
 
     /// 创建闲时章节摘要协调器：与检索复用同一个 `VectorStore` 实例。

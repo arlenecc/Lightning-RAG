@@ -32,7 +32,7 @@ public final class RagSearchTool: AgentTool {
             ]),
             "top_k": .object([
                 "type": .string("integer"),
-                "description": .string("候选片段数，默认 5，范围 1-10；开启重排序时"
+                "description": .string("候选片段数，默认 3，范围 1-10；开启重排序时"
                     + "最终条数由设置里的 TopN 决定"),
             ]),
         ]),
@@ -51,7 +51,7 @@ public final class RagSearchTool: AgentTool {
     public func run(_ args: [String: JSONValue]) async throws -> ToolResult {
         let query = args.trimmedString("query")
         guard !query.isEmpty else { return .fail("缺少参数: query") }
-        let topK = args.boundedInt("top_k", default: 5, range: 1...10)
+        let topK = args.boundedInt("top_k", default: 3, range: 1...10)
         let source = args.trimmedString("source")
         do {
             let output = try await engine.searchFormatted(

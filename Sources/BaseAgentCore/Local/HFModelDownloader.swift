@@ -13,10 +13,15 @@ public final class HFModelDownloader: @unchecked Sendable {
     public struct FileEntry: Sendable, Equatable {
         public let path: String
         public let size: Int64
+        /// 远程仓库内路径（含子目录前缀），用于拼接下载 URL。
+        /// 子目录模型（如 potion 的 `int4/`）本地落点需剥掉前缀，但远程 URL
+        /// 必须保留前缀，否则会指向仓库根下不存在的文件而 404。为空时等同 `path`。
+        public let remotePath: String
 
-        public init(path: String, size: Int64) {
+        public init(path: String, size: Int64, remotePath: String? = nil) {
             self.path = path
             self.size = size
+            self.remotePath = remotePath ?? path
         }
     }
 
@@ -187,7 +192,7 @@ public final class HFModelDownloader: @unchecked Sendable {
             try handle.truncate(atOffset: 0)
         }
 
-        var request = URLRequest(url: resolveURL(repo: repo, path: file.path))
+        var request = URLRequest(url: resolveURL(repo: repo, path: file.remotePath))
         if offset > 0 {
             request.setValue("bytes=\(offset)-", forHTTPHeaderField: "Range")
         }
@@ -440,7 +445,9 @@ public enum RequiredModelCatalog {
             let stripped = String(file.path.dropFirst(prefix.count))
             guard !stripped.isEmpty,
                   HFModelDownloader.isNeededFile(stripped) else { continue }
-            out.append(HFModelDownloader.FileEntry(path: stripped, size: file.size))
+            out.append(HFModelDownloader.FileEntry(path: stripped,
+                                                  size: file.size,
+                                                  remotePath: file.path))
         }
         return out
     }

@@ -149,6 +149,9 @@ public final class KernelLoop {
     public let budget: ContextBudget
     public let consolidateEvery: Int
     public let maxToolChars: Int
+    /// RAG 工具结果进历史的收紧上限（字符）。0 表示不额外收紧，沿用 L1 的
+    /// `maxToolChars`。见 `AgentConfig.kernelRagHistoryChars`。
+    public let ragHistoryChars: Int
     public var maxTurns: Int
     public private(set) var distillRequested = false
 
@@ -220,6 +223,7 @@ public final class KernelLoop {
             config.kernelConsolidateEvery == 0 ? 8 : config.kernelConsolidateEvery)
         self.consolidateEvery = max(1, min(configured, max(1, resolved.rawTurns)))
         self.maxToolChars = config.kernelMaxToolChars == 0 ? 8_000 : config.kernelMaxToolChars
+        self.ragHistoryChars = config.kernelRagHistoryChars
         let fallbackTurns = config.maxIterations == 0 ? 15 : config.maxIterations
         self.maxTurns = max(1, maxTurns == 0 ? fallbackTurns : maxTurns)
     }
@@ -309,6 +313,9 @@ public final class KernelLoop {
         var pending = userInput
         var finalText = ""
         var exitReason: ExitReason = .maxTurns
+        /// 触发 `.done` 退出的最后一轮是否为「无工具纯文字回答」。文字步骤
+        /// （说明 / 总结 / 边界）本就靠文字收尾，不应被当成「步骤未完成」训诫。
+        var finalTurnNoTool = false
         // 多模态图像只挂到「本次 run 的第一条用户消息」（即触发本轮的用户输入），
         // 不重复挂到后续的工具有/续跑轮次。resume（自动续跑）由 Agent 显式传空。
         var attachImages: [Data]? = images.isEmpty ? nil : images
@@ -432,7 +439,12 @@ public final class KernelLoop {
                 } else {
                     nudgeBudget = finishNudgeMax
                 }
-                if !openSteps.isEmpty && finishNudge < nudgeBudget {
+                // 已完成实质工作、且本轮是「纯文字回答」（无工具调用）时，不再逼模型
+                // 调工具——说明 / 总结 / 能力边界这类文字步骤本就不需要工具。否则会陷入
+                // 「步骤 X 已完成，无需调用工具」与「你必须调用工具」的死循环，并可能把
+                // 这句元陈述当成最终答复返回。直接放行到无工具即结束分支收下答案。
+                let turnedTextAnswer = resp.toolCalls.isEmpty && didWork
+                if !openSteps.isEmpty && finishNudge < nudgeBudget && !turnedTextAnswer {
                     finishNudge += 1
                     let todo = openSteps.prefix(5)
                         .map { "\($0.id).\($0.title)" }.joined(separator: "; ")
@@ -510,6 +522,7 @@ public final class KernelLoop {
                 session.finishTurn(rec, assistantText: resp.content,
                                    summary: l2Summary(resp.content),
                                    rawContent: resp.rawContent)
+                finalTurnNoTool = true
                 exitReason = .done
                 break
             }
@@ -591,7 +604,13 @@ public final class KernelLoop {
 
             let outcomes = toOutcomes(toolCalls, rawResults)
             let toolResults = zip(toolCalls, outcomes).map { tc, outcome in
-                ToolResultRecord(id: tc.id, name: tc.name, content: outcome.data)
+                var rec = ToolResultRecord(id: tc.id, name: tc.name, content: outcome.data)
+                // RAG 结果 bulky：进历史 / KV 前缀前按 `ragHistoryChars` 单独收紧，
+                // 只保留最相关头部，避免几千字符的大返回把历史撑大、拖慢后续每轮生成。
+                // 不影响 `outcomes` —— nextPrompt / shouldExit 已基于完整数据算过。
+                rec.content = KernelLoop.trimRagHistory(rec.name, rec.content,
+                                                       limit: ragHistoryChars)
+                return rec
             }
             let summary = resp.summary.isEmpty
                 ? l2Summary(resp.content, toolNames: toolCalls.map(\.name))
@@ -640,7 +659,9 @@ public final class KernelLoop {
             finalText = "（已达到本轮最大轮次上限 \(maxTurns)，任务可能未完成。请先总结已完成的进展，再询问用户是否继续。）"
         }
         // 提醒次数用尽后模型仍要收尾：尊重决定，但必须把「其实没做完」告诉用户。
-        if exitReason == .done && finishNudge > 0 {
+        // 例外：最后一轮是无工具的纯文字回答——文字步骤（说明 / 总结 / 边界）本就
+        // 靠文字收尾，不应被误报为「步骤未完成」。
+        if exitReason == .done && finishNudge > 0 && !finalTurnNoTool {
             let left = session.planOpenSteps()
             if !left.isEmpty {
                 let todo = left.prefix(8).map { "\($0.id).\($0.title)" }.joined(separator: "; ")
@@ -862,6 +883,19 @@ public final class KernelLoop {
         var copy = raw
         copy.id = "kcall_\(toolCallCounter)"
         return copy
+    }
+
+    // MARK: ACT：RAG 工具结果进历史前的收紧
+
+    /// RAG 工具结果进历史 / KV 前缀前的纯函数收紧：保留最相关头部、丢弃尾部，
+    /// 避免 bulky 大返回把历史撑大、拖慢后续每轮生成。非 `rag_` 前缀、或
+    /// `limit <= 0`、或内容未超限时原样返回（调用方据此决定是否收紧）。
+    static func trimRagHistory(_ name: String, _ content: String, limit: Int) -> String {
+        guard limit > 0, name.hasPrefix("rag_"), content.count > limit else {
+            return content
+        }
+        return String(content.prefix(limit))
+            + "\n…[RAG 结果已截断至 \(limit) 字符，原始 \(content.count) 字符]"
     }
 
     // MARK: ACT：工具结果 → StepOutcome（L1 裁剪在这里发生）

@@ -213,6 +213,7 @@ private final class PotionRuntime {
             let state = State(session: session, tokenizer: tokenizer,
                               unknownTokenID: unknown)
             self.state = state
+            AgentLog.info("semantic_chunk: 语义切片模型已加载并使用：\(directory.path)")
             return state
         } catch {
             failed = true
