@@ -64,7 +64,26 @@ public final class HFModelDownloader: @unchecked Sendable {
     // MARK: 文件清单
 
     /// 列出仓库中推理需要的文件（过滤 README / 脚本 / 图片等）。
+    ///
+    /// 与单文件下载同样的 3 次重试：TLS/网络瞬时抖动（首次很快失败）
+    /// 不应直接把错误抛给启动下载流程。
     public func listNeededFiles(repo: String) async throws -> [FileEntry] {
+        var lastError: Error?
+        for attempt in 0..<3 {
+            if attempt > 0 {
+                try? await Task.sleep(nanoseconds: 1_500_000_000)
+            }
+            do {
+                return try await listNeededFilesOnce(repo: repo)
+            } catch {
+                if error is CancellationError { throw error }
+                lastError = error
+            }
+        }
+        throw lastError ?? HFError.badResponse("获取模型文件列表失败：\(repo)")
+    }
+
+    private func listNeededFilesOnce(repo: String) async throws -> [FileEntry] {
         var comps = URLComponents(
             url: baseURL.appendingPathComponent("api/models/\(repo)/tree/main"),
             resolvingAgainstBaseURL: false)

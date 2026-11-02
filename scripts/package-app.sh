@@ -84,6 +84,11 @@ if [[ ! -x "$BINARY" ]]; then
   exit 1
 fi
 
+# 打包前强制重建，确保产物反映当前源码（避免复用 stale 的 Release 二进制
+# 导致新功能未进包）。
+echo "构建 $CONFIG 产物…"
+swift build -c "$CONFIG" --disable-sandbox
+
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources" "$APP/Contents/Frameworks"
 
