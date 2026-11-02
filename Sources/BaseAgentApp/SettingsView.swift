@@ -502,36 +502,24 @@ struct SettingsView: View {
     private var knowledgeSection: some View {
         GroupBox {
             VStack(alignment: .leading, spacing: 12) {
+                // 工作目录行（独立一行）。
                 HStack(spacing: 8) {
                     Text("工作目录").font(.caption)
                     TextField("~/base-agent-workspace", text: $workspace)
                         .textFieldStyle(.roundedBorder)
                     Button("选择…") { chooseDirectory($workspace, title: "选择工作目录") }
-                    Text("知识库目录").font(.caption)
-                    TextField("留空 = workspace/knowledge_base", text: $knowledgeBase)
-                        .textFieldStyle(.roundedBorder)
-                    Button("选择…") { chooseDirectory($knowledgeBase, title: "选择知识库目录") }
                 }
 
-                // 知识库操作按钮：紧跟工作目录配置行，依次为
-                // 应用配置 / 同步知识 / 停止同步 / 向量去重。
-                // 窗口较窄时拆成两行右对齐，避免按钮被裁剪。
-                ViewThatFits(in: .horizontal) {
-                    HStack(spacing: 8) {
-                        Spacer(minLength: 8)
-                        knowledgeButtons()
-                        stopAndDedupeButtons()
-                    }
-                    VStack(alignment: .leading, spacing: 6) {
-                        HStack(spacing: 8) {
-                            Spacer(minLength: 8)
-                            knowledgeButtons()
-                        }
-                        HStack(spacing: 8) {
-                            Spacer(minLength: 8)
-                            stopAndDedupeButtons()
-                        }
-                    }
+                // 源目录行：目录选择之后紧跟四个操作按钮（应用配置 / 同步知识 /
+                // 停止同步 / 向量去重），同一行内排列，不再单独成块折行。
+                HStack(spacing: 8) {
+                    Text("源目录").font(.caption)
+                    TextField("留空 = workspace/knowledge_base", text: $knowledgeBase)
+                        .textFieldStyle(.roundedBorder)
+                        .frame(maxWidth: .infinity)
+                    Button("选择…") { chooseDirectory($knowledgeBase, title: "选择源目录") }
+                    knowledgeButtons()
+                    stopAndDedupeButtons()
                 }
 
                 // Embedding 行：模型类型 / 本地路径之后紧接切片设置（语义切片 +
@@ -594,6 +582,10 @@ struct SettingsView: View {
                         }
                     }
                 }
+                // ANN 设置：二值 ANN（stage 1 自研 bann）与主 ANN 索引的
+                // 状态与维护按钮（构建/续建、停止、删除）。
+                Text("ANN设置").font(.caption).foregroundStyle(.secondary)
+
                 // 二值 ANN：stage 1 优先走自研 bann，未构建时回退 bin 表暴力汉明。
                 // 后接主 ANN 索引摘要与维护按钮（构建/续建、停止、删除）。
                 ViewThatFits(in: .horizontal) {
