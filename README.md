@@ -48,8 +48,8 @@ VARIANT=lite  scripts/package-app.sh release && VARIANT=lite  scripts/package-dm
 
 | VARIANT | 内置模型 | DMG |
 |---|---|---|
-| `clean`（默认） | 无；potion 语义切片 / jina embedding / jina reranker 均在首次启动时从 hf-mirror 自动下载 | `dist/Lightning-RAG-1.2.10-clean.dmg` |
-| `lite` | potion-multilingual-128M int4（语义切片）+ jina-embeddings-v5-text-nano-mlx-int4 + jina-reranker-v2-base-multilingual-onnx | `dist/Lightning-RAG-1.2.10-lite.dmg` |
+| `clean`（默认） | 无；potion 语义切片 / jina embedding / jina reranker 均在首次启动时从 hf-mirror 自动下载 | `dist/Lightning-RAG-1.2.13-clean.dmg` |
+| `lite` | potion-multilingual-128M int4（语义切片）+ jina-embeddings-v5-text-nano-mlx-int4 + jina-reranker-v2-base-multilingual-onnx | `dist/Lightning-RAG-1.2.13-lite.dmg` |
 
 两个版本共用 `dist/Lightning-RAG.app`（应用本体与显示名不变，只有内置模型不同），
 因此需按「打包 App → 打包 DMG」的顺序逐个构建。两个版本都不含主模型、辅助模型
@@ -59,7 +59,7 @@ VARIANT=lite  scripts/package-app.sh release && VARIANT=lite  scripts/package-dm
 `package-dmg.sh` 的参数覆盖；旧版的 `all-in-one`（主模型 / 辅助模型 / OCR 一并打包）
 已移除，相关模型改为在配置窗口指定或由启动下载流程补齐。
 
-测试覆盖（当前 660 个 XCTest；真实模型 E2E 在本地权重存在时随每次测试自动运行，缺少权重或需要外网/GGUF 等环境的用例会跳过）：sqlite-vec 事务写入/回滚、两段式 KNN、二值签名编码与 LSB-first 位打包、
+测试覆盖（当前 700+ 个 XCTest；真实模型 E2E 在本地权重存在时随每次测试自动运行，缺少权重或需要外网/GGUF 等环境的用例会跳过）：sqlite-vec 事务写入/回滚、两段式 KNN、二值签名编码与 LSB-first 位打包、
     bin 表同 rowid 写入与覆盖率计数器、两阶段粗筛精排与 ANN 旁路、
     FTS5 中文分词、RRF 混合检索、RAG 增量/删除清理、重排序 TopN 决定最终条数（关闭时回到调用方 top_k）、内置 reranker 的打包清单与默认配置解析（`localRerankerModel` / `localRerankerModelPath` 留空时仍回落到 App 内置 jina reranker）、EPUB/DOCX/HTML 解析、扫描版 EPUB 归一化 + OCR、PDF 文本层、Ovis 文本页快路径、NaturalLanguage 切片、切片参数一致性（模型窗口收口、检索呈现上限随切片放大、切片参数变化触发重建）、配置迁移与旧键兼容（含 `auto_preload_main` / `aux_enabled` 默认值、主/辅助 KV 复用与量化键的缺省跟随与读写往返）、Agent 工具循环、ask_user 续跑、checkpoint 同步、code_run 写护栏、L3 去重、大纲围栏，以及摘要溢出保留、代码围栏/中文换行/正文数字保留、技能索引入口回退、空库维度自愈、`models/` 相对路径解析，以及 KV 复用增量与完整 prompt 的逐 token 模板对齐、预热前缀对齐、清空对话时失效 KV cache；GGUF 模型路径/mmproj 解析、进程内 llama.cpp 框架加载、ONNX 缺少权重时的明确报错，合成 ONNX decoder 图的 past/present 管线，简单 HTML 表格转 Markdown、复杂表格保留 HTML、Markdown 语法/缩进保留、纯文本 HTML/实体/噪声清理、空行与空格密度压缩、跨目录副本与 content_hash 去重、手动向量去重保留最早入库切片并写副本 tombstone，以及切片缺失/旧版 manifest/失败页文件的增量重建。真实模型链路覆盖：jina-v5 的 `Query: `/`Document: ` 前缀 → 可配置 Matryoshka 维度（默认 128，可选 32/64/128/256/512/768）截断 → 重新 L2 归一化 → 用户选择的元素类型入库（默认 int8，128 维时 128B/行），同时从截断前原生
     768 维生成二值签名写入 `chunk_vectors_bin` → 查询 top1 与 `rag_search` 全链路；jina-v3 的切片 → embedding → 256 维 Matryoshka 截断 → 重新归一化 → int8 入库（256B/行）→ 查询 top1；nomic-int8 的 int8 + Matryoshka 512 召回与 fp32 全维（768）基线对比；以及内置 jina reranker 经 `LocalModelFactory` 加载 ONNX 后对相关段落打分（达到默认 0.45 阈值且高于强无关基线）；`RAGPipelineVerificationTests` 使用仓库 `models/`（可用 `EMBED_BENCH_MODELS_DIR` 指向 App 包模型）跑通 6 篇文档入库 → 22 切片 int8 → 混合检索 + RRF → 重排 → ANN → `rag_search` / `rag_outline` / `rag_status` 全链路。
@@ -95,7 +95,7 @@ HTML 与 Office 解析另有专项覆盖：HTML 保存页的本地 iframe / fram
 - **L0**：工具返回即捕获，硬上限 20k 字符。
 - **L1**：注入前按预算裁剪工具结果（head + tail，HTML 标签白名单去噪，保留源码尖括号）。
 - **L2**：旧轮次折叠为 `<summary>` / 工具名摘要。
-- **L3**：超预算时折叠到 `raw_turns + 1` 轮，每 8 轮主动 consolidate（配置值下限 8）；raw 窗口至少覆盖一个 consolidate 周期，避免每个用户回合都因窗口滑动而重建 KV cache；连续重复摘要按正文合并。
+- **L3**：超预算时折叠到 `raw_turns + 1` 轮，每 24 轮主动 consolidate（周期下限 8 轮）；raw 窗口至少覆盖一个 consolidate 周期，避免每个用户回合都因窗口滑动而重建 KV cache；连续重复摘要按正文合并。
 - **L4**：`start_long_term_update` 或长任务结束时用 LLM 蒸馏事实、经验与技能；自动续跑会跨段累计蒸馏请求，不会因分段而丢失。
 
 ### 2. 工具与能力层
@@ -103,6 +103,8 @@ HTML 与 Office 解析另有专项覆盖：HTML 保存页的本地 iframe / fram
 原子工具：`file_read` / `file_write` / `file_modify`（别名 `file_patch`）、`code_run`、`shell_run`、`web_scan`、`webexec_js`（别名 `web_execute_js`）、`ask_user`。
 
 能力工具：`update_plan`、`update_working_checkpoint`、`start_long_term_update`、`work_memory`、`memory_graph`、`memory_search`、`skill_search`、`skill_semantic_search`、`skill_load`、`skill_save`、`rag_search`、`rag_outline`、`rag_status`、`rag_ingest`、MCP 动态工具。
+
+**RAG 检索策略（少而精）**：用户问书/文档内容时，先 `rag_outline` 获取全书/章节摘要与结构树；若大纲摘要已覆盖问题则直接引用、**不再检索**；整体性问题（全书大意/主题）只搜前言/引言/导论，针对性问题只搜目标章节（检索词带上章节标题，`source=书名`）。内核在每次 `rag_outline`（或每次 `run()`）之后对 `rag_search` 设**硬上限（默认 3 次）**：超出部分不再真正调用，直接预置失败并提示「基于已检索内容与大纲摘要直接综合作答」，彻底杜绝同一问题反复换关键词 scatter 检索。
 
 所有文件类工具路径锁定在 workspace 内，并解析 symlink 防止逃逸。`code_run` / `shell_run` / MCP 调用按配置触发确认。
 
@@ -137,7 +139,7 @@ HTML 与 Office 解析另有专项覆盖：HTML 保存页的本地 iframe / fram
 | HTML | SwiftSoup 提取标题/列表/表格并转 Markdown |
 | TXT / MD / CSV / JSON | 原生解析并清洗；CSV 转 Markdown 表格；JSON/JSONL 包成 ```` ```json ```` 代码围栏；支持 UTF-8/UTF-16 BOM 与 GB18030 |
 
-PDF 文本层对所有引擎共用一套有界提取（`PDFTextExtractor`）：图片 XObject 达到 16 的页面不再调用 `PDFPage.string`，改用 `CGPDFScanner` 按字体 + ToUnicode + 文本状态逐操作符提取，避开 CoreGraphics 文本行布局在图文混排页的病态空白区域分析（实测 383 页、319MB 的 PDF 中，第 18 页 392 张图会让单页内存涨到 42GB 且长时间不返回）；扫描器输出为空时自然进入 OCR，绝不回退 PDFKit。低图片页继续走 PDFKit，保留成熟的阅读顺序与分段行为；简单字体固定按单字节码解码，只有 Type0 使用 ToUnicode 的 codespace 宽度。
+PDF 文本层对所有引擎共用一套有界提取（`PDFTextExtractor`）：图片 XObject 达到 16 的页面不再调用 `PDFPage.string`，改用 `CGPDFScanner` 按字体 + ToUnicode + 文本状态逐操作符提取，避开 CoreGraphics 文本行布局在图文混排页的病态空白区域分析（实测 383 页、319MB 的 PDF 中，第 18 页 392 张图会让单页内存涨到 42GB 且长时间不返回）；扫描器输出为空时自然进入 OCR，绝不回退 PDFKit。低图片页继续走 PDFKit，保留成熟的阅读顺序与分段行为；简单字体固定按单字节码解码，只有 Type0 使用 ToUnicode 的 codespace 宽度。此外针对带特殊 APP13/Exif 段、CoreGraphics 拒绝解码的扫描版 PDF（整页渲染可能全白），`CPDFShim` 在渲染结果被判定为近空白且页面含内嵌图片 XObject 时，自动回退到内嵌 JPEG 流级提取，避免全书被误判为空白页。
 
 统一清洗（`DocumentCleaner`）会先暂存围栏代码块与行内代码（占位符使用私用区字符，不会被控制字符归一化破坏），再处理 Ovis OCR 输出的 HTML `<table>`：简单表格转成 GFM Markdown（兼容缺失闭合标签、`<br>`），而含 `colspan`/`rowspan` 合并单元格、嵌套表格、`caption`、多行表头或单元格内列表/图片/公式等无法无损表达的复杂表格会保留原始 HTML `<table>`，避免信息丢失。之后才清理标签/实体/噪声。HTML 解码会把 `&amp;`、`&nbsp;`、`&hellip;` 等还原为实际字符，而不是统一替换成空格；块级标签保留段落换行，内联标签直接删除；脚本/样式/SVG/iframe 等容器整块移除，属性与 CSS 残片单独清理。自动识别 Markdown 后，标题、列表、引用、链接、表格、分隔线、代码块与缩进都会被保留，纯文本则把链接压成文字并去掉 URL/邮箱。Unicode 层会删除 NBSP/零宽字符/软连字符/BOM/替换字符（U+FFFD）/变体选择符/私用区/非字符与孤立组合符；合并汉字之间的 OCR 空格（「新 中 新」→「新中新」）；把 `......` 归一为 `……`、压缩重复中文标点；连续装饰符号与符号密度过高的噪声行会丢弃，连续重复行只保留一条。中文硬换行在两侧都是 CJK 时不补空格；纯数字行只在页首/页尾 3 行内视为页码，正文中的年份/编号不会被误删。最后做密度压缩：去掉行尾空格，页标记、连续列表项、表格行、引用行之间不保留空行；短 OCR 行直接合并，长段落之间保留一个空行；标题、代码块与保留的 HTML 表格前后保留结构分隔。实测一本 2101 行的 OCR Markdown 从 1050 个空行压到 47 个。清洗规则变化会使 `pipeline_version` 递增，下一次同步会重建旧文件的索引。
 
