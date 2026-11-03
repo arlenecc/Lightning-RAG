@@ -220,7 +220,7 @@ public final class KernelLoop {
         // 避免每个用户回合都触发一次慢 prefill。
         // 但周期不能超过 raw 窗口：超出时窗口每轮都滑动，等于每轮都重建。
         let configured = max(8,
-            config.kernelConsolidateEvery == 0 ? 8 : config.kernelConsolidateEvery)
+            config.kernelConsolidateEvery == 0 ? 24 : config.kernelConsolidateEvery)
         self.consolidateEvery = max(1, min(configured, max(1, resolved.rawTurns)))
         self.maxToolChars = config.kernelMaxToolChars == 0 ? 8_000 : config.kernelMaxToolChars
         self.ragHistoryChars = config.kernelRagHistoryChars
@@ -608,8 +608,13 @@ public final class KernelLoop {
                 // RAG 结果 bulky：进历史 / KV 前缀前按 `ragHistoryChars` 单独收紧，
                 // 只保留最相关头部，避免几千字符的大返回把历史撑大、拖慢后续每轮生成。
                 // 不影响 `outcomes` —— nextPrompt / shouldExit 已基于完整数据算过。
-                rec.content = KernelLoop.trimRagHistory(rec.name, rec.content,
+                let trimmed = KernelLoop.trimRagHistory(rec.name, rec.content,
                                                        limit: ragHistoryChars)
+                if trimmed.count < rec.content.count {
+                    log("[rag-trim] \(rec.name) 原始 \(rec.content.count) → "
+                        + "\(trimmed.count) 字符（ragHistoryChars=\(ragHistoryChars)）")
+                }
+                rec.content = trimmed
                 return rec
             }
             let summary = resp.summary.isEmpty

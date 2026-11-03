@@ -295,7 +295,7 @@ public final class Agent: @unchecked Sendable {
             // 每个用户回合都重建一次（表现为“快两句又慢”）。
             rawTurns: max(8,
                           config.kernelRawTurns == 0 ? 8 : config.kernelRawTurns,
-                          config.kernelConsolidateEvery == 0 ? 8 : config.kernelConsolidateEvery),
+                          config.kernelConsolidateEvery == 0 ? 24 : config.kernelConsolidateEvery),
             maxDigestLines: config.kernelMaxDigestLines == 0 ? 40 : config.kernelMaxDigestLines
         )
 

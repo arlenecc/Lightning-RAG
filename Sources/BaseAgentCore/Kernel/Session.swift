@@ -354,10 +354,17 @@ public final class Session: @unchecked Sendable {
         return folded
     }
 
-    /// CONSOLIDATE 的折叠策略：折到只剩最近一轮，给下一个周期留满 raw 窗口。
+    /// CONSOLIDATE 的折叠策略：**存储层**落地 —— 把 `turns` 真正压缩进 `extraDigest`，
+    /// 折到只剩最近一轮，给下一个周期留满 raw 窗口。
     ///
-    /// 只折「超出 rawTurns 的部分」会让折叠后窗口仍然贴着上限，
-    /// 再跑 2~3 轮就又开始把最老轮滑进摘要区，KV 前缀再次失效。
+    /// 与 `windows()`（渲染层，只决定当轮怎么渲染、不改 `turns`）不同，这里是唯一
+    /// 会**缩小 `turns` 数组**的地方；不这么做，`turns` 无限增长（内存 + 每轮计算成本），
+    /// 且一旦累计轮数超过 `rawTurns`，最老原文轮滑进 `old` 被重新编码 → 逐轮废 KV。
+    ///
+    /// 为什么折到「只剩最近一轮」而不是只折已摘要区（`old`）？因为段内 `old` 本来就
+    /// 为空（`rawTurns` 全覆盖），折 `old` = 折 0，存储永不收敛。把稳定的原文 token
+    /// 换成摘要 token 必然改变前缀，但这是**一个周期仅一次**的塌陷；若只折 `old`，
+    /// 则 `old` 会无限膨胀、最终逐轮塌陷，比一次重置更糟。
     /// 返回实际折叠的轮数。
     @discardableResult
     public func foldForConsolidation() -> Int {
@@ -367,7 +374,12 @@ public final class Session: @unchecked Sendable {
 
     // MARK: 组装消息
 
-    /// 切分 `(old, raw)` —— L3 的核心。
+    /// 切分 `(old, raw)` —— L3 的核心，**纯渲染层**决策。
+    ///
+    /// 本函数**只决定「这一轮发给模型时」哪些轮当摘要、哪些轮当原文**，
+    /// **绝不修改存储的 `turns` 数组**：`turns` 逐轮累加，从不被这里裁掉。
+    /// 摘要 `<earlier_context>` 是 `l3Fold(extraDigest + old.map{digestLine})`
+    /// 每轮现算的：只要 `old` 非空，每轮多吞一轮 → 摘要文本变 → 前缀 token 变 → KV 废。
     ///
     /// `raw` = 最近 `rawTurns` 个**已完成**的轮 + 当前进行中的轮。
     /// `old` = 其余全部，折叠成摘要行。
@@ -376,6 +388,10 @@ public final class Session: @unchecked Sendable {
     /// 早先用「raw 软配额 40%」做收缩阈值，会把 8 轮窗口压到 5~6 轮：
     /// 每新增一轮就有旧轮滑进 `<earlier_context>`（消息索引 1），
     /// 跨轮 KV 前缀每轮都失效、全量 prefill —— 这是「越聊越慢」的根因。
+    ///
+    /// 段内（两次 CONSOLIDATE 之间）`old` 恒为空、`rawTurns` 覆盖全部已完成轮，
+    /// 摘要 = 固定 `extraDigest` → 前缀稳定 → KV 整段复用。把累加的 `turns` 真正
+    /// 落地成摘要、让 `old` 清零的是 `foldForConsolidation()`（存储层），不是这里。
     func windows() -> (old: [TurnRecord], raw: [TurnRecord]) {
         guard let current = turns.last else { return ([], []) }
         let completed = Array(turns.dropLast())
@@ -448,6 +464,9 @@ public final class Session: @unchecked Sendable {
         let (old, raw) = windows()
         foldedCount = extraDigest.count + old.count
 
+        // 摘要 = 存储层 `extraDigest`（仅 CONSOLIDATE 时变，稳定）
+        //       + 渲染层 `old` 的摘要行（随 `turns` 增长逐轮变）。
+        // `old` 为空时（段内）摘要即固定 `extraDigest`，前缀不变 → KV 复用。
         let digest = l3Fold(
             extraDigest + old.map { $0.digestLine() },
             maxLines: maxDigestLines
