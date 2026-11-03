@@ -83,16 +83,37 @@ public final class ONNXReranker: RerankProvider, @unchecked Sendable {
         return scores
     }
 
-    /// 长度分桶的批次规划：按 token 长度升序分组（同长度按原始索引稳定排序），
-    /// 每组内 pad 到组内最长，短文档不再陪跑段内最长文档。
-    static func lengthBucketedBatches(lengths: [Int], batchSize: Int) -> [[Int]] {
+    /// 长度分桶的批次规划：按 token 长度升序排列后，**按长度比例**聚桶——
+    /// 桶内最长不超过桶内最短的 `ratioThreshold` 倍（默认 1.5），同时单桶不超过
+    /// `batchSize` 上限。这样短文档只陪跑到「长度相近」的文档，避免被长尾文档
+    /// 一把 pad 到超长、徒增计算；长度齐整时仍会自然并成大桶吃满 batching 收益。
+    /// `ratioThreshold` 取 `.infinity` 时退化为固定 `batchSize` 切片（旧行为）。
+    static func lengthBucketedBatches(
+        lengths: [Int], batchSize: Int, ratioThreshold: Double = 1.5
+    ) -> [[Int]] {
         let size = max(1, batchSize)
         let ordered = lengths.indices.sorted {
             lengths[$0] == lengths[$1] ? $0 < $1 : lengths[$0] < lengths[$1]
         }
-        return stride(from: 0, to: ordered.count, by: size).map { start in
-            Array(ordered[start..<min(start + size, ordered.count)])
+        var batches: [[Int]] = []
+        var current: [Int] = []
+        var currentMin = Int.max
+        for idx in ordered {
+            let len = lengths[idx]
+            if current.isEmpty {
+                current = [idx]
+                currentMin = len
+            } else if current.count < size,
+                      Double(len) <= Double(currentMin) * ratioThreshold {
+                current.append(idx)
+            } else {
+                batches.append(current)
+                current = [idx]
+                currentMin = len
+            }
         }
+        if !current.isEmpty { batches.append(current) }
+        return batches
     }
 
     // MARK: - 推理
