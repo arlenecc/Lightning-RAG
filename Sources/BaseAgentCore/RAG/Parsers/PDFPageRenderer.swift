@@ -169,6 +169,102 @@ public enum PDFPageRenderer {
         return rendered
     }
 
+    /// 页面图像统一入口（多图情况）：单页产出**一张或多张**图。
+    ///
+    /// 常规长宽比页面与旧行为一致（返回单张，长边压到 `targetLongSide`）；
+    /// 但遇到**极端长宽比**页面（如整本书被压成一张超高窄条，长边压到目标值后
+    /// 短边只剩几十像素、文字完全不可读）时，会先把短边渲染到 `targetLongSide`
+    /// 保证可读，再沿长边切成若干 ≤`targetLongSide` 的方块条，逐条 OCR 拼接，
+    /// 避免「长边压制 → 短边崩溃 → 整页空白 → 解析失败」。
+    static func produceImages(document: CGPDFDocument,
+                              pageIndex: Int,
+                              targetLongSide: Int,
+                              dpi: Double) -> [CGImage] {
+        guard let cgPage = document.page(at: pageIndex + 1) else { return [] }
+        let box = Self.pageBox(cgPage)
+        guard box.width >= 1, box.height >= 1 else { return [] }
+        let rotation = ((cgPage.rotationAngle % 360) + 360) % 360
+        let quarterTurn = rotation == 90 || rotation == 270
+        let displayWidth = quarterTurn ? box.height : box.width
+        let displayHeight = quarterTurn ? box.width : box.height
+        let shortSidePt = min(displayWidth, displayHeight)
+        let longSidePt = max(displayWidth, displayHeight)
+        // 按旧逻辑长边压到 targetLongSide 后，短边若仍可读则走单图；
+        // 否则进入分块路径。384px 是 Vision/Ovis 可读性下限。
+        let minReadableSide: CGFloat = 384
+        let normalShortSidePx = shortSidePt * (CGFloat(targetLongSide) / longSidePt)
+        if normalShortSidePx >= minReadableSide {
+            if let image = produceImage(document: document, pageIndex: pageIndex,
+                                        targetLongSide: targetLongSide, dpi: dpi) {
+                return [image]
+            }
+            return []
+        }
+        return Self.produceTiledImages(cgPage: cgPage, shortSidePt: shortSidePt,
+                                      longSidePt: longSidePt, targetLongSide: targetLongSide)
+    }
+
+    /// 极端长宽比页面：把短边渲染到 `targetLongSide`（保证可读），再沿长边切成
+    /// 若干 ≤`targetLongSide` 的方块条。返回各自独立内存的瓦片（不依赖来源大图）。
+    private static func produceTiledImages(cgPage: CGPDFPage,
+                                           shortSidePt: CGFloat,
+                                           longSidePt: CGFloat,
+                                           targetLongSide: Int) -> [CGImage] {
+        // 用与页面等比例的缩放：短边 → targetLongSide，长边按同样比例放大，
+        // 因此瓦片天然是边长 ≤targetLongSide 的方块，文字不会被压扁。
+        let dpiFor = max(36.0, (CGFloat(targetLongSide) / shortSidePt) * 72.0)
+        let scale = CGFloat(targetLongSide) / shortSidePt
+        let longPx = Int((longSidePt * scale).rounded())
+        guard let full = render(cgPage: cgPage, dpi: dpiFor,
+                               maxLongSide: longPx + 2, maxPixelCount: 0) else {
+            return []
+        }
+        let longIsVertical = full.height >= full.width
+        let axisLength = longIsVertical ? full.height : full.width
+        let crossLength = longIsVertical ? full.width : full.height
+        var tiles: [CGImage] = []
+        var start = 0
+        while start < axisLength {
+            let length = min(targetLongSide, axisLength - start)
+            let rect = longIsVertical
+                ? CGRect(x: 0, y: start, width: crossLength, height: length)
+                : CGRect(x: start, y: 0, width: length, height: crossLength)
+            guard let cropped = full.cropping(to: rect),
+                  let copied = copyImage(cropped) else { break }
+            tiles.append(copied)
+            start += targetLongSide
+        }
+        return tiles
+    }
+
+    /// 页面盒：优先 CropBox，缺失或非法时回退 MediaBox。
+    private static func pageBox(_ cgPage: CGPDFPage) -> CGRect {
+        var box = cgPage.getBoxRect(.cropBox)
+        if box.width < 1 || box.height < 1 {
+            box = cgPage.getBoxRect(.mediaBox)
+        }
+        return box
+    }
+
+    /// 把位图拷贝成独立内存（白底），使瓦片不再依赖来源大图底层数据，
+    /// 来源大图释放后瓦片仍有效。
+    private static func copyImage(_ image: CGImage) -> CGImage? {
+        let width = image.width
+        let height = image.height
+        guard width > 0, height > 0 else { return nil }
+        let colorSpace = CGColorSpace(name: CGColorSpace.sRGB)
+            ?? CGColorSpaceCreateDeviceRGB()
+        guard let context = CGContext(
+            data: nil, width: width, height: height, bitsPerComponent: 8,
+            bytesPerRow: 0, space: colorSpace,
+            bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue) else { return nil }
+        context.setFillColor(CGColor(red: 1, green: 1, blue: 1, alpha: 1))
+        context.fill(CGRect(x: 0, y: 0, width: width, height: height))
+        context.interpolationQuality = .medium
+        context.draw(image, in: CGRect(x: 0, y: 0, width: width, height: height))
+        return context.makeImage()
+    }
+
     /// 兜底：提取页面内像素数最大的 DCTDecode 图片流，直接交给 ImageIO 解码。
     /// 与 `extractEmbeddedJPEG` 的差异：不要求整页唯一图片流，且接受
     /// CoreGraphics 报告 raw 但以 SOI 开头的 JPEG 字节（见 CPDFShim.h）。

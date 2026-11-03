@@ -6,8 +6,9 @@ import CoreGraphics
 /// 结构（对应渲染优化的 ①③④ 三项）：
 /// - 每 worker 独占一个 `CGPDFDocument` 实例，只在自己的任务里访问，
 ///   规避 PDFPage/CGPDFDocument 的线程安全问题，无需加锁；
-/// - worker 内串行产图（[PDFPageRenderer.produceImage]：优先直接提取内嵌
-///   JPEG，失败回退 CoreGraphics 栅格化），每产出一页立即把 OCR 提交到
+/// - worker 内串行产图（[PDFPageRenderer.produceImages]：优先直接提取内嵌
+///   JPEG，失败回退 CoreGraphics 栅格化；极端长宽比页面会切成多条方块），
+///   每产出一页（可能含多条瓦片）立即把 OCR 提交到
 ///   内层任务组，不等后续页渲染——渲染与识别跨页重叠；
 /// - worker 之间并行（数量由 `PDFProcessingPlan` 按文件体积决定），
 ///   多文件同时解析时总计页面图像由全局 `imageGate` 硬性限流。
@@ -147,34 +148,60 @@ enum PDFPageScanRunner {
                             let renderStarted = Date()
                             // PDFKit/CoreGraphics 每页会产生大量 autoreleased 对象；
                             // 长循环不排空池会把整本书的页对象一直留在内存里。
-                            let image = autoreleasepool {
-                                PDFPageRenderer.produceImage(
+                            let images = autoreleasepool {
+                                PDFPageRenderer.produceImages(
                                     document: document,
                                     pageIndex: pageIndex,
                                     targetLongSide: targetLongSide,
                                     dpi: dpi)
                             }
                             let renderSeconds = Date().timeIntervalSince(renderStarted)
-                            guard let image else {
+                            guard !images.isEmpty else {
                                 outcomes.append(Outcome(index: pageIndex, isBlank: true,
                                                         renderFailed: true,
                                                         text: nil, needsVLM: false,
                                                         renderSeconds: renderSeconds))
                                 return true
                             }
-                            guard !PDFPageRenderer.isNearlyBlank(image) else {
+                            guard !images.allSatisfy({ PDFPageRenderer.isNearlyBlank($0) }) else {
                                 outcomes.append(Outcome(index: pageIndex, isBlank: true,
                                                         text: nil, needsVLM: false,
                                                         renderSeconds: renderSeconds))
                                 return true
                             }
-                            inner.addTask {
-                                defer { Self.imageGate.release() }
-                                let result = try await perPage(pageIndex, image)
-                                return Outcome(index: pageIndex, isBlank: false,
-                                               text: result.text, needsVLM: result.needsVLM,
-                                               renderSeconds: renderSeconds,
-                                               ocrSeconds: result.busySeconds)
+                            if images.count == 1 {
+                                inner.addTask {
+                                    defer { Self.imageGate.release() }
+                                    let result = try await perPage(pageIndex, images[0])
+                                    return Outcome(index: pageIndex, isBlank: false,
+                                                   text: result.text, needsVLM: result.needsVLM,
+                                                   renderSeconds: renderSeconds,
+                                                   ocrSeconds: result.busySeconds)
+                                }
+                            } else {
+                                // 极端长宽比页面被切成多条：逐条 OCR 后按页拼接。
+                                inner.addTask {
+                                    defer { Self.imageGate.release() }
+                                    var combined = ""
+                                    var anyNeedsVLM = false
+                                    var busy: Double = 0
+                                    for tile in images {
+                                        if Task.isCancelled { throw AgentError.cancelled }
+                                        let result = try await perPage(pageIndex, tile)
+                                        busy += result.busySeconds
+                                        if result.needsVLM { anyNeedsVLM = true }
+                                        if let text = result.text,
+                                           !text.trimmingCharacters(
+                                               in: .whitespacesAndNewlines).isEmpty {
+                                            combined += (combined.isEmpty ? "" : "\n\n") + text
+                                        }
+                                    }
+                                    return Outcome(index: pageIndex, isBlank: false,
+                                                   text: combined.isEmpty ? nil : combined,
+                                                   needsVLM: anyNeedsVLM,
+                                                   renderSeconds: renderSeconds,
+                                                   ocrSeconds: busy)
+                                }
                             }
                             permitTransferred = true
                             return true
