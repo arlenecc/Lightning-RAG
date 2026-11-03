@@ -126,6 +126,10 @@ private let minAttemptsBeforeBlock = 3
 private let blockNudgeMax = 2
 private let repeatCallWarn = 2
 private let repeatCallLimit = 4
+/// 单次大纲（rag_outline）之后允许的 rag_search 次数硬上限。
+/// 超过后内核直接把多余检索预置为失败，逼模型基于已有结果 + 大纲摘要作答，
+/// 杜绝「同一问题反复换关键词 scatter 检索」的无效搜索。
+private let maxRagSearchesPerOutline = 3
 
 private let askUserPattern =
     "(请(提供|告诉|告知|说明|补充|指定|确认)|需要(你|您)(提供|告诉|确认|补充)|"
@@ -188,6 +192,8 @@ public final class KernelLoop {
     private var repeatStreak = 0
     private var lastCallSigs: [String] = []
     private var toolCallCounter = 0
+    /// 当前「大纲后检索预算」已用次数；每次 rag_outline 清零，每次 run() 也清零。
+    private var ragSearchCount = 0
     private var resume = false
     private var pendingSeed: FailureSnapshot?
 
@@ -289,6 +295,7 @@ public final class KernelLoop {
         planFinishNudge = 0
         repeatStreak = 0
         lastCallSigs = []
+        ragSearchCount = 0
         self.resume = resume
         if let seed = pendingSeed {
             failedTotal = seed.failedTotal
@@ -555,13 +562,49 @@ public final class KernelLoop {
                 }
             }
 
+            // ---- 大纲后检索次数硬上限（默认 3）----
+            // 每次 `rag_outline` 开启新一轮「检索预算」并清零；超出上限的 `rag_search`
+            // 直接预置失败，逼模型基于已有结果与大纲摘要综合作答，杜绝无效重复检索。
+            var executeCalls: [ToolCall] = []
+            var preset: [Int: ToolResult] = [:]
+            var liveCount = ragSearchCount
+            for (i, tc) in toolCalls.enumerated() {
+                switch tc.name {
+                case "rag_outline":
+                    liveCount = 0
+                    executeCalls.append(tc)
+                case "rag_search":
+                    if liveCount >= maxRagSearchesPerOutline {
+                        preset[i] = .fail(
+                            "已达单次大纲后的检索上限（\(maxRagSearchesPerOutline) 次）。"
+                            + "请基于已检索内容与大纲摘要直接综合作答，不要再调用 rag_search。")
+                        continue
+                    }
+                    liveCount += 1
+                    executeCalls.append(tc)
+                default:
+                    executeCalls.append(tc)
+                }
+            }
+            if liveCount != ragSearchCount {
+                log("[kernel] 大纲后检索计数 \(ragSearchCount) → \(liveCount)"
+                    + "（上限 \(maxRagSearchesPerOutline)）")
+            }
+            ragSearchCount = liveCount
+
             let rawResults: [ToolResult]
             do {
-                rawResults = try await runtime.execute(toolCalls)
+                let executed = try await runtime.execute(executeCalls)
+                var it = executed.makeIterator()
+                rawResults = toolCalls.enumerated().map { (i, _) in
+                    if let pre = preset[i] { return pre }
+                    return it.next()!
+                }
             } catch {
                 log("[kernel] dispatcher error: \(describe(error))")
-                rawResults = Array(repeating: ToolResult.fail("工具未返回结果"),
-                                   count: toolCalls.count)
+                rawResults = toolCalls.enumerated().map { (i, _) in
+                    preset[i] ?? .fail("工具未返回结果")
+                }
             }
 
             // 失败记账必须在拼装 pending 之前：步骤内失败数要在 update_plan
