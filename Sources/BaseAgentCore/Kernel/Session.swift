@@ -394,6 +394,14 @@ public final class Session: @unchecked Sendable {
     /// 段内（两次 CONSOLIDATE 之间）`old` 恒为空、`rawTurns` 覆盖全部已完成轮，
     /// 摘要 = 固定 `extraDigest` → 前缀稳定 → KV 整段复用。把累加的 `turns` 真正
     /// 落地成摘要、让 `old` 清零的是 `foldForConsolidation()`（存储层），不是这里。
+    ///
+    /// 裁剪时机边界（理解「何时裁 / 何时累积 / KV 何时失效」）：
+    /// - 工具输出在**产出时**裁一次（L0 ≤20k 硬顶 + L1 动态 `maxChars`，见 `Loop` 捕获点），
+    ///   以已裁剪字符串冻结进 `turn.toolResults`；`renderRaw` 注入时直接取、不二次裁 → 前缀稳定。
+    /// - 对话轮在段内**逐轮累积、不重裁**：每轮 `raw` +1，前缀（system + extraDigest + old）不变
+    ///   → KV 整段复用；仅当越过 `rawTurns`/`rawCeiling` 时最老轮滑入 `old`（折成一行摘要）才始裁。
+    /// - 唯一的大裁是 CONSOLIDATE（每 `consolidateEvery` 轮或 `totalOver`）：`foldForConsolidation()`
+    ///   把历史整段折成 `extraDigest` → 该轮前缀变化 → KV 失效一次，之后段内重新稳定。
     func windows() -> (old: [TurnRecord], raw: [TurnRecord]) {
         guard let current = turns.last else { return ([], []) }
         let completed = Array(turns.dropLast())
@@ -462,6 +470,10 @@ public final class Session: @unchecked Sendable {
     }
 
     /// 产出本轮发给模型的完整消息列表（已过 L1/L3）。
+    /// `systemPrompt` 含「静态协议 + 动态上下文（工作记忆/当天事实/检查点）」，位于消息头部；
+    /// 段内 `extraDigest` 不变时头部恒定 → 前缀 KV 复用。仅当动态上下文或 CONSOLIDATE 后的
+    /// `extraDigest` 变化，头部才改变 → 该轮 KV 失效一次。注意：API 每轮都重发**完整**消息列表
+    /// （无「仅追加新内容」模式），KV 复用是提供方基于前缀匹配的优化，而非跳过旧内容。
     public func buildMessages(systemPrompt: String, userText: String = "") -> [ChatMessage] {
         let (old, raw) = windows()
         foldedCount = extraDigest.count + old.count

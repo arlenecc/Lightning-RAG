@@ -19,6 +19,7 @@ final class KernelLoopRagSearchCapTests: XCTestCase {
         let session = Session(budget: ContextBudget(total: 60_000), rawTurns: 50)
         var config = AgentConfig()
         config.kernelConsolidateEvery = 24
+        config.kernelRawTurns = 50  // 大窗口：本测试验证 RAG 上限，期间不应触发 CONSOLIDATE 折掉历史
 
         let runtime = KernelRuntime(
             stream: { _, _, _ in
@@ -105,6 +106,7 @@ final class KernelLoopRagSearchCapTests: XCTestCase {
         let session = Session(budget: ContextBudget(total: 60_000), rawTurns: 50)
         var config = AgentConfig()
         config.kernelConsolidateEvery = 24
+        config.kernelRawTurns = 50  // 大窗口：本测试验证 RAG 上限，期间不应触发 CONSOLIDATE 折掉历史
         let runtime = KernelRuntime(
             stream: { _, _, _ in
                 callCounter[0] += 1
