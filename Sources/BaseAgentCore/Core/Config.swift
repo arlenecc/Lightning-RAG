@@ -115,7 +115,21 @@ public struct AgentConfig: Sendable {
 
     // 内核：三态自动机 + 五级压缩
     public var kernelMaxContextTokens: Int = 30_000
-    public var kernelRawTurns: Int = 2
+    /// 稳定 raw 窗口：段内（两次 CONSOLIDATE 之间）保留最近 `kernelRawTurns` 个
+    /// 已完成轮作为原文；超过的部分才会被 `windows()` 滑进 `<earlier_context>`。
+    /// 它是 CONSOLIDATE 周期的**上钳位**——见下方 `kernelConsolidateEvery` 警示。
+    /// 默认 24 与 `kernelConsolidateEvery` 对齐，使"每 24 轮折"真正生效
+    /// （否则旧默认 2 会把周期钳成每 2 轮折）。
+    public var kernelRawTurns: Int = 24
+    /// 周期性主动折叠的「目标」间隔（轮）。
+    /// ⚠️ 联动警示：实际生效周期 = `min(max(8, kernelConsolidateEvery), kernelRawTurns)`
+    /// （见 `Loop.swift` 构造）。即本参数会被 `kernelRawTurns` 钳住——若 `kernelRawTurns`
+    /// 小于本值，周期会被钳成 `kernelRawTurns`（例如旧默认 rawTurns=2 会把"每 24 轮"压成
+    /// 每 2 轮折）；当前 `kernelRawTurns` 已默认配到 24 与本值对齐，使"每 24 轮折"生效。
+    /// 周期超过 `kernelRawTurns` 不仅无效，反而有害：段内 raw 窗口会超出稳定阈值、
+    /// `windows()` 每轮滑窗 → KV 前缀每轮失效 → 全量 prefill（越聊越慢）。
+    /// 想要更长稳定上下文，应优先调大 `kernelRawTurns`（它会同时抬高本钳位上限），
+    /// 而非单改本参数。
     public var kernelConsolidateEvery: Int = 24
     /// L1 工具结果字符上限。与 RAG 输出总上限（ragSearchMaxTotalChars=12000）
     /// 取较小值生效：默认 8000 让 RAG 结果不会被内核二次静默截断。

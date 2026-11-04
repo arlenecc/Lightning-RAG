@@ -129,6 +129,8 @@ public final class Session: @unchecked Sendable {
     public private(set) var planRevision = 0
     /// 因摘要区超限被真正丢弃的行数（用于省略标记的累计值）。
     private var digestDropped = 0
+    /// 上次发出「稳定 raw 窗口越顶」告警的轮次；用于节流，避免段内每轮刷屏。
+    private var lastOldSlidingWarnTurn: Int = -1000
 
     public init(budget: ContextBudget, rawTurns: Int = 2, maxDigestLines: Int = 40) {
         self.budget = budget
@@ -463,6 +465,24 @@ public final class Session: @unchecked Sendable {
     public func buildMessages(systemPrompt: String, userText: String = "") -> [ChatMessage] {
         let (old, raw) = windows()
         foldedCount = extraDigest.count + old.count
+
+        // 运行时诊断：段内 `old` 非空 = 稳定 raw 窗口已越顶——raw 被迫滑进
+        // `<earlier_context>`，意味着 kernelRawTurns 在当前负载下不足，KV 前缀每轮
+        // 失效（越聊越慢）。借此判断 24（或所配值）是否够用：若持续出现该告警，
+        // 应调大 kernelMaxContextTokens 抬高 rawCeiling，而非单加 kernelRawTurns。
+        // 节流：相邻告警间隔 ≥8 轮，避免工具密集段每轮刷屏。
+        if !old.isEmpty, currentTurn - lastOldSlidingWarnTurn >= 8 {
+            lastOldSlidingWarnTurn = currentTurn
+            let nonRaw = budget.used("system") + budget.used("earlier") + budget.used("tools")
+            let rawCeiling = max(0, budget.total - budget.quota.reserve - nonRaw)
+            let rawTokens = TokenEstimator.estimate(Self.renderRaw(raw))
+            AgentLog.warning(
+                "[context] 稳定 raw 窗口已越顶：段内 \(old.count) 轮滑入 <earlier_context>"
+                + "（raw \(raw.count) 轮≈\(rawTokens) token / 上限 \(rawCeiling)）。"
+                + " kernelRawTurns=\(rawTurns) 在当前负载下不足，"
+                + "建议调大 kernelMaxContextTokens 抬高 rawCeiling，或精简单轮 token。"
+            )
+        }
 
         // 摘要 = 存储层 `extraDigest`（仅 CONSOLIDATE 时变，稳定）
         //       + 渲染层 `old` 的摘要行（随 `turns` 增长逐轮变）。
