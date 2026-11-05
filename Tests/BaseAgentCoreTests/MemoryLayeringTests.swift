@@ -276,11 +276,25 @@ final class MemoryLayeringTests: XCTestCase {
         let agent = Agent(llm: NoopLLM2(), config: config, callbacks: SilentCallbacks())
         defer { agent.close() }
 
-        let chars = agent.systemPrompt().count
-        let tokens = TokenEstimator.estimate(agent.systemPrompt())
+        let full = agent.systemPrompt()
+        let chars = full.count
+        let tokens = TokenEstimator.estimate(full)
         print("[memory-layering] system chars=\(chars) estimatedTokens=\(tokens) "
             + "budget=\(config.kernelMaxContextTokens) "
             + "reserve=\(ContextBudget(total: config.kernelMaxContextTokens).quota.reserve)")
+        // 分段量化，便于评估精简收益。
+        for (name, text) in [("BASE", BASE_SYSTEM_PROMPT),
+                             ("L0-SOP", MEMORY_MANAGEMENT_SOP),
+                             ("L1-INDEX", DEFAULT_GLOBAL_MEM_INSIGHT)] {
+            print("[memory-layering]   \(name): chars=\(text.count) "
+                + "tokens=\(TokenEstimator.estimate(text))")
+        }
+        // warmup 前缀 = system + 全量工具 schema；KVCacheEffectivenessTests 断言
+        // 首轮 cached > 3000 token，精简 system 后必须确认仍有足够前缀。
+        let schemaTokens = TokenEstimator.estimate(
+            agent.dispatcher.schemas().map { $0.jsonString() }.joined(separator: "\n"))
+        print("[memory-layering]   TOOLS-SCHEMA: tokens=\(schemaTokens) "
+            + "warmupPrefix≈\(tokens + schemaTokens)")
         XCTAssertLessThan(tokens, config.kernelMaxContextTokens,
                           "常驻 SOP+L1 已超过整个上下文预算，必须缩短或调大预算")
     }
