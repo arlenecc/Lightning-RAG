@@ -95,7 +95,7 @@ public final class OvisVLMService: VLMService, @unchecked Sendable {
         }
 
         do {
-            var input = try await container.prepare(input: userInput)
+            let input = try await container.prepare(input: userInput)
             let parameters = GenerateParameters(
                 maxTokens: max(1, maxTokens),
                 temperature: 0,
@@ -117,8 +117,8 @@ public final class OvisVLMService: VLMService, @unchecked Sendable {
                     break
                 }
             }
-            // 显式释放 MLX 图像输入张量，避免其随闭包跨 await 滞留占用显存/内存。
-            input = nil
+            // `input` 为局部变量，函数返回时 ARC 自然释放其持有的 MLX 张量，
+            // 无需手动置 nil（LMInput 非可选类型不能赋 nil，且它不会跨函数调用滞留）。
             return Self.stripThinking(text).trimmingCharacters(in: .whitespacesAndNewlines)
         } catch is CancellationError {
             throw AgentError.cancelled
