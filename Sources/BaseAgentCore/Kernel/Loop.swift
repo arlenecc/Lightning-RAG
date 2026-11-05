@@ -359,7 +359,10 @@ public final class KernelLoop {
             // ---- THINK ----
             state = .think
             // 规划门：还没干过实际活、且还没有计划时，持续提醒先规划再动手。
-            if session.getPlan() == nil && !didWork && !isSimpleInput(userInput) {
+            // 轻量轮（寒暄/能力问询）没有工具 schema，注入「先调 update_plan」
+            // 只会让模型反复声明要建计划却无从执行。
+            if toolsEnabled && session.getPlan() == nil && !didWork
+                && !isSimpleInput(userInput) {
                 pending += planGateHint
             }
             var userText = session.anchorPrompt(extra: pending)
@@ -405,6 +408,25 @@ public final class KernelLoop {
             }
 
             if !resp.hasCalls {
+                // 轻量轮（寒暄/能力问询）：工具 schema 已禁用，所有「先建计划 /
+                // 必须调工具」的反思门与 nudge 都不适用，否则模型会被要求执行
+                // 根本不存在的工具，陷入元陈述重复。直接收下纯文本答复。
+                if !toolsEnabled {
+                    // 剥掉模型可能仍写出的 <summary> 元陈述，只把真正的正文展示/入库，
+                    // 避免「我该做什么」这类自我描述被当成给用户的回答。
+                    let visible = stripSummaryTags(resp.content)
+                        .trimmingCharacters(in: .whitespacesAndNewlines)
+                    let answer = visible.isEmpty
+                        ? "你好，有什么可以帮你？"
+                        : visible
+                    finalText = answer
+                    session.finishTurn(rec, assistantText: answer,
+                                       summary: l2Summary(answer),
+                                       rawContent: resp.rawContent)
+                    finalTurnNoTool = true
+                    exitReason = .done
+                    break
+                }
                 // 反思门：模型想收尾，但计划里还有未完成步骤 —— 不能就这么放它走。
                 let openSteps = session.planOpenSteps()
 
@@ -541,7 +563,7 @@ public final class KernelLoop {
             // ---- 规划前置门：先于执行 ----
             let hasActual = toolCalls.contains { $0.name != "update_plan" }
             let hasPlanOp = toolCalls.contains { $0.name == "update_plan" }
-            if session.getPlan() == nil
+            if toolsEnabled && session.getPlan() == nil
                 && !didWork
                 && hasActual && !hasPlanOp
                 && !resume {
@@ -669,7 +691,6 @@ public final class KernelLoop {
                                toolCalls: toolCalls, toolResults: toolResults,
                                summary: summary, rawContent: resp.rawContent)
             resetRetryGuards()
-            let hasSummary = hasSummaryTag(resp.content)
 
             if outcomes.contains(where: { $0.shouldExit }) {
                 finalText = resp.content
@@ -685,9 +706,6 @@ public final class KernelLoop {
             }
 
             var parts = nextPrompts.sorted()
-            if !hasSummary {
-                parts.append("[TIPS] 回复正文必须包含 <summary>…</summary>（≤30 字物理快照）。")
-            }
             // 失败恢复提示：计划步骤出错时不许停下等用户说「继续」。
             parts.append(contentsOf: recoveryHints(toolCalls, rawResults,
                                                    batch: batch,
@@ -1153,12 +1171,20 @@ public final class KernelLoop {
             return emptyRetry <= maxEmptyRetry ? "retry" : "done"
         }
         let tail = String(content.suffix(120))
-        if truncationMarks.contains(where: { tail.contains($0) })
-            || (content.hasSuffix("</summary>") && content.count < 100) {
+        if truncationMarks.contains(where: { tail.contains($0) }) {
             emptyRetry += 1
             return emptyRetry <= maxEmptyRetry ? "retry" : "done"
         }
-        if looksLikeUnexecutedCode(content) {
+        // 已给出正文（哪怕很短，如「红色方块。」）就直接放行：缺 `<summary>`
+        // 不是重试理由，为补标签重跑一轮只会制造重复的元陈述。
+        // 只有「整段回复剥掉 <summary> 后完全没有正文」才说明用户收不到内容。
+        let visible = stripSummaryTags(content)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if visible.isEmpty {
+            emptyRetry += 1
+            return emptyRetry <= maxEmptyRetry ? "retry" : "done"
+        }
+        if looksLikeUnexecutedCode(visible) {
             return "reask"
         }
         return "done"

@@ -348,16 +348,29 @@ public struct RequiredModel: Sendable, Equatable, Identifiable {
     public let directory: URL
     /// 仓库内子目录：只下载该子目录下的文件并剥掉前缀（如 potion 的 `int4`）。
     public let subpath: String?
+    /// 运行时真正会加载的权重文件名（basename 白名单）。
+    /// `nil` = 不限制（按扩展名宽松判定，适用于分片 safetensors / gguf）。
+    /// ONNX 后端只认 `resolveONNXModel` 候选名单里的名字，避免把仓库里
+    /// `model_fp16.onnx` / 原版 `model.safetensors` 这类永远不读的权重拉下来。
+    public let allowedWeightNames: Set<String>?
 
-    public init(kind: String, repo: String, directory: URL, subpath: String? = nil) {
+    public init(kind: String, repo: String, directory: URL,
+                subpath: String? = nil,
+                allowedWeightNames: Set<String>? = nil) {
         self.kind = kind
         self.repo = repo
         self.directory = directory
         self.subpath = subpath
+        self.allowedWeightNames = allowedWeightNames
     }
 }
 
 public enum RequiredModelCatalog {
+    /// 与 `LocalModelRegistry.resolveONNXModel` 同源的可加载权重文件名。
+    /// 取 basename，这样 `onnx/model_int8.onnx` 与根目录同名文件都能命中。
+    public static let onnxWeightNames: Set<String> = Set(
+        LocalModelRegistry.onnxCandidateNames.map { ($0 as NSString).lastPathComponent }
+    )
     /// 解析当前配置需要的全部本地模型（按目录去重）。
     public static func models(for config: AgentConfig) -> [RequiredModel] {
         var seen = Set<String>()
@@ -385,10 +398,31 @@ public enum RequiredModelCatalog {
             } else {
                 repoName = (trimmed as NSString).lastPathComponent
             }
+            // ONNX 后端的 embedding / reranker 只加载候选名单里的权重文件，
+            // 下载清单与就绪判定都按这份白名单走；MLX / GGUF 不限制（分片权重）。
+            let backend: String
+            switch registryKind {
+            case .reranker: backend = config.localRerankerBackend
+            case .embedding: backend = config.localEmbeddingBackend
+            default: backend = ""
+            }
+            // 用户显式选定了一个具体权重文件（config 里写的是文件路径）时，
+            // registry 会把它归一成父目录，但运行时按用户选的文件直接采用，
+            // 文件名不必在候选名单里 —— 这类不能套白名单，否则永远判缺失。
+            var explicitIsDirectory: ObjCBool = false
+            let explicitWeightFile = ["onnx", "safetensors", "gguf"].contains(
+                (trimmed as NSString).pathExtension.lowercased())
+                && FileManager.default.fileExists(
+                    atPath: (trimmed as NSString).expandingTildeInPath,
+                    isDirectory: &explicitIsDirectory)
+                && !explicitIsDirectory.boolValue
+            let weightNames: Set<String>? = backend.lowercased() == "onnx"
+                && !explicitWeightFile ? onnxWeightNames : nil
             out.append(RequiredModel(
                 kind: kind,
                 repo: "\(HFModelDownloader.repoOwner)/\(repoName)",
-                directory: dir))
+                directory: dir,
+                allowedWeightNames: weightNames))
         }
 
         if config.llmProvider == "local" {
@@ -427,65 +461,105 @@ public enum RequiredModelCatalog {
         return out
     }
 
-    /// 按 model 的仓库子目录过滤文件并剥掉前缀（无子目录时原样返回）。
+    /// 下载清单过滤：按仓库子目录剥前缀 + 按运行时可加载权重白名单筛选。
     ///
-    /// potion 等多量化档仓库（fp16/int8/int4 平级）只取目标档位，
-    /// 避免把其它档位的数百 MB 权重一并拉下来。
+    /// potion 等多量化档仓库（fp16/int8/int4 平级）只取目标档位；ONNX 后端
+    /// 只取 `resolveONNXModel` 候选名单里的权重，避免把 fp16 / 原版
+    /// safetensors 这类运行时永远不读的数百 MB 文件拉下来。
     public static func scopedFiles(
         for model: RequiredModel,
         in files: [HFModelDownloader.FileEntry]
     ) -> [HFModelDownloader.FileEntry] {
-        guard let subpath = model.subpath?
-            .trimmingCharacters(in: .whitespacesAndNewlines),
-            !subpath.isEmpty else { return files }
-        let prefix = subpath.hasSuffix("/") ? subpath : subpath + "/"
+        let subpath = model.subpath?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        // 普通模型（无子目录、无白名单）保持原样返回：清单在
+        // listNeededFiles 阶段已按 isNeededFile 过滤过一次，不重复处理。
+        guard !subpath.isEmpty || model.allowedWeightNames != nil else {
+            return files
+        }
+        let prefix = subpath.isEmpty ? "" : (subpath.hasSuffix("/") ? subpath : subpath + "/")
         var out: [HFModelDownloader.FileEntry] = []
         for file in files {
-            guard file.path.hasPrefix(prefix) else { continue }
-            let stripped = String(file.path.dropFirst(prefix.count))
-            guard !stripped.isEmpty,
-                  HFModelDownloader.isNeededFile(stripped) else { continue }
-            out.append(HFModelDownloader.FileEntry(path: stripped,
+            let localPath: String
+            if prefix.isEmpty {
+                localPath = file.path
+            } else {
+                guard file.path.hasPrefix(prefix) else { continue }
+                localPath = String(file.path.dropFirst(prefix.count))
+            }
+            guard !localPath.isEmpty,
+                  HFModelDownloader.isNeededFile(localPath) else { continue }
+            // 权重文件必须在运行时可加载名单内（非权重文件如 config/tokenizer 放行）。
+            if let allowed = model.allowedWeightNames,
+               isWeightPath(localPath),
+               !allowed.contains((localPath as NSString).lastPathComponent) {
+                continue
+            }
+            out.append(HFModelDownloader.FileEntry(path: localPath,
                                                   size: file.size,
-                                                  remotePath: file.path))
+                                                  remotePath: file.remotePath))
         }
         return out
     }
 
-    /// 缺失（目录不存在或没有任何权重文件）的必需模型。
+    /// 缺失（目录不存在或没有可加载的权重文件）的必需模型。
     public static func missingModels(for config: AgentConfig) -> [RequiredModel] {
-        models(for: config).filter { !isComplete($0.directory) }
+        models(for: config).filter { !isComplete($0) }
     }
 
-    /// 模型目录是否就绪：存在至少一个可加载的权重文件。
-    ///
+    /// 与运行时同源的就绪判定：只认可加载文件名，且体积必须达标。
+    public static func isComplete(_ model: RequiredModel) -> Bool {
+        isComplete(model.directory, allowedWeightNames: model.allowedWeightNames)
+    }
+
+    /// 宽松版（不限制权重文件名），供按目录查询使用。
+    public static func isComplete(_ directory: URL) -> Bool {
+        isComplete(directory, allowedWeightNames: nil)
+    }
+
     /// 必须覆盖用户自配模型的全部形态，否则会被永远判定缺失：
     /// - registry 对显式选定的 `.onnx` / `.safetensors` / `.gguf` 文件
     ///   直接返回**文件 URL** 而非目录；
     /// - ONNX 权重可能位于 `onnx/` 子目录（registry 的候选搜索范围）；
     /// - 分片权重为 `model-00001-of-0000N.safetensors`（按扩展名命中）。
-    public static func isComplete(_ directory: URL) -> Bool {
+    ///
+    /// 体积校验是必需的：下载中断会留下 1 字节占位文件，若算作就绪，
+    /// 启动会跳过补全、真正加载时才失败（实测 embedding 就踩过这个坑）。
+    private static func isComplete(_ directory: URL,
+                                   allowedWeightNames: Set<String>?) -> Bool {
         let fm = FileManager.default
         var isDirectory: ObjCBool = false
         guard fm.fileExists(atPath: directory.path, isDirectory: &isDirectory) else {
             return false
         }
-        // 用户显式指定的单个权重文件。
+        // 权重文件最小也在数十 KB；4KB 阈值足够保守，只挡空文件/占位符。
+        let minWeightBytes: Int64 = 4_096
+        func usable(_ name: String, at url: URL) -> Bool {
+            guard isWeightPath(name) else { return false }
+            if let allowed = allowedWeightNames,
+               !allowed.contains((name as NSString).lastPathComponent) {
+                return false
+            }
+            return HFModelDownloader.fileSize(at: url) >= minWeightBytes
+        }
+        // 用户显式指定的单个权重文件：运行时 `resolveONNXModel` 直接采用它、
+        // 不走候选名单，所以这里也不能套白名单（只校验体积与扩展名）。
         if !isDirectory.boolValue {
-            return isWeightPath(directory.path)
+            return isWeightPath(directory.lastPathComponent)
+                && HFModelDownloader.fileSize(at: directory) >= minWeightBytes
         }
         // 目录：顶层与 onnx/ 子目录（与 registry 的 ONNX 候选范围一致）。
         let scopes = [directory, directory.appendingPathComponent("onnx", isDirectory: true)]
         for scope in scopes {
             let items = (try? fm.contentsOfDirectory(atPath: scope.path)) ?? []
-            if items.contains(where: { isWeightPath($0) }) {
+            for item in items where usable(item, at: scope.appendingPathComponent(item)) {
                 return true
             }
         }
         return false
     }
 
-    private static func isWeightPath(_ path: String) -> Bool {
+    static func isWeightPath(_ path: String) -> Bool {
         let ext = (path as NSString).pathExtension.lowercased()
         return ext == "safetensors" || ext == "onnx" || ext == "gguf" || ext == "npz"
     }

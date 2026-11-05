@@ -571,6 +571,7 @@ public final class Agent: @unchecked Sendable {
         // 只有非寒暄/简单问询才进入技能固化统计；是否真正提示还要看本轮
         // 是否用过计划（见本次 run 末尾），避免简单查询被提示保存技能。
         let skillCandidate: Skill? = SkillManager.isTrivialRequest(userInput)
+            || SkillManager.isCapabilityQuery(userInput)
             ? nil
             : skills.recordRequest(userInput)
 
@@ -583,12 +584,13 @@ public final class Agent: @unchecked Sendable {
         }
 
         // 任务边界：已收尾的旧计划清空；未收尾的注入一次性判断提示。
-        // 寒暄轮既不触碰计划，也不提供任何工具——直接文本回复。
+        // 寒暄轮/能力问询轮既不触碰计划，也不提供任何工具——直接文本回复。
         let isGreeting = SkillManager.isGreeting(userInput)
+        let lightweightTurn = isGreeting || SkillManager.isCapabilityQuery(userInput)
         if session.getPlan() == nil, let stored = PlanStore.load(config) {
             session.setPlan(stored)
         }
-        if session.getPlan() != nil, !isGreeting {
+        if session.getPlan() != nil, !lightweightTurn {
             if session.planOpenSteps().isEmpty {
                 session.clearPlan()
                 PlanStore.clear(config)
@@ -604,21 +606,14 @@ public final class Agent: @unchecked Sendable {
                 log("[plan] 上一任务计划未收尾，已注入新任务/继续任务的判断提示")
             }
         }
-        if !isGreeting, SkillManager.isTrivialRequest(userInput) {
-            // 一步能完成的简单请求：允许调用所需工具，但不要为它建立计划。
-            session.working["__trivial_hint__"] = .string(
-                "[系统提示] 本条消息是一个简单请求（一步即可完成）：如需信息可直接调用"
-                + "对应工具获取结果后回答，但**不要**调用 update_plan 建立计划，"
-                + "也不要建议保存新技能。")
-        }
         callbacks.onPlanUpdated(session.getPlan())
 
         // 本轮是否真正创建/更新过计划：寒暄、简单问询、单次查询不会变，
         // 因此不触发技能固化建议。
         let planRevisionBefore = session.planRevision
-        kernel.maxTurns = isGreeting ? 2 : maxIterations
+        kernel.maxTurns = lightweightTurn ? 2 : maxIterations
         var result = await kernel.run(userInput, resume: false,
-                                      emitFinished: false, toolsEnabled: !isGreeting,
+                                      emitFinished: false, toolsEnabled: !lightweightTurn,
                                       images: images)
         // distillRequested 是「本段内调用过 start_long_term_update」；
         // 自动续跑会重置它，因此必须在门面层跨段累计。
@@ -735,10 +730,10 @@ public final class Agent: @unchecked Sendable {
         // 把 session 写入持久化队列，因此后续任何异常都不会让提炼任务丢失）。
         _ = rawSessionStore.archivePastSessions()
 
-        // 寒暄跳过事实抽取/蒸馏，但**记忆维护仍要跑**：它消费的是持久化队列，
-        // 否则寒暄轮归档的 session 会一直挂在队列里等不到提炼。
+        // 寒暄/能力问询跳过事实抽取与蒸馏，但**记忆维护仍要跑**：它消费的是
+        // 持久化队列，否则这些轮归档的 session 会一直挂在队列里等不到提炼。
         fireFinished(text: text, distillRequested: distillRequested,
-                     substantive: substantive, isGreeting: isGreeting)
+                     substantive: substantive, isGreeting: lightweightTurn)
         callbacks.onFinished()
         return text
     }
@@ -905,7 +900,7 @@ public final class Agent: @unchecked Sendable {
                     .joined(separator: ", ")
                 if sourceCount > shown { names += " (and \(sourceCount - shown) more)" }
                 sections.append("# Knowledge base\n\(chunks) chunks in \(sourceCount) file(s): "
-                    + "\(names). Answer from these via `rag_search`.")
+                    + "\(names). Follow the knowledge-base strategy in the system prompt.")
             } else {
                 sections.append("# Knowledge base\nConfigured but empty. Use `rag_ingest` to index.")
             }
@@ -913,7 +908,7 @@ public final class Agent: @unchecked Sendable {
             // 启动后状态快照还没生成（由 UI 在后台刷新）：先给一个无统计的轻提示，
             // 仍可正常检索，不阻塞本轮。
             sections.append("# Knowledge base\nIndexed locally. "
-                + "Use `rag_search` to retrieve relevant passages.")
+                + "Follow the knowledge-base strategy in the system prompt to retrieve passages.")
         }
 
         let text = sections.joined(separator: "\n\n")

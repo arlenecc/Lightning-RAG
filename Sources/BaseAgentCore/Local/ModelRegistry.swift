@@ -342,7 +342,10 @@ public enum LocalModelRegistry {
 
     /// ONNX 权重候选文件名（按优先级）：量化/int8 > int4 > 未量化(FP16)。
     /// 先当前目录，再 `onnx/` 子目录。
-    private static let onnxCandidateNames: [String] = [
+    ///
+    /// 这是运行时 `resolveONNXModel` 的**唯一真源**；模型下载清单与就绪判定
+    /// 也复用它，避免下载了 fp16 / safetensors 这类运行时根本不读的权重。
+    public static let onnxCandidateNames: [String] = [
         "model_quantized.onnx",
         "model_int8.onnx",
         "model_int4.onnx",

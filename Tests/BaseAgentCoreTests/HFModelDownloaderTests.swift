@@ -4,6 +4,11 @@ import XCTest
 /// HF 镜像模型下载：文件过滤、必需模型清单解析、（门控的）真实下载。
 final class HFModelDownloaderTests: XCTestCase {
 
+    /// 模拟一个体积达标的权重文件（真实权重远大于此，4KB 是就绪判定阈值）。
+    private static func fakeWeight() -> Data {
+        Data(repeating: 0x41, count: 8_192)
+    }
+
     func testNeededFilePredicate() {
         // 权重与配置 / tokenizer 必须拉取。
         XCTAssertTrue(HFModelDownloader.isNeededFile("config.json"))
@@ -36,6 +41,10 @@ final class HFModelDownloaderTests: XCTestCase {
         var config = AgentConfig()
         config.workspace = NSTemporaryDirectory()
             + "/hf-catalog-\(UUID().uuidString)"
+        // 显式把 embedding 目录锚定到临时锚点：否则 registry 会回退到真实的
+        // ~/.base-agent/models，测试写假权重会污染用户目录并影响后续运行。
+        config.localEmbeddingModelPath = anchor
+            .appendingPathComponent("jina-embeddings-v5-text-nano-mlx-int4").path
         defer { try? FileManager.default.removeItem(atPath: config.workspace) }
 
         let repos = RequiredModelCatalog.models(for: config).map(\.repo)
@@ -64,7 +73,7 @@ final class HFModelDownloaderTests: XCTestCase {
             at: embedding.directory, withIntermediateDirectories: true)
         FileManager.default.createFile(
             atPath: embedding.directory.appendingPathComponent("model.safetensors").path,
-            contents: Data([1]))
+            contents: Self.fakeWeight())
         let after = RequiredModelCatalog.missingModels(for: config)
         XCTAssertFalse(after.contains { $0.kind == "Embedding" })
         XCTAssertEqual(after.count, missing.count - 1)
@@ -83,7 +92,7 @@ final class HFModelDownloaderTests: XCTestCase {
         try! FileManager.default.createDirectory(at: embeddingDir, withIntermediateDirectories: true)
         FileManager.default.createFile(
             atPath: embeddingDir.appendingPathComponent("model.safetensors").path,
-            contents: Data([1]))
+            contents: Self.fakeWeight())
         defer { try? FileManager.default.removeItem(at: bundleRoot) }
 
         // bundledModelsDirectory 参数化接口本身就是 bundle 搜索的实现，
@@ -142,7 +151,7 @@ final class HFModelDownloaderTests: XCTestCase {
         try FileManager.default.createDirectory(at: cfgModelDir, withIntermediateDirectories: true)
         FileManager.default.createFile(
             atPath: cfgModelDir.appendingPathComponent("model.safetensors").path,
-            contents: Data([1]))
+            contents: Self.fakeWeight())
         defer { try? FileManager.default.removeItem(at: cfgModelDir) }
 
         let resolved = try LocalModelRegistry.resolveDirectory(
@@ -167,7 +176,7 @@ final class HFModelDownloaderTests: XCTestCase {
 
         // 1) 显式指定单个 .onnx 权重文件（registry 直接返回文件 URL）。
         let onnxFile = root.appendingPathComponent("my-reranker.onnx")
-        FileManager.default.createFile(atPath: onnxFile.path, contents: Data([1]))
+        FileManager.default.createFile(atPath: onnxFile.path, contents: Self.fakeWeight())
         config.localRerankerModelPath = onnxFile.path
         config.localRerankerBackend = "onnx"
         XCTAssertFalse(RequiredModelCatalog.missingModels(for: config)
@@ -181,7 +190,7 @@ final class HFModelDownloaderTests: XCTestCase {
             withIntermediateDirectories: true)
         FileManager.default.createFile(
             atPath: onnxDir.appendingPathComponent("onnx/model_quantized.onnx").path,
-            contents: Data([1]))
+            contents: Self.fakeWeight())
         config.localEmbeddingModelPath = onnxDir.path
         config.localEmbeddingBackend = "onnx"
         XCTAssertFalse(RequiredModelCatalog.missingModels(for: config)
@@ -193,7 +202,7 @@ final class HFModelDownloaderTests: XCTestCase {
         try! FileManager.default.createDirectory(at: shardedDir, withIntermediateDirectories: true)
         FileManager.default.createFile(
             atPath: shardedDir.appendingPathComponent("model-00001-of-00002.safetensors").path,
-            contents: Data([1]))
+            contents: Self.fakeWeight())
         FileManager.default.createFile(
             atPath: shardedDir.appendingPathComponent("model.safetensors.index.json").path,
             contents: Data([1]))
@@ -257,6 +266,48 @@ final class HFModelDownloaderTests: XCTestCase {
         let plainScoped = RequiredModelCatalog.scopedFiles(for: plain, in: files)
         XCTAssertEqual(plainScoped.count, files.count)
         XCTAssertTrue(plainScoped.allSatisfy { $0.remotePath == $0.path })
+    }
+
+    /// ONNX 后端只下载运行时 `resolveONNXModel` 认得的权重：
+    /// 仓库里的 fp16 档与原版 safetensors 不该再被拉下来（实测曾白下 1.1GB）。
+    func testONNXScopedFilesSkipUnloadableWeights() {
+        let model = RequiredModel(
+            kind: "Reranker",
+            repo: "arlenecc/jina-reranker-v2-base-multilingual-onnx",
+            directory: URL(fileURLWithPath: "/tmp/reranker"),
+            allowedWeightNames: RequiredModelCatalog.onnxWeightNames)
+        let files: [HFModelDownloader.FileEntry] = [
+            .init(path: "config.json", size: 1_102),
+            .init(path: "tokenizer.json", size: 17_082_734),
+            .init(path: "model.safetensors", size: 556_892_306),
+            .init(path: "onnx/model_fp16.onnx", size: 557_164_815),
+            .init(path: "onnx/model_int8.onnx", size: 208_171_351),
+            .init(path: "onnx/model_quantized.onnx", size: 279_577_152),
+        ]
+        let scoped = RequiredModelCatalog.scopedFiles(for: model, in: files)
+        XCTAssertEqual(scoped.map(\.path),
+                       ["config.json", "tokenizer.json",
+                        "onnx/model_int8.onnx", "onnx/model_quantized.onnx"])
+        // 远程路径保持不变，下载 URL 才能拼对。
+        XCTAssertTrue(scoped.allSatisfy { $0.remotePath == $0.path })
+    }
+
+    /// 下载中断留下的 1 字节占位文件不能算就绪，否则启动跳过补全、
+    /// 真正加载时才失败。
+    func testTinyWeightFileIsNotComplete() {
+        let dir = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("hf-tiny-\(UUID().uuidString)", isDirectory: true)
+        try! FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        let weight = dir.appendingPathComponent("model.safetensors")
+        FileManager.default.createFile(atPath: weight.path, contents: Data([1]))
+        XCTAssertFalse(RequiredModelCatalog.isComplete(dir),
+                       "1 字节权重应判缺失，触发重新下载")
+
+        try! Self.fakeWeight().write(to: weight)
+        XCTAssertTrue(RequiredModelCatalog.isComplete(dir),
+                      "体积达标后应判就绪")
     }
 
     /// 语义切片条目跟随 rag_semantic_chunking 开关：关闭时不出现在清单里。

@@ -581,6 +581,7 @@ public final class MLXLLMService: LLMService, PreloadableLLMService,
     /// generation prompt。工具清单参与该前缀渲染，所以也必须一起传入。
     public func warmup(systemPrompt: String, tools: [JSONValue]) async throws {
         guard !systemPrompt.isEmpty else { return }
+        let warmupStarted = Date()
         // 预热失败/取消时不能留下旧缓存，否则正式请求会接着旧前缀生成。
         invalidateKVCache()
         warmupCacheSnapshot = nil
@@ -653,6 +654,38 @@ public final class MLXLLMService: LLMService, PreloadableLLMService,
             input: LMInput(tokens: MLXArray(tokens)),
             model: model, cache: cache, state: nil, parameters: parameters)
         let wrapped = StatefulTokenIterator(iterator: iterator)
+
+        // MLX 惰性求值：TokenIterator.prepare()/next() 内部只用 asyncEval（异步提交），
+        // cache.copy() 也只是惰性切片。若此时就返回，状态栏会提前显示「预热结束」，
+        // 而首句要现场补做 prefill、并首次编译 decode/sampler 路径的 Metal kernel
+        // （实测首句额外 20~30s，Metal 缓存到启动后 85s 才落盘）。
+        // 因此预热必须把 GPU 工作真正做完再返回。
+        // 1) 强制求值：让「已 prefill」的 KV 状态不再是欠条。
+        eval(cache.flatMap { $0.state })
+
+        // 2) 牺牲性 decode：用独立 KV cache + 与正式请求一致的采样参数跑一步生成，
+        //    提前编译 decode/采样路径的 kernel。独立 cache 保证不污染主前缀快照。
+        do {
+            let inferParameters = Self.parameters(
+                maxTokens: 2, temperature: 0.7, topP: topP, topK: topK,
+                minP: minP, repetitionPenalty: repetitionPenalty,
+                promptBatchSize: promptBatchSize, kvInt8: kvInt8)
+            let decodeCache = Self.stabilizeQuantizedCache(
+                try model.newCache(parameters: inferParameters), kvInt8: kvInt8)
+            var scratch = try TokenIterator(
+                input: LMInput(tokens: MLXArray(Array(tokens.prefix(2)))),
+                model: model, cache: decodeCache, state: nil,
+                parameters: inferParameters)
+            if scratch.next() != nil {
+                eval(decodeCache.flatMap { $0.state })
+            }
+        } catch {
+            // kernel 预热失败不该让整个预热失效：主前缀缓存仍可用。
+            AgentLog.info("[mlx-warmup] decode kernel 预热跳过：\(error.localizedDescription)")
+        }
+
+        // 3) 等 GPU 队列排空（shader 编译、权重换入全部完成），状态栏才是真就绪。
+        Stream.defaultStream.synchronize()
         try Task.checkCancellation()
 
         // 裁掉占位 user 段：后续 KV 与快照都只保留与正式请求对齐的 system 段。
@@ -688,7 +721,8 @@ public final class MLXLLMService: LLMService, PreloadableLLMService,
         pendingGeneratedAssistant = false
         cachedToolsKey = toolsKey
         AgentLog.info("[mlx-warmup] prefill tokens=\(tokens.count) kept=\(keepCount) "
-            + "tools=\(tools.count)")
+            + "tools=\(tools.count) "
+            + "gpu_ready_ms=\(Int(Date().timeIntervalSince(warmupStarted) * 1000))")
     }
 
     /// 释放本地权重；实际释放发生在所有引用消失后，同时清空 MLX 缓存。

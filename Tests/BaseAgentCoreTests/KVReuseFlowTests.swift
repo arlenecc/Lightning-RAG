@@ -134,7 +134,9 @@ final class KVReuseFlowTests: XCTestCase {
         let agent = Agent(llm: service, config: config, callbacks: CollectingCallbacks(collector))
         defer { agent.close() }
 
-        _ = await agent.run("用一句话介绍你自己，不要调用任何工具。")
+        // 不用「介绍你自己」：它会命中能力问询快速通道（toolsEnabled=false），
+        // 与预热/跨轮的全量工具前缀不一致，测的就不是 KV 复用了。
+        _ = await agent.run("用一句话说明什么是向量检索，不要调用任何工具。")
         _ = await agent.run("接着回答：1+1 等于几？只回答数字。")
         _ = await agent.run("再回答：2+2 等于几？只回答数字。")
 

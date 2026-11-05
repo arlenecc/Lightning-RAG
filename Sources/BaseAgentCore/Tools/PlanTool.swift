@@ -62,7 +62,7 @@ public final class UpdatePlanTool: AgentTool {
         + "MUST be written before any actual tool call is issued, so progress is "
         + "tracked from step one; op='patch' to mark a step done/blocked with its "
         + "conclusion, op='append' when you discover a missing step, op='clear' "
-        + "when finished. Mark a step 'blocked' only after at least 2 different "
+        + "when finished. Mark a step 'blocked' only after at least 3 different "
         + "methods have failed (explain why in note) — a single failure is not a "
         + "reason to give up on a step. The plan is re-injected into your context "
         + "every turn — keep it accurate."

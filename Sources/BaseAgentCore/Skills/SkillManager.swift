@@ -122,6 +122,45 @@ public final class SkillManager {
                              options: [.regularExpression, .caseInsensitive]) != nil
     }
 
+    /// 能力/身份问询：「你能做什么」「有哪些工具/能力」「介绍一下自己」等。
+    ///
+    /// 答案就写在 system prompt 的工具清单里，不需要调用任何工具。与 `isGreeting`
+    /// 同级走轻量通道（无工具 schema、maxTurns=2、不输出 summary）；否则模型会
+    /// 为了「列出可用技能 / 知识库文档 / RAG 索引状态」连调多个工具，并在每轮
+    /// `<summary>` 里反复写「工具调用已完成」的元陈述，实测每轮拖 7-8s。
+    public static func isCapabilityQuery(_ text: String) -> Bool {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, !trimmed.contains("\n"), trimmed.count <= 40 else {
+            return false
+        }
+        let lower = trimmed.lowercased()
+        // 夹带具体动作/对象的请求不是能力问询（「你能帮我查下这个文件吗」）。
+        let taskVerbs = [
+            "查一下", "查下", "查查", "搜一下", "搜下", "读一下", "读下", "打开",
+            "写一下", "写下", "改一下", "改下", "分析", "总结", "生成", "下载",
+            "执行", "运行", "编译", "翻译", "整理", "读取", "写入", "列出文件",
+            "fix", "debug", "write", "read", "open", "search for", "look up",
+        ]
+        if taskVerbs.contains(where: { lower.contains($0) }) { return false }
+        // 「能/会/可以」后允许若干衬字，覆盖「你能帮我做什么」「你都能干啥」；
+        // 具体任务请求已由上面的 taskVerbs + 40 字上限挡住，不会误放行。
+        let pattern =
+            "(能|会|可以).{0,6}(什么|啥|哪些|干啥|做啥)|"
+            + "(有哪些|有什么|支持哪些|支持的?|列出|列一下|介绍).{0,8}"
+            + "(能力|功能|工具|技能|命令|本领|用途|知识库|记忆)|"
+            + "(能力|功能|工具|技能)(清单|列表|范围|介绍|概览)|"
+            + "你是谁|你是什么|介绍(一下|下)?(你|自己|你自己)|"
+            + "what can you|what are your|who are you|capabilities|features"
+        // `range(of:.regularExpression)` 对非法正则会静默返回 nil（不抛错），
+        // 因此这里用 NSRegularExpression 显式校验，避免括号不配对时判定恒为 false。
+        guard let regex = try? NSRegularExpression(pattern: pattern,
+                                                   options: .caseInsensitive) else {
+            return false
+        }
+        let range = NSRange(trimmed.startIndex..., in: trimmed)
+        return regex.firstMatch(in: trimmed, range: range) != nil
+    }
+
     /// 寒暄、感谢、身份询问与短问询：不进入技能固化统计。
     ///
     /// 只放行「明显不需要计划」的短文本；含动作动词的请求一律按任务处理。
