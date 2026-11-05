@@ -118,21 +118,30 @@ public final class UpdateWorkingCheckpointTool: AgentTool {
 
 // MARK: - start_long_term_update
 
-/// `start_long_term_update`：触发 L4 经验蒸馏。
+/// `start_long_term_update`：**L2/L3 文件的唯一正式写入入口**（改进6）。
 ///
-/// 不直接改长期记忆文件，只把「本会话检查点 + 待提纯材料」返回给模型，
-/// 并向内核发出 distill 标记（内核按工具名 `start_long_term_update` 识别）。
+/// 本身不直接写文件，而是「门控 + 返回提纯 prompt 与材料」，由模型随后用
+/// `file_patch` 少量追加。门控：当前轮数 < `minTurns`(5) 直接拒绝，短任务不许碰长期记忆。
+///
+/// 内核（`Loop.swift` 按工具名）仍会置 `distillRequested`，触发后台图谱蒸馏；
+/// 但 L2 `memory/global_mem.txt` / L3 `memory/*_sop.md` 的写入必须经过这里。
 public final class StartLongTermUpdateTool: AgentTool {
     public let name = "start_long_term_update"
     public let description =
-        "After finishing a task or reaching a checkpoint, distill durable experience "
-        + "into long-term memory. Only for verified facts, user preferences and lessons "
-        + "that are expensive to rediscover. Then (optionally) call memory_graph to add "
-        + "the distilled entities, or skill_save to freeze a reusable procedure. "
+        "ONLY gate for writing long-term memory files (L2/L3). Call after finishing a task "
+        + "or reaching an important checkpoint; rejected before turn 5. Returns the purification "
+        + "prompt and current L1 index. Then follow L0 decision tree: verified environment facts "
+        + "-> append to memory/global_mem.txt; hard-won task pitfalls -> append/create "
+        + "memory/xxx_sop.md. Use file_patch (small additions only), then sync the L1 index. "
         + "Skip if nothing durable was learned."
+
+    /// 短任务门控：当前轮数小于此值直接拒绝。
+    public static let minTurns = 5
 
     private let config: AgentConfig
     private let callbacks: AgentCallbacks?
+    private weak var registry: ToolRegistry?
+    private let memoryDir: MemoryDirectory
 
     public var parameters: JSONValue {
         ToolSupport.objectSchema(
@@ -145,33 +154,55 @@ public final class StartLongTermUpdateTool: AgentTool {
     public init(config: AgentConfig, callbacks: AgentCallbacks?, registry: ToolRegistry? = nil) {
         self.config = config
         self.callbacks = callbacks
-        _ = registry
+        self.registry = registry
+        self.memoryDir = MemoryDirectory(workspace: config.workspace)
     }
 
     public func run(_ args: [String: JSONValue]) async throws -> ToolResult {
+        // 门控：轮数不足直接拒绝，短任务不碰长期记忆。
+        let turn = registry?.session?.currentTurn ?? 0
+        guard turn >= Self.minTurns else {
+            return .fail("记忆提纯被拒绝：当前轮数 \(turn) < \(Self.minTurns)。"
+                + "短任务不许写长期记忆，请直接完成任务；到达重要检查点且轮数足够后再调用。")
+        }
+
         let focus = ToolSupport.optionalString(args, "focus") ?? ""
-        var transcript = CheckpointStore.read(config)
+        // 材料优先取内存 Session 的 key_info（默认 persist=false 不落盘），
+        // 为空再回退磁盘检查点；避免旧实现"读盘恒空"的问题。
+        var transcript = registry?.session?.getKeyInfo() ?? ""
+        if transcript.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            transcript = CheckpointStore.read(config)
+        }
         if !transcript.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            transcript = "[checkpoint]\n\(transcript)"
+            transcript = "[working_checkpoint]\n\(transcript)"
         } else {
             transcript = "(当前会话尚无有效记录)"
         }
 
+        let l1 = memoryDir.read(memoryDir.l1File, limit: SystemPromptLimits.maxL1Chars) ?? ""
+
         let payload = JSONValue.object([
-            "status": .string("DISTILL_REQUESTED"),
+            "status": .string("DISTILL_READY"),
+            "turn": .int(turn),
             "focus": .string(focus),
             "transcript": .string(String(transcript.suffix(3_000))),
+            // 注入上下文：L0 META-SOP 与整份 L1 已常驻 system prompt（在其后），
+            // 这里再回一份 L1 当前全文，供同步 patch 时精确匹配 old。
+            "l1_current": .string(l1),
+            "prompt": .string(MEMORY_PURIFY_PROMPT),
             "next": .array([
-                .string("memory_graph(op=create_entity/add_observations) 写入验证过的事实与偏好"),
-                .string("skill_save(...) 若该流程可复用，固化为 SKILL.md"),
-                .string("rag_ingest() 若有外部语料需要灌入本地知识库"),
+                .string("先 file_read 读 memory/global_mem.txt 与相关 xxx_sop.md 现状（先读后patch）"),
+                .string("按 L0 决策树归类：环境特异性事实 → file_patch 追加到 memory/global_mem.txt"),
+                .string("特定任务技术/坑 → file_patch 追加或新建 memory/xxx_sop.md"),
+                .string("每次 L2/L3 变更后，用 file_patch 同步 L1 索引行（只放关键词/名称，≤30 行）"),
             ]),
             "rules": .array([
-                .string("只写经工具验证成功的信息；禁止写入推测、临时状态、通用常识"),
-                .string("合并重复、压缩冗述，不堆叠流水账"),
+                .string("只写经工具验证成功的信息；禁止写入推测、临时状态、通用常识、易重建细节"),
+                .string("合并重复、压缩冗述，不堆叠流水账；不得把模型推测记作用户要求"),
+                .string("memory/ 下只能 file_patch 少量追加，禁止 file_write 覆盖与 code_run 批量改写"),
                 .string("无提纯价值则跳过，不要为了调用而调用"),
             ]),
         ])
-        return .ok(compactJSON(payload, maxChars: 2_600))
+        return .ok(compactJSON(payload, maxChars: 3_600))
     }
 }

@@ -954,7 +954,9 @@ public final class KernelLoop {
         let maxChars = budget.remainingForTool(n, maxChars: maxToolChars)
         var out: [StepOutcome] = []
         for (tc, res) in zip(toolCalls, rawResults) {
-            if tc.name == "start_long_term_update" {
+            // 只有门控**成功**才允许触发后续经验蒸馏。门控失败（如当前轮数 <5）
+            // 返回 .fail，若仍置位就等于绕过「短任务不许碰长期记忆」的约束。
+            if tc.name == "start_long_term_update", res.success {
                 distillRequested = true
             }
             // L0：先兜住病态长度；L1：再按 RAW 区余额裁到真正要注入的长度。

@@ -12,15 +12,19 @@ public enum AgentToolFactory {
                              skillManager: SkillManager,
                              skillIndex: SkillIndex,
                              skillRetriever: SkillRetriever,
-                             workMemory: WorkMemory? = nil) -> ToolRegistry {
+                             workMemory: WorkMemory? = nil,
+                             sopTracker: SOPReadTracker = SOPReadTracker()) -> ToolRegistry {
         let registry = ToolRegistry(config: config, callbacks: callbacks)
         registry.session = session
         registry.ragEngine = ragEngine
         let sharedWorkMemory = workMemory ?? WorkMemory(workspace: config.workspace)
         registry.workMemory = sharedWorkMemory
+        // 改进5：file_read 使用调用方（Agent）持有的 tracker，reset() 才能清空。
+        let sharedSOPTracker = sopTracker
 
         var tools: [AgentTool] = [
-            FileReadTool(config: config, callbacks: callbacks, registry: registry),
+            FileReadTool(config: config, callbacks: callbacks, registry: registry,
+                         sopTracker: sharedSOPTracker),
             FileWriteTool(config: config, callbacks: callbacks, registry: registry),
             FileModifyTool(config: config, callbacks: callbacks, registry: registry),
             CodeRunTool(config: config, callbacks: callbacks, registry: registry),

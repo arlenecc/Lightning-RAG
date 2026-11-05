@@ -234,6 +234,11 @@ public final class Agent: @unchecked Sendable {
     public let ragEngine: RAGEngine
     public let workMemory: WorkMemory
     public let session: Session
+    /// 多级记忆目录（L0–L4）。与 `.agent/` 下既有 WorkMemory/GraphMemory 并存。
+    public let memoryDirectory: MemoryDirectory
+    public let rawSessionStore: RawSessionStore
+    /// 与 FileReadTool 共享的 SOP 去重记录器（reset() 时清空）。
+    public let sopReadTracker: SOPReadTracker
     public lazy var dispatcher: AgentToolDispatcher = AgentToolDispatcher(agent: self)
     public private(set) var mcpClients: [MCPClient] = []
     private var mcpConnectTask: Task<Bool, Never>?
@@ -247,7 +252,23 @@ public final class Agent: @unchecked Sendable {
     /// 动态上下文按「一次用户请求」冻结：同一轮内的多次工具循环复用同一段，
     /// 保证 system + 历史前缀稳定，KV cache 才能跨调用命中。
     private var cachedDynamicContext: String?
-    private var distillMinTurns = 6
+    /// L0/L1 常驻 system 前缀缓存。`systemPrompt()` 每个 THINK 轮都被调用，
+    /// 必须按「文件签名 + 内容」缓存，否则每轮同步读盘且前缀可能抖动。
+    private var cachedStaticSystem: String?
+    private var cachedStaticSignature = ""
+    private let staticSystemLock = NSLock()
+    /// 本次用户请求内冻结的 system prompt：保证整次请求（含多次 THINK / 自动续跑）
+    /// 前缀逐字节一致 → KV 可复用；落盘时也写这一份，历史与实发一致。
+    /// 下一个请求重新读 L0/L1，实现「L1 变更后即时重新加载」。
+    private var requestSystemPrompt: String?
+    private let requestSystemLock = NSLock()
+    /// 改进1：本用户请求内 `finishTurn` 结束的轮引用快照。
+    /// 用引用而非拷贝，且早于 CONSOLIDATE 折叠收集，保证被折掉的轮全文不丢。
+    private var finishedTurnSnapshot: [TurnRecord] = []
+    private let rawSessionSnapshotLock = NSLock()
+    /// 改进8：上次**成功产出整理建议**的轮次，按压缩周期节流，避免每轮都调 LLM。
+    private var lastMemoryTidyTurn = 0
+    private let tidyStateLock = NSLock()
     private let backgroundLock = NSLock()
     private var backgroundRunning = false
     /// 上一轮结束后启动的辅助模型任务（事实抽取/蒸馏）。
@@ -284,6 +305,12 @@ public final class Agent: @unchecked Sendable {
         self.skillRetriever = SkillRetriever(manager: self.skills, embedding: embedding)
         self.ragEngine = RAGEngine(config: config, embedding: embedding)
         self.workMemory = WorkMemory(workspace: config.workspace)
+        let memoryDir = MemoryDirectory(workspace: config.workspace)
+        memoryDir.ensureLayout()
+        self.memoryDirectory = memoryDir
+        self.rawSessionStore = RawSessionStore(directory: memoryDir)
+        let sharedSOPTracker = SOPReadTracker()
+        self.sopReadTracker = sharedSOPTracker
         // 内核预算不能超过模型实际生效的上下文，否则消息会撑破 KV 硬上限。
         let kernelBudget = min(
             config.kernelMaxContextTokens == 0 ? 30_000 : config.kernelMaxContextTokens,
@@ -306,10 +333,17 @@ public final class Agent: @unchecked Sendable {
                 config: config, callbacks: callbacks, session: self.session,
                 ragEngine: self.ragEngine, skillManager: self.skills,
                 skillIndex: self.skillIndex, skillRetriever: self.skillRetriever,
-                workMemory: self.workMemory)
+                workMemory: self.workMemory, sopTracker: sharedSOPTracker)
         }
         self.tools.session = self.session
         self.tools.ragEngine = self.ragEngine
+        // 改进1/2：每轮结束时收集轮引用，run() 末尾一次性追加落盘。
+        session.onTurnFinished = { [weak self] rec in
+            guard let self else { return }
+            self.rawSessionSnapshotLock.lock()
+            self.finishedTurnSnapshot.append(rec)
+            self.rawSessionSnapshotLock.unlock()
+        }
         // RAG 检索结果的辅助模型精简：动态读取当前 auxLLM（AppModel 可在
         // 运行中替换辅助模型），阈值判断在 RAGEngine.condenseIfNeeded 内。
         self.ragEngine.auxCondenser = { [weak self] text in
@@ -408,6 +442,12 @@ public final class Agent: @unchecked Sendable {
         turnIndex = 0
         lastUserText = ""
         cachedDynamicContext = nil
+        // Session.turnIndex 归零后，若不同步复位节流标记，
+        // `turn >= lastTidy + 8` 会长期为 false → 清空对话后整理再也不跑。
+        markMemoryTidyDone(turn: 0)
+        releaseRequestSystemPrompt()
+        clearFinishedTurnSnapshot()
+        sopReadTracker.reset()
         // 清空对话后 Session 已重置，但本地 LLM 仍持有旧会话的 KV cache；
         // 不失效会让下一轮继续复用已经“被清空”的历史。
         invalidateKVCache()
@@ -520,6 +560,8 @@ public final class Agent: @unchecked Sendable {
         await cancelBackgroundWork()
         turnIndex += 1
         cachedDynamicContext = nil
+        clearFinishedTurnSnapshot()
+        freezeRequestSystemPrompt()  // 本次请求内 system 前缀固定；落盘也用这一份
         lastUserText = userInput
         log("USER: \(userInput)")
 
@@ -676,21 +718,111 @@ public final class Agent: @unchecked Sendable {
                 description: skillCandidate.description,
                 score: Double(skillCandidate.keywords.count)))
         }
-        // 寒暄没有任何需要持久化的事实/经验，跳过后台抽取与蒸馏；
-        // 简单请求保留事实抽取（用户偏好、环境信息往往在一次小请求里）。
-        if !isGreeting {
-            fireFinished(text: text, distillRequested: distillRequested,
-                         substantive: substantive)
-        }
+        // 改进1/2：本用户请求的完整轨迹落盘（无条件、不依赖辅助模型）。
+        // 用 `finishedTurnSnapshot`（早于 CONSOLIDATE 收集）而非 session.turns，
+        // 否则被折掉的轮全文会永久丢失。
+        // `requestSystemPrompt` 是 run() 开头冻结的那一份（本轮模型实际看到的前缀），
+        // 不能用请求结束后的 systemPrompt()：本轮若 patch 过 L1，签名已变，写进去
+        // 的会是"未来"的提示，历史与实发不一致。
+        rawSessionStore.appendSession(
+            systemText: takeRequestSystemPrompt() ?? systemPrompt(),
+            userText: lastUserText.isEmpty ? userInput : lastUserText,
+            turns: takeFinishedTurnSnapshot(),
+            finalText: text)
+        releaseRequestSystemPrompt()
+
+        // 改进7 前半：过期记录预处理/打包（纯文件，单次最多 1 天；内部在删原文前
+        // 把 session 写入持久化队列，因此后续任何异常都不会让提炼任务丢失）。
+        _ = rawSessionStore.archivePastSessions()
+
+        // 寒暄跳过事实抽取/蒸馏，但**记忆维护仍要跑**：它消费的是持久化队列，
+        // 否则寒暄轮归档的 session 会一直挂在队列里等不到提炼。
+        fireFinished(text: text, distillRequested: distillRequested,
+                     substantive: substantive, isGreeting: isGreeting)
         callbacks.onFinished()
         return text
     }
 
     // MARK: 系统提示
 
-    /// 稳定的系统提示。不随轮次变化，保证 KV cache 的系统前缀可跨调用复用。
+    private func clearFinishedTurnSnapshot() {
+        rawSessionSnapshotLock.lock()
+        finishedTurnSnapshot.removeAll()
+        rawSessionSnapshotLock.unlock()
+    }
+
+    private func freezeRequestSystemPrompt() {
+        let frozen = buildStaticSystemPrompt()
+        requestSystemLock.lock()
+        requestSystemPrompt = frozen
+        requestSystemLock.unlock()
+    }
+
+    private func takeRequestSystemPrompt() -> String? {
+        requestSystemLock.lock(); defer { requestSystemLock.unlock() }
+        return requestSystemPrompt
+    }
+
+    private func releaseRequestSystemPrompt() {
+        requestSystemLock.lock()
+        requestSystemPrompt = nil
+        requestSystemLock.unlock()
+    }
+
+    private func markMemoryTidyDone(turn: Int) {
+        tidyStateLock.lock()
+        lastMemoryTidyTurn = turn
+        tidyStateLock.unlock()
+    }
+
+    private func readLastMemoryTidyTurn() -> Int {
+        tidyStateLock.lock(); defer { tidyStateLock.unlock() }
+        return lastMemoryTidyTurn
+    }
+
+    private func takeFinishedTurnSnapshot() -> [TurnRecord] {
+        rawSessionSnapshotLock.lock()
+        defer { rawSessionSnapshotLock.unlock() }
+        let snapshot = finishedTurnSnapshot
+        finishedTurnSnapshot.removeAll()
+        return snapshot
+    }
+
+    /// 稳定的系统提示 = BASE 协议 + L0 META-SOP + L1 全局索引。
+    ///
+    /// 改进3/4：L0 与 L1 **常驻** system prompt，L1 跟在 L0 之后。
+    /// 改进4「实时更新维护」：每次调用按 L0/L1 文件的 mtime+size 签名判定，
+    /// 文件被 patch 后自动重建并重新注入；内容不变则复用缓存字符串，
+    /// 保证 system 前缀逐字节稳定、KV cache 可跨调用复用。
+    /// 文件变 → 前缀变 → 该轮 KV 失效一次（低频、可接受）。
     public func systemPrompt() -> String {
-        BASE_SYSTEM_PROMPT
+        // 请求内冻结：同一用户请求的所有 THINK 轮拿到完全相同的 system 字符串，
+        // 即使本轮中途 patch 了 L1 也不会在请求内造成 KV 前缀抖动；下一请求重新加载。
+        if let frozen = takeRequestSystemPrompt() { return frozen }
+        return buildStaticSystemPrompt()
+    }
+
+    /// 按 L0/L1 文件内容签名重建 system 前缀。签名计算与缓存更新放在同一临界区，
+    /// 避免并发调用缓存出「旧签名 + 新内容」的不一致组合。
+    private func buildStaticSystemPrompt() -> String {
+        staticSystemLock.lock()
+        defer { staticSystemLock.unlock() }
+        let signature = memoryDirectory.signature()
+        if signature == cachedStaticSignature, let cachedStaticSystem {
+            return cachedStaticSystem
+        }
+        let sop = memoryDirectory.loadSOP(maxChars: SystemPromptLimits.maxSOPChars)
+        let l1 = memoryDirectory.loadL1(maxChars: SystemPromptLimits.maxL1Chars)
+        var text = BASE_SYSTEM_PROMPT
+        if !sop.isEmpty {
+            text += "\n\n# [L0 META-SOP: memory_management_sop]\n" + sop
+        }
+        if !l1.isEmpty {
+            text += "\n\n# [L1 Global Memory Insight]\n" + l1
+        }
+        cachedStaticSystem = text
+        cachedStaticSignature = signature
+        return text
     }
 
     /// 动态上下文（工作记忆、当天事实、检查点、命中技能、知识库状态）。
@@ -826,7 +958,11 @@ public final class Agent: @unchecked Sendable {
             : summary
         appendMemorySummary(final, reason: reason)
         let folded = session.forceFold(old.count)
-        session.appendDigest("[摘要 \(Self.timeString())] \(final.prefix(400))")
+        let digestLine = "[摘要 \(Self.timeString())] \(final.prefix(400))"
+        session.appendDigest(digestLine)
+        // 改进2：兜底收缩生成的上下文摘要也追加进当天 digest 文件，
+        // 保证"当天对话摘要历史"不因只统计逐轮快照而缺项。
+        rawSessionStore.appendFoldedDigest([digestLine])
         log("[context] 兜底收缩：折叠 \(folded) 轮（reason: \(reason)）")
         callbacks.onContextShrunk(final, reason)
         return true
@@ -842,7 +978,8 @@ public final class Agent: @unchecked Sendable {
     // MARK: 结束后：事实抽取 + L4 蒸馏
 
     func fireFinished(text: String, distillRequested: Bool? = nil,
-                      substantive: Bool = true) {
+                      substantive: Bool = true,
+                      isGreeting: Bool = false) {
         // 与参考实现一致：取最近 6 条 User/Assistant 消息（交替），而不是每轮只取一条。
         var recentLines: [String] = []
         for turn in session.turns.reversed() {
@@ -860,21 +997,29 @@ public final class Agent: @unchecked Sendable {
         let recent = recentLines.reversed().joined(separator: "\n\n")
         let user = lastUserText.trimmingCharacters(in: .whitespacesAndNewlines)
         // 简单请求往往一句话（「查下 xx 文件多少行」+「120 行」），
-        // 阈值放宽到 6/8 字；纯寒暄在调用方已被过滤。
-        guard user.count >= 6, text.count >= 8, !recent.isEmpty else { return }
+        // 阈值放宽到 6/8 字。寒暄不做事实抽取/蒸馏，但仍要消费归档队列。
+        let canExtract = !isGreeting && user.count >= 6 && text.count >= 8 && !recent.isEmpty
+
+        // 改进7：待提炼队列是**持久化**的，寒暄轮、辅助模型暂不可用、后台任务
+        // 被下一次 run 取消等情况都不会丢，本轮或下一轮重新拾起即可。
+        let hasPending = !memoryDirectory.pendingInsightIds().isEmpty
+        // 改进8：与上下文压缩周期对齐，后台用辅助引擎产出整理建议（不改记忆文件）。
+        let tidyEvery = max(8, config.kernelConsolidateEvery)
+        let shouldTidy = !isGreeting && session.currentTurn >= readLastMemoryTidyTurn() + tidyEvery
+        let hasLLMWork = canExtract || hasPending || shouldTidy
+        guard hasLLMWork else { return }
 
         // 主模型无法提供独立会话时，后台请求会清空并覆盖主会话 KV；
-        // 与其次次让下一句话全量 prefill，不如放弃这一轮事实抽取。
+        // 此时**只跳过 LLM 工作**（归档/入队已在同步阶段完成，队列保留待下次消费）。
         let service = auxLLM ?? llm
         guard Self.backgroundRequestOptions(for: service, isMain: service === llm) != nil else {
-            log("[memory] 主模型不支持独立会话，跳过后台事实抽取/蒸馏")
+            log("[memory] 主模型不支持独立会话，跳过后台 LLM；待提炼队列已保留")
             return
         }
 
         // 没有计划的简单对话不做技能/经验蒸馏；事实抽取仍然保留。
-        let shouldDistill = substantive
-            && ((distillRequested ?? kernel.distillRequested)
-                || session.currentTurn >= distillMinTurns)
+        let shouldDistill = canExtract && substantive
+            && (distillRequested ?? kernel.distillRequested)
         let transcript = session.allDigestLines().suffix(25).joined(separator: "\n")
         backgroundTaskLock.lock()
         backgroundTask?.cancel()
@@ -883,9 +1028,29 @@ public final class Agent: @unchecked Sendable {
         let task = Task.detached(priority: .utility) { [weak self] in
             guard let self else { return }
             defer { self.finishBackgroundTask(generation) }
-            await self.extractFacts(conversation: recent)
+            if canExtract { await self.extractFacts(conversation: recent) }
             guard !Task.isCancelled else { return }
             if shouldDistill { await self.distillExperience(transcript: transcript) }
+            guard !Task.isCancelled else { return }
+            // 改进7：从持久化队列消费（不依赖本次归档结果），成功才出队。
+            // 改进8：辅助引擎产出整理建议，不改写 L1/L2/L3。
+            if hasPending || shouldTidy {
+                let maintenance = MemoryMaintenance(
+                    directory: self.memoryDirectory,
+                    log: { [weak self] line in self?.log(line) },
+                    collect: { [weak self] messages, temperature in
+                        guard let self, self.beginBackgroundIfIdle() else { return "" }
+                        defer { self.endBackground() }
+                        return await self.collectChat(messages, temperature: temperature)
+                    })
+                if hasPending { await maintenance.mineHistoryInsights() }
+                guard !Task.isCancelled else { return }
+                if shouldTidy, await maintenance.tidyMemory() {
+                    // 仅在整理**成功产出建议**后才推进节流标记；被取消 / 校验失败
+                    // 会保留待办，下一轮重试，不会"标记已消费却没干活"。
+                    self.markMemoryTidyDone(turn: self.session.currentTurn)
+                }
+            }
         }
         backgroundTask = task
         backgroundTaskLock.unlock()

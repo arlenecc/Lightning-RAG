@@ -8,6 +8,8 @@ public final class FileReadTool: AgentTool {
     public let description = "Read the textual contents of a file inside the workspace."
 
     private let config: AgentConfig
+    /// 改进5：SOP 只读一次的去重记录器，由 ToolFactory 注入（与 Agent 同生命周期）。
+    private let sopTracker: SOPReadTracker
 
     public var parameters: JSONValue {
         ToolSupport.objectSchema(
@@ -18,8 +20,10 @@ public final class FileReadTool: AgentTool {
             required: ["path"])
     }
 
-    public init(config: AgentConfig, callbacks: AgentCallbacks?, registry: ToolRegistry? = nil) {
+    public init(config: AgentConfig, callbacks: AgentCallbacks?, registry: ToolRegistry? = nil,
+                sopTracker: SOPReadTracker = SOPReadTracker()) {
         self.config = config
+        self.sopTracker = sopTracker
         _ = callbacks
         _ = registry
     }
@@ -56,6 +60,19 @@ public final class FileReadTool: AgentTool {
                     output += "\n… [文件共 \(size) 字节，仅显示前 "
                         + "\(ToolSupport.maxReadChars) 字符]"
                 }
+                // 改进5：L1 索引定位到的 SOP 全文进入当前轮（内核 L1 会把它裁到
+                // remainingForTool 的最大长度）。追加"只提炼一次"的指令，让模型
+                // 立即把要点沉淀为 key_info，此后每轮靠 key_info 回注，不再重读全文。
+                if isMemorySOP(full) {
+                    let first = sopTracker.markIfFirst(full)
+                    output += first
+                        ? "\n\n[SOP 已全文载入] 立即调用 update_working_checkpoint(key_info=...) "
+                            + "把本 SOP 的关键前置条件与典型坑提炼进去；key_info 每轮自动回注，"
+                            + "正常情况下本次会话无需再次 file_read 本文件。"
+                        : "\n\n[SOP 重复载入] 本文件本次会话已读过，要点应已在 key_info 中；"
+                            + "若 key_info 仍含要点请直接据此行动；若已被覆盖/清空导致要点丢失，"
+                            + "应立即重新读取全文并再次提炼，不要凭印象继续。"
+                }
                 return .ok(output)
             }
 
@@ -66,6 +83,22 @@ public final class FileReadTool: AgentTool {
         } catch {
             return ToolSupport.failure(error)
         }
+    }
+
+    /// 只识别**本工作区 memory/ 根目录正下方**的 L3 SOP（`*_sop.md`）与 L0
+    /// META-SOP。传入的是 `resolveWorkspacePath` 归一化后的绝对路径：
+    /// 用「包含 memory/ 子串」会误伤 `docs/memory/foo_sop.md` 这类无关文件。
+    private func isMemorySOP(_ fullPath: String) -> Bool {
+        let memoryRoot = (MemoryDirectory(workspace: config.workspace).root as NSString)
+            .standardizingPath
+        let normalized = (fullPath as NSString).standardizingPath
+        let prefix = memoryRoot + "/"
+        guard normalized.hasPrefix(prefix) else { return false }
+        // 必须是直接子文件（非嵌套目录），避免把 memory/raw_session/ 下的内容误判。
+        let relative = String(normalized.dropFirst(prefix.count))
+        guard !relative.contains("/") else { return false }
+        let name = relative.lowercased()
+        return name.hasSuffix("_sop.md") || name == "memory_management_sop.md"
     }
 }
 

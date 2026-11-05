@@ -132,6 +132,14 @@ public final class Session: @unchecked Sendable {
     /// 上次发出「稳定 raw 窗口越顶」告警的轮次；用于节流，避免段内每轮刷屏。
     private var lastOldSlidingWarnTurn: Int = -1000
 
+    /// 改进1/2：每轮 `finishTurn` 后由 Agent 注入的「历史全文落盘」回调。
+    ///
+    /// 必须挂在**存储层写入点而非 run 末尾**：`foldForConsolidation()` 会把
+    /// `turns` 折到只剩一轮，若在请求末尾统一取 `session.turns`，被折掉的轮
+    /// 全文就永久丢失；而这里每轮结束时该轮数据仍完整，且早于任何折叠。
+    /// 回调只做 O(1) 追加 I/O，不进入上下文、不占内存。
+    public var onTurnFinished: ((TurnRecord) -> Void)?
+
     public init(budget: ContextBudget, rawTurns: Int = 2, maxDigestLines: Int = 40) {
         self.budget = budget
         self.rawTurns = max(0, rawTurns)
@@ -169,6 +177,7 @@ public final class Session: @unchecked Sendable {
         // 被 rollback 的轮不会走到这里，提示会继续保留给下一轮。
         working.removeValue(forKey: "__truncated__")
         working.removeValue(forKey: "__plan_boundary__")
+        onTurnFinished?(rec)
     }
 
     /// 空轮/无效轮不占历史，直接回退。
@@ -368,6 +377,16 @@ public final class Session: @unchecked Sendable {
     /// 换成摘要 token 必然改变前缀，但这是**一个周期仅一次**的塌陷；若只折 `old`，
     /// 则 `old` 会无限膨胀、最终逐轮塌陷，比一次重置更糟。
     /// 返回实际折叠的轮数。
+    ///
+    /// **不调用任何 LLM**：被折叠轮的摘要早在每轮模型响应时由 `Loop` 调
+    /// `l2Summary(resp.content)` 生成并存进 `TurnRecord.summary`（优先模型 `<summary>`
+    /// 协议输出，缺失时回退到首句/工具名）。这里只调 `digestLine()` 把**每条**被摘轮已存的
+    /// 摘要行 `"[T{n}] <summary>"` 追加进 `extraDigest`——因此**不会只保留末轮摘要、
+    /// 前面轮摘要全部丢失**：段内 8 轮全折时 8 条摘要一并入库，`extraDigest` 跨段累积成
+    /// 常驻 `<earlier_context>`。唯一有损处是 `compactDigest` 的 `maxDigestLines`(40) 封顶：
+    /// 超出丢最老行并补 `"[…更早的 N 轮已折叠省略]"` 标记，属有意的历史保留上限，
+    /// 而非每个周期只留一条摘要。L2/L3 折叠全程纯字符串收集，与 L4 蒸馏（单独 `DISTILL_SYSTEM`
+    /// 请求，落长期记忆）完全正交。
     @discardableResult
     public func foldForConsolidation() -> Int {
         guard turns.count > 1 else { return 0 }
@@ -475,12 +494,21 @@ public final class Session: @unchecked Sendable {
     /// `extraDigest` 变化，头部才改变 → 该轮 KV 失效一次。注意：API 每轮都重发**完整**消息列表
     /// （无「仅追加新内容」模式），KV 复用是提供方基于前缀匹配的优化，而非跳过旧内容。
     public func buildMessages(systemPrompt: String, userText: String = "") -> [ChatMessage] {
+        // system / earlier 都必须先记账：`windows()` 的 rawCeiling 依赖
+        // budget.used(system/earlier/tools)。沿用上一轮值会造成两类高估——
+        // ① L0/L1 常驻后首轮 system≈5k token 被漏算；
+        // ② CONSOLIDATE 后 extraDigest 从 0 跳到 N 行，该轮 earlier 仍是旧值。
+        // 这里先按「固定的 extraDigest」记一版下限（渲染层 old 部分随后由
+        // windows() 自己用 renderRaw 估算卡顶，不会因此超支）。
+        budget.setUsed("system", tokens: TokenEstimator.estimate(systemPrompt))
+        budget.setUsed("earlier", tokens: TokenEstimator.estimate(
+            l3Fold(extraDigest, maxLines: maxDigestLines)))
         let (old, raw) = windows()
         foldedCount = extraDigest.count + old.count
 
         // 运行时诊断：段内 `old` 非空 = 稳定 raw 窗口已越顶——raw 被迫滑进
         // `<earlier_context>`，意味着 kernelRawTurns 在当前负载下不足，KV 前缀每轮
-        // 失效（越聊越慢）。借此判断 24（或所配值）是否够用：若持续出现该告警，
+        // 失效（越聊越慢）。借此判断 kernelRawTurns（默认 8）是否够用：若持续出现该告警，
         // 应调大 kernelMaxContextTokens 抬高 rawCeiling，而非单加 kernelRawTurns。
         // 节流：相邻告警间隔 ≥8 轮，避免工具密集段每轮刷屏。
         if !old.isEmpty, currentTurn - lastOldSlidingWarnTurn >= 8 {
@@ -520,8 +548,7 @@ public final class Session: @unchecked Sendable {
             messages.append(ChatMessage(role: .user, content: userText))
         }
 
-        // 记账
-        budget.setUsed("system", tokens: TokenEstimator.estimate(systemPrompt))
+        // 记账（system 已在 windows() 前设置，避免首轮 rawCeiling 高估）
         budget.setUsed("earlier", tokens: TokenEstimator.estimate(digest))
         budget.setUsed("raw", tokens: TokenEstimator.estimate(
             Self.renderRaw(raw) + (extraUser ? userText : "")
