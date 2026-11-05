@@ -84,13 +84,18 @@ public final class OvisVLMService: VLMService, @unchecked Sendable {
             )
         }
 
-        let ciImage = CIImage(cgImage: image)
-        let userInput = UserInput(chat: [
-            .user(prompt, images: [.ciImage(ciImage)])
-        ])
+        // 与 Vision 路径对称：把图像输入构建限制在 autoreleasepool 内，
+        // 避免每页 OCR 在 Swift 并发工作线程上累积 autoreleased Core Image 对象
+        // （长批量 OCR / 识别失败导致更多页走 OCR 时内存会持续上涨直到崩溃）。
+        let userInput: UserInput = autoreleasepool {
+            let ciImage = CIImage(cgImage: image)
+            return UserInput(chat: [
+                .user(prompt, images: [.ciImage(ciImage)])
+            ])
+        }
 
         do {
-            let input = try await container.prepare(input: userInput)
+            var input = try await container.prepare(input: userInput)
             let parameters = GenerateParameters(
                 maxTokens: max(1, maxTokens),
                 temperature: 0,
@@ -112,6 +117,8 @@ public final class OvisVLMService: VLMService, @unchecked Sendable {
                     break
                 }
             }
+            // 显式释放 MLX 图像输入张量，避免其随闭包跨 await 滞留占用显存/内存。
+            input = nil
             return Self.stripThinking(text).trimmingCharacters(in: .whitespacesAndNewlines)
         } catch is CancellationError {
             throw AgentError.cancelled
@@ -135,11 +142,16 @@ public final class OvisVLMService: VLMService, @unchecked Sendable {
     private static func stripThinking(_ text: String) -> String {
         var result = text
         let pattern = "<think>[\\s\\S]*?</think>"
-        if let regex = try? NSRegularExpression(pattern: pattern, options: []) {
-            let range = NSRange(result.startIndex..<result.endIndex, in: result)
-            result = regex.stringByReplacingMatches(in: result, options: [], range: range, withTemplate: "")
+        // NSRegularExpression 是 autoreleased 的 Foundation 对象，长批量推理下
+        // 需在 autoreleasepool 内创建，否则随并发工作线程累积。
+        let stripped = autoreleasepool {
+            if let regex = try? NSRegularExpression(pattern: pattern, options: []) {
+                let range = NSRange(result.startIndex..<result.endIndex, in: result)
+                return regex.stringByReplacingMatches(in: result, options: [], range: range, withTemplate: "")
+            }
+            return result
         }
-        result = result
+        result = stripped
             .replacingOccurrences(of: "<think>", with: "")
             .replacingOccurrences(of: "</think>", with: "")
         return result

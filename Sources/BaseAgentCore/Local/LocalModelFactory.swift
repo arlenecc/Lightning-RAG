@@ -828,6 +828,17 @@ public final class VLMServicePool: VLMService, @unchecked Sendable {
                                                maxTokens: maxTokens)
         }
     }
+
+    /// 卸载池内每个实例的权重；保留池本身，下次识别时按需重载。
+    ///
+    /// 关键修复：默认的 `VLMService.unload()` 是空实现，若不复写，`LocalModelFactory
+    /// .unloadOCRWeights` 在 `endOCRJob` 时遍历缓存实例调用 `unload()` 对池无效，
+    /// 池内 Ovis 实例权重会一直常驻（约 8GB），跨多次转换/同步持续叠加。
+    public func unload() async {
+        for service in services {
+            await service.unload()
+        }
+    }
 }
 
 /// 线程安全的模型实例缓存。构建过程在锁外执行，避免加载大模型时阻塞其他查询。

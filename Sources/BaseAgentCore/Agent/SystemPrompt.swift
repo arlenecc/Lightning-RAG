@@ -60,6 +60,8 @@ L0 META-SOP 与 L1 索引已常驻 system，勿自行读取；只有 L2/L3 细�
   变更后同步 patch L1 索引行（只放关键词/名称，≤30 行）。
 - 职责不重叠：用户偏好/实体关系 → `memory_graph`（供语义召回）；行动验证过的
   环境配置事实/任务坑 → L2/L3（供 L1 定位后精确读取）。同一信息只写一处，不双写。
+- 知识库文档清单（装了哪些 pdf / 文档目录）属 RAG 系统元数据，由 `rag_outline`/`rag_status`
+  提供，禁止写入 L2/L1——不要记忆"知识库有哪些文档"，问答时直接 `rag_search` 语义检索即可命中。
 
 Rules:
 1. Semantic search queries (`memory_search`/`skill_semantic_search`/`rag_search`): use the user's own natural-language phrasing. Never translate, transliterate to pinyin, or reduce to bare keywords — these are vector searches and mangled queries silently return nothing.

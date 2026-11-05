@@ -477,11 +477,11 @@ public final class KernelLoop {
                     } else if !didWork {
                         let nowStep = openSteps.first(where: { $0.status == "doing" })
                             ?? openSteps[0]
-                        let phrase = resume ? "在本段没有调用任何工具" : "**一次工具都没调用**"
+                        let phrase = resume ? "在本段没有调用任何工具" : "还没有调用**实际工具**去推进"
                         pending = """
-                        [System] 计划已建立，但你还\(phrase)——只把计划写出来不算开始执行。这是第 \(finishNudge) 次提醒。
+                        [System] 计划已建立，但你还\(phrase)当前步骤——只调 `update_plan` 不算推进，它只更新计划状态、不能替代真实的文件读取 / 检索 / 执行。这是第 \(finishNudge) 次提醒。
                         现在立即开始执行当前步骤（Now）：\(nowStep.id). \(nowStep.title)。
-                        要求：下一轮必须包含**工具调用**（读文件 / 执行命令 / 检索 / 写代码等实际动作），不要只描述你打算做什么，不要停下来问用户是否开始或是否继续。
+                        要求：下一轮必须包含**实际工具调用**（读文件 / 执行命令 / 检索 / 写代码等），不要只描述你打算做什么，不要停下来问用户是否开始或是否继续。
                         """
                     } else {
                         pending = """
@@ -611,8 +611,10 @@ public final class KernelLoop {
             // 把它重置之前，被「未充分尝试就 blocked」的守卫读走。
             let stepFailsBefore = stepFails
             let batch = trackFailures(toolCalls, rawResults)
-            // 建计划本身不算「开工」：只调 update_plan 就收尾 = 只规划不执行。
-            if hasActual { didWork = true }
+            // 建计划（create）不算开工；但 patch 实际改变了步骤状态（尤其标 done）
+            // 算「做过事」——避免「只调了 update_plan 却被判定为一次工具都没调用」的
+            // 误导，也让纯文字收尾时把已 patch 完成的计划正确视为已完成。
+            if hasActual || batch.planPatched { didWork = true }
 
             // ---- 重复调用检测（成功调用也要管）----
             let sigs = toolCalls.map(callSig)
@@ -715,6 +717,34 @@ public final class KernelLoop {
                 let todo = left.prefix(8).map { "\($0.id).\($0.title)" }.joined(separator: "; ")
                 finalText += "\n\n---\n⚠ 计划中仍有 \(left.count) 个未完成步骤：\(todo)"
                     + "（内核已多次要求继续执行仍未完成。若某步其实已做完，用 update_plan 补标 done；若确实不可行，标 blocked 并写明原因。）"
+            }
+        }
+
+        // 纯文字收尾且计划仍有未完成步骤：自动标记完成并落盘，避免下次用户输入时
+        // 内核带着未完成计划从上一步重新执行（模型用文字总结代替 update_plan 收尾
+        // 时极易漏标 done）。仅在本轮确实执行过工具（didWork）时才兜底，避免
+        // 「从未干活就标完成」把真实计划清掉。
+        if exitReason == .done && finalTurnNoTool && didWork {
+            if let plan = session.getPlan(),
+               plan.steps.contains(where: { $0.status == "pending" || $0.status == "doing" }) {
+                var completed = plan
+                var autoDone = 0
+                for i in completed.steps.indices {
+                    if completed.steps[i].status == "pending"
+                        || completed.steps[i].status == "doing" {
+                        completed.steps[i].status = "done"
+                        if completed.steps[i].note.isEmpty {
+                            completed.steps[i].note = "自动标记完成（无工具收尾）"
+                        }
+                        autoDone += 1
+                    }
+                }
+                session.setPlan(completed)
+                try? PlanStore.save(completed, config: config)
+                callbacks.onPlanUpdated(completed)
+                if autoDone > 0 {
+                    finalText += "\n\n---\n（计划已自动标记 \(autoDone) 个步骤为完成）"
+                }
             }
         }
 
@@ -973,6 +1003,9 @@ public final class KernelLoop {
         var failed: [(name: String, error: String)] = []
         var repeats: [(name: String, error: String)] = []
         var planMutated = false
+        /// 仅 `update_plan(op="patch")` 成功改变步骤状态时为真；`create` 不算，
+        /// 因为「只建计划」仍视为未开工。
+        var planPatched = false
     }
 
     private func resultOK(_ res: ToolResult) -> (Bool, String) {
@@ -992,7 +1025,11 @@ public final class KernelLoop {
         for (tc, res) in zip(toolCalls, rawResults) {
             let (ok, err) = resultOK(res)
             if tc.name == "update_plan" {
-                if ok { batch.planMutated = true }
+                if ok {
+                    batch.planMutated = true
+                    let op = (tc.arguments["op"]?.stringValue ?? "").lowercased()
+                    if op == "patch" { batch.planPatched = true }
+                }
                 continue
             }
             if ok { continue }
