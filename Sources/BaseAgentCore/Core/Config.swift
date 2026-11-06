@@ -281,6 +281,15 @@ public struct AgentConfig: Sendable {
     /// FTS5 召回 over-fetch 倍数。
     public var ragFTSOverfetch: Int = 4
 
+    // RAG MCP 服务（MCP 2025-06-18 Streamable HTTP，供其它大模型应用对接）
+    /// 监听范围：false = 仅本机（绑定 127.0.0.1，默认）；true = 局域网（绑定 0.0.0.0）。
+    public var ragMCPListenLan: Bool = false
+    /// 服务监听端口（默认 8080；migrate 会钳制到 1~65535）。
+    public var ragMCPPort: Int = 8080
+    /// 服务开关（默认关闭）。App 启动后按此恢复服务状态；修改监听范围/端口
+    /// 后需要停止再启动才生效。
+    public var ragMCPEnabled: Bool = false
+
     // 向量落盘编码
     /// 向量元素类型：int8（默认；默认模型 128 维时每行 128B）/ fp32 / fp16 / bin。
     /// fp16 每维 2 字节，因 sqlite-vec 0.1.9 没有该列类型，走普通表 + 精确扫描。
@@ -575,6 +584,9 @@ public struct AgentConfig: Sendable {
         if let v = int("rag_aux_summarize_max_chars") { ragAuxSummarizeMaxChars = v }
         if let v = int("rag_vector_overfetch") { ragVectorOverfetch = v }
         if let v = int("rag_fts_overfetch") { ragFTSOverfetch = v }
+        if let v = bool("rag_mcp_listen_lan") { ragMCPListenLan = v }
+        if let v = int("rag_mcp_port") { ragMCPPort = v }
+        if let v = bool("rag_mcp_enabled") { ragMCPEnabled = v }
         if let v = string("rag_vector_element_type"),
            let parsed = VectorElementType(rawValue: v.lowercased()) {
             ragVectorElementType = parsed
@@ -692,6 +704,8 @@ public struct AgentConfig: Sendable {
         ragRerankCandidateMultiplier = max(1, min(5, ragRerankCandidateMultiplier))
         // 二值粗筛候选数：手改配置可能越界，统一收口到 50...1000。
         ragBinaryCoarseCandidates = max(50, min(1_000, ragBinaryCoarseCandidates))
+        // RAG MCP 服务端口：钳制到合法 TCP 端口范围，非法值回落默认 8080。
+        if !(1...65535).contains(ragMCPPort) { ragMCPPort = 8080 }
         // docling/marker 已移除：旧配置值统一由 PDFEngine(stored:) 归一化为 ovis。
         // 默认 embedding 迁移到 jina-embeddings-v5-text-nano（MLX int4）：
         // 上一版默认是 jina-v3，更早是 nomic MLX int8 / bge。
@@ -951,6 +965,9 @@ public struct AgentConfig: Sendable {
             "rag_aux_summarize_max_chars": ragAuxSummarizeMaxChars,
             "rag_vector_overfetch": ragVectorOverfetch,
             "rag_fts_overfetch": ragFTSOverfetch,
+            "rag_mcp_listen_lan": ragMCPListenLan,
+            "rag_mcp_port": ragMCPPort,
+            "rag_mcp_enabled": ragMCPEnabled,
             "rag_vector_element_type": ragVectorElementType.rawValue,
             "rag_matryoshka": ragMatryoshka.rawValue,
             "rag_matryoshka_dim": ragMatryoshkaDim,

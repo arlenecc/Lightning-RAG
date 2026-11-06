@@ -243,6 +243,72 @@ final class AppViewModel: ObservableObject {
     private var configGeneration = 0
     /// `applyConfig { sync }` 路径：记住应用配置前已加载的模型，同步结束后再恢复。
     private var pendingSyncRestore: (main: Bool, aux: Bool)?
+    // MARK: RAG MCP 服务（供其它大模型应用对接，共享同一个知识库引擎）
+    @Published var ragMCPRunning = false
+    private var ragMCPServer: RAGMCPServer?
+
+    /// 启动 RAG MCP 服务（MCP 2025-06-18 Streamable HTTP）。
+    /// 与 App 内 RAG 共用同一个 `RAGEngine`：入库/检索/删除就是同一套既有流程。
+    @MainActor
+    func startRAGMCPService() {
+        guard let engine = agent?.ragEngine else {
+            appendLog("[rag-mcp] Agent 未就绪，无法启动 MCP 服务")
+            return
+        }
+        stopRAGMCPService(persistDisabled: false)
+        let options = RAGMCPServerOptions(
+            listenLAN: config.ragMCPListenLan,
+            port: config.ragMCPPort)
+        let server = RAGMCPServer(engine: engine, options: options) { [weak self] line in
+            Task { @MainActor [weak self] in self?.appendLog(line) }
+        }
+        do {
+            try server.start()
+            ragMCPServer = server
+            ragMCPRunning = true
+            config.ragMCPEnabled = true
+            try? config.save(Self.configPath)
+            appendLog("[rag-mcp] MCP 服务已启动："
+                + "http://\(config.ragMCPListenLan ? "0.0.0.0" : "127.0.0.1"):\(config.ragMCPPort)/mcp")
+        } catch {
+            appendLog("[rag-mcp] 启动失败：\(error.localizedDescription)")
+        }
+    }
+
+    /// 停止 RAG MCP 服务。`persistDisabled=false` 用于配置重建等场景：
+    /// 只停实例，不把用户「启用」的开关落盘成关闭。
+    @MainActor
+    func stopRAGMCPService(persistDisabled: Bool = true) {
+        guard ragMCPServer != nil || ragMCPRunning else {
+            if persistDisabled, config.ragMCPEnabled {
+                config.ragMCPEnabled = false
+                try? config.save(Self.configPath)
+            }
+            return
+        }
+        ragMCPServer?.stop()
+        ragMCPServer = nil
+        ragMCPRunning = false
+        if persistDisabled {
+            config.ragMCPEnabled = false
+            try? config.save(Self.configPath)
+        }
+    }
+
+    /// 只更新监听配置（不重建 Agent）：成功返回 true，端口非法返回 false。
+    @MainActor
+    @discardableResult
+    func updateRAGMCPSettings(listenLAN: Bool, port: Int) -> Bool {
+        guard (1...65535).contains(port) else { return false }
+        config.ragMCPListenLan = listenLAN
+        config.ragMCPPort = port
+        do {
+            try config.save(Self.configPath)
+        } catch {
+            appendLog("[rag-mcp] 配置保存失败: \(error.localizedDescription)")
+        }
+        return true
+    }
 
     static var configPath: String {
         (NSHomeDirectory() as NSString).appendingPathComponent(".base-agent/config.json")
@@ -290,6 +356,10 @@ final class AppViewModel: ObservableObject {
         // 即使无需预加载模型（API 模式/未启用辅助模型），也要让闲时摘要
         // 在启动后按空闲计时自动开始。
         scheduleIdleUnload()
+        // 按配置恢复 RAG MCP 服务（默认关闭；上次运行中才会自动重启）。
+        if config.ragMCPEnabled {
+            startRAGMCPService()
+        }
     }
 
     // MARK: 默认模型下载（hf-mirror）
@@ -547,9 +617,15 @@ final class AppViewModel: ObservableObject {
                 self.syncTask?.cancel()
                 self.syncTask = nil
                 self.isStoppingSync = false
+                // 旧 Agent 即将关闭：先停 MCP 服务（共享同一引擎），不改动开关。
+                self.stopRAGMCPService(persistDisabled: false)
                 self.agent?.close()
                 LocalModelFactory.shared.clearCaches()
                 self.buildAgent()
+                // 新引擎就绪后按新配置恢复服务（监听范围/端口可能已变化）。
+                if newConfig.ragMCPEnabled {
+                    self.startRAGMCPService()
+                }
                 if auxWasLoaded && !newConfig.auxEnabled {
                     self.appendLog("[model] 辅助模型已关闭，不再加载")
                 }

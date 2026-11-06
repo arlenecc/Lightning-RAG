@@ -470,6 +470,41 @@ public enum DocumentLookupResult: Sendable, Equatable {
     case notFound
 }
 
+/// 已入库文档的清单条目（manifest 视角）：MCP `list_document` 等外部接口使用。
+public struct RAGDocumentSummary: Sendable, Equatable {
+    public var docName: String
+    public var source: String
+    public var mdPath: String
+    public var chunkCount: Int?
+    public var sizeBytes: Int64?
+    public var modifiedAt: Double?
+    public var duplicateOf: String?
+    public var discarded: Bool?
+
+    public init(docName: String, source: String, mdPath: String,
+                chunkCount: Int? = nil, sizeBytes: Int64? = nil,
+                modifiedAt: Double? = nil, duplicateOf: String? = nil,
+                discarded: Bool? = nil) {
+        self.docName = docName
+        self.source = source
+        self.mdPath = mdPath
+        self.chunkCount = chunkCount
+        self.sizeBytes = sizeBytes
+        self.modifiedAt = modifiedAt
+        self.duplicateOf = duplicateOf
+        self.discarded = discarded
+    }
+}
+
+/// 知识遗忘/删除结果。
+public enum RAGDeleteOutcome: Sendable, Equatable {
+    /// 已删除：`chunksRemoved` = 清掉的切片数，`docName` = 实际删除的文档。
+    case deleted(chunksRemoved: Int, docName: String)
+    /// 同名/同路径多候选，拒绝猜测性删除。
+    case ambiguous([String])
+    case notFound
+}
+
 /// `rag_outline` 使用的增强目录：修复后的目录 + 已生成的章节/全书摘要。
 public struct EnrichedDocumentOutline: Sendable, Equatable {
     public var record: DocumentRecord
@@ -2607,6 +2642,73 @@ public final class RAGEngine {
 
     public func listDocuments() -> [String] {
         (withStoreSafe { $0.listDocuments() }) ?? []
+    }
+
+    // MARK: - MCP 服务薄层 API（RAGMCPServer 使用，不影响既有入库/检索流程）
+
+    /// 已入库文档清单（manifest 视角）：含切片数、文件大小、重复副本标记。
+    /// 与 `listDocuments(limit:)`（documents 表视角）互补，供外部 MCP 客户端浏览。
+    public func listIngestedDocuments(limit: Int = 500) -> [RAGDocumentSummary] {
+        let manifest = manifestStore.load()
+        let entries = manifest
+            .sorted { $0.key < $1.key }
+            .prefix(max(1, limit))
+        return entries.map { source, entry in
+            RAGDocumentSummary(
+                docName: entry.docName,
+                source: source,
+                mdPath: entry.mdPath,
+                chunkCount: entry.chunkCount,
+                sizeBytes: entry.size,
+                modifiedAt: entry.mtime,
+                duplicateOf: entry.duplicateOf,
+                discarded: entry.discarded)
+        }
+    }
+
+    /// 知识遗忘/删除：清掉文档对应切片向量、documents 表记录与 markdown 缓存。
+    /// 多候选同名时拒绝猜测性删除（返回 `ambiguous`），绝不静默删错文件。
+    /// 存储层错误向上抛出，由调用方（MCP/工具层）转成可读提示。
+    public func deleteDocument(_ name: String) throws -> RAGDeleteOutcome {
+        let target = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !target.isEmpty else { return .notFound }
+        switch lookupDocument(target) {
+        case .notFound:
+            return .notFound
+        case .ambiguous(let records):
+            return .ambiguous(records.map(\.docName))
+        case .found(let record):
+            // manifest key = 完整来源路径；删除逻辑与 ingest 清理共用同一条
+            // `removeIndexedSource` 路径，保证向量/记录/缓存清理行为一致。
+            let manifest = manifestStore.load()
+            let entry = manifest.first { $0.value.docName == record.docName }
+                ?? manifest.first { $0.value.mdPath == record.mdPath && !record.mdPath.isEmpty }
+            let source = entry?.key
+                ?? record.mdPath
+                ?? ((knowledgeBase as NSString)
+                    .appendingPathComponent((record.docName as NSString).lastPathComponent))
+            // 先清掉切片向量（拿行数做反馈），再走统一的清理路径删除
+            // documents 表记录与 markdown 缓存；removeIndexedSource 内部会再
+            // deleteBySource 一次（幂等，返回 0）。
+            let chunksRemoved = try withStore { store -> Int in
+                let chunks = try store.deleteBySource(source)
+                Self.removeIndexedSource(
+                    source: source, entry: entry?.value, store: store,
+                    markdownDir: markdownDir, knowledgeBase: knowledgeBase)
+                return chunks
+            }
+            invalidateStatusCache()
+            return .deleted(chunksRemoved: chunksRemoved, docName: record.docName)
+        }
+    }
+
+    /// 读取文档解析后的 markdown 缓存原文（`get_document` 透传用）。
+    /// 未命中或缓存文件缺失返回 nil。
+    public func readMarkdown(for docName: String) -> String? {
+        guard case .found(let record) = lookupDocument(docName) else { return nil }
+        let path = record.mdPath
+        guard !path.isEmpty, FileManager.default.fileExists(atPath: path) else { return nil }
+        return try? String(contentsOfFile: path, encoding: .utf8)
     }
 
     /// 创建闲时章节摘要协调器：与检索复用同一个 `VectorStore` 实例。

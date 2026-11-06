@@ -126,6 +126,9 @@ struct SettingsView: View {
     /// 默认信任 mtime + 大小；开启后为「保留时间戳的同尺寸改动」再校验内容指纹。
     @State private var verifyFingerprint = false
     @State private var showAdvanced = false
+    /// RAG MCP 服务（Streamable HTTP）：监听范围 / 端口（运行中时锁定）。
+    @State private var ragMCPScope = false
+    @State private var ragMCPPortText = "8080"
 
     @State private var statusMessage = ""
 
@@ -625,6 +628,35 @@ struct SettingsView: View {
 
                 DisclosureGroup("高级设置", isExpanded: $showAdvanced) {
                     VStack(alignment: .leading, spacing: 10) {
+                        HStack(spacing: 8) {
+                            Text("RAG MCP服务").font(.caption)
+                            Picker("", selection: $ragMCPScope) {
+                                Text("仅限本机").tag(false)
+                                Text("局域网可用").tag(true)
+                            }
+                            .labelsHidden()
+                            .frame(width: 104)
+                            .disabled(model.ragMCPRunning)
+                            Text("端口").font(.caption2).foregroundStyle(.secondary)
+                            TextField("8080", text: $ragMCPPortText)
+                                .textFieldStyle(.roundedBorder)
+                                .frame(width: 64)
+                                .disabled(model.ragMCPRunning)
+                            Circle()
+                                .fill(model.ragMCPRunning ? Color.green : Color.secondary.opacity(0.5))
+                                .frame(width: 8, height: 8)
+                            Text(model.ragMCPRunning ? "运行中" : "未启动")
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                                .frame(width: 44, alignment: .leading)
+                            Button(model.ragMCPRunning ? "停止服务" : "启动服务") {
+                                toggleRAGMCPService()
+                            }
+                            .disabled(ragMCPStartDisabled)
+                            Spacer(minLength: 8)
+                        }
+                        .help("把知识库 RAG 能力以 MCP 服务（Streamable HTTP）提供给其它大模型应用；"
+                              + "修改监听范围或端口后需停止再启动才生效。默认仅本机 127.0.0.1:8080")
                         HStack(spacing: 8) {
                             Text("自定义OCR模型").font(.caption)
                             Picker("", selection: $vlmBackend) {
@@ -1216,6 +1248,28 @@ struct SettingsView: View {
         }
     }
 
+    // MARK: - RAG MCP 服务
+
+    /// 端口输入是否合法（非法时禁用启动按钮，避免保存坏配置）。
+    private var ragMCPPortValue: Int? {
+        Int(ragMCPPortText.trimmingCharacters(in: .whitespaces))
+    }
+    private var ragMCPStartDisabled: Bool {
+        if model.ragMCPRunning { return model.isSyncing }
+        return (ragMCPPortValue.flatMap { (1...65535).contains($0) } != true)
+            || model.isSyncing
+    }
+
+    private func toggleRAGMCPService() {
+        if model.ragMCPRunning {
+            model.stopRAGMCPService()
+            return
+        }
+        guard let port = ragMCPPortValue, (1...65535).contains(port) else { return }
+        model.updateRAGMCPSettings(listenLAN: ragMCPScope, port: port)
+        model.startRAGMCPService()
+    }
+
     // MARK: - 加载 / 应用
 
     private func load() {
@@ -1298,6 +1352,8 @@ struct SettingsView: View {
         autoIngest = config.ragAutoIngest
         ingestConcurrency = config.ragIngestConcurrency
         visionConcurrency = config.ragVisionConcurrency
+        ragMCPScope = config.ragMCPListenLan
+        ragMCPPortText = String(config.ragMCPPort)
         mlxCacheLimitMB = config.mlxCacheLimitMB
         mlxMemoryLimitMB = config.mlxMemoryLimitMB
         annEnabled = config.ragANNEnabled
