@@ -11,7 +11,7 @@ macOS 原生自主 Agent。控制流是**三态自动机 + 五级上下文压缩
 ## 环境要求
 
 - macOS 14+
-- Swift 6.0+（Xcode 16+；本项目在 Swift 6.4 工具链验证）
+- Swift 6.3+ 工具链（Xcode 26+）。依赖 `mlx-swift 0.32.3` 的 `Package.swift` 声明 `// swift-tools-version: 6.3`，SwiftPM 依赖解析会强制要求工具链 ≥ 6.3.0；旧工具链构建时报 `Dependencies could not be resolved because 'mlx-swift' >= 0.31.5 contains incompatible tools version (6.3.0)`（仅影响从源码构建，运行打包好的 DMG 不受影响）。本项目在 Swift 6.4 工具链验证
 - 本地模型（可选）：
   - LLM：MLX-LM / MLX-VLM 模型目录、GGUF 文件、ONNX 解码器目录（`input_ids` + `logits`，可选 `past_key_values`）
   - OCR VLM：MLX 模型目录、GGUF + mmproj；ONNX VLM 暂无通用图适配
@@ -31,6 +31,8 @@ swift run Lightning-RAG
 ```
 
 > 如果出现 `swift-plugin-server` / 宏插件 `malformed response` 错误，是 SwiftPM 沙箱与 MLX 宏插件在部分工具链上的兼容问题；使用 `--disable-sandbox` 可绕过。正常环境可直接 `swift build`。
+>
+> 如果依赖解析时报 `contains incompatible tools version (6.3.0)`，说明本机 Swift 工具链低于 6.3（`swift --version` 确认），升级 Xcode 26+ 后重试。
 
 运行测试：
 
@@ -50,8 +52,8 @@ VARIANT=lite  scripts/package-app.sh release && VARIANT=lite  scripts/package-dm
 
 | VARIANT | 内置模型 | DMG |
 |---|---|---|
-| `clean`（默认） | 无；potion 语义切片 / jina embedding / jina reranker 均在首次启动时从 hf-mirror 自动下载 | `dist/Lightning-RAG-1.2.17-clean.dmg` |
-| `lite` | potion-multilingual-128M int4（语义切片）+ jina-embeddings-v5-text-nano-mlx-int4 + jina-reranker-v2-base-multilingual-onnx | `dist/Lightning-RAG-1.2.17-lite.dmg` |
+| `clean`（默认） | 无；potion 语义切片 / jina embedding / jina reranker 均在首次启动时从 hf-mirror 自动下载 | `dist/Lightning-RAG-1.2.18-clean.dmg` |
+| `lite` | potion-multilingual-128M int4（语义切片）+ jina-embeddings-v5-text-nano-mlx-int4 + jina-reranker-v2-base-multilingual-onnx | `dist/Lightning-RAG-1.2.18-lite.dmg` |
 
 两个版本共用 `dist/Lightning-RAG.app`（应用本体与显示名不变，只有内置模型不同），
 因此需按「打包 App → 打包 DMG」的顺序逐个构建。两个版本都不含主模型、辅助模型
@@ -67,6 +69,47 @@ VARIANT=lite  scripts/package-app.sh release && VARIANT=lite  scripts/package-dm
     768 维生成二值签名写入 `chunk_vectors_bin` → 查询 top1 与 `rag_search` 全链路；jina-v3 的切片 → embedding → 256 维 Matryoshka 截断 → 重新归一化 → int8 入库（256B/行）→ 查询 top1；nomic-int8 的 int8 + Matryoshka 512 召回与 fp32 全维（768）基线对比；以及内置 jina reranker 经 `LocalModelFactory` 加载 ONNX 后对相关段落打分（达到默认 0.45 阈值且高于强无关基线）；`RAGPipelineVerificationTests` 使用仓库 `models/`（可用 `EMBED_BENCH_MODELS_DIR` 指向 App 包模型）跑通 6 篇文档入库 → 22 切片 int8 → 混合检索 + RRF → 重排 → ANN → `rag_search` / `rag_outline` / `rag_status` 全链路。
 
 HTML 与 Office 解析另有专项覆盖：HTML 保存页的本地 iframe / frameset 接力（取正文最多的一份）、big5 等老编码嗅探、依赖 JavaScript 的页面给出明确失败原因、含 `h1` 的 `<header>` 保留、裸文本节点与 `<li>` 内块级元素、结构化清洗档保留 URL/IP 与段落空行；DOCX 编号列表与 `w:br`/`xml:space`、脚注编号与末尾列表、`styles.xml` 样式名解析标题；XLSX 日期与百分比格式、注音跳过、多行单元格不拆表；PPTX 演讲者备注与段内换行。旧版 Office 另有专项覆盖：OLE2 复合文档扇区/FAT/miniFAT 读取与损坏文件拒绝、`.doc` 字号标题/粗斜体/中文、`.xls` BIFF8 共享字符串/日期/百分比/公式与多 sheet、`.ppt` 幻灯片顺序、标题正文、演讲者备注与 Windows-1252 文本，以及 PPT95/加密/空文档/记录超限的明确报错。独立 Markdown 转换另覆盖单文件输出、目录相对结构、同名后缀、单文件失败不中断整批、输出目录跳过与不支持格式拒绝。
+
+## RAG MCP 服务（对外接入）
+
+协议实现基于官方 [MCP Swift SDK](https://github.com/modelcontextprotocol/swift-sdk)
+（vendor 在 `Vendor/mcp-swift-sdk/`，2025-11-25 规范：Streamable HTTP + stdio 两种传输、
+协议版本协商、会话管理、SSE 流、Origin 防回绑校验均由官方实现承担）。
+本机知识库通过 7 个 MCP 工具对外暴露：`parse_and_ingest_document`、`delete_document`
+（别名 `forget_context`）、`list_document`、`extract_metadata`、
+`hybrid_search_with_rerank`、`get_document`——入库/检索/删除与 App 内功能
+共享同一个知识库引擎，不影响原流程。
+
+### Streamable HTTP（默认关闭）
+
+配置窗口「高级设置 → RAG MCP 服务」：选择仅限本机 / 局域网 + 端口，启动后：
+
+- 端点：`http://127.0.0.1:<port>/mcp`（局域网模式为 `http://0.0.0.0:<port>/mcp`）；
+- 多会话：每个客户端 `initialize` 各自获得独立 `Mcp-Session-Id`，`DELETE` 显式终止；
+- 安全（规范 MUST）：本机模式校验 Host/Origin 防 DNS rebinding，非本机来源 403；
+  不支持的 `MCP-Protocol-Version` 返回 400；非 initialize 请求缺会话头 400、未知会话 404。
+
+### stdio（子进程接入）
+
+包内可执行文件 `rag-mcp-stdio`（`.app` 内位于
+`Contents/MacOS/rag-mcp-stdio`，源码调试用 `swift run rag-mcp-stdio`），
+与 App 共用 `~/.base-agent/config.json` 与知识库，日志走 stderr、协议走 stdout：
+
+```bash
+rag-mcp-stdio [--config <config.json>] [--kb <知识库目录>]
+```
+
+客户端（Claude Desktop / Claude Code 等）接入示例：
+
+```json
+{
+  "mcpServers": {
+    "lightning-rag": {
+      "command": "/Applications/Lightning-RAG.app/Contents/MacOS/rag-mcp-stdio"
+    }
+  }
+}
+```
 
 ## 界面
 
@@ -120,7 +163,7 @@ HTML 与 Office 解析另有专项覆盖：HTML 保存页的本地 iframe / fram
 - 子进程超时/取消时递归终止进程树（`pgrep -P`），避免 `npx`/shell 留下孤儿；失败时把 stdout/stderr 尾部并入错误，模型能看到真实报错。
 - 风险判定覆盖裸 `~`、`/`、`..`、`$HOME`/`${HOME}` 等目标，且不会把 `rm -rf ./` 误判为工作区外操作。
 - `web_scan` 首请求与每次重定向都拒绝 loopback/私网/link-local/云元数据地址（SSRF）；响应体上限 8MB、重定向 5 次，任务取消时立即中止下载。
-- MCP stdio 客户端：启动串行化；`shutdown()` 后不会被 `callTool` 复活；接收缓冲有界；服务端 `tools/list_changed` 会同步更新工具注册表与 schema 缓存。
+- MCP stdio 客户端（官方 SDK `Client` + `StdioTransport`）：启动串行化；`shutdown()` 后不会被 `callTool` 复活；进程退出立即断开并使挂起请求失败；服务端 `tools/list_changed` 会同步更新工具注册表与 schema 缓存。
 - `AtomicFile` 使用同目录临时文件 + 原子替换，不再「先删旧再 move」。
 - 所有 `URLSession`（OpenAI/Web/MCP 之外的 HTTP 工具）在 Agent 关闭或配置切换时 `invalidateAndCancel`。
 - MLX 空闲 buffer cache 上限夹在 256MB...2GB（`mlx_cache_limit_mb`，默认 1024MB）；实测 1GB 让 decode 快 5–8%，且仍接近 jina-v3 embedding 的复用 buffer 工作集（约 1.27GB），2GB 不会带来额外提速，只是多留空闲缓存。配置切换时清理模型实例缓存，避免旧权重常驻。卸载/切换路径不再同步调用 `MLX.Memory.clearCache()`，防止与仍在 GPU 线程执行的 `asyncEval` 并发释放 command encoder 导致 SIGSEGV。
@@ -309,6 +352,8 @@ Sources/
     Skills/                    # 技能发现、索引、语义检索
     Agent/                     # Agent 门面、工具工厂、系统提示
   BaseAgentApp/                # SwiftUI 界面
+  RAGMCPStdio/                 # MCP stdio 服务入口（rag-mcp-stdio）
+Vendor/mcp-swift-sdk/          # 官方 MCP Swift SDK（本地 vendor）
 Tests/BaseAgentCoreTests/      # XCTest
 docs/软件设计文档.md
 ```
