@@ -176,6 +176,8 @@ public final class KernelLoop {
     private var reaskGuard = 0
     private var turnsUsed = 0
     private var lastConsolidatedTurn = -1
+    /// 同一轮只做一次「提前折叠」，避免单轮内容本身就超顶时死循环。
+    private var lastEarlyFoldTurn = -1
     private var totalTokens = 0
     private var finishNudge = 0
 
@@ -214,7 +216,7 @@ public final class KernelLoop {
 
         let resolved = session ?? Session(
             budget: ContextBudget(total: config.kernelMaxContextTokens),
-            rawTurns: config.kernelRawTurns == 0 ? 2 : config.kernelRawTurns,
+            rawTurns: config.kernelRawTurns == 0 ? 10 : config.kernelRawTurns,
             maxDigestLines: config.kernelMaxDigestLines == 0 ? 40 : config.kernelMaxDigestLines
         )
         self.session = resolved
@@ -222,11 +224,12 @@ public final class KernelLoop {
         // 读的余额是两本账。
         self.budget = resolved.budget
 
-        // 折叠会改写消息前缀并强制一次 KV 重建；至少 8 轮再折，
-        // 避免每个用户回合都触发一次慢 prefill。
-        // 但周期不能超过 raw 窗口：超出时窗口每轮都滑动，等于每轮都重建。
-        let configured = max(8,
-            config.kernelConsolidateEvery == 0 ? 24 : config.kernelConsolidateEvery)
+        // 折叠会丢弃旧历史并强制一次 KV 重建；周期至少 2 轮，避免每个用户回合
+        // 都重建。默认 8 轮：折叠后保留最近 2 轮原文，新前缀 = system + 2 轮，
+        // prefill 仍远短于整段历史，也避免了折叠处上下文断裂。
+        // 周期不能超过 raw 窗口：超出时窗口每轮都滑动，等于每轮都重建。
+        let configured = max(2,
+            config.kernelConsolidateEvery == 0 ? 8 : config.kernelConsolidateEvery)
         self.consolidateEvery = max(1, min(configured, max(1, resolved.rawTurns)))
         self.maxToolChars = config.kernelMaxToolChars == 0 ? 8_000 : config.kernelMaxToolChars
         self.ragHistoryChars = config.kernelRagHistoryChars
@@ -338,21 +341,34 @@ public final class KernelLoop {
             if needsConsolidate() {
                 state = .consolidate
                 lastConsolidatedTurn = session.currentTurn
-                let over = budget.totalOver
-                let reason = over ? "预算告罄" : "每 \(consolidateEvery) 轮"
-                // 一次折到只剩最近一轮：留满下一个周期的 raw 窗口。
-                // 只折「超出部分」时，折叠后窗口仍贴着上限，2~3 轮后又开始
-                // 每轮滑窗（`<earlier_context>` 变化 → KV 前缀失效 → 全量 prefill）。
-                let folded = session.foldForConsolidation()
-                if folded > 0 {
-                    runtime.invalidateKV?()
-                }
-                log("[kernel] CONSOLIDATE (\(reason)) folded=\(folded) \(session.statsDescription())")
-                _ = await hooks.consolidated(session, reason: reason)
-                if over && folded == 0 && shrinkGuard < 3 {
+                let foldReason: String
+                // needsAutoShrink = 已用超过 90% 最大上下文：唯一允许把旧
+                // 上下文摘要回注到 <earlier_context> 的路径（LLM 自动收缩）。
+                // 注意不用 totalOver（79% 输出预留线），那是预算分配量。
+                if budget.needsAutoShrink, shrinkGuard < 3 {
+                    foldReason = "context-90"
                     shrinkGuard += 1
-                    _ = await hooks.consolidated(session, reason: "fold-exhausted")
+                    let shrunk = await hooks.consolidated(session, reason: "context-90")
+                    log("[kernel] CONSOLIDATE (上下文 >90%) shrunk=\(shrunk) "
+                        + session.statsDescription())
+                    if shrunk {
+                        runtime.invalidateKV?()
+                    } else {
+                        // 没有可用辅助模型：退化成丢弃式折叠，保证不死循环。
+                        let dropped = session.discardHistory(keepingRecent: 2)
+                        if dropped > 0 { runtime.invalidateKV?() }
+                    }
+                } else {
+                    foldReason = "periodic"
+                    // 常规主动折叠：旧上下文丢弃、不回注摘要，但保留最近
+                    // 2 轮原文，避免折叠处上下文断裂。
+                    let dropped = session.discardHistory(keepingRecent: 2)
+                    if dropped > 0 { runtime.invalidateKV?() }
+                    log("[kernel] CONSOLIDATE (每 \(consolidateEvery) 轮) "
+                        + "dropped=\(dropped) 保留最近 2 轮 \(session.statsDescription())")
                 }
+                // 边界通知：刷新 system 前缀（L0/L1 变更延迟到这里生效）+ 预热 KV。
+                await hooks.didFold(session, reason: foldReason, tools: schemas())
                 _ = transition("done")
             }
 
@@ -375,24 +391,40 @@ public final class KernelLoop {
             let rec = session.startTurn(prompt: userText, images: attachImages)
             attachImages = nil
             turnsUsed += 1
-            let messages = session.buildMessages(systemPrompt: systemPrompt(), userText: userText)
-            _ = schemas()
+            let sys = systemPrompt()
+            let toolSchemas = schemas()   // 先记 tools 账，raw 硬顶才算得准
+            // A：段内禁止滑窗。若把全部已完成轮发出去会越过 raw 硬顶，先一次性
+            // 提前折叠（保留最近 2 轮 + 当前轮），把「每轮滑窗 → KV 反复全量
+            // prefill」收敛成「每 N 轮一次可预期的重建」。
+            if session.rawWouldExceedCeiling(systemTokens: TokenEstimator.estimate(sys)),
+               lastEarlyFoldTurn != session.currentTurn {
+                lastEarlyFoldTurn = session.currentTurn
+                let dropped = session.discardHistory(keepingRecent: 3)
+                if dropped > 0 {
+                    runtime.invalidateKV?()
+                    log("[kernel] 提前折叠（raw 窗口将越顶）dropped=\(dropped) "
+                        + "保留最近 2 轮 \(session.statsDescription())")
+                    await hooks.didFold(session, reason: "early-raw-ceiling",
+                                        tools: toolSchemas)
+                }
+            }
+            let messages = session.buildMessages(systemPrompt: sys, userText: userText)
 
             var respOptional: LLMResponse? = nil
             do {
                 respOptional = try await ask(messages, toolsEnabled: toolsEnabled)
             } catch {
                 let msg = describe(error)
-                // 上下文超长是可恢复的：交给上层兜底收缩后重试同一轮。
+                // 上下文超长：丢弃旧历史后重试同一轮，不生成摘要回注。
+                // 只有「占用 >90%」的自动收缩才允许把旧摘要写回上下文。
                 if isContextError(msg) && shrinkGuard < 3 {
                     shrinkGuard += 1
                     session.rollbackTurn()
                     runtime.invalidateKV?()
-                    let shrunk = await hooks.consolidated(session, reason: "fold-exhausted")
-                    if shrunk {
-                        log("[kernel] 上下文超长，兜底收缩后重试 (\(shrinkGuard))")
-                        continue
-                    }
+                    let dropped = session.resetForFreshContext()
+                    log("[kernel] 上下文超长，丢弃 \(dropped) 轮旧历史后重试 (\(shrinkGuard))")
+                    await hooks.didFold(session, reason: "context-limit", tools: schemas())
+                    continue
                 }
                 log("[kernel] LLM error: \(msg)")
                 hooks.failed(session, error: msg)
@@ -620,7 +652,8 @@ public final class KernelLoop {
                 var it = executed.makeIterator()
                 rawResults = toolCalls.enumerated().map { (i, _) in
                     if let pre = preset[i] { return pre }
-                    return it.next()!
+                    // 并行/串行分支返回数量不足时不能强解包崩掉整个内核。
+                    return it.next() ?? .fail("工具调度返回的结果数量不足")
                 }
             } catch {
                 log("[kernel] dispatcher error: \(describe(error))")
@@ -758,7 +791,11 @@ public final class KernelLoop {
                     }
                 }
                 session.setPlan(completed)
-                try? PlanStore.save(completed, config: config)
+                do {
+                    try PlanStore.save(completed, config: config)
+                } catch {
+                    AgentLog.warning("[kernel] 计划落盘失败: \(error.localizedDescription)")
+                }
                 callbacks.onPlanUpdated(completed)
                 if autoDone > 0 {
                     finalText += "\n\n---\n（计划已自动标记 \(autoDone) 个步骤为完成）"
@@ -786,9 +823,11 @@ public final class KernelLoop {
 
     private func needsConsolidate() -> Bool {
         let turn = session.currentTurn
-        // 紧急折叠只看硬顶（是否侵入输出预留）。raw 软配额是建议值，
-        // 用 rawOver 判紧急会变成「每轮折 1 轮 + 每轮丢 KV + 每轮全量 prefill」。
-        if budget.totalOver { return true }
+        // needsAutoShrink = 已用超过 90% 最大上下文（独立于 21% 输出预留）：
+        // 触发唯一一次「摘要回注式」自动收缩。totalOver 只是预算诊断量，
+        // 不再触发折叠；raw 软配额是建议值，用 rawOver 判紧急会变成
+        // 「每轮折 1 轮 + 每轮丢 KV + 每轮全量 prefill」。
+        if budget.needsAutoShrink { return true }
         if turn > 0 && turn % consolidateEvery == 0 && turn != lastConsolidatedTurn {
             return true
         }
@@ -999,7 +1038,13 @@ public final class KernelLoop {
     private func toOutcomes(_ toolCalls: [ToolCall],
                             _ rawResults: [ToolResult]) -> [StepOutcome] {
         let n = max(1, toolCalls.count)
-        let maxChars = budget.remainingForTool(n, maxChars: maxToolChars)
+        // B：按本折叠段内剩余轮数均摊硬余量，预算前移到工具结果产出时，
+        // 让段内累计 raw 不越顶 → 不滑窗 / 不提前折叠 → KV 前缀只追加。
+        let turn = max(1, session.currentTurn)
+        let period = max(1, consolidateEvery)
+        let segmentLeft = max(1, period - ((turn - 1) % period))
+        let maxChars = budget.remainingForTool(n, maxChars: maxToolChars,
+                                               reserveTurns: segmentLeft)
         var out: [StepOutcome] = []
         for (tc, res) in zip(toolCalls, rawResults) {
             // 只有门控**成功**才允许触发后续经验蒸馏。门控失败（如当前轮数 <5）
@@ -1009,10 +1054,19 @@ public final class KernelLoop {
             }
             // L0：先兜住病态长度；L1：再按 RAW 区余额裁到真正要注入的长度。
             let captured = l0Capture(res.toMessage(), hardCap: l0HardCap)
-            out.append(StepOutcome(data: l1Trim(captured, maxChars: maxChars),
-                                   nextPrompt: "\n"))
+            out.append(Self.outcome(data: l1Trim(captured, maxChars: maxChars),
+                                    result: res))
         }
         return out
+    }
+
+    /// 工具结果 → 自动机下一步。`"\n"` 是「本轮继续」的哨兵；工具若显式要求
+    /// 中断（`ToolResult.shouldExit`）必须透传，否则 `outcomes.contains {
+    /// $0.shouldExit }` 恒为 false，中断信号被吞掉、自动机会继续空转。
+    static func outcome(data: String, result: ToolResult) -> StepOutcome {
+        StepOutcome(data: data,
+                    nextPrompt: result.shouldExit ? nil : "\n",
+                    shouldExit: result.shouldExit)
     }
 
     // MARK: ACT：失败记账与自动恢复提示

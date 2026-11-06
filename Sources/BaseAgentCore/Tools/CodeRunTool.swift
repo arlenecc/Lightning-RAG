@@ -92,8 +92,9 @@ public final class CodeRunTool: AgentTool {
             try code.write(to: scriptURL, atomically: true, encoding: .utf8)
 
             let callbacks = self.callbacks
-            // Python 代码通过 sitecustomize 注入「工作区外禁写」护栏。
-            // 其他语言没有可注入的等价钩子，只依赖 shouldConfirm 的风险判定。
+            // Python 代码通过 sitecustomize 注入「工作区外禁写 + L0/L1 记忆禁写」
+            // 护栏。其他语言没有可注入的等价钩子，只依赖 shouldConfirm 的风险判定
+            // 与文件工具侧的守卫（shell/MCP 属 OS 级能力，无法在此层拦截）。
             var environment: [String: String]? = nil
             var guardDirectory: URL? = nil
             if spec.prefixArguments.contains("python3") {
@@ -170,12 +171,21 @@ public final class CodeRunTool: AgentTool {
     import os
 
     _WORKSPACE = os.path.realpath(os.environ.get("BASE_AGENT_WORKSPACE", ""))
+    # L0/L1 会逐字进入 system prompt：即便位于工作区内，也不许脚本改写，
+    # 否则一次提示词注入就能持久化到之后所有会话。
+    _MEMORY_PROMPT_FILES = set([
+        os.path.realpath(os.path.join(_WORKSPACE, "memory", "memory_management_sop.md")),
+        os.path.realpath(os.path.join(_WORKSPACE, "memory", "global_mem_insight.txt")),
+    ])
 
     def _inside(path):
         try:
             real = os.path.realpath(os.fspath(path))
         except Exception:
             return False
+        if real in _MEMORY_PROMPT_FILES:
+            raise PermissionError(
+                "code_run write guard: refusing to rewrite system-prompt memory: %r" % (path,))
         return bool(_WORKSPACE) and (real == _WORKSPACE or real.startswith(_WORKSPACE + os.sep))
 
     def _write_mode(mode):

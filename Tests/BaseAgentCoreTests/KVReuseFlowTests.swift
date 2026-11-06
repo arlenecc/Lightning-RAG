@@ -127,9 +127,8 @@ final class KVReuseFlowTests: XCTestCase {
         config.maxIterations = 1
 
         let collector = LogCollector()
-        let previousSink = AgentLog.sink
-        AgentLog.sink = { collector.append($0) }
-        defer { AgentLog.sink = previousSink }
+        // Agent.run 会把底层 AgentLog 按任务注入到 CollectingCallbacks.onLog；
+        // 不再改进程级全局 sink，避免并发测试互相串日志 / 互相抹掉 sink。
 
         let agent = Agent(llm: service, config: config, callbacks: CollectingCallbacks(collector))
         defer { agent.close() }
@@ -171,9 +170,8 @@ final class KVReuseFlowTests: XCTestCase {
         config.maxIterations = 3
 
         let collector = LogCollector()
-        let previousSink = AgentLog.sink
-        AgentLog.sink = { collector.append($0) }
-        defer { AgentLog.sink = previousSink }
+        // Agent.run 会把底层 AgentLog 按任务注入到 CollectingCallbacks.onLog；
+        // 不再改进程级全局 sink，避免并发测试互相串日志 / 互相抹掉 sink。
 
         let agent = Agent(llm: service, config: config, callbacks: CollectingCallbacks(collector))
         defer { agent.close() }

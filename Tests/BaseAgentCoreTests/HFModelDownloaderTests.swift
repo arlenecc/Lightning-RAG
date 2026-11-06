@@ -25,6 +25,61 @@ final class HFModelDownloaderTests: XCTestCase {
         XCTAssertFalse(HFModelDownloader.isNeededFile(".gitattributes"))
     }
 
+    /// 远端 tree API 的 path 不可信：拒绝 zip-slip 式写入。
+    func testSafeRelativePathRejectsTraversal() {
+        let safe = HFModelDownloader.isSafeRelativePath
+        XCTAssertTrue(safe("config.json"))
+        XCTAssertTrue(safe("sub/dir/model_quantized.onnx"))
+        XCTAssertFalse(safe("../../etc/passwd"))
+        XCTAssertFalse(safe("sub/../../evil.safetensors"))
+        XCTAssertFalse(safe("/etc/model.safetensors"))
+        XCTAssertFalse(safe("~/model.safetensors"))
+        XCTAssertFalse(safe("..\\evil.safetensors"))
+        XCTAssertFalse(safe("C:/model.onnx"))
+        XCTAssertFalse(safe("sub//model.onnx"))
+        XCTAssertFalse(safe("./model.onnx"))
+        XCTAssertFalse(safe(""))
+        XCTAssertFalse(safe("a\u{0000}b.json"))
+    }
+
+    /// containment 必须解析符号链接，避免软链把下载写到目录外。
+    func testContainedRejectsSymlinkEscape() throws {
+        let fm = FileManager.default
+        let root = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("hf-contained-\(UUID().uuidString)", isDirectory: true)
+        let outside = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("hf-outside-\(UUID().uuidString)", isDirectory: true)
+        try fm.createDirectory(at: root, withIntermediateDirectories: true)
+        try fm.createDirectory(at: outside, withIntermediateDirectories: true)
+        defer { try? fm.removeItem(at: root); try? fm.removeItem(at: outside) }
+
+        XCTAssertTrue(HFModelDownloader.isContained(
+            root.appendingPathComponent("model.safetensors"), in: root))
+        XCTAssertFalse(HFModelDownloader.isContained(
+            root.appendingPathComponent("../escape.json"), in: root))
+
+        let link = root.appendingPathComponent("link")
+        try fm.createSymbolicLink(at: link, withDestinationURL: outside)
+        XCTAssertFalse(HFModelDownloader.isContained(
+            link.appendingPathComponent("model.safetensors"), in: root))
+    }
+
+    /// 恶意 FileEntry 即使绕过清单过滤，也必须在落盘前被拒绝（不发网络请求）。
+    func testDownloadRejectsTraversalEntry() async throws {
+        let downloader = HFModelDownloader()
+        let directory = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("hf-dl-\(UUID().uuidString)", isDirectory: true)
+        let entry = HFModelDownloader.FileEntry(
+            path: "../../escaped.safetensors", size: 8_192)
+        do {
+            try await downloader.download(repo: "org/model", file: entry,
+                                          into: directory, progress: { _, _ in })
+            XCTFail("应拒绝越界路径")
+        } catch let error as HFModelDownloader.HFError {
+            XCTAssertTrue(error.errorDescription?.contains("非法") == true)
+        }
+    }
+
     func testCatalogResolvesDefaultModels() {
         // 把应用模型目录锚定到一个空目录：默认 "models/..." 值在该目录下
         // 都不存在（判定应全部缺失），同时避免测试进程解析到项目根的

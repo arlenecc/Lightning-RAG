@@ -189,12 +189,16 @@ public final class TurnRecord: @unchecked Sendable {
 public protocol KernelHooks: AnyObject {
     /// 折叠/沉淀回调。返回 true 表示上下文真的变小了。
     func consolidated(_ session: Session, reason: String) async -> Bool
+    /// 折叠边界通知（周期性 / 90% 收缩 / 提前折叠 / 异常重试）。
+    /// Agent 在此刷新 system 前缀（L0/L1 变更延迟到边界生效）并预热 KV。
+    func didFold(_ session: Session, reason: String, tools: [JSONValue]) async
     func finished(_ session: Session, text: String)
     func failed(_ session: Session, error: String)
 }
 
 public extension KernelHooks {
     func consolidated(_ session: Session, reason: String) async -> Bool { false }
+    func didFold(_ session: Session, reason: String, tools: [JSONValue]) async {}
     func finished(_ session: Session, text: String) {}
     func failed(_ session: Session, error: String) {}
 }

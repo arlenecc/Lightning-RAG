@@ -402,13 +402,14 @@ final class ContentDedupRegistry: @unchecked Sendable {
 
 // MARK: - 并发 Ingest 任务
 
-private struct ScannedFile: Sendable {
+struct ScannedFile: Sendable {
     let path: String
     let relativePath: String
 }
 
 /// 原始文件采样指纹相同的文件组。代表文件负责解析/入库，其余副本清理向量。
-private struct DuplicateFileGroup: Sendable {
+/// 全量哈希二次校验后，只有内容确实一致的文件才会进入同一组。
+struct DuplicateFileGroup: Sendable {
     let representative: ScannedFile
     let duplicates: [ScannedFile]
 }
@@ -2255,6 +2256,13 @@ public final class RAGEngine {
     /// rerank 墙钟超时：触发后立刻回退 RRF，不让整个检索被模型拖住。
     private struct RerankTimeout: Error {}
 
+    /// reranker 返回分数数量与候选数不符：不能静默跳过重排（旧行为会让
+    /// TopN 直接沿用未过滤的 RRF 候选），必须与失败/超时走同一条降级路径。
+    private struct RerankCountMismatch: Error {
+        let got: Int
+        let expected: Int
+    }
+
     /// 给可取消的异步操作加墙钟超时；0 表示不限制。
     static func withTimeout<T: Sendable>(
         _ seconds: Double,
@@ -2356,6 +2364,7 @@ public final class RAGEngine {
                     sourceFilter: sourceFilter, sourceContains: sourceContains,
                     rrfK: config.ragRRFK,
                     overfetch: config.ragVectorOverfetch,
+                    ftsOverfetch: config.ragFTSOverfetch,
                     binary: binaryOptions,
                     // ANN 索引就绪时向量通道走分块 IVF；不可用（未构建/
                     // 尾块超预算/维度不符）时内部自动回退精确路径。
@@ -2425,6 +2434,8 @@ public final class RAGEngine {
                     hits = filtered.isEmpty
                         ? Array(hits.sorted { $0.score > $1.score }.prefix(resultCount))
                         : filtered
+                } else {
+                    throw RerankCountMismatch(got: scores.count, expected: hits.count)
                 }
             } catch {
                 // 失败或超时：明确按 RRF 分排序（hybridSearch 融合时已写入 rrfScore），
@@ -2436,6 +2447,10 @@ public final class RAGEngine {
                 if error is RerankTimeout {
                     AgentLog.warning("RAG rerank 超时（\(config.ragRerankTimeoutSeconds)s），"
                         + "已回退 RRF 排序（最多 3 条）")
+                } else if let mismatch = error as? RerankCountMismatch {
+                    AgentLog.warning("RAG rerank 返回分数数量不符"
+                        + "（\(mismatch.got)/\(mismatch.expected)），"
+                        + "使用 RRF 排序（最多 3 条）")
                 } else {
                     AgentLog.warning("RAG rerank 失败，使用 RRF 排序（最多 3 条）: "
                         + error.localizedDescription)
@@ -2990,7 +3005,7 @@ public final class RAGEngine {
 
     /// 用「文件大小 + 采样指纹」把同一本书的不同目录副本分组。
     /// 每组只保留一个代表文件参与解析；优先已有 manifest 的完整条目。
-    private static func groupDuplicateFiles(
+    static func groupDuplicateFiles(
         _ files: [ScannedFile],
         manifest: [String: RAGManifestEntry],
         force: Bool,
@@ -3049,13 +3064,34 @@ public final class RAGEngine {
                 if let only = group.first { unique.append(only) }
                 continue
             }
-            let representative = group.min {
-                duplicateRank($0, manifest) < duplicateRank($1, manifest)
-            }!
-            unique.append(representative)
-            groups.append(DuplicateFileGroup(
-                representative: representative,
-                duplicates: group.filter { $0.path != representative.path }))
+            // 采样指纹对 >4MB 文件只读头/中/尾各 64KB：两个不同文件完全可能
+            // 在这三段里一致。直接据此判重复会把整本书的向量清掉、内容永久丢失。
+            // 只对候选组做全量哈希二次校验（比解析整本 PDF 便宜得多）。
+            var verified: [String: [ScannedFile]] = [:]
+            var unreadable: [ScannedFile] = []
+            for file in group {
+                let digest = fullContentHash(file.path)
+                if digest.isEmpty {
+                    unreadable.append(file)
+                } else {
+                    verified[digest, default: []].append(file)
+                }
+            }
+            for bucket in verified.values {
+                guard bucket.count > 1,
+                      let representative = bucket.min(by: {
+                          duplicateRank($0, manifest) < duplicateRank($1, manifest)
+                      }) else {
+                    unique.append(contentsOf: bucket)
+                    continue
+                }
+                unique.append(representative)
+                groups.append(DuplicateFileGroup(
+                    representative: representative,
+                    duplicates: bucket.filter { $0.path != representative.path }))
+            }
+            // 无法读取的一律当作独立文件：不能因「无法证明相同」而删内容。
+            unique.append(contentsOf: unreadable)
         }
 
         unique.sort {
@@ -3274,5 +3310,21 @@ public final class RAGEngine {
             return ""
         }
         return hasher.finalize().prefix(8).map { String(format: "%02x", $0) }.joined()
+    }
+
+    /// 全量内容哈希：只用于重复文件候选组的二次校验（见 `groupDuplicateFiles`）。
+    /// 流式读取，失败返回空串，调用方必须按「无法证明相同」保守处理。
+    static func fullContentHash(_ path: String) -> String {
+        guard let handle = FileHandle(forReadingAtPath: path) else { return "" }
+        defer { try? handle.close() }
+        var hasher = SHA256()
+        do {
+            while let data = try handle.read(upToCount: 1 << 20), !data.isEmpty {
+                hasher.update(data: data)
+            }
+        } catch {
+            return ""
+        }
+        return hasher.finalize().map { String(format: "%02x", $0) }.joined()
     }
 }

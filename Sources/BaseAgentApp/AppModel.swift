@@ -118,11 +118,30 @@ final class UICallbacks: AgentCallbacks, @unchecked Sendable {
         runOnMain {
             let alert = NSAlert()
             alert.messageText = "需要确认"
-            alert.informativeText = message
             alert.alertStyle = .warning
             // 默认按钮是「拒绝」：回车/误触不会自动放行高风险操作。
             alert.addButton(withTitle: "拒绝")
             alert.addButton(withTitle: "允许")
+
+            // 确认文案现在包含完整实参（不能只显示摘要，否则「批准 A、执行 B」）。
+            // 长参数放进可滚动附件视图，既不撑爆弹窗，也保证用户能看完。
+            if message.count > 600 {
+                alert.informativeText = "请核对下面实际执行的完整参数："
+                let frame = NSRect(x: 0, y: 0, width: 560, height: 260)
+                let textView = NSTextView(frame: frame)
+                textView.string = message
+                textView.isEditable = false
+                textView.isRichText = false
+                textView.font = NSFont.monospacedSystemFont(ofSize: 11, weight: .regular)
+                textView.textContainerInset = NSSize(width: 4, height: 4)
+                let scroll = NSScrollView(frame: frame)
+                scroll.documentView = textView
+                scroll.hasVerticalScroller = true
+                scroll.borderType = .bezelBorder
+                alert.accessoryView = scroll
+            } else {
+                alert.informativeText = message
+            }
             return alert.runModal() == .alertSecondButtonReturn
         }
     }

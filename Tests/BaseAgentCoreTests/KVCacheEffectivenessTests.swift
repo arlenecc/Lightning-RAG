@@ -26,12 +26,6 @@ final class KVCacheEffectivenessTests: XCTestCase {
         func onLog(_ line: String) { collector.append(line) }
     }
 
-    private func installSink(_ collector: LogCollector) -> () -> Void {
-        let previous = AgentLog.sink
-        AgentLog.sink = { collector.append($0) }
-        return { AgentLog.sink = previous }
-    }
-
     /// 从 `[mlx-kv] reuse=… cached=N …` 提取 cached 值。
     private func cachedTokens(_ line: String) -> Int? {
         guard let range = line.range(of: "cached=") else { return nil }
@@ -90,8 +84,8 @@ final class KVCacheEffectivenessTests: XCTestCase {
         config.maxIterations = 1
 
         let collector = LogCollector()
-        let restore = installSink(collector)
-        defer { restore() }
+        // Agent.run 按任务把底层日志注入 CollectingCallbacks.onLog；
+        // 不再使用进程级全局 sink（并发测试会互相串日志）。
 
         let agent = Agent(llm: service, config: config,
                           callbacks: CollectingCallbacks(collector))
@@ -157,8 +151,6 @@ final class KVCacheEffectivenessTests: XCTestCase {
         defer { service.close() }
 
         let collector = LogCollector()
-        let restore = installSink(collector)
-        defer { restore() }
 
         let system = "你是测试助手，回答必须极简。"
         // 与 App 真实顺序一致：先预热 system 段，再开始对话。
@@ -168,13 +160,16 @@ final class KVCacheEffectivenessTests: XCTestCase {
         }
 
         func turn(_ messages: [ChatMessage]) async throws -> String {
-            var output = ""
-            for try await event in service.chatStream(
-                messages: messages, tools: [], temperature: 0.1) {
-                if event.kind == .content { output += event.content }
-                if event.kind == .done { break }
+            // 该用例直接调 service（不过 Agent.run），手动把日志绑到本任务。
+            try await AgentLog.withTaskSink({ collector.append($0) }) {
+                var output = ""
+                for try await event in service.chatStream(
+                    messages: messages, tools: [], temperature: 0.1) {
+                    if event.kind == .content { output += event.content }
+                    if event.kind == .done { break }
+                }
+                return output.trimmingCharacters(in: .whitespacesAndNewlines)
             }
-            return output.trimmingCharacters(in: .whitespacesAndNewlines)
         }
 
         // 调 1：全量构建（无缓存）。

@@ -1261,27 +1261,29 @@ public final class VectorStore: @unchecked Sendable {
             }
         }
 
+        // 两段式：先只取 rowid（不读 blob），再按批读向量。
+        // 旧的无过滤路径 `SELECT rowid, embedding FROM vector` 会把整库向量
+        // 一次性装进内存（大库可达数百 MB）；单条 IN 语句也有变量数上限，
+        // 所以全库与单来源都必须分批。
+        let ids: [Int64]
         if let sourceFilter {
-            // 仍然是两段式：先取该 source 的 rowid，再按批读向量（不做 JOIN）。
-            // 单条 IN 语句的变量数有上限，大来源必须分批，否则会直接报错。
-            let ids = try rowIDs(source: sourceFilter)
-            guard !ids.isEmpty else { return [] }
-            scored.reserveCapacity(ids.count)
-            var index = 0
-            while index < ids.count {
-                let batch = Array(ids[index..<min(index + deleteBatchSize, ids.count)])
-                let placeholders = Array(repeating: "?", count: batch.count).joined(separator: ",")
-                let rows = try db.query(
-                    "SELECT rowid, embedding FROM \(Self.vectorTable) "
-                    + "WHERE rowid IN (\(placeholders))",
-                    batch.map { SQLValue.int($0) })
-                appendScores(rows: rows)
-                index += batch.count
-            }
+            ids = try rowIDs(source: sourceFilter)
         } else {
-            let rows = try db.query("SELECT rowid, embedding FROM \(Self.vectorTable)")
-            scored.reserveCapacity(rows.count)
+            ids = try db.query("SELECT rowid FROM \(Self.vectorTable)")
+                .compactMap { $0["rowid"]?.intValue }
+        }
+        guard !ids.isEmpty else { return [] }
+        scored.reserveCapacity(ids.count)
+        var index = 0
+        while index < ids.count {
+            let batch = Array(ids[index..<min(index + deleteBatchSize, ids.count)])
+            let placeholders = Array(repeating: "?", count: batch.count).joined(separator: ",")
+            let rows = try db.query(
+                "SELECT rowid, embedding FROM \(Self.vectorTable) "
+                + "WHERE rowid IN (\(placeholders))",
+                batch.map { SQLValue.int($0) })
             appendScores(rows: rows)
+            index += batch.count
         }
         return scored.sorted { $0.1 > $1.1 }
     }
@@ -1481,6 +1483,7 @@ public final class VectorStore: @unchecked Sendable {
                              sourceFilter: String? = nil,
                              sourceContains: String? = nil,
                              rrfK: Int = 60, overfetch: Int = 2,
+                             ftsOverfetch: Int? = nil,
                              binary: BinaryCoarseOptions? = nil,
                              ann: ANNQueryOptions? = nil,
                              deadline: Date? = nil) throws -> [SearchHit] {
@@ -1508,9 +1511,13 @@ public final class VectorStore: @unchecked Sendable {
         }
 
         // 内层候选量：每路仅比最终条数多 1-2 倍，不再乘 4。
+        // FTS 与向量各自可配 over-fetch：FTS 字面命中少时多召回一些能明显
+        // 改善 RRF 融合；nil 表示沿用向量倍数（旧行为，供直接调用方兼容）。
         let inner = max(topK * max(1, overfetch), 20)
+        let ftsInner = max(topK * max(1, ftsOverfetch ?? overfetch), 20)
         let targeted = sourceContains != nil
         let candidateCount = targeted ? max(inner * 4, 20) : inner
+        let ftsCandidateCount = targeted ? max(ftsInner * 4, 20) : ftsInner
         var binaryScores: [Int64: Double] = [:]
         var vectorCandidates: [(Int64, Double)] = []
         if vectorUsable {
@@ -1554,7 +1561,7 @@ public final class VectorStore: @unchecked Sendable {
                 unlocked = true
 
                 var ftsCandidates = try self.ftsCandidates(
-                    reader, query: query, limit: candidateCount,
+                    reader, query: query, limit: ftsCandidateCount,
                     sourceFilter: sourceFilter)
                 var vectorPool = vectorCandidates
                 if let needle = sourceContains?.trimmingCharacters(in: .whitespacesAndNewlines),

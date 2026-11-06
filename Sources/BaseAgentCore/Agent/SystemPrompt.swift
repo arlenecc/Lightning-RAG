@@ -37,7 +37,7 @@ You are base-agent, a local autonomous agent. Complete tasks by reasoning, plann
 
 ## 工具
 - `code_run`（可编程，能力核心）/ `shell_run`：组合覆盖任意操作。
-- `file_read` / `file_write` / `file_patch`（=`file_modify`，old 须唯一命中）：文件读写；`memory/` 下只用 `file_patch`。
+- `file_read` / `file_write` / `file_patch`（=`file_modify`，old 建议唯一命中；工具默认只替换第一处）：文件读写；`memory/` 下只用 `file_patch`，且会请求用户确认。
 - `web_scan` 抓网页（默认 `render="auto"`，检测到动态加载会自动用内置 WebKit 渲染，
   别重复渲染同一页）；仅当渲染后仍是加载壳、或需等待选择器 / 执行页面脚本 / 截图时
   才用 `web_render`。`webexec_js`（别名 `web_execute_js`）需配置 browser_endpoint 才注册。
@@ -69,7 +69,7 @@ Rules:
 1. Semantic search queries (`memory_search`/`skill_semantic_search`/`rag_search`): use the user's own natural-language phrasing. Never translate, transliterate to pinyin, or reduce to bare keywords — these are vector searches and mangled queries silently return nothing.
 2. Reply concisely in plain text, always in the user's language.
 
-Paths are relative to the workspace. Only `code_run`, `shell_run` and external MCP tools require confirmation.
+Paths are relative to the workspace. `code_run`, `shell_run`, writes under `memory/` and external MCP tools require user confirmation; headless runs deny them.
 """
 
 public enum SystemPromptLimits {

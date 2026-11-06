@@ -417,7 +417,11 @@ public final class HTMLParser: DocumentParser {
     public func parse(url: URL,
                       options: ParserOptions,
                       progress: ((ParserProgress) -> Void)?) async throws -> ParsedDocument {
-        let rendered = try render(url.standardizedFileURL, depth: 0, visited: [])
+        // 框架接力的边界固定为「入口文档所在目录」：浏览器另存为会把正文放在
+        // <页面>_files/ 子目录里，但绝不该让外部 HTML 通过 file:// 或 ../
+        // 把工作区外（甚至任意本地文件）的内容带进知识库。
+        let root = url.standardizedFileURL.deletingLastPathComponent()
+        let rendered = try render(url.standardizedFileURL, depth: 0, visited: [], root: root)
         let markdown = rendered.markdown.trimmingCharacters(in: .whitespacesAndNewlines)
 
         guard !markdown.isEmpty else {
@@ -443,7 +447,8 @@ public final class HTMLParser: DocumentParser {
     /// 解析单个 HTML 文件。页面正文过短时，自动接力到被保存网页同目录下的
     /// 本地 `iframe` / `frame` / `object` 内容（浏览器「网页另存为」会把正文
     /// 框架单独存成 `<页面>_files/N.html`，只读主文件会得到空正文）。
-    private func render(_ url: URL, depth: Int, visited: Set<String>) throws -> RenderedHTML {
+    private func render(_ url: URL, depth: Int, visited: Set<String>,
+                        root: URL) throws -> RenderedHTML {
         guard let data = try? Data(contentsOf: url) else {
             throw AgentError.parse("无法读取文件：\(url.lastPathComponent)")
         }
@@ -465,7 +470,7 @@ public final class HTMLParser: DocumentParser {
         // 正文过短：优先从本地框架文件里取真正的正文。
         if depth < Self.maxFrameDepth, markdown.count < Self.frameFallbackThreshold,
            let embedded = renderEmbedded(document, base: url, currentLength: markdown.count,
-                                         depth: depth, visited: visited),
+                                         depth: depth, visited: visited, root: root),
            !embedded.markdown.isEmpty {
             var merged = embedded
             if merged.title.isEmpty { merged.title = result.title }
@@ -480,7 +485,8 @@ public final class HTMLParser: DocumentParser {
 
     /// 在候选的本地框架文档里挑正文最多的一份。
     private func renderEmbedded(_ document: Document, base: URL, currentLength: Int,
-                                depth: Int, visited: Set<String>) -> RenderedHTML? {
+                                depth: Int, visited: Set<String>,
+                                root: URL) -> RenderedHTML? {
         var visited = visited
         visited.insert(base.standardizedFileURL.path)
 
@@ -498,11 +504,12 @@ public final class HTMLParser: DocumentParser {
         var best: RenderedHTML?
         var bestSource: String?
         for reference in references.prefix(Self.maxFrameCandidates) {
-            guard let target = localFrameURL(reference, base: base),
+            guard let target = localFrameURL(reference, base: base, root: root),
                   !visited.contains(target.path),
                   FileManager.default.fileExists(atPath: target.path) else { continue }
             do {
-                var candidate = try render(target, depth: depth + 1, visited: visited)
+                var candidate = try render(target, depth: depth + 1, visited: visited,
+                                           root: root)
                 candidate.markdown = candidate.markdown
                     .trimmingCharacters(in: .whitespacesAndNewlines)
                 guard !candidate.markdown.isEmpty else { continue }
@@ -524,7 +531,7 @@ public final class HTMLParser: DocumentParser {
 
     /// 框架引用 → 本地文件 URL：只接受本地路径（不联网抓取），
     /// 忽略 data:/javascript:/about: 与 http(s) 引用。
-    private func localFrameURL(_ reference: String, base: URL) -> URL? {
+    private func localFrameURL(_ reference: String, base: URL, root: URL) -> URL? {
         let cleaned = RAGArchivePath.stripFragmentAndQuery(reference)
             .trimmingCharacters(in: .whitespacesAndNewlines)
         guard !cleaned.isEmpty else { return nil }
@@ -537,12 +544,22 @@ public final class HTMLParser: DocumentParser {
         let extensionName = (decoded as NSString).pathExtension.lowercased()
         guard Self.frameExtensions.contains(extensionName) else { return nil }
 
-        if decoded.hasPrefix("file://") {
+        let candidate: URL
+        if decoded.lowercased().hasPrefix("file://") {
             guard let url = URL(string: decoded), url.isFileURL else { return nil }
-            return url.standardizedFileURL
+            candidate = url.standardizedFileURL
+        } else {
+            let baseDirectory = base.deletingLastPathComponent()
+            candidate = URL(fileURLWithPath: decoded,
+                            relativeTo: baseDirectory).standardizedFileURL
         }
-        let baseDirectory = base.deletingLastPathComponent()
-        return URL(fileURLWithPath: decoded, relativeTo: baseDirectory).standardizedFileURL
+        // 绝对路径、../ 上跳、符号链接都不得越出入口文档所在目录；
+        // 用 realpath 比较，避免用 symlink 指向工作区外的文件。
+        let resolved = candidate.resolvingSymlinksInPath().standardizedFileURL.path
+        let rootPath = root.resolvingSymlinksInPath().standardizedFileURL.path
+        let prefix = rootPath.hasSuffix("/") ? rootPath : rootPath + "/"
+        guard resolved.hasPrefix(prefix) else { return nil }
+        return candidate
     }
 
     /// 空正文的原因说明：区分「正文在框架里」「依赖 JavaScript 渲染」与真空白页。

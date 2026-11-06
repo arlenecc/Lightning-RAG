@@ -68,8 +68,8 @@ public final class AgentToolDispatcher {
             }
 
             if tool.shouldConfirm(call.arguments) {
-                let message = AgentToolDispatcher.confirmMessage(name: call.name,
-                                                                 args: call.arguments)
+                let message = ToolSupport.confirmationMessage(name: call.name,
+                                                              args: call.arguments)
                 guard agent.callbacks.confirm(message) else {
                     agent.log("[tool] \(call.name) DENIED by user")
                     let result = ToolResult.fail("User denied \(call.name) (\(message))")
@@ -149,52 +149,6 @@ public final class AgentToolDispatcher {
         }
     }
 
-    // MARK: 确认提示
-
-    static func confirmMessage(name: String, args: [String: JSONValue]) -> String {
-        if name == "code_run" || name == "shell_run" {
-            let payload = args["code"]?.stringValue ?? args["command"]?.stringValue ?? ""
-            let purpose = summarizeCommandOrCode(payload)
-            let timeout = args["timeout"]?.stringValue
-            var message = name == "code_run" ? "即将执行代码：\(purpose)" : "即将执行命令：\(purpose)"
-            if let timeout { message += "\n超时：\(timeout)s" }
-            return message + "\n\n是否继续？"
-        }
-        var pretty = JSONValue.object(args).jsonString()
-        if pretty.count > 500 { pretty = String(pretty.prefix(500)) + "…" }
-        return "即将调用工具 `\(name)`：\n\(pretty)\n\n是否继续？"
-    }
-
-    private static func summarizeCommandOrCode(_ text: String) -> String {
-        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return "（空）" }
-        if !trimmed.contains("\n") {
-            let program = trimmed.split(separator: " ").first.map(String.init) ?? ""
-            let known: [String: String] = [
-                "pip": "安装/管理 Python 包", "npm": "安装/管理 Node 包",
-                "brew": "安装/管理 macOS 软件", "git": "Git 版本控制操作",
-                "curl": "发起网络请求", "wget": "下载文件",
-                "python": "运行 Python 脚本", "python3": "运行 Python 脚本",
-                "node": "运行 Node 脚本", "rm": "删除文件/目录",
-                "mv": "移动/重命名文件", "cp": "复制文件",
-                "docker": "Docker 容器操作", "ssh": "SSH 远程连接",
-            ]
-            if let label = known[program] { return label }
-        }
-        for line in trimmed.split(separator: "\n") {
-            let value = line.trimmingCharacters(in: .whitespaces)
-            if value.hasPrefix("#") {
-                let comment = value.drop(while: { $0 == "#" }).trimmingCharacters(in: .whitespaces)
-                if !comment.isEmpty, !comment.hasPrefix("!") { return String(comment.prefix(80)) }
-            }
-            if value.hasPrefix("\"\"\"") || value.hasPrefix("'''") {
-                let doc = value.trimmingCharacters(in: CharacterSet(charactersIn: "\"' "))
-                if !doc.isEmpty { return String(doc.prefix(80)) }
-            }
-        }
-        let first = trimmed.split(separator: "\n").first.map(String.init) ?? trimmed
-        return "执行代码片段：" + String(first.prefix(60))
-    }
 }
 
 // MARK: - 内核 hooks
@@ -203,9 +157,16 @@ private final class AgentKernelHooks: KernelHooks {
     weak var agent: Agent?
     init(agent: Agent) { self.agent = agent }
 
+    /// 只在「上下文占用 >90%」的自动收缩时生成并回注旧上下文摘要。
+    /// 每 8 轮的周期性折叠走丢弃式路径（保留最近 2 轮原文），不经过这里、不回注任何内容。
     func consolidated(_ session: Session, reason: String) async -> Bool {
-        guard reason == "fold-exhausted" else { return false }
+        guard reason == "context-90" else { return false }
         return await agent?.shrinkSession(reason: reason) ?? false
+    }
+
+    /// 折叠边界：刷新 system 前缀 + 预热 KV（周期性 / 90% / 提前折叠 / 异常重试）。
+    func didFold(_ session: Session, reason: String, tools: [JSONValue]) async {
+        await agent?.onFoldBoundary(reason: reason, tools: tools)
     }
 
     func finished(_ session: Session, text: String) {
@@ -257,11 +218,15 @@ public final class Agent: @unchecked Sendable {
     private var cachedStaticSystem: String?
     private var cachedStaticSignature = ""
     private let staticSystemLock = NSLock()
-    /// 本次用户请求内冻结的 system prompt：保证整次请求（含多次 THINK / 自动续跑）
-    /// 前缀逐字节一致 → KV 可复用；落盘时也写这一份，历史与实发一致。
-    /// 下一个请求重新读 L0/L1，实现「L1 变更后即时重新加载」。
+    /// 冻结的 system prompt：两次折叠之间的所有 THINK 轮（含跨用户请求与
+    /// 自动续跑）前缀逐字节一致 → KV 可复用；落盘时也写这一份，历史与实发一致。
+    /// 不按请求重读 L0/L1，而是**跨请求冻结到折叠边界** —— 段内即使 L1 被
+    /// patch，头部也不抖动；折叠时由 `onFoldBoundary` 刷新并预热 KV。
     private var requestSystemPrompt: String?
     private let requestSystemLock = NSLock()
+    /// 折叠纪元：每次折叠 +1；`frozenSystemEpoch` 记录当前快照属于哪个纪元。
+    private var systemFoldEpoch = 0
+    private var frozenSystemEpoch = -1
     /// 改进1：本用户请求内 `finishTurn` 结束的轮引用快照。
     /// 用引用而非拷贝，且早于 CONSOLIDATE 折叠收集，保证被折掉的轮全文不丢。
     private var finishedTurnSnapshot: [TurnRecord] = []
@@ -317,12 +282,12 @@ public final class Agent: @unchecked Sendable {
             config.effectiveMainContextTokens)
         self.session = Session(
             budget: ContextBudget(total: kernelBudget),
-            // raw 窗口至少覆盖一个 consolidate 周期：否则每新增一轮都会把
-            // 最老轮次挤进 <earlier_context>，消息前缀随之改变，KV cache 只能
-            // 每个用户回合都重建一次（表现为“快两句又慢”）。
+            // raw 窗口至少覆盖「一个折叠周期 + 折叠时保留的 2 轮」：否则段内
+            // 每新增一轮都会挤掉最老轮，KV cache 反复重建（“快两句又慢”）。
+            // 挤出的旧轮直接丢弃、不回注摘要。
             rawTurns: max(8,
-                          config.kernelRawTurns == 0 ? 8 : config.kernelRawTurns,
-                          config.kernelConsolidateEvery == 0 ? 24 : config.kernelConsolidateEvery),
+                          config.kernelRawTurns == 0 ? 10 : config.kernelRawTurns,
+                          (config.kernelConsolidateEvery == 0 ? 8 : config.kernelConsolidateEvery) + 2),
             maxDigestLines: config.kernelMaxDigestLines == 0 ? 40 : config.kernelMaxDigestLines
         )
 
@@ -445,7 +410,12 @@ public final class Agent: @unchecked Sendable {
         // Session.turnIndex 归零后，若不同步复位节流标记，
         // `turn >= lastTidy + 8` 会长期为 false → 清空对话后整理再也不跑。
         markMemoryTidyDone(turn: 0)
-        releaseRequestSystemPrompt()
+        // 清空对话 = 新段起点：重新读 L0/L1，别沿用上一段的冻结前缀。
+        requestSystemLock.lock()
+        requestSystemPrompt = nil
+        systemFoldEpoch = 0
+        frozenSystemEpoch = -1
+        requestSystemLock.unlock()
         clearFinishedTurnSnapshot()
         sopReadTracker.reset()
         // 清空对话后 Session 已重置，但本地 LLM 仍持有旧会话的 KV cache；
@@ -492,7 +462,12 @@ public final class Agent: @unchecked Sendable {
     public func shutdownForTermination() async {
         if let background = takeBackgroundTask() {
             background.cancel()
-            _ = await background.value
+            // 退出流程也不能被不响应取消的辅助模型无限拖住。
+            let exited = await Self.waitForTaskExit(background,
+                                                   timeoutNanos: 10_000_000_000)
+            if !exited {
+                AgentLog.warning("[background] 退出时后台任务 10s 未结束，继续卸载模型")
+            }
         }
         mcpTaskLock.lock()
         mcpClosed = true
@@ -555,13 +530,24 @@ public final class Agent: @unchecked Sendable {
 
     @discardableResult
     public func run(_ userInput: String, images: [Data] = []) async -> String {
+        // 底层组件（MLX/GGUF/RAG/解析）的 AgentLog 输出按本次请求路由到自己的
+        // callbacks，而不是进程级全局 sink：并发会话/测试之间不会互相串日志。
+        // detached 后台任务不继承 taskSink，仍由全局 sink 兜底。
+        await AgentLog.withTaskSink({ [weak self] line in
+            self?.callbacks.onLog(line)
+        }) {
+            await self.runInternal(userInput, images: images)
+        }
+    }
+
+    private func runInternal(_ userInput: String, images: [Data]) async -> String {
         // 前台请求优先：上一轮的后台摘要/事实抽取还在跑时，先取消并等它退出，
         // 否则 2B 辅助模型会和主模型抢 GPU（实测主模型会从 ~15 tps 掉到 ~5 tps）。
         await cancelBackgroundWork()
         turnIndex += 1
         cachedDynamicContext = nil
         clearFinishedTurnSnapshot()
-        freezeRequestSystemPrompt()  // 本次请求内 system 前缀固定；落盘也用这一份
+        freezeRequestSystemPrompt()  // 段内冻结 system 前缀；落盘也写这一份
         lastUserText = userInput
         log("USER: \(userInput)")
 
@@ -648,7 +634,8 @@ public final class Agent: @unchecked Sendable {
                 result = await kernel.run(
                     "[System] 任务在上一段达到轮次上限被截断，已自动续跑。"
                     + "请继续执行计划中的剩余步骤；不要询问用户是否继续。",
-                    resume: true, emitFinished: false)
+                    resume: true, emitFinished: false,
+                    toolsEnabled: !lightweightTurn)
             } else {
                 log("[agent] 模型提前收尾但计划未完成（\(open)），自动续跑 "
                     + "\(segments)/\(autoContinueMax)")
@@ -662,7 +649,8 @@ public final class Agent: @unchecked Sendable {
                 result = await kernel.run(
                     "[System] 上一条回复被判定为提前收尾，已自动续跑。"
                     + "请按上面的指示处理计划中的剩余步骤；不要询问用户是否继续。",
-                    resume: true, emitFinished: false)
+                    resume: true, emitFinished: false,
+                    toolsEnabled: !lightweightTurn)
             }
             distillRequested = distillRequested || result.distilled
             carry = kernel.failureSnapshot()
@@ -716,15 +704,15 @@ public final class Agent: @unchecked Sendable {
         // 改进1/2：本用户请求的完整轨迹落盘（无条件、不依赖辅助模型）。
         // 用 `finishedTurnSnapshot`（早于 CONSOLIDATE 收集）而非 session.turns，
         // 否则被折掉的轮全文会永久丢失。
-        // `requestSystemPrompt` 是 run() 开头冻结的那一份（本轮模型实际看到的前缀），
+        // `requestSystemPrompt` 是本折叠段冻结的那一份（本轮模型实际看到的前缀），
         // 不能用请求结束后的 systemPrompt()：本轮若 patch 过 L1，签名已变，写进去
         // 的会是"未来"的提示，历史与实发不一致。
+        // 不再在请求末尾释放：段内跨请求复用同一前缀，直到折叠边界才刷新。
         rawSessionStore.appendSession(
             systemText: takeRequestSystemPrompt() ?? systemPrompt(),
             userText: lastUserText.isEmpty ? userInput : lastUserText,
             turns: takeFinishedTurnSnapshot(),
             finalText: text)
-        releaseRequestSystemPrompt()
 
         // 改进7 前半：过期记录预处理/打包（纯文件，单次最多 1 天；内部在删原文前
         // 把 session 写入持久化队列，因此后续任何异常都不会让提炼任务丢失）。
@@ -746,22 +734,48 @@ public final class Agent: @unchecked Sendable {
         rawSessionSnapshotLock.unlock()
     }
 
-    private func freezeRequestSystemPrompt() {
+    /// 段内（两次折叠之间）system 前缀逐字节冻结，只有折叠边界才重新读
+    /// L0/L1：否则 L1 在段中被 patch 会让头部变化 → KV 全量重建。
+    private func freezeRequestSystemPrompt(force: Bool = false) {
+        requestSystemLock.lock()
+        let needsRebuild = force
+            || frozenSystemEpoch != systemFoldEpoch
+            || requestSystemPrompt == nil
+        requestSystemLock.unlock()
+        guard needsRebuild else { return }
         let frozen = buildStaticSystemPrompt()
         requestSystemLock.lock()
         requestSystemPrompt = frozen
+        frozenSystemEpoch = systemFoldEpoch
         requestSystemLock.unlock()
+    }
+
+    /// 折叠边界（周期性 / 90% / 提前折叠 / 异常重试）：
+    /// ① L0/L1 变更到此才生效，段内 system 前缀保持恒定（C）；
+    /// ② 用新 system 预热 KV，让折叠后的首轮只 prefill 增量而非全量（D）。
+    private func advanceSystemFoldEpoch() {
+        requestSystemLock.lock()
+        systemFoldEpoch += 1
+        requestSystemLock.unlock()
+    }
+
+    func onFoldBoundary(reason: String, tools: [JSONValue]) async {
+        advanceSystemFoldEpoch()
+        freezeRequestSystemPrompt(force: true)
+        guard let warmup = llm as? WarmupLLMService else { return }
+        let current = takeRequestSystemPrompt() ?? buildStaticSystemPrompt()
+        do {
+            try await warmup.warmup(systemPrompt: current, tools: tools)
+            log("[context] 折叠后已预热 system 前缀（\(reason)）")
+        } catch {
+            AgentLog.warning("[context] 折叠后预热失败（\(reason)）："
+                + error.localizedDescription)
+        }
     }
 
     private func takeRequestSystemPrompt() -> String? {
         requestSystemLock.lock(); defer { requestSystemLock.unlock() }
         return requestSystemPrompt
-    }
-
-    private func releaseRequestSystemPrompt() {
-        requestSystemLock.lock()
-        requestSystemPrompt = nil
-        requestSystemLock.unlock()
     }
 
     private func markMemoryTidyDone(turn: Int) {
@@ -786,13 +800,11 @@ public final class Agent: @unchecked Sendable {
     /// 稳定的系统提示 = BASE 协议 + L0 META-SOP + L1 全局索引。
     ///
     /// 改进3/4：L0 与 L1 **常驻** system prompt，L1 跟在 L0 之后。
-    /// 改进4「实时更新维护」：每次调用按 L0/L1 文件的 mtime+size 签名判定，
-    /// 文件被 patch 后自动重建并重新注入；内容不变则复用缓存字符串，
-    /// 保证 system 前缀逐字节稳定、KV cache 可跨调用复用。
-    /// 文件变 → 前缀变 → 该轮 KV 失效一次（低频、可接受）。
+    /// 段内冻结：两次折叠之间的所有 THINK 轮（含跨用户请求）都拿到逐字节
+    /// 相同的 system 字符串，即使中途 patch 了 L1 也不会让 KV 前缀抖动。
+    /// L0/L1 变更延迟到折叠边界，由 `onFoldBoundary` 按文件签名重建并预热；
+    /// 文件变 → 前缀变 → 该轮 KV 失效一次（低频、可预期，且本来就要重建）。
     public func systemPrompt() -> String {
-        // 请求内冻结：同一用户请求的所有 THINK 轮拿到完全相同的 system 字符串，
-        // 即使本轮中途 patch 了 L1 也不会在请求内造成 KV 前缀抖动；下一请求重新加载。
         if let frozen = takeRequestSystemPrompt() { return frozen }
         return buildStaticSystemPrompt()
     }
@@ -922,8 +934,11 @@ public final class Agent: @unchecked Sendable {
         ragEngine.cachedStatus(maxAge: .infinity)
     }
 
-    // MARK: 兜底收缩
+    // MARK: 上下文 >90% 自动收缩（唯一会回注旧摘要的路径）
 
+    /// 用辅助模型把旧对话压成一条要点摘要，回注到 `<earlier_context>`。
+    /// 旧轮本身直接丢弃（不生成逐轮摘要行），避免摘要越堆越占上下文。
+    /// 周期性折叠不调这里 —— 那条路径直接清空历史、从 system 重新开始。
     func shrinkSession(reason: String) async -> Bool {
         guard session.turns.count > 1 else { return false }
         let old = Array(session.turns.dropLast())
@@ -952,13 +967,13 @@ public final class Agent: @unchecked Sendable {
             ? old.map { $0.digestLine() }.joined(separator: "; ")
             : summary
         appendMemorySummary(final, reason: reason)
-        let folded = session.forceFold(old.count)
+        let folded = session.discardTurns(old.count)
         let digestLine = "[摘要 \(Self.timeString())] \(final.prefix(400))"
         session.appendDigest(digestLine)
-        // 改进2：兜底收缩生成的上下文摘要也追加进当天 digest 文件，
+        // 改进2：自动收缩生成的上下文摘要也追加进当天 digest 文件，
         // 保证"当天对话摘要历史"不因只统计逐轮快照而缺项。
         rawSessionStore.appendFoldedDigest([digestLine])
-        log("[context] 兜底收缩：折叠 \(folded) 轮（reason: \(reason)）")
+        log("[context] 自动收缩：丢弃 \(folded) 轮，回注 1 条摘要（reason: \(reason)）")
         callbacks.onContextShrunk(final, reason)
         return true
     }
@@ -998,7 +1013,8 @@ public final class Agent: @unchecked Sendable {
         // 改进7：待提炼队列是**持久化**的，寒暄轮、辅助模型暂不可用、后台任务
         // 被下一次 run 取消等情况都不会丢，本轮或下一轮重新拾起即可。
         let hasPending = !memoryDirectory.pendingInsightIds().isEmpty
-        // 改进8：与上下文压缩周期对齐，后台用辅助引擎产出整理建议（不改记忆文件）。
+        // 改进8：至少 8 轮做一次整理建议（与折叠周期对齐），
+        // 后台用辅助引擎产出建议、不改记忆文件。
         let tidyEvery = max(8, config.kernelConsolidateEvery)
         let shouldTidy = !isGreeting && session.currentTurn >= readLastMemoryTidyTurn() + tidyEvery
         let hasLLMWork = canExtract || hasPending || shouldTidy
@@ -1051,11 +1067,49 @@ public final class Agent: @unchecked Sendable {
         backgroundTaskLock.unlock()
     }
 
-    /// 取消上一轮的后台辅助任务，并等待它让出 GPU。
+    /// 一次性 continuation 保护：`task.value` 与超时任务赛跑，先到者 resume。
+    private final class ExitWaiter: @unchecked Sendable {
+        private let lock = NSLock()
+        private var resumed = false
+        private let continuation: CheckedContinuation<Bool, Never>
+        init(_ continuation: CheckedContinuation<Bool, Never>) {
+            self.continuation = continuation
+        }
+        func finish(_ value: Bool) {
+            lock.lock()
+            guard !resumed else { lock.unlock(); return }
+            resumed = true
+            lock.unlock()
+            continuation.resume(returning: value)
+        }
+    }
+
+    /// 等待后台任务退出，带看门狗。辅助模型的一次生成可能正卡在 GPU 上、
+    /// 迟迟不响应取消；无限 `await task.value` 会把新请求（甚至退出流程）卡死。
+    /// 用两个非结构化任务赛跑，超时即可返回，返回 false 表示任务仍在跑。
+    static func waitForTaskExit(_ task: Task<Void, Never>,
+                                timeoutNanos: UInt64) async -> Bool {
+        await withCheckedContinuation { cont in
+            let waiter = ExitWaiter(cont)
+            Task.detached {
+                _ = await task.value
+                waiter.finish(true)
+            }
+            Task.detached {
+                try? await Task.sleep(nanoseconds: timeoutNanos)
+                waiter.finish(false)
+            }
+        }
+    }
+
+    /// 取消上一轮的后台辅助任务，并等它让出 GPU（最多 3s）。
     private func cancelBackgroundWork() async {
         guard let task = takeBackgroundTask() else { return }
         task.cancel()
-        _ = await task.value
+        let exited = await Self.waitForTaskExit(task, timeoutNanos: 3_000_000_000)
+        if !exited {
+            AgentLog.warning("[background] 后台任务取消 3s 未退出，主请求不再等待")
+        }
     }
 
     /// 取走并清空后台任务引用（同步方法，避免在 async 上下文直接操作 NSLock）。

@@ -57,24 +57,27 @@ final class GGUFKVReuseTests: XCTestCase {
         defer { service.close() }
 
         let collector = LogBox()
-        let previous = AgentLog.sink
-        AgentLog.sink = { collector.append($0) }
-        defer { AgentLog.sink = previous }
+        // 日志按任务绑定，不再改进程级全局 sink（并发测试会互相串/互相抹掉）。
+        func logged(_ messages: [ChatMessage]) async throws {
+            try await AgentLog.withTaskSink({ collector.append($0) }) {
+                _ = try await collect(service, messages: messages)
+            }
+        }
 
         let system = ChatMessage(role: .system, content: "你是测试助手，回答必须极简。")
-        _ = try await collect(service, messages: [
+        try await logged([
             system, ChatMessage(role: .user, content: "北京有什么好吃的？一句话。")])
         // 形态①：正常追加。
-        _ = try await collect(service, messages: [
+        try await logged([
             system,
             ChatMessage(role: .user, content: "北京有什么好吃的？一句话。"),
             ChatMessage(role: .assistant, content: "烤鸭。"),
             ChatMessage(role: .user, content: "上海呢？一句话。")])
         // 形态②：新 prompt 更短（回退重试）。
-        _ = try await collect(service, messages: [
+        try await logged([
             system, ChatMessage(role: .user, content: "深圳呢？一句话。")])
         // 形态③：历史首条 user 被改写（中途分叉）。
-        _ = try await collect(service, messages: [
+        try await logged([
             system,
             ChatMessage(role: .user, content: "介绍广州（改写后的历史）"),
             ChatMessage(role: .assistant, content: "广州。"),

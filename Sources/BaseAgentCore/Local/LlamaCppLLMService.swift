@@ -95,6 +95,11 @@ public final class LlamaCppLLMService: LLMService, PreloadableLLMService,
                                        continuation: continuation)
                     continuation.finish()
                 } catch {
+                    // 与 MLX 侧对齐：整轮被取消后不保留任何跨轮缓存，避免下一轮
+                    // 从语义上已作废的会话前缀继续生成（取消可能发生在生成中途）。
+                    if error is CancellationError {
+                        invalidateKVCache()
+                    }
                     continuation.finish(throwing: Self.mapError(error, modelPath: modelPath))
                 }
             }
@@ -312,9 +317,21 @@ public final class LlamaCppLLMService: LLMService, PreloadableLLMService,
 
             let suffix = Array(tokens[common...])
             let prefillStart = Date()
-            try LlamaCppContext.decode(tokens: suffix,
-                                       context: loaded.context,
-                                       chunkSize: loaded.batchSize)
+            do {
+                try LlamaCppContext.decode(tokens: suffix,
+                                           context: loaded.context,
+                                           chunkSize: loaded.batchSize)
+            } catch {
+                // prefill 中途失败/取消：内存已写入部分新后缀，但账目仍是旧前缀，
+                // 不清会让下一轮前缀匹配撞上半截 KV（generateLoop 的失败路径
+                // 已有同样清理，这里补上 prefill 段）。
+                if let memory = loaded.memory {
+                    llama_memory_clear(memory, true)
+                }
+                cachedTokens = []
+                cachedToolsKey = nil
+                throw error
+            }
             let prefillMilliseconds = Int(Date().timeIntervalSince(prefillStart) * 1_000)
             let cachedPromptTokens = common
 

@@ -129,6 +129,16 @@ public final class FileWriteTool: AgentTool {
         _ = registry
     }
 
+    /// `memory/` 内的新建文件（如 L3 SOP）必须由人复核；L0/L1 更直接由
+    /// `guardMemoryWrite` 硬拒，不给确认后覆盖的机会。
+    public func shouldConfirm(_ args: [String: JSONValue]) -> Bool {
+        guard let path = ToolSupport.optionalString(args, "path"),
+              let full = try? ToolSupport.resolveWorkspacePath(path, workspace: config.workspace)
+        else { return false }
+        return ToolSupport.isManagedMemoryPath(full, workspace: config.workspace)
+            && !ToolSupport.isSystemPromptMemoryFile(full, workspace: config.workspace)
+    }
+
     public func run(_ args: [String: JSONValue]) async throws -> ToolResult {
         do {
             let path = try ToolSupport.requireString(args, "path")
@@ -143,6 +153,7 @@ public final class FileWriteTool: AgentTool {
             }
 
             let full = try ToolSupport.resolveWorkspacePath(path, workspace: config.workspace)
+            try ToolSupport.guardMemoryWrite(full, workspace: config.workspace)
             try AtomicFile.write(content, to: full)
             return .ok("Wrote \(content.count) chars to \(path)")
         } catch {
@@ -183,6 +194,15 @@ public final class FileModifyTool: AgentTool {
         self.config = config
         _ = callbacks
         _ = registry
+    }
+
+    /// `memory/` 下只允许 `file_patch` 少量追加，且每次都必须人工复核：
+    /// 这些文件会被回注 system prompt / 长期记忆，静默改写等于持久化注入。
+    public func shouldConfirm(_ args: [String: JSONValue]) -> Bool {
+        guard let path = ToolSupport.optionalString(args, "path"),
+              let full = try? ToolSupport.resolveWorkspacePath(path, workspace: config.workspace)
+        else { return false }
+        return ToolSupport.isManagedMemoryPath(full, workspace: config.workspace)
     }
 
     public func run(_ args: [String: JSONValue]) async throws -> ToolResult {

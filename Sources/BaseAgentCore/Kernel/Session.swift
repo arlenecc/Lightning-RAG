@@ -134,9 +134,9 @@ public final class Session: @unchecked Sendable {
 
     /// 改进1/2：每轮 `finishTurn` 后由 Agent 注入的「历史全文落盘」回调。
     ///
-    /// 必须挂在**存储层写入点而非 run 末尾**：`foldForConsolidation()` 会把
-    /// `turns` 折到只剩一轮，若在请求末尾统一取 `session.turns`，被折掉的轮
-    /// 全文就永久丢失；而这里每轮结束时该轮数据仍完整，且早于任何折叠。
+    /// 必须挂在**存储层写入点而非 run 末尾**：CONSOLIDATE 会清空 `turns`，
+    /// 若在请求末尾统一取 `session.turns`，被丢弃的轮全文就永久丢失；
+    /// 而这里每轮结束时该轮数据仍完整，且早于任何折叠。
     /// 回调只做 O(1) 追加 I/O，不进入上下文、不占内存。
     public var onTurnFinished: ((TurnRecord) -> Void)?
 
@@ -345,6 +345,12 @@ public final class Session: @unchecked Sendable {
     }
 
     // MARK: CONSOLIDATE：主动折叠
+    //
+    // 说明：`forceFold` / `foldForConsolidation` 是「摘要式折叠」的兼容 API，
+    // 保留给测试与诊断观察。生产 CONSOLIDATE 已改用下面的
+    // `discardHistory(keepingRecent: 2)`：丢弃旧轮、保留最近 2 轮原文、
+    // 不回注摘要；只有占用 >90% 才由 Agent 侧 appendDigest 写入一条 LLM 摘要。
+    // `resetForFreshContext()` 只用于 context-limit 异常重试。
 
     /// 把最老的 n 轮从 `turns` 摘掉，摘要行留进 `extraDigest`。
     ///
@@ -393,34 +399,79 @@ public final class Session: @unchecked Sendable {
         return forceFold(turns.count - 1)
     }
 
+    /// 只丢弃最老的 n 轮，**不生成任何摘要行**（不回注上下文）。
+    /// 旧轮全文已由 `onTurnFinished` 逐轮落盘，L2 摘要 / L3 折叠历史负责长期维护。
+    @discardableResult
+    public func discardTurns(_ n: Int) -> Int {
+        let count = min(max(0, n), turns.count)
+        guard count > 0 else { return 0 }
+        turns.removeFirst(count)
+        foldedCount += count
+        return count
+    }
+
+    /// 彻底清空历史轮与折叠摘要，下一轮从 system + 本轮输入重新开始。
+    ///
+    /// 目前只用于 `context-limit` 异常重试（需要最短上下文）。周期性主动
+    /// 折叠走 `discardHistory(keepingRecent: 2)`，保留最近 2 轮原文防断裂。
+    /// 历史本身并未删除 —— 每轮 `finishTurn` 已把完整 TurnRecord 落盘，
+    /// L2/L3/L4 记忆层照常维护。
+    /// `<earlier_context>` 的唯一来源是 `appendDigest`，只有「上下文占用 >90%」
+    /// 的自动收缩才会写它。
+    @discardableResult
+    public func resetForFreshContext() -> Int {
+        let dropped = turns.count
+        turns.removeAll(keepingCapacity: true)
+        extraDigest.removeAll(keepingCapacity: true)
+        digestDropped = 0
+        foldedCount += dropped
+        return dropped
+    }
+
+    /// 丢弃式折叠（防断裂版）：只保留最近 `keep` 轮原文，更早的轮直接丢弃，
+    /// 不生成摘要、不回注 `<earlier_context>`，并清掉旧摘要残留。
+    ///
+    /// 周期性主动折叠（每 8 轮）走这条路径：保留的 2 轮让模型仍看得到紧邻的
+    /// 上文（刚返回的工具结果、刚给出的结论），避免折叠处上下文断裂；
+    /// KV 仍只重建一次，新前缀 = system + 2 轮，远短于整段历史。
+    @discardableResult
+    public func discardHistory(keepingRecent keep: Int) -> Int {
+        let dropped = discardTurns(turns.count - max(0, keep))
+        extraDigest.removeAll(keepingCapacity: true)
+        digestDropped = 0
+        return dropped
+    }
+
     // MARK: 组装消息
 
     /// 切分 `(old, raw)` —— L3 的核心，**纯渲染层**决策。
     ///
     /// 本函数**只决定「这一轮发给模型时」哪些轮当摘要、哪些轮当原文**，
     /// **绝不修改存储的 `turns` 数组**：`turns` 逐轮累加，从不被这里裁掉。
-    /// 摘要 `<earlier_context>` 是 `l3Fold(extraDigest + old.map{digestLine})`
-    /// 每轮现算的：只要 `old` 非空，每轮多吞一轮 → 摘要文本变 → 前缀 token 变 → KV 废。
+    /// `old` 只在渲染层决定「哪些轮不发原文」：溢出的旧轮**直接丢弃**，不再折成
+    /// 摘要回注；`<earlier_context>` 只由 `extraDigest` 产生（见 `buildMessages`）。
     ///
     /// `raw` = 最近 `rawTurns` 个**已完成**的轮 + 当前进行中的轮。
     /// `old` = 其余全部，折叠成摘要行。
     ///
     /// 只有真正逼近模型上下文硬顶（侵入 reserve）时才收缩 `raw`。
-    /// 早先用「raw 软配额 40%」做收缩阈值，会把 8 轮窗口压到 5~6 轮：
+    /// 早先用「raw 软配额 40%」做收缩阈值，会把 raw 窗口压到 5~6 轮：
     /// 每新增一轮就有旧轮滑进 `<earlier_context>`（消息索引 1），
     /// 跨轮 KV 前缀每轮都失效、全量 prefill —— 这是「越聊越慢」的根因。
     ///
     /// 段内（两次 CONSOLIDATE 之间）`old` 恒为空、`rawTurns` 覆盖全部已完成轮，
-    /// 摘要 = 固定 `extraDigest` → 前缀稳定 → KV 整段复用。把累加的 `turns` 真正
-    /// 落地成摘要、让 `old` 清零的是 `foldForConsolidation()`（存储层），不是这里。
+    /// `extraDigest` 为空 → 无 `<earlier_context>` → 前缀稳定 → KV 整段复用。
+    /// 每 8 轮由 `discardHistory(keepingRecent: 2)`（存储层）丢弃旧轮、保留
+    /// 最近 2 轮原文；这里只负责渲染层切分，不改变存储。
     ///
     /// 裁剪时机边界（理解「何时裁 / 何时累积 / KV 何时失效」）：
     /// - 工具输出在**产出时**裁一次（L0 ≤20k 硬顶 + L1 动态 `maxChars`，见 `Loop` 捕获点），
     ///   以已裁剪字符串冻结进 `turn.toolResults`；`renderRaw` 注入时直接取、不二次裁 → 前缀稳定。
-    /// - 对话轮在段内**逐轮累积、不重裁**：每轮 `raw` +1，前缀（system + extraDigest + old）不变
-    ///   → KV 整段复用；仅当越过 `rawTurns`/`rawCeiling` 时最老轮滑入 `old`（折成一行摘要）才始裁。
-    /// - 唯一的大裁是 CONSOLIDATE（每 `consolidateEvery` 轮或 `totalOver`）：`foldForConsolidation()`
-    ///   把历史整段折成 `extraDigest` → 该轮前缀变化 → KV 失效一次，之后段内重新稳定。
+    /// - 对话轮在段内**逐轮累积、不重裁**：每轮 `raw` +1，前缀不变 → KV 整段复用；
+    ///   仅当越过 `rawTurns`/`rawCeiling` 时最老轮滑入 `old` 被直接丢弃（不回注）。
+    /// - 大裁是 CONSOLIDATE：每 `consolidateEvery` 轮 `discardHistory(keepingRecent: 2)`
+    ///   丢旧轮、保留最近 2 轮原文 → 该轮前缀变化、KV 重建一次，之后段内重新稳定；
+    ///   仅 `needsAutoShrink`（占用 >90%）才走 LLM 摘要收缩并回注 `extraDigest`。
     func windows() -> (old: [TurnRecord], raw: [TurnRecord]) {
         guard let current = turns.last else { return ([], []) }
         let completed = Array(turns.dropLast())
@@ -438,6 +489,23 @@ public final class Session: @unchecked Sendable {
         let old = keep > 0 ? Array(completed.dropLast(keep)) : completed
         let raw = (keep > 0 ? Array(completed.suffix(keep)) : []) + [current]
         return (old, raw)
+    }
+
+    /// 只估算：把**全部**已完成轮 + 当前轮都发出去，是否会越过 raw 硬顶。
+    ///
+    /// 段内在 `buildMessages` 之前用它触发「提前折叠」，避免 `windows()`
+    /// 逐轮减 keep 删掉已完成轮 —— 那会让消息前缀每轮分叉、KV 全量 prefill。
+    /// 不修改任何状态，可安全地每轮调用；`windows()` 的减 keep 只作为
+    /// 提前折叠后仍超顶时的最后硬保护。
+    public func rawWouldExceedCeiling(systemTokens: Int) -> Bool {
+        guard let current = turns.last else { return false }
+        let completed = Array(turns.dropLast())
+        let earlierTokens = TokenEstimator.estimate(
+            l3Fold(extraDigest, maxLines: maxDigestLines))
+        let nonRaw = systemTokens + earlierTokens + budget.used("tools")
+        let ceiling = max(0, budget.total - budget.quota.reserve - nonRaw)
+        return TokenEstimator.estimate(
+            Self.renderRaw(completed + [current])) > ceiling
     }
 
     /// 估算原文区大小。必须与实际发出的消息同源：
@@ -506,10 +574,10 @@ public final class Session: @unchecked Sendable {
         let (old, raw) = windows()
         foldedCount = extraDigest.count + old.count
 
-        // 运行时诊断：段内 `old` 非空 = 稳定 raw 窗口已越顶——raw 被迫滑进
-        // `<earlier_context>`，意味着 kernelRawTurns 在当前负载下不足，KV 前缀每轮
-        // 失效（越聊越慢）。借此判断 kernelRawTurns（默认 8）是否够用：若持续出现该告警，
-        // 应调大 kernelMaxContextTokens 抬高 rawCeiling，而非单加 kernelRawTurns。
+        // 运行时诊断：段内 `old` 非空 = 稳定 raw 窗口已越顶——最老几轮原文被
+        // 直接丢弃（不回注摘要），意味着 rawTurns 在当前负载下不足，KV 前缀每轮
+        // 失效（越聊越慢）。借此判断 kernelRawTurns（默认 10 = 周期 8 + 保留 2）
+        // 是否够用：若持续告警，应调大 kernelMaxContextTokens 抬高 rawCeiling。
         // 节流：相邻告警间隔 ≥8 轮，避免工具密集段每轮刷屏。
         if !old.isEmpty, currentTurn - lastOldSlidingWarnTurn >= 8 {
             lastOldSlidingWarnTurn = currentTurn
@@ -517,20 +585,19 @@ public final class Session: @unchecked Sendable {
             let rawCeiling = max(0, budget.total - budget.quota.reserve - nonRaw)
             let rawTokens = TokenEstimator.estimate(Self.renderRaw(raw))
             AgentLog.warning(
-                "[context] 稳定 raw 窗口已越顶：段内 \(old.count) 轮滑入 <earlier_context>"
+                "[context] 稳定 raw 窗口已越顶：段内 \(old.count) 轮原文被丢弃"
                 + "（raw \(raw.count) 轮≈\(rawTokens) token / 上限 \(rawCeiling)）。"
+                + " KV 前缀本轮将失效；说明提前折叠/段内均摊未生效（E 健康告警），"
                 + " kernelRawTurns=\(rawTurns) 在当前负载下不足，"
-                + "建议调大 kernelMaxContextTokens 抬高 rawCeiling，或精简单轮 token。"
+                + "建议调大 kernelMaxContextTokens 抬高 rawCeiling 或减小 kernelMaxToolChars。"
             )
         }
 
-        // 摘要 = 存储层 `extraDigest`（仅 CONSOLIDATE 时变，稳定）
-        //       + 渲染层 `old` 的摘要行（随 `turns` 增长逐轮变）。
-        // `old` 为空时（段内）摘要即固定 `extraDigest`，前缀不变 → KV 复用。
-        let digest = l3Fold(
-            extraDigest + old.map { $0.digestLine() },
-            maxLines: maxDigestLines
-        )
+        // 摘要只来自 `extraDigest`：它只在「上下文占用 >90% 自动收缩」时写入，
+        // 是 `<earlier_context>` 的唯一来源。渲染层滑出的 `old` 轮直接丢弃，
+        // 不再折成摘要回注（旧历史交由 L2/L3 记忆层维护）。
+        // 段内 `extraDigest` 恒为空 → 无 `<earlier_context>` → 前缀稳定、KV 复用。
+        let digest = l3Fold(extraDigest, maxLines: maxDigestLines)
 
         var messages: [ChatMessage] = [ChatMessage(role: .system, content: systemPrompt)]
         if !digest.isEmpty {
@@ -558,7 +625,8 @@ public final class Session: @unchecked Sendable {
 
     // MARK: 供工具/UI 观察
 
-    /// 已折叠（L3）区的摘要行。
+    /// 已折叠区的摘要行，**仅供 UI / 诊断观察**，不进入本轮上下文。
+    /// `old` 的摘要行仍在这里可见，但 `buildMessages` 已不再把它们回注。
     public func digestLines() -> [String] {
         let (old, _) = windows()
         return extraDigest + old.map { $0.digestLine() }

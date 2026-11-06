@@ -31,13 +31,23 @@ public struct Quota: Sendable, Equatable {
 /// 内核从不事后问「上下文是不是太大了」，而是先分配、再让每一级压缩在其配额内
 /// 开销。配额按比例从 `total` 派生，因此换模型（更大/更小窗口）时无需改代码。
 public final class ContextBudget: @unchecked Sendable {
-    /// 比例（合计 1.0）。
+    /// 输出预留比例（21%）。这是**预算分配量**：`remainingForTool` 的硬余量、
+    /// `windows()` 的 raw 窗口上限都由 `total - reserve`（79%）派生，
+    /// 保证模型始终有 21% 的窗口可用于生成。
+    public static let reserveRatio: Double = 0.21
+
+    /// 自动收缩触发线（占最大上下文 90%）。这是**安全阈值**，与输出预留
+    /// 完全解耦：平时预算分配把 used 压在 79% 以下，只有在估算偏差或单轮
+    /// 内容过大、真实占用逼近硬顶时，才触发「旧上下文摘要回注」的兜底收缩。
+    public static let autoShrinkRatio: Double = 0.90
+
+    /// 比例（合计 1.0）；reserve 直接引用上面的常量，避免两处数字漂移。
     private static let ratio: [String: Double] = [
         "system": 0.13,
         "earlier": 0.09,
         "raw": 0.40,
         "tools": 0.17,
-        "reserve": 0.21,
+        "reserve": reserveRatio,
     ]
 
     public let total: Int
@@ -90,9 +100,21 @@ public final class ContextBudget: @unchecked Sendable {
         remainingForRaw() <= 0
     }
 
-    /// 整体越界（含 reserve 被吃掉）。
+    /// 已用侵入输出预留（79% 硬顶）——**预算诊断量**，不再触发任何折叠。
+    /// 收缩触发请看下面独立的 `needsAutoShrink`（90%）。
     public var totalOver: Bool {
         used() > total - quota.reserve
+    }
+
+    /// 独立的收缩触发线（绝对 token 数），由 `autoShrinkRatio` 决定。
+    public var autoShrinkThreshold: Int {
+        Int(Double(total) * Self.autoShrinkRatio)
+    }
+
+    /// 是否触发「摘要回注式」自动收缩：唯一允许把旧上下文摘要写回
+    /// `<earlier_context>` 的条件。周期性折叠走丢弃式路径，不读这个值。
+    public var needsAutoShrink: Bool {
+        used() > autoShrinkThreshold
     }
 
     /// 除 RAW 外其它区合计超支的 token 数 —— 要从 RAW 里扣回来。
@@ -123,14 +145,20 @@ public final class ContextBudget: @unchecked Sendable {
     /// 按「硬上下文余量」而不是 raw 软配额分配：软配额只是建议值，
     /// 用它做阈值会让 raw 超过 12k 后所有工具结果一律被压到 600 字符，
     /// 模型读不到完整文件就只能反复重读，反而更慢。
-    public func remainingForTool(_ nCalls: Int = 1, maxChars: Int = 8_000) -> Int {
+    ///
+    /// `reserveTurns` = 本折叠段内还剩几轮：按它均摊硬余量，把预算控制
+    /// 前移到工具结果产出时，让段内累计 raw 不越顶 → 不滑窗、不提前折叠
+    /// → 消息前缀只追加、KV 整段复用。
+    public func remainingForTool(_ nCalls: Int = 1, maxChars: Int = 8_000,
+                                 reserveTurns: Int = 1) -> Int {
         let n = max(1, nCalls)
+        let turns = max(1, reserveTurns)
         let hardLeft = total - quota.reserve - used()
         if hardLeft <= 0 {
             // 已经吃进输出预留：只给最小可诊断额度，逼内核立即折叠。
             return min(maxChars, 600)
         }
-        return max(600, min(maxChars, hardLeft * 3 / n))
+        return max(600, min(maxChars, hardLeft * 3 / (n * turns)))
     }
 
     /// token → 字符的粗换算（用于给压缩器设置裁剪长度）。

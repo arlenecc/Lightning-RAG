@@ -104,13 +104,69 @@ public final class HFModelDownloader: @unchecked Sendable {
         }
         var entries: [FileEntry] = []
         for item in list {
+            // 远端清单不可信：先挡住 `../`、绝对路径、盘符等，否则会被
+            // appendingPathComponent 落到模型目录之外（zip-slip 式写入）。
             guard (item["type"] as? String) == "file",
                   let path = item["path"] as? String,
+                  Self.isSafeRelativePath(path),
                   Self.isNeededFile(path) else { continue }
             let size = (item["size"] as? NSNumber)?.int64Value ?? 0
             entries.append(FileEntry(path: path, size: size))
         }
         return entries
+    }
+
+    /// 远端清单里的路径能否安全落到模型目录内。
+    ///
+    /// 拒绝：绝对路径、`~`、空/`.`/`..` 段、Windows 反斜杠与盘符、URL scheme、
+    /// NUL 和超长路径。`appendingPathComponent` 不会规范化 `..`，因此必须在
+    /// 拼路径之前就过滤；`download` 里还有一次 containment 兜底。
+    public static func isSafeRelativePath(_ path: String) -> Bool {
+        guard !path.isEmpty, path.utf8.count <= 1024,
+              !path.contains("\0"), !path.contains("\\"),
+              !path.hasPrefix("/"), !path.hasPrefix("~") else { return false }
+        let segments = path.split(separator: "/", omittingEmptySubsequences: false)
+        guard !segments.isEmpty else { return false }
+        for segment in segments {
+            let part = String(segment)
+            if part.isEmpty || part == "." || part == ".." { return false }
+            if part.contains(":") { return false }
+        }
+        return true
+    }
+
+    /// 解析符号链接后，target 是否仍在 root 目录内（root 本身不算）。
+    static func isContained(_ target: URL, in root: URL) -> Bool {
+        let resolved = canonicalPath(target)
+        let rootPath = canonicalPath(root)
+        let prefix = rootPath.hasSuffix("/") ? rootPath : rootPath + "/"
+        return resolved.hasPrefix(prefix)
+    }
+
+    /// 展开路径里所有**已存在**的符号链接，再拼回尚未创建的尾部组件。
+    ///
+    /// `URL.resolvingSymlinksInPath()` 在目标文件不存在时不会展开中间的
+    /// symlink（下载前正是这种情形），直接用它会让 `root/link/model` 中的
+    /// `link -> /elsewhere` 逃过前缀比对。所以从最深的不存在组件往上找到
+    /// 第一个真实目录，对它做 realpath 后再拼回剩余组件。
+    private static func canonicalPath(_ url: URL) -> String {
+        let fm = FileManager.default
+        var missing: [String] = []
+        var cursor = url.standardizedFileURL
+        while cursor.path != "/" {
+            var isDirectory: ObjCBool = false
+            if fm.fileExists(atPath: cursor.path, isDirectory: &isDirectory) { break }
+            missing.insert(cursor.lastPathComponent, at: 0)
+            cursor = cursor.deletingLastPathComponent()
+        }
+        var resolved = cursor.resolvingSymlinksInPath().standardizedFileURL
+        for component in missing {
+            // 已解析部分本身可能是 symlink 目标；继续逐段 realpath，
+            // 防止新拼上的组件里又出现指向外部的符号链接。
+            resolved = resolved.appendingPathComponent(component)
+                .resolvingSymlinksInPath().standardizedFileURL
+        }
+        return resolved.path
     }
 
     /// 推理运行时会读取的文件类型：权重（safetensors/onnx/gguf）、配置与
@@ -136,8 +192,17 @@ public final class HFModelDownloader: @unchecked Sendable {
     public func download(repo: String, file: FileEntry, into directory: URL,
                          progress: @escaping @Sendable (_ received: Int64, _ total: Int64) -> Void
     ) async throws {
+        // FileEntry 也可能由打包清单/子目录模型转换构造，不只来自远端 tree API；
+        // 因此落盘前再校验一次，并确认解析符号链接后仍在目标目录内。
+        guard Self.isSafeRelativePath(file.path),
+              Self.isSafeRelativePath(file.remotePath) else {
+            throw HFError.badResponse("非法的模型文件路径：\(file.path)")
+        }
         let fm = FileManager.default
-        let destination = directory.appendingPathComponent(file.path)
+        let destination = directory.appendingPathComponent(file.path).standardizedFileURL
+        guard Self.isContained(destination, in: directory) else {
+            throw HFError.badResponse("模型文件路径越出目标目录：\(file.path)")
+        }
         if Self.fileSize(at: destination) == file.size {
             progress(file.size, file.size)
             return

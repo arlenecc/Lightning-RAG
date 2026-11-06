@@ -67,6 +67,8 @@ public struct AgentConfig: Sendable {
     public var knowledgeBase: String = ""
     public var requestTimeout: Double = 120.0
     public var maxIterations: Int = 15
+    /// 预留（当前未接线）：历史窗口实际由 kernelRawTurns / kernelConsolidateEvery
+    /// / kernelMaxContextTokens 决定，本字段只做配置兼容，不参与裁剪决策。
     public var maxHistory: Int = 50
     public var maxContextTokens: Int = 32768
     /// prompt prefill 每次前向的 token 上限（0 = 使用 MLX 默认值）。
@@ -98,6 +100,8 @@ public struct AgentConfig: Sendable {
     public var kvCacheInt8: Bool = true
     /// 辅助模型的 KV cache int8 量化开关（缺省跟随 `kv_cache_int8`）。
     public var auxKvCacheInt8: Bool = true
+    /// 预留（当前未接线）：上下文收缩由 L3 CONSOLIDATE 与 context-limit 重建处理，
+    /// 不由本比例触发；保留字段以兼容旧配置文件。
     public var contextShrinkRatio: Double = 0.9
 
     /// 实际生效的主模型上下文：min(配置上下文, KV 硬上限)。
@@ -116,21 +120,18 @@ public struct AgentConfig: Sendable {
     // 内核：三态自动机 + 五级压缩
     public var kernelMaxContextTokens: Int = 30_000
     /// 稳定 raw 窗口：段内（两次 CONSOLIDATE 之间）保留最近 `kernelRawTurns` 个
-    /// 已完成轮作为原文；超过的部分才会被 `windows()` 滑进 `<earlier_context>`。
-    /// 它是 CONSOLIDATE 周期的**上钳位**——见下方 `kernelConsolidateEvery` 警示。
-    /// 默认 8：即有效折叠周期 = `min(max(8, kernelConsolidateEvery), 8)` = 每 8 轮折，
-    /// 等价于「8 轮滑动窗口 + 历史 summary」。取较小值是权衡——窗口越小，每轮稳态推理
-    /// 的 head 越短、计算量越小，代价是 CONSOLIDATE 更频繁（KV 失效更勤）；取大值则反之。
-    public var kernelRawTurns: Int = 8
-    /// 周期性主动折叠的「目标」间隔（轮）。默认 8，与 `kernelRawTurns` 对齐 →
-    /// 实际生效周期 = `min(max(8, kernelConsolidateEvery), kernelRawTurns)` = 每 8 轮折。
-    /// ⚠️ 联动警示（见 `Loop.swift` 构造）：本参数会被 `kernelRawTurns` 钳住——若把本值配成
-    /// 大于 `kernelRawTurns`（例如本值 24 而 rawTurns=8），周期仍被钳成 `kernelRawTurns`（每 8 轮折）；
-    /// 本值低于 8 也会被 `max(8,·)` 抬到 8（避免每轮都慢 prefill）。
-    /// 周期超过 `kernelRawTurns` 不仅无效，反而有害：段内 raw 窗口会超出稳定阈值、
-    /// `windows()` 每轮滑窗 → KV 前缀每轮失效 → 全量 prefill（越聊越慢）。
-    /// 想调大稳定窗口（更久不折、head 更长、每轮少算前缀外推）应同步调大 `kernelRawTurns`
-    /// （它会抬高本钳位上限），而非单改本参数；但注意 head 变长会加大每轮稳态推理计算量。
+    /// 已完成轮作为原文；溢出的旧轮**直接丢弃**，不再折成摘要回注上下文。
+    /// 默认 10 = 折叠周期 8 + 折叠时保留的 2 轮：段内最多正好 10 轮，
+    /// 不会中途滑窗挤掉最老轮（那会让 KV 前缀每轮变化、反复全量 prefill）。
+    /// 它同时也是 CONSOLIDATE 周期的上钳位（见 `Loop.swift` 构造）。
+    public var kernelRawTurns: Int = 10
+    /// 周期性主动折叠间隔（轮），默认 8。触发时丢弃旧历史，但**保留最近 2 轮
+    /// 原文**以防折叠处上下文断裂；不回注任何摘要、不给上下文加负担，KV 只
+    /// 重建一次（旧历史已由 `onTurnFinished` 逐轮落盘，交给 L2 摘要 / L3 折叠
+    /// 历史 / L4 长期记忆维护）。
+    /// 实际生效周期 = `min(max(1, 本值), kernelRawTurns)`；配大于 rawTurns 会被钳住。
+    /// **唯一例外**：上下文占用超过最大上下文 90%（`ContextBudget.needsAutoShrink`）时
+    /// 触发自动收缩，才会用 LLM 生成旧上下文摘要并回注 `<earlier_context>`。
     public var kernelConsolidateEvery: Int = 8
     /// L1 工具结果字符上限。与 RAG 输出总上限（ragSearchMaxTotalChars=12000）
     /// 取较小值生效：默认 8000 让 RAG 结果不会被内核二次静默截断。
@@ -215,6 +216,8 @@ public struct AgentConfig: Sendable {
     public var auxMmprojPath: String = ""
     /// 辅助模型 ONNX 的 tokenizer 目录；留空时从模型目录读取。
     public var auxTokenizerPath: String = ""
+    /// 预留（当前未接线）：OCR 后端由 ragOCREngine / ragOCRModelPath 选择，
+    /// 暂无 CoreML 分支；保留字段以兼容旧配置文件。
     public var ragOCRCoreML: Bool = false
     public var ragOCRPreprocess: Bool = true
     public var ragOCRBinarize: Bool = true
@@ -266,6 +269,8 @@ public struct AgentConfig: Sendable {
     public var ragVerifyFingerprint: Bool = false
 
     // SQLite + sqlite-vec 存储
+    /// 预留（当前固定 sqlite）：migrate() 会把非 "sqlite" 的配置强制归一，
+    /// 生产检索只由 ragSQLiteVecEnabled / elementType 决定存储形态。
     public var ragStorageBackend: String = "sqlite"
     public var ragSQLiteVecEnabled: Bool = true
     /// 混合检索 RRF 常数（原项目 RRF k=60）。
@@ -338,7 +343,9 @@ public struct AgentConfig: Sendable {
     public var auxLLMProvider: String = "local"
     public var auxLocalLLMModel: String = "models/Qwen3.5-2B-MLX-4bit"
     public var auxLocalLLMBackend: String = "mlx-lm"
-    /// 辅助模型默认低温 + 轻重复惩罚：减少发散和复读，同时保持原文信息。
+    /// 预留（当前未接线）：各辅助任务（摘要/事实抽取/蒸馏/RAG 浓缩）按任务
+    /// 固定低温度 0.1~0.2，避免发散；设置面板保留该字段以兼容旧配置，
+    /// 修改它不会改变辅助调用温度。其它采样参数（auxTopP/auxTopK 等）正常生效。
     public var auxTemperature: Double = 0.3
     public var auxMaxTokens: Int = 32768
     /// 辅助调用默认 8k 上下文：缩短 prefill、降低 KV 内存，加快响应。

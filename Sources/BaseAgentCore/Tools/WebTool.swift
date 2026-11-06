@@ -1,6 +1,41 @@
 import Foundation
 import CoreFoundation
 
+// MARK: - 网页 URL 安全策略
+
+/// 所有「把 URL 交给网络层」的路径都必须走这里：
+/// `web_scan` / `web_render` 首请求、WKWebView 主文档与 iframe 页内导航、
+/// `webexec_js` 交给浏览器桥的 `url`。
+///
+/// 只校验入口远远不够：页面内的 JS 重定向、iframe、表单提交会绕开工具层。
+/// 策略与 `WebRedirectGuard` 同源（协议白名单 + 解析后的私网/回环黑名单）。
+enum WebURLPolicy {
+    static let loopbackHosts: Set<String> = ["localhost", "127.0.0.1", "::1"]
+
+    /// 返回拒绝原因；nil 表示允许。
+    static func rejectionReason(for url: URL,
+                                allowLoopbackForTesting: Bool = false) -> String? {
+        guard let scheme = url.scheme?.lowercased(),
+              scheme == "http" || scheme == "https" else {
+            return "Only http/https URLs are supported, got: \(url.scheme ?? "none")"
+        }
+        guard let host = url.host, !host.isEmpty else {
+            return "Invalid URL: missing host"
+        }
+        guard WebRedirectGuard.isBlockedHost(host) else { return nil }
+        if allowLoopbackForTesting, loopbackHosts.contains(host.lowercased()) { return nil }
+        return "Blocked: \(host) resolves to a private/loopback address (SSRF protection)."
+    }
+
+    /// 字符串入口：解析失败也明确拒绝。
+    static func validate(_ raw: String,
+                         allowLoopbackForTesting: Bool = false) -> String? {
+        guard let url = URL(string: raw) else { return "Invalid URL: \(raw)" }
+        return rejectionReason(for: url,
+                               allowLoopbackForTesting: allowLoopbackForTesting)
+    }
+}
+
 // MARK: - web_scan
 
 /// `web_scan`：抓取 http/https URL 并返回可见正文（HTML 去脚本/样式后提取）。
@@ -485,6 +520,17 @@ public final class WebExecJsTool: AgentTool, ShutdownableTool {
             required: ["script"])
     }
 
+    /// 外部（非回环）浏览器桥会把脚本/页面内容发到远端主机，必须人工确认；
+    /// headless 下由 fail-closed 默认拒绝。本机桥（localhost:9222 等）无需打扰用户。
+    public func shouldConfirm(_ args: [String: JSONValue]) -> Bool {
+        let endpoint = config.browserEndpoint
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let url = URL(string: endpoint), let host = url.host?.lowercased() else {
+            return false
+        }
+        return !WebURLPolicy.loopbackHosts.contains(host)
+    }
+
     public init(config: AgentConfig, callbacks: AgentCallbacks?, registry: ToolRegistry? = nil) {
         self.config = config
         _ = callbacks
@@ -507,20 +553,33 @@ public final class WebExecJsTool: AgentTool, ShutdownableTool {
                     + "Playwright HTTP bridge (e.g. http://localhost:9222) to use webexec_js.")
             }
 
+            // 端点必须是绝对 http(s) URL：配错成 file:// / 相对路径时在发请求前失败。
+            let base = endpoint.hasSuffix("/") ? String(endpoint.dropLast()) : endpoint
+            guard let bridgeURL = URL(string: base + "/exec"),
+                  let scheme = bridgeURL.scheme?.lowercased(),
+                  scheme == "http" || scheme == "https",
+                  bridgeURL.host?.isEmpty == false else {
+                return .fail("Invalid browser_endpoint: expected an absolute http(s) URL "
+                    + "with a host: \(String(endpoint.prefix(120)))")
+            }
+
+            // 模型给的 url 会由浏览器桥真实导航，必须与 web_scan / web_render 同策略：
+            // 否则 file:// 或云元数据地址可借桥读取本机/内网内容。
+            let navigationURL = ToolSupport.string(args, "url")
+            if !navigationURL.isEmpty,
+               let reason = WebURLPolicy.validate(navigationURL) {
+                return .fail("Blocked navigation URL: \(reason)")
+            }
+
             let payload = JSONValue.object([
-                "url": .string(ToolSupport.string(args, "url")),
+                "url": .string(navigationURL),
                 "script": .string(script),
                 "action": .string(ToolSupport.string(args, "action")),
                 "selector": .string(ToolSupport.string(args, "selector")),
                 "value": .string(ToolSupport.string(args, "value")),
             ])
 
-            let base = endpoint.hasSuffix("/") ? String(endpoint.dropLast()) : endpoint
-            guard let url = URL(string: base + "/exec") else {
-                return .fail("Invalid browser_endpoint: \(endpoint)")
-            }
-
-            var request = URLRequest(url: url)
+            var request = URLRequest(url: bridgeURL)
             request.httpMethod = "POST"
             request.timeoutInterval = requestTimeout
             request.setValue("application/json", forHTTPHeaderField: "Content-Type")
@@ -594,24 +653,11 @@ public final class WebRenderTool: AgentTool, ShutdownableTool {
         _ = registry
     }
 
-    /// URL 校验：协议白名单 + SSRF 黑名单（复用 web_scan 的 WebRedirectGuard）。
+    /// URL 校验：复用共享策略（与 WKWebView 页内导航、webexec_js 同源）。
     /// 返回错误文案；nil 表示通过。internal 便于测试。
     static func validateURL(_ raw: String) -> String? {
-        guard let url = URL(string: raw), let host = url.host, !host.isEmpty else {
-            return "Invalid URL: \(raw)"
-        }
-        guard url.scheme == "http" || url.scheme == "https" else {
-            return "Only http/https URLs are supported, got: \(url.scheme ?? "none")"
-        }
-        if WebRedirectGuard.isBlockedHost(host) {
-            // 测试豁免仅限明确回环地址（本地 mini server），其余私网照拦。
-            let loopback = ["127.0.0.1", "localhost", "::1"].contains(host.lowercased())
-            if !(WebRenderer.localhostAllowedForTesting && loopback) {
-                return "Blocked: \(host) resolves to a private/loopback address "
-                    + "(SSRF protection)."
-            }
-        }
-        return nil
+        WebURLPolicy.validate(
+            raw, allowLoopbackForTesting: WebRenderer.localhostAllowedForTesting)
     }
 
     public func run(_ args: [String: JSONValue]) async throws -> ToolResult {

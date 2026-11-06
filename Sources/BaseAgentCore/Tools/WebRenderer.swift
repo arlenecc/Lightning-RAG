@@ -25,32 +25,101 @@ final class WebRenderer: @unchecked Sendable {
     /// 渲染任务串行化（复用同一个 WKWebView；NSLock 不能跨 await 持有）。
     private let serial = AsyncSemaphore(value: 1)
 
-    /// 网络层拦截被墙/无价值资源（tracker、广告、第三方字体）。
-    /// 这些域的同步 <script src> 会永久阻塞 HTML 解析器（body 进不了 DOM），
-    /// 且对正文提取毫无价值。ContentRuleList 在 decidePolicyFor 之前的网络层生效。
-    /// 首次访问时同步编译（进程内缓存一次）。
-    private static let compiledBlocklist: WKContentRuleList? = {
-        let json = """
-        [{"trigger":{"url-filter":".*ajax\\\\.googleapis\\\\.com.*"},"action":{"type":"block"}},
-          {"trigger":{"url-filter":".*fonts\\\\.googleapis\\\\.com.*"},"action":{"type":"block"}},
-          {"trigger":{"url-filter":".*fonts\\\\.gstatic\\\\.com.*"},"action":{"type":"block"}},
-          {"trigger":{"url-filter":".*google-analytics\\\\.com.*"},"action":{"type":"block"}},
-          {"trigger":{"url-filter":".*googletagmanager\\\\.com.*"},"action":{"type":"block"}},
-          {"trigger":{"url-filter":".*doubleclick\\\\.net.*"},"action":{"type":"block"}},
-          {"trigger":{"url-filter":".*connect\\\\.facebook\\\\.net.*"},"action":{"type":"block"}},
-          {"trigger":{"url-filter":".*scorecardresearch\\\\.com.*"},"action":{"type":"block"}}]
+    /// 网络层拦截：广告/tracker + SSRF 目标（私网、回环、云元数据、file://）。
+    ///
+    /// `decidePolicyForNavigationAction` 只覆盖主文档/iframe 导航，拦不住页面
+    /// 脚本主动发起的 XHR/fetch/子资源；那些必须由 ContentRuleList 在网络层拦掉。
+    /// 规则统一用 `[.]` 字符类代替转义点号，避免 Swift/JSON/正则三层转义出错。
+    /// 测试豁免回环时编译另一套规则（放行 127.0.0.1/localhost/::1）。
+    static func blockRulesJSON(allowLoopback: Bool) -> String {
+        let loopback = allowLoopback ? "" : """
+          {"trigger":{"url-filter":"^https?://127[.]"},"action":{"type":"block"}},
+          {"trigger":{"url-filter":"^https?://localhost"},"action":{"type":"block"}},
+          {"trigger":{"url-filter":"^https?://0[.]0[.]0[.]0"},"action":{"type":"block"}},
+          {"trigger":{"url-filter":"^https?://[[]::1[]]"},"action":{"type":"block"}},
         """
-        let semaphore = DispatchSemaphore(value: 0)
-        var compiled: WKContentRuleList?
-        WKContentRuleListStore.default().compileContentRuleList(
-            forIdentifier: "base-agent-webrender-blocklist",
-            encodedContentRuleList: json) { list, _ in
-            compiled = list
-            semaphore.signal()
+        return """
+        [
+          {"trigger":{"url-filter":"^file://"},"action":{"type":"block"}},
+          {"trigger":{"url-filter":"^https?://10[.]"},"action":{"type":"block"}},
+          {"trigger":{"url-filter":"^https?://192[.]168[.]"},"action":{"type":"block"}},
+          {"trigger":{"url-filter":"^https?://169[.]254[.]"},"action":{"type":"block"}},
+          {"trigger":{"url-filter":"^https?://172[.]1[6-9][.]"},"action":{"type":"block"}},
+          {"trigger":{"url-filter":"^https?://172[.]2[0-9][.]"},"action":{"type":"block"}},
+          {"trigger":{"url-filter":"^https?://172[.]3[01][.]"},"action":{"type":"block"}},
+          {"trigger":{"url-filter":"^https?://100[.]6[4-9][.]"},"action":{"type":"block"}},
+          {"trigger":{"url-filter":"^https?://100[.]7[0-9][.]"},"action":{"type":"block"}},
+          {"trigger":{"url-filter":"^https?://100[.]1[01][0-9][.]"},"action":{"type":"block"}},
+          {"trigger":{"url-filter":"^https?://100[.]12[0-7][.]"},"action":{"type":"block"}},
+          {"trigger":{"url-filter":"^https?://[[]fe80"},"action":{"type":"block"}},
+          {"trigger":{"url-filter":"^https?://[[]fc"},"action":{"type":"block"}},
+          {"trigger":{"url-filter":"^https?://[[]fd"},"action":{"type":"block"}},
+          {"trigger":{"url-filter":"^https?://metadata[.]google[.]internal"},"action":{"type":"block"}},
+        \(loopback)
+          {"trigger":{"url-filter":".*ajax[.]googleapis[.]com.*"},"action":{"type":"block"}},
+          {"trigger":{"url-filter":".*fonts[.]googleapis[.]com.*"},"action":{"type":"block"}},
+          {"trigger":{"url-filter":".*fonts[.]gstatic[.]com.*"},"action":{"type":"block"}},
+          {"trigger":{"url-filter":".*google-analytics[.]com.*"},"action":{"type":"block"}},
+          {"trigger":{"url-filter":".*googletagmanager[.]com.*"},"action":{"type":"block"}},
+          {"trigger":{"url-filter":".*doubleclick[.]net.*"},"action":{"type":"block"}},
+          {"trigger":{"url-filter":".*connect[.]facebook[.]net.*"},"action":{"type":"block"}},
+          {"trigger":{"url-filter":".*scorecardresearch[.]com.*"},"action":{"type":"block"}}
+        ]
+        """
+    }
+
+    /// `WKContentRuleList` 不是 Sendable；用 unchecked box 跨 actor 边界，
+    /// 对象本身只在 MainActor 内交给 WKWebViewConfiguration。
+    private final class RuleBox: @unchecked Sendable {
+        let list: WKContentRuleList?
+        init(_ list: WKContentRuleList?) { self.list = list }
+    }
+
+    private actor RuleCache {
+        static let shared = RuleCache()
+        private var lists: [Bool: RuleBox] = [:]
+        func cached(_ key: Bool) -> RuleBox? { lists[key] }
+        func store(_ box: RuleBox, for key: Bool) { lists[key] = box }
+    }
+
+    /// 异步编译 + 进程内缓存。
+    ///
+    /// **绝不能用 `DispatchSemaphore.wait()` 等编译结果**：`compileContentRuleList`
+    /// 的回调经主 runloop 投递，在主线程同步阻塞会让回调永远不回来（实测两套规则
+    /// 在阻塞版恒定超时，放开 runloop 后立刻编译成功），规则集恒为 nil、
+    /// 网络层防护静默失效。这里用 continuation 让出主线程，再与超时任务赛跑。
+    private static func rules(allowLoopback: Bool) async -> RuleBox {
+        let cache = RuleCache.shared
+        if let cached = await cache.cached(allowLoopback) { return cached }
+        let box: RuleBox = await withTaskGroup(
+            of: RuleBox.self, returning: RuleBox.self) { group in
+            group.addTask {
+                await withCheckedContinuation { cont in
+                    WKContentRuleListStore.default().compileContentRuleList(
+                        forIdentifier: "base-agent-webrender-"
+                            + (allowLoopback ? "loopback" : "strict"),
+                        encodedContentRuleList: Self.blockRulesJSON(
+                            allowLoopback: allowLoopback)) { list, _ in
+                        cont.resume(returning: RuleBox(list))
+                    }
+                }
+            }
+            group.addTask {
+                try? await Task.sleep(nanoseconds: 5_000_000_000)
+                return RuleBox(nil)
+            }
+            let first = await group.next() ?? RuleBox(nil)
+            group.cancelAll()
+            return first
         }
-        _ = semaphore.wait(timeout: .now() + 3)
-        return compiled
-    }()
+        if box.list != nil {
+            await cache.store(box, for: allowLoopback)
+        } else {
+            AgentLog.warning("WKContentRuleList 编译失败/超时：页内 XHR 网络层防护降级，"
+                + "导航策略仍然生效")
+        }
+        return box
+    }
 
     /// 页面加载软超时：被墙/长轮询资源会让 didFinish 永不到来，
     /// 到点后停止网络等待、提取已解析的 DOM。
@@ -58,6 +127,8 @@ final class WebRenderer: @unchecked Sendable {
     @MainActor private var webView: WKWebView?
     @MainActor private var dialogBox: ScriptDialogBox?
     @MainActor private var navBox: NavigationBox?
+    /// 当前 webView 装配的 ContentRuleList 所用的回环豁免标志。
+    @MainActor private var configuredAllowLoopback = false
 
     /// 页面 alert/confirm/prompt 的静默实现，避免弹窗阻塞渲染。
     @MainActor
@@ -83,6 +154,10 @@ final class WebRenderer: @unchecked Sendable {
     private final class NavigationBox: NSObject, WKNavigationDelegate {
         var continuation: CheckedContinuation<Void, Error>?
         private var finished = false
+        /// 与工具层同一套 URL 策略；仅本地 mini server 测试会豁免回环。
+        var allowLoopbackForTesting = false
+        /// 页内被拦下的导航次数（诊断用）。
+        var blockedNavigations = 0
 
         /// 复用前复位：上次任务的 finished 标志不得挡住新页面的回调。
         func reset() {
@@ -119,6 +194,22 @@ final class WebRenderer: @unchecked Sendable {
                      withError error: Error) {
             finish(.failure(convert(error)))
         }
+
+        /// 页面内跳转（JS 重定向、iframe、表单提交、服务端重定向）也必须过 SSRF
+        /// 校验：入口 URL 安全 ≠ 页面后续请求的 URL 安全。
+        func webView(_ webView: WKWebView,
+                     decidePolicyFor navigationAction: WKNavigationAction,
+                     decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
+            guard let url = navigationAction.request.url,
+                  WebURLPolicy.rejectionReason(
+                      for: url,
+                      allowLoopbackForTesting: allowLoopbackForTesting) == nil else {
+                blockedNavigations += 1
+                decisionHandler(.cancel)
+                return
+            }
+            decisionHandler(.allow)
+        }
     }
 
     /// 等待整页渲染完成并提取结果。`timeout` 覆盖加载 + 等待 + 脚本全流程。
@@ -137,12 +228,14 @@ final class WebRenderer: @unchecked Sendable {
                 maxContentWait: TimeInterval = 8) async throws -> Outcome {
         guard await serial.acquire() else { throw AgentError.cancelled }
         defer { serial.release() }
+        // 编译规则时让出主线程（回调依赖主 runloop），完成后再进 renderOnMain。
+        let rules = await Self.rules(allowLoopback: Self.localhostAllowedForTesting)
         return try await withTimeout(timeout, "渲染") {
             try await self.renderOnMain(
                 url: url, waitMS: waitMS, waitSelector: waitSelector, script: script,
                 wantHTML: wantHTML, wantScreenshot: wantScreenshot,
                 waitForTextGrowthFrom: waitForTextGrowthFrom,
-                maxContentWait: maxContentWait)
+                maxContentWait: maxContentWait, rules: rules)
         }
     }
 
@@ -174,8 +267,9 @@ final class WebRenderer: @unchecked Sendable {
                               wantHTML: Bool,
                               wantScreenshot: Bool,
                               waitForTextGrowthFrom: Int?,
-                              maxContentWait: TimeInterval) async throws -> Outcome {
-        let webView = try ensureWebView()
+                              maxContentWait: TimeInterval,
+                              rules: RuleBox) async throws -> Outcome {
+        let webView = try ensureWebView(rules: rules.list)
 
         // 1. 加载页面：didFinish 或软超时取先到者。软超时到点 stopLoading
         //    （停止网络等待、保留已解析 DOM）后继续提取；取消时同样 stopLoading
@@ -253,23 +347,33 @@ final class WebRenderer: @unchecked Sendable {
     }
 
     @MainActor
-    private func ensureWebView() throws -> WKWebView {
-        if let webView { return webView }
+    private func ensureWebView(rules: WKContentRuleList?) throws -> WKWebView {
+        let allowLoopback = Self.localhostAllowedForTesting
+        if let webView, configuredAllowLoopback == allowLoopback {
+            navBox?.allowLoopbackForTesting = allowLoopback
+            return webView
+        }
+        // 豁免标志变了：规则集属于 configuration，创建后不可改，只能重建。
+        webView?.stopLoading()
+        self.webView = nil
+
         let configuration = WKWebViewConfiguration()
         // default()：跨工具调用保留 cookie/登录态（与外部浏览器桥行为一致）。
         configuration.websiteDataStore = .default()
-        if let blocklist = Self.compiledBlocklist {
-            configuration.userContentController.add(blocklist)
+        if let rules {
+            configuration.userContentController.add(rules)
         }
         let webView = WKWebView(frame: CGRect(x: 0, y: 0, width: 1440, height: 900),
                                 configuration: configuration)
         let nav = NavigationBox()
+        nav.allowLoopbackForTesting = allowLoopback
         let dialog = ScriptDialogBox()
         webView.navigationDelegate = nav
         webView.uiDelegate = dialog
         navBox = nav
         dialogBox = dialog
         self.webView = webView
+        configuredAllowLoopback = allowLoopback
         return webView
     }
 

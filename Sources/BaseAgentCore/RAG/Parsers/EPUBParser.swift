@@ -8,6 +8,13 @@ import SwiftSoup
 
 /// 归档读取：统一把 ZIPFoundation 的失败转换为 AgentError。
 enum RAGArchiveReader {
+    /// 单个 ZIP 条目的解压上限：防御压缩比极高的 zip bomb，同时容纳扫描版
+    /// EPUB 的整页图 / 整章 XHTML（常规数 MB，极端转制本可达数十 MB）。
+    /// 放宽到 128 MiB 是为了避免超限条目被静默跳过、整章正文丢失。
+    /// 不能只信目录里的 uncompressedSize（data descriptor 可为 0 或被伪造），
+    /// 解压时还要逐块累加校验。OfficeParser 复用同一上限。
+    static let maxEntryBytes = 128 * 1024 * 1024
+
     static func open(_ url: URL) throws -> Archive {
         do {
             return try Archive(url: url, accessMode: .read)
@@ -16,11 +23,19 @@ enum RAGArchiveReader {
         }
     }
 
-    static func data(_ archive: Archive, path: String) -> Data? {
+    static func data(_ archive: Archive, path: String,
+                     maxBytes: Int = RAGArchiveReader.maxEntryBytes) -> Data? {
         guard let entry = entry(archive, path: path) else { return nil }
+        guard entry.uncompressedSize <= UInt64(maxBytes) else { return nil }
         var data = Data()
         do {
-            _ = try archive.extract(entry) { data.append($0) }
+            // Consumer 是 throws 的：超限立即中断解压，不会把整条炸弹读进内存。
+            _ = try archive.extract(entry) { chunk in
+                guard data.count + chunk.count <= maxBytes else {
+                    throw AgentError.parse("归档条目超过解压上限：\(path)")
+                }
+                data.append(chunk)
+            }
             return data
         } catch {
             return nil

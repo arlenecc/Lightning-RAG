@@ -146,6 +146,105 @@ final class OfficeAndHTMLTests: XCTestCase {
         XCTAssertEqual(parsed.metadata["embedded_source"], "10.html")
     }
 
+    /// 外部 HTML 不得用 file:// 或 ../ 把知识库目录之外的本地文件内容带进索引。
+    func testHTMLFrameRejectsOutOfRootFileURLs() throws {
+        let outside = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("base-agent-outside-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: outside, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: outside) }
+        try "绝密：不应进入知识库的本地文件内容"
+            .write(to: outside.appendingPathComponent("secret.html"),
+                   atomically: true, encoding: .utf8)
+
+        let cases = [
+            outside.appendingPathComponent("secret.html").absoluteString,
+            "../\(outside.lastPathComponent)/secret.html",
+            "\(outside.path)/secret.html",
+        ]
+        for (index, reference) in cases.enumerated() {
+            let url = directory.appendingPathComponent("escape-\(index).html")
+            try """
+            <html><head><title>外壳</title></head><body>
+            <iframe src="\(reference)"></iframe>
+            </body></html>
+            """.write(to: url, atomically: true, encoding: .utf8)
+            XCTAssertThrowsError(try awaitSync {
+                try await HTMLParser().parse(url: url, options: ParserOptions(), progress: nil)
+            }, "引用 \(reference) 应被拒绝")
+            let parsed = try? awaitSync {
+                try await HTMLParser().parse(url: url, options: ParserOptions(), progress: nil)
+            }
+            XCTAssertFalse(parsed?.text.contains("绝密") == true)
+        }
+    }
+
+    /// 合法的同目录 / 子目录框架接力仍需正常工作。
+    func testHTMLFrameAllowsInRootFileURL() throws {
+        let frames = directory.appendingPathComponent("page_files", isDirectory: true)
+        try FileManager.default.createDirectory(at: frames, withIntermediateDirectories: true)
+        let target = frames.appendingPathComponent("body.html")
+        try """
+        <html><body><p>来自入口目录内 file:// 框架的正文内容，足够长以被选中。</p></body></html>
+        """.write(to: target, atomically: true, encoding: .utf8)
+        let url = directory.appendingPathComponent("page.html")
+        try """
+        <html><head><title>外壳</title></head><body>
+        <iframe src="\(target.absoluteString)"></iframe>
+        </body></html>
+        """.write(to: url, atomically: true, encoding: .utf8)
+
+        let parsed = try awaitSync {
+            try await HTMLParser().parse(url: url, options: ParserOptions(), progress: nil)
+        }
+        XCTAssertTrue(parsed.text.contains("入口目录内"), parsed.text)
+        XCTAssertEqual(parsed.metadata["embedded_source"], "body.html")
+    }
+
+    /// zip bomb：声明大小或实际解压量超限时必须返回 nil，且不能把整条数据读进内存。
+    func testArchiveReaderRejectsOversizedEntry() throws {
+        let archiveURL = directory.appendingPathComponent("bomb.zip")
+        let archive = try Archive(url: archiveURL, accessMode: .create)
+        // 高压缩比内容：1MB 的 'A' 压缩后只有几 KB，但解压会分配 1MB。
+        let payload = Data(repeating: 0x41, count: 1 << 20)
+        try archive.addEntry(with: "big.txt", type: .file,
+                             uncompressedSize: Int64(payload.count),
+                             compressionMethod: .deflate,
+                             provider: { position, size in
+                                 payload.subdata(in: Int(position)..<Int(position) + size)
+                             })
+        let read = try Archive(url: archiveURL, accessMode: .read)
+        XCTAssertNotNil(RAGArchiveReader.data(read, path: "big.txt"))
+        XCTAssertNil(RAGArchiveReader.data(read, path: "big.txt", maxBytes: 1024))
+    }
+
+    /// 默认上限放宽到 128 MiB：介于旧上限（64 MiB）与新上限之间的条目
+    /// 必须能通过预检，避免极端扫描版 EPUB 的整章正文被静默跳过。
+    func testArchiveReaderDefaultLimitIs128MiB() throws {
+        XCTAssertEqual(RAGArchiveReader.maxEntryBytes, 128 * 1024 * 1024)
+        let archiveURL = directory.appendingPathComponent("large-entry.zip")
+        let archive = try Archive(url: archiveURL, accessMode: .create)
+        let payload = Data(repeating: 0x41, count: 1 << 20)
+        // 声明 100 MiB（> 旧 64 MiB、< 新 128 MiB），实际只写 1 MiB：
+        // 只验证目录预检阈值，不真的分配上百 MB 内存。
+        try archive.addEntry(with: "big.txt", type: .file,
+                             uncompressedSize: Int64(100 * 1024 * 1024),
+                             compressionMethod: .deflate,
+                             provider: { position, size in
+                                 let start = Int(position)
+                                 guard start < payload.count else { return Data() }
+                                 return payload.subdata(
+                                    in: start..<min(start + size, payload.count))
+                             })
+        let read = try Archive(url: archiveURL, accessMode: .read)
+        XCTAssertEqual(read["big.txt"]?.uncompressedSize, UInt64(100 * 1024 * 1024))
+        XCTAssertNotNil(RAGArchiveReader.data(read, path: "big.txt",
+                                              maxBytes: RAGArchiveReader.maxEntryBytes),
+                        "100 MiB 条目在新默认上限内，不应被预检拒绝")
+        XCTAssertNil(RAGArchiveReader.data(read, path: "big.txt",
+                                          maxBytes: 64 * 1024 * 1024),
+                     "旧上限 64 MiB 会拒绝它（对照）")
+    }
+
     func testHTMLFramesetPicksLocalFrameWithMostContent() throws {
         try """
         <html><body><p>目录</p></body></html>

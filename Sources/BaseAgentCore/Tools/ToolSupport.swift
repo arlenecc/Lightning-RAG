@@ -218,12 +218,28 @@ public enum ToolSupport {
         return full
     }
 
-    /// 解析符号链接并标准化路径（等价 Python os.path.realpath）。
+    /// 解析符号链接并标准化路径（等价 Python `os.path.realpath`）。
+    ///
+    /// `URL.resolvingSymlinksInPath()` 在**尾部组件不存在**时不会展开中间的
+    /// symlink：`workspace/link/evil.txt` 会原样返回，看起来仍在 workspace 内，
+    /// 但随后由 OS 落盘时却写到了 link 指向的外部目录。这里先上溯到真实存在
+    /// 的祖先目录并 realpath，再逐段拼回缺失组件、每段重新解析 symlink。
     public static func realPath(_ path: String) -> String {
-        URL(fileURLWithPath: path)
-            .resolvingSymlinksInPath()
-            .standardizedFileURL
-            .path
+        let fm = FileManager.default
+        var url = URL(fileURLWithPath: path).standardizedFileURL
+        var missing: [String] = []
+        while !fm.fileExists(atPath: url.path) {
+            let parent = url.deletingLastPathComponent()
+            if parent.path == url.path { break }
+            missing.append(url.lastPathComponent)
+            url = parent
+        }
+        var resolved = url.resolvingSymlinksInPath().standardizedFileURL
+        for component in missing.reversed() {
+            resolved.appendPathComponent(component)
+            resolved = resolved.resolvingSymlinksInPath().standardizedFileURL
+        }
+        return resolved.path
     }
 
     /// workspace/.agent/<name> 状态文件路径。
@@ -237,6 +253,136 @@ public enum ToolSupport {
     public static func fileSize(_ path: String) -> Int {
         let attributes = try? FileManager.default.attributesOfItem(atPath: path)
         return (attributes?[.size] as? NSNumber)?.intValue ?? 0
+    }
+
+    // MARK: 多级记忆写保护
+
+    /// `memory/` 根目录（realpath 归一化）。L0/L1 会被逐字拼进 system prompt，
+    /// L2/L3/L4 由记忆引擎维护 —— 通用文件工具不得静默改写它们，否则一次
+    /// 提示词注入就能把指令持久化到后续所有会话。
+    public static func managedMemoryRoot(workspace: String) -> String {
+        realPath((workspace as NSString).appendingPathComponent("memory"))
+    }
+
+    /// 是否落在 `<workspace>/memory/` 目录树内（含 symlink 解析后的越界排除）。
+    public static func isManagedMemoryPath(_ fullPath: String, workspace: String) -> Bool {
+        let root = managedMemoryRoot(workspace: workspace)
+        let target = realPath(fullPath)
+        return target == root || target.hasPrefix(root + "/")
+    }
+
+    /// 会被逐字注入 system prompt 的两个文件：L0 META-SOP 与 L1 索引。
+    public static func isSystemPromptMemoryFile(_ fullPath: String, workspace: String) -> Bool {
+        guard isManagedMemoryPath(fullPath, workspace: workspace) else { return false }
+        let protected: Set<String> = ["memory_management_sop.md", "global_mem_insight.txt"]
+        return protected.contains((fullPath as NSString).lastPathComponent)
+    }
+
+    /// `file_write` 写入前守卫。协议只允许 `file_patch` 少量追加，故：
+    /// - L0/L1 一律不允许覆盖/重建（无论文件当前是否存在）；
+    /// - `memory/` 内已存在的其它文件不允许覆盖；
+    /// - 新建 L3 SOP 等文件允许，但由 `shouldConfirm` 强制人工复核。
+    public static func guardMemoryWrite(_ fullPath: String, workspace: String) throws {
+        guard isManagedMemoryPath(fullPath, workspace: workspace) else { return }
+        if isSystemPromptMemoryFile(fullPath, workspace: workspace) {
+            throw ToolError.message(
+                "拒绝用 file_write 写 `memory/` 的 L0/L1 文件：它们直接注入 system prompt。"
+                + "若确需修改，请用 file_patch 做词级修改（会请求用户确认）。")
+        }
+        if FileManager.default.fileExists(atPath: fullPath) {
+            throw ToolError.message(
+                "拒绝用 file_write 覆盖 `memory/` 内已有文件；按 META-SOP 只能 "
+                + "用 file_patch 少量追加（会请求用户确认）。")
+        }
+    }
+
+    // MARK: 工具确认（所见即所执行）
+
+    /// 确认弹窗单条参数上限。超限时保留头尾，绝不把危险尾部藏起来。
+    public static let maxConfirmChars = 12_000
+
+    /// 构造人工确认文案。
+    ///
+    /// 用户看到的内容必须与实际传给 `tool.run(args)` 的参数一致。旧实现只显示
+    /// 「首行注释/程序名摘要」，模型（或被网页/文档注入的模型）能把真正的危险
+    /// 命令藏在后续行里 —— 用户批准 A、实际执行 B。这里改为逐行引用完整原文，
+    /// 每行加 `| ` 前缀使内容里伪造的 UI 文本一眼可辨；超长时头尾截断。
+    public static func confirmationMessage(name: String,
+                                           args: [String: JSONValue]) -> String {
+        let executionKey: String? = name == "code_run" ? "code"
+            : (name == "shell_run" ? "command" : nil)
+        let body: String
+        if let executionKey {
+            body = optionalString(args, executionKey) ?? ""
+        } else {
+            body = JSONValue.object(args).jsonString(pretty: true)
+        }
+
+        var message = "即将调用工具 `\(name)`，以下是实际执行的完整参数：\n"
+        if executionKey != nil, let summary = executionSummary(body) {
+            message += "摘要（取自内容本身，不可作为审批依据）：\(summary)\n"
+        }
+        if body.isEmpty { message += "（参数为空）\n" }
+        message += quotedForConfirmation(body)
+
+        if let timeout = optionalDouble(args, "timeout") {
+            message += "\n超时：\(timeout)s"
+        }
+        if let executionKey {
+            var others: [String: JSONValue] = [:]
+            for (key, value) in args where key != executionKey && key != "timeout" {
+                others[key] = value
+            }
+            if !others.isEmpty {
+                message += "\n其它参数：" + JSONValue.object(others).jsonString()
+            }
+        }
+        return message + "\n\n是否继续？"
+    }
+
+    private static func quotedForConfirmation(_ text: String) -> String {
+        let truncated = text.count > maxConfirmChars
+        let shown = truncated ? truncateHeadTail(text, limit: maxConfirmChars) : text
+        let quoted = shown.split(separator: "\n", omittingEmptySubsequences: false)
+            .map { "| " + $0 }
+            .joined(separator: "\n")
+        let warning = truncated
+            ? "⚠ 参数共 \(text.count) 字符，超出确认框上限；下面只显示首尾片段。\n"
+            : ""
+        return warning + "----- 实际参数开始 -----\n"
+            + quoted + "\n----- 实际参数结束 -----"
+    }
+
+    /// 仅用于标题提示，绝不能替代上面的完整原文。
+    private static func executionSummary(_ text: String) -> String? {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return "（空）" }
+        if !trimmed.contains("\n") {
+            let program = trimmed.split(separator: " ").first.map(String.init) ?? ""
+            let known: [String: String] = [
+                "pip": "安装/管理 Python 包", "npm": "安装/管理 Node 包",
+                "brew": "安装/管理 macOS 软件", "git": "Git 版本控制操作",
+                "curl": "发起网络请求", "wget": "下载文件",
+                "python": "运行 Python 脚本", "python3": "运行 Python 脚本",
+                "node": "运行 Node 脚本", "rm": "删除文件/目录",
+                "mv": "移动/重命名文件", "cp": "复制文件",
+                "docker": "Docker 容器操作", "ssh": "SSH 远程连接",
+            ]
+            if let label = known[program] { return label }
+        }
+        for line in trimmed.split(separator: "\n") {
+            let value = line.trimmingCharacters(in: .whitespaces)
+            if value.hasPrefix("#") {
+                let comment = value.drop(while: { $0 == "#" }).trimmingCharacters(in: .whitespaces)
+                if !comment.isEmpty, !comment.hasPrefix("!") { return String(comment.prefix(80)) }
+            }
+            if value.hasPrefix("\"\"\"") || value.hasPrefix("'''") {
+                let doc = value.trimmingCharacters(in: CharacterSet(charactersIn: "\"' "))
+                if !doc.isEmpty { return String(doc.prefix(80)) }
+            }
+        }
+        let first = trimmed.split(separator: "\n").first.map(String.init) ?? trimmed
+        return "执行代码片段：" + String(first.prefix(60))
     }
 
     // MARK: 输出截断

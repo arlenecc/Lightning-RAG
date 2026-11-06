@@ -278,8 +278,13 @@ public final class AliasTool: AgentTool {
     }
 
     public func run(_ args: [String: JSONValue]) async throws -> ToolResult {
-        guard let registry else { return .fail("alias \(name) not bound") }
-        return try await registry.execute(targetName, args)
+        guard let registry, let target = registry.get(targetName) else {
+            return .fail("alias \(name) not bound")
+        }
+        // 确认由 AgentToolDispatcher 统一完成（shouldConfirm 已转发目标工具），
+        // 这里直接执行目标：避免二次弹窗，也避免 headless fail-closed 把
+        // 已经确认过的别名调用再次误拒。
+        return try await target.run(args)
     }
 }
 
@@ -348,9 +353,13 @@ public final class ToolRegistry {
         guard let tool = get(name) else {
             return .fail("unknown tool: \(name)")
         }
-        if tool.shouldConfirm(args), let callbacks {
-            let detail = JSONValue.object(args).jsonString()
-            let ok = callbacks.confirm("执行工具 \(name)？\n\(detail.prefix(800))")
+        if tool.shouldConfirm(args) {
+            // fail-closed：没有确认通道就绝不执行需要人工复核的工具。
+            // 旧实现 `if ..., let callbacks` 在 headless 下会静默跳过确认。
+            guard let callbacks else {
+                return .fail("工具 \(name) 需要人工确认，但当前没有确认通道（headless fail-closed）")
+            }
+            let ok = callbacks.confirm(ToolSupport.confirmationMessage(name: name, args: args))
             if !ok { return .fail("User denied") }
         }
         return try await tool.run(args)
@@ -401,12 +410,22 @@ public extension AgentCallbacks {
     func onError(_ message: String) {}
     func onContextShrunk(_ summary: String, _ reason: String) {}
     func onSkillSuggested(_ skill: SkillSuggestion) {}
-    func confirm(_ message: String) -> Bool { true }
+    /// 默认拒绝：没有实现人工确认通道的调用方（headless / 测试 / CLI）不得
+    /// 静默放行高风险工具。需要放行的场景必须显式使用 `AutoConfirmCallbacks`。
+    func confirm(_ message: String) -> Bool { false }
     func askUser(_ prompt: String) -> String? { nil }
     func onFinished() {}
 }
 
+/// 没有任何 UI 输出、且**默认拒绝**一切确认请求的回调（fail-closed）。
 public final class NoopCallbacks: AgentCallbacks {}
+
+/// 显式自动批准：仅供单元测试或完全受信任的无人值守自动化使用。
+/// 生产入口必须提供真实的人工确认实现（见 `AppModel.confirm`）。
+public final class AutoConfirmCallbacks: AgentCallbacks {
+    public init() {}
+    public func confirm(_ message: String) -> Bool { true }
+}
 
 // MARK: - Shared lightweight models
 
@@ -550,13 +569,27 @@ public func expandPath(_ path: String) -> String {
 /// 进程内简单日志（UI 通过 AgentCallbacks.onLog 接管展示）。
 public enum AgentLog {
     private static let queue = DispatchQueue(label: "base-agent.log")
+    /// 进程级兜底 sink：没有任务级 sink 时才生效（App 启动时接一次）。
     nonisolated(unsafe) public static var sink: ((String) -> Void)?
 
+    /// 任务局部 sink，优先于全局 sink：按调用链而不是进程全局路由日志。
+    /// `Task` / `async` 子调用会继承，`Task.detached` 不继承 —— 后台任务的
+    /// 日志不会再串进前台请求的收集器（全量测试里 KV 日志串扰的根因）。
+    @TaskLocal public static var taskSink: ((String) -> Void)?
+
+    /// 在当前任务上下文安装 sink，作用域结束自动失效，不触碰全局状态。
+    public static func withTaskSink<T: Sendable>(
+        _ handler: @escaping (String) -> Void,
+        _ body: () async throws -> T) async rethrows -> T {
+        try await $taskSink.withValue(handler, operation: body)
+    }
+
     public static func info(_ message: String) {
+        let local = taskSink
         queue.sync {
             let line = "[\(Self.timestamp())] \(message)"
             FileHandle.standardError.write((line + "\n").data(using: .utf8)!)
-            sink?(line)
+            if let local { local(line) } else { sink?(line) }
         }
     }
 
