@@ -9,12 +9,26 @@ public struct MCPServerConfig: Codable, Sendable, Equatable {
     public var command: String
     public var args: [String]
     public var env: [String: String]
+    /// 非空时走 Streamable HTTP 直连该端点（忽略 command/args/env）。
+    public var url: String?
 
-    public init(name: String, command: String, args: [String] = [], env: [String: String] = [:]) {
+    public init(name: String, command: String, args: [String] = [],
+                env: [String: String] = [:], url: String? = nil) {
         self.name = name
         self.command = command
         self.args = args
         self.env = env
+        self.url = url
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        name = try container.decode(String.self, forKey: .name)
+        // HTTP 直连形态可以没有 command；旧配置一律有。
+        command = try container.decodeIfPresent(String.self, forKey: .command) ?? ""
+        args = try container.decodeIfPresent([String].self, forKey: .args) ?? []
+        env = try container.decodeIfPresent([String: String].self, forKey: .env) ?? [:]
+        url = try container.decodeIfPresent(String.self, forKey: .url)
     }
 }
 

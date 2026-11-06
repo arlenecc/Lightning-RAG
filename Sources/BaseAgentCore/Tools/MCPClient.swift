@@ -12,15 +12,17 @@ public struct MCPClientError: Error, LocalizedError, Sendable {
     public var errorDescription: String? { message }
 }
 
-// MARK: - 官方 SDK stdio 客户端封装
+// MARK: - 官方 SDK MCP 客户端封装（stdio 子进程 / Streamable HTTP 双形态）
 //
-/// 基于官方 MCP Swift SDK（`Client` + `StdioTransport`）的 MCP 客户端。
+/// 基于官方 MCP Swift SDK 的 MCP 客户端，支持两种接入形态：
+/// - **stdio**：`init(name:command:...)` 拉起子进程，`ProcessPipeTransport` 走管道；
+/// - **HTTP**：`init(name:url:...)` 直连 Streamable HTTP 端点（SDK
+///   `HTTPClientTransport`），无需子进程。
 ///
 /// SDK 负责协议层：initialize 握手与版本协商（2025-11-25 / 2025-06-18 /
 /// 2025-03-26 / 2024-11-05）、JSON-RPC 编解码、请求响应配对、通知分发、
 /// 服务端反向请求。本类只负责：
-/// - 子进程生命周期：PATH 查找、环境变量合并、启动失败上报；
-/// - 进程退出感知：terminationHandler → 断开 SDK 客户端（挂起请求立即失败）；
+/// - 形态一的生命周期：子进程 PATH 查找、环境变量合并、退出感知；
 /// - 超时控制：SDK 无内置超时，统一用任务组竞速实现；
 /// - 工具清单缓存与 `notifications/tools/list_changed` 回调（`onToolsChanged`）；
 /// - 结果渲染：content 数组 → 文本，超长截断。
@@ -29,6 +31,8 @@ public final class MCPClient: @unchecked Sendable {
     public let command: String
     public let args: [String]
     public let env: [String: String]
+    /// 非空 = Streamable HTTP 直连形态（无子进程）。
+    public let remoteURL: URL?
     public let timeout: TimeInterval
     public let maxOutputChars: Int
 
@@ -49,6 +53,7 @@ public final class MCPClient: @unchecked Sendable {
     /// 服务端通知 tools/list_changed 后回调最新工具清单。
     public var onToolsChanged: (([JSONValue]) -> Void)?
 
+    /// stdio 形态：拉起 `command` 子进程走管道。
     public init(name: String, command: String, args: [String] = [],
                 env: [String: String] = [:], timeout: TimeInterval = 30,
                 maxOutputChars: Int = 200_000) {
@@ -56,13 +61,31 @@ public final class MCPClient: @unchecked Sendable {
         self.command = command
         self.args = args
         self.env = env
+        self.remoteURL = nil
         self.timeout = max(1, timeout)
         self.maxOutputChars = max(1, maxOutputChars)
     }
 
+    /// HTTP 形态：直连 Streamable HTTP 端点（如本机 RAG MCP 服务）。
+    public init(name: String, url: String, timeout: TimeInterval = 30,
+                maxOutputChars: Int = 200_000) {
+        self.name = name
+        self.command = ""
+        self.args = []
+        self.env = [:]
+        self.remoteURL = URL(string: url)
+        self.timeout = max(1, timeout)
+        self.maxOutputChars = max(1, maxOutputChars)
+    }
+
+    /// 按配置自动选择形态：`url` 非空走 HTTP，否则 stdio。
     public convenience init(config: MCPServerConfig, timeout: TimeInterval = 30) {
-        self.init(name: config.name, command: config.command,
-                  args: config.args, env: config.env, timeout: timeout)
+        if let url = config.url, !url.isEmpty {
+            self.init(name: config.name, url: url, timeout: timeout)
+        } else {
+            self.init(name: config.name, command: config.command,
+                      args: config.args, env: config.env, timeout: timeout)
+        }
     }
 
     deinit {
@@ -116,6 +139,35 @@ public final class MCPClient: @unchecked Sendable {
     }
 
     private func performStart() async throws {
+        if let endpoint = remoteURL {
+            guard endpoint.scheme == "http" || endpoint.scheme == "https" else {
+                throw MCPClientError("MCP 服务 '\(name)' 的端点非法：\(endpoint.absoluteString)")
+            }
+            try await performStartHTTP(endpoint)
+        } else {
+            try await performStartStdio()
+        }
+    }
+
+    /// HTTP 形态：官方 `HTTPClientTransport` 直连，无子进程。
+    private func performStartHTTP(_ endpoint: URL) async throws {
+        let client = MCP.Client(name: "base-agent", version: AppVersion.current)
+        self.setSDKClient(client)
+        lock.lock(); running = true; lock.unlock()
+        do {
+            let info = try await withTimeout(timeout, "initialize") {
+                let transport = MCP.HTTPClientTransport(endpoint: endpoint, streaming: true)
+                return try await client.connect(transport: transport)
+            }
+            try await finishHandshake(client: client, info: info)
+        } catch {
+            stop()
+            throw error
+        }
+    }
+
+    /// stdio 形态：拉起子进程，`ProcessPipeTransport` 走管道。
+    private func performStartStdio() async throws {
         // 重连时必须使用全新的 Process / Pipe / Client / Transport：
         // Process 不能重复 run，SDK Client 断开后也不应复用。
         let process = Process()
@@ -177,7 +229,6 @@ public final class MCPClient: @unchecked Sendable {
             AgentLog.warning("MCP[stderr]: \(String(text.prefix(500)))")
         }
 
-
         // 事件驱动管道 Transport（不用官方 StdioTransport：其 10ms 轮询抛错
         // 在 XCTest 错误观察钩子下会饿死协作线程池，见 ProcessPipeTransport 注释）。
         let transport = ProcessPipeTransport(
@@ -188,33 +239,39 @@ public final class MCPClient: @unchecked Sendable {
             version: AppVersion.current)
         self.setSDKClient(client)
 
-
         do {
             let info = try await withTimeout(timeout, "initialize") {
                 try await client.connect(transport: transport)
             }
-            let infoValue = try JSONValue(sdkValue: .object([
-                "protocolVersion": .string(info.protocolVersion),
-                "serverInfo": (try? MCP.Value(info.serverInfo)) ?? .null,
-            ]))
-            lock.lock()
-            serverInfo = infoValue
-            lock.unlock()
-
-            await client.onNotification(MCP.ToolListChangedNotification.self) {
-                [weak self] _ in
-                guard let self else { return }
-                // SDK 消息循环会内联 await 本处理器；refreshTools 的
-                // listTools 响应同样要经该循环分发，内联等待会自等自死锁
-                // （通知 → 等清单响应 → 响应又只能由被阻塞的循环处理）。
-                // 必须脱开到非结构化 Task，让循环立刻继续消费消息。
-                Task { await self.handleToolsChanged() }
-            }
-            try await refreshTools()
+            try await finishHandshake(client: client, info: info)
         } catch {
             stop()
             throw error
         }
+    }
+
+    /// 握手公共尾部：记录 serverInfo、注册 tools/list_changed 处理器、
+    /// 拉取初始工具清单。
+    private func finishHandshake(client: MCP.Client,
+                                 info: MCP.Initialize.Result) async throws {
+        let infoValue = try JSONValue(sdkValue: .object([
+            "protocolVersion": .string(info.protocolVersion),
+            "serverInfo": (try? MCP.Value(info.serverInfo)) ?? .null,
+        ]))
+        lock.lock()
+        serverInfo = infoValue
+        lock.unlock()
+
+        await client.onNotification(MCP.ToolListChangedNotification.self) {
+            [weak self] _ in
+            guard let self else { return }
+            // SDK 消息循环会内联 await 本处理器；refreshTools 的
+            // listTools 响应同样要经该循环分发，内联等待会自等自死锁
+            // （通知 → 等清单响应 → 响应又只能由被阻塞的循环处理）。
+            // 必须脱开到非结构化 Task，让循环立刻继续消费消息。
+            Task { await self.handleToolsChanged() }
+        }
+        try await refreshTools()
     }
 
     private func currentSDKClient() -> MCP.Client? {
@@ -254,7 +311,7 @@ public final class MCPClient: @unchecked Sendable {
         return tools
     }
 
-    /// 终止进程并断开 SDK 客户端。幂等。
+    /// 断开连接（stdio 形态同时终止子进程）。幂等。
     public func stop() {
         lock.lock()
         running = false
@@ -263,20 +320,23 @@ public final class MCPClient: @unchecked Sendable {
         let pid = process.processIdentifier
         lock.unlock()
 
-        stderrPipe.fileHandleForReading.readabilityHandler = nil
+        if remoteURL == nil {
+            // stdio 形态才有的子进程/管道清理。
+            stderrPipe.fileHandleForReading.readabilityHandler = nil
 
-        if process.isRunning {
-            // MCP 子进程通常是 npx/node 包装：必须连同子进程树一起终止。
-            if pid > 0 {
-                ToolProcessRunner.terminateProcessTree(pid: pid, signal: SIGTERM)
-                ToolProcessRunner.terminateProcessTree(pid: pid, signal: SIGKILL)
-            } else {
-                process.terminate()
+            if process.isRunning {
+                // MCP 子进程通常是 npx/node 包装：必须连同子进程树一起终止。
+                if pid > 0 {
+                    ToolProcessRunner.terminateProcessTree(pid: pid, signal: SIGTERM)
+                    ToolProcessRunner.terminateProcessTree(pid: pid, signal: SIGKILL)
+                } else {
+                    process.terminate()
+                }
             }
+            try? stdinPipe.fileHandleForWriting.close()
+            try? stdoutPipe.fileHandleForReading.close()
+            try? stderrPipe.fileHandleForReading.close()
         }
-        try? stdinPipe.fileHandleForWriting.close()
-        try? stdoutPipe.fileHandleForReading.close()
-        try? stderrPipe.fileHandleForReading.close()
 
         if let client {
             // 断开会取消全部挂起请求（SDK 行为），无需自己维护 pending 表。
