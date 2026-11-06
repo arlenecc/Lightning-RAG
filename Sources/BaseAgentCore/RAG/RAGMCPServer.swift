@@ -5,12 +5,12 @@ import Network
 // MARK: - RAG MCP 服务（官方 MCP Swift SDK，2025-11-25 规范）
 //
 // 协议层（JSON-RPC 编解码、版本协商、会话管理、Origin/协议版本校验、SSE 流）
-// 全部由官方 SDK 承担：HTTP 模式用 `StatefulHTTPServerTransport`（每个会话一个
-// transport + server），stdio 模式用 `StdioTransport`（见 rag-mcp-stdio 可执行）。
+// 全部由官方 SDK 承担：HTTP 模式用 `StatefulHTTPServerTransport`
+// （每个会话一个 transport + server）。
 // 本文件只负责：
 // - HTTP 前端：NWListener + 极简 HTTP/1.1 解析，把请求喂给对应会话的 transport；
 // - 工具层：`RAGMCPToolset` 把 RAGEngine 能力注册成 SDK Server 的 tools/list、
-//   tools/call 处理器（HTTP / stdio / 测试共用同一套）。
+//   tools/call 处理器（HTTP / 测试共用同一套）。
 
 /// RAG MCP 服务监听配置。`listenLAN=false` 只绑 127.0.0.1（默认），
 /// `true` 绑 0.0.0.0 允许局域网访问。
@@ -846,5 +846,5 @@ extension NSString {
 
 /// App 版本号（Info.plist 优先，回退脚本维护的发布版本）。
 public enum AppVersion {
-    public static var current: String = "1.2.18"
+    public static var current: String = "1.2.19"
 }

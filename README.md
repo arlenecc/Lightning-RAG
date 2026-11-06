@@ -52,8 +52,8 @@ VARIANT=lite  scripts/package-app.sh release && VARIANT=lite  scripts/package-dm
 
 | VARIANT | 内置模型 | DMG |
 |---|---|---|
-| `clean`（默认） | 无；potion 语义切片 / jina embedding / jina reranker 均在首次启动时从 hf-mirror 自动下载 | `dist/Lightning-RAG-1.2.18-clean.dmg` |
-| `lite` | potion-multilingual-128M int4（语义切片）+ jina-embeddings-v5-text-nano-mlx-int4 + jina-reranker-v2-base-multilingual-onnx | `dist/Lightning-RAG-1.2.18-lite.dmg` |
+| `clean`（默认） | 无；potion 语义切片 / jina embedding / jina reranker 均在首次启动时从 hf-mirror 自动下载 | `dist/Lightning-RAG-1.2.19-clean.dmg` |
+| `lite` | potion-multilingual-128M int4（语义切片）+ jina-embeddings-v5-text-nano-mlx-int4 + jina-reranker-v2-base-multilingual-onnx | `dist/Lightning-RAG-1.2.19-lite.dmg` |
 
 两个版本共用 `dist/Lightning-RAG.app`（应用本体与显示名不变，只有内置模型不同），
 因此需按「打包 App → 打包 DMG」的顺序逐个构建。两个版本都不含主模型、辅助模型
@@ -73,7 +73,7 @@ HTML 与 Office 解析另有专项覆盖：HTML 保存页的本地 iframe / fram
 ## RAG MCP 服务（对外接入）
 
 协议实现基于官方 [MCP Swift SDK](https://github.com/modelcontextprotocol/swift-sdk)
-（vendor 在 `Vendor/mcp-swift-sdk/`，2025-11-25 规范：Streamable HTTP + stdio 两种传输、
+（vendor 在 `Vendor/mcp-swift-sdk/`，2025-11-25 规范：Streamable HTTP 传输、
 协议版本协商、会话管理、SSE 流、Origin 防回绑校验均由官方实现承担）。
 本机知识库通过 7 个 MCP 工具对外暴露：`parse_and_ingest_document`、`delete_document`
 （别名 `forget_context`）、`list_document`、`extract_metadata`、
@@ -89,23 +89,13 @@ HTML 与 Office 解析另有专项覆盖：HTML 保存页的本地 iframe / fram
 - 安全（规范 MUST）：本机模式校验 Host/Origin 防 DNS rebinding，非本机来源 403；
   不支持的 `MCP-Protocol-Version` 返回 400；非 initialize 请求缺会话头 400、未知会话 404。
 
-### stdio（子进程接入）
-
-包内可执行文件 `rag-mcp-stdio`（`.app` 内位于
-`Contents/MacOS/rag-mcp-stdio`，源码调试用 `swift run rag-mcp-stdio`），
-与 App 共用 `~/.base-agent/config.json` 与知识库，日志走 stderr、协议走 stdout：
-
-```bash
-rag-mcp-stdio [--config <config.json>] [--kb <知识库目录>]
-```
-
-客户端（Claude Desktop / Claude Code 等）接入示例：
+客户端（Claude Desktop / Claude Code 等支持 Streamable HTTP 的应用）接入示例：
 
 ```json
 {
   "mcpServers": {
     "lightning-rag": {
-      "command": "/Applications/Lightning-RAG.app/Contents/MacOS/rag-mcp-stdio"
+      "url": "http://127.0.0.1:8080/mcp"
     }
   }
 }
@@ -352,7 +342,6 @@ Sources/
     Skills/                    # 技能发现、索引、语义检索
     Agent/                     # Agent 门面、工具工厂、系统提示
   BaseAgentApp/                # SwiftUI 界面
-  RAGMCPStdio/                 # MCP stdio 服务入口（rag-mcp-stdio）
 Vendor/mcp-swift-sdk/          # 官方 MCP Swift SDK（本地 vendor）
 Tests/BaseAgentCoreTests/      # XCTest
 docs/软件设计文档.md

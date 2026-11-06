@@ -2,12 +2,6 @@ import Darwin
 import Foundation
 import MCP
 
-#if canImport(System)
-    import System
-#else
-    @preconcurrency import SystemPackage
-#endif
-
 // MARK: - 错误
 
 /// MCP 客户端错误（进程管理 / 超时 / 结果渲染）。协议层错误由官方 SDK 的
@@ -147,6 +141,7 @@ public final class MCPClient: @unchecked Sendable {
         }
 
         lock.lock(); running = true; lock.unlock()
+
         do {
             try process.run()
         } catch {
@@ -182,14 +177,17 @@ public final class MCPClient: @unchecked Sendable {
             AgentLog.warning("MCP[stderr]: \(String(text.prefix(500)))")
         }
 
-        // 官方 StdioTransport 直读子进程 stdout / 直写子进程 stdin。
-        let transport = MCP.StdioTransport(
-            input: FileDescriptor(rawValue: stdoutPipe.fileHandleForReading.fileDescriptor),
-            output: FileDescriptor(rawValue: stdinPipe.fileHandleForWriting.fileDescriptor))
+
+        // 事件驱动管道 Transport（不用官方 StdioTransport：其 10ms 轮询抛错
+        // 在 XCTest 错误观察钩子下会饿死协作线程池，见 ProcessPipeTransport 注释）。
+        let transport = ProcessPipeTransport(
+            input: stdoutPipe.fileHandleForReading.fileDescriptor,
+            output: stdinPipe.fileHandleForWriting.fileDescriptor)
         let client = MCP.Client(
             name: "base-agent",
             version: AppVersion.current)
         self.setSDKClient(client)
+
 
         do {
             let info = try await withTimeout(timeout, "initialize") {
@@ -206,7 +204,11 @@ public final class MCPClient: @unchecked Sendable {
             await client.onNotification(MCP.ToolListChangedNotification.self) {
                 [weak self] _ in
                 guard let self else { return }
-                await self.handleToolsChanged()
+                // SDK 消息循环会内联 await 本处理器；refreshTools 的
+                // listTools 响应同样要经该循环分发，内联等待会自等自死锁
+                // （通知 → 等清单响应 → 响应又只能由被阻塞的循环处理）。
+                // 必须脱开到非结构化 Task，让循环立刻继续消费消息。
+                Task { await self.handleToolsChanged() }
             }
             try await refreshTools()
         } catch {

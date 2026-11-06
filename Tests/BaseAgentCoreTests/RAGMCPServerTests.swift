@@ -3,7 +3,7 @@ import XCTest
 @testable import BaseAgentCore
 
 /// 对接 RAG MCP 服务（官方 MCP Swift SDK，Streamable HTTP）的端到端测试。
-/// 覆盖：官方 SDK 客户端全链路 / 原始 HTTP 协议行为 / stdio 共用工具层 / 生命周期。
+/// 覆盖：官方 SDK 客户端全链路 / 原始 HTTP 协议行为 / InMemory 共用工具层 / 生命周期。
 final class RAGMCPServerTests: XCTestCase {
     private var directory: URL!
 

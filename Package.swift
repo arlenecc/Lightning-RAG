@@ -7,8 +7,6 @@ let package = Package(
     products: [
         .library(name: "BaseAgentCore", targets: ["BaseAgentCore"]),
         .executable(name: "Lightning-RAG", targets: ["BaseAgentApp"]),
-        // RAG 知识库的 MCP stdio 服务：供 Claude Desktop 等以子进程方式接入
-        .executable(name: "rag-mcp-stdio", targets: ["RAGMCPStdio"]),
     ],
     dependencies: [
         // Tokenizer：swift-transformers 的 Tokenizers 模块
@@ -27,6 +25,8 @@ let package = Package(
         .package(url: "https://github.com/huggingface/swift-jinja.git", from: "2.5.2"),
         // 官方 MCP Swift SDK（本地 vendor，见 Vendor/mcp-swift-sdk/README.md）
         .package(path: "Vendor/mcp-swift-sdk"),
+        // BaseAgentCore 自定义 Transport 需要实现官方协议的 logger 字段
+        .package(url: "https://github.com/apple/swift-log.git", from: "1.5.0"),
     ],
     targets: [
         // sqlite-vec v0.1.9 amalgamation，静态编入进程（SQLITE_CORE 模式）
@@ -69,6 +69,7 @@ let package = Package(
                 .product(name: "AEXML", package: "AEXML"),
                 .product(name: "SwiftSoup", package: "SwiftSoup"),
                 .product(name: "MCP", package: "mcp-swift-sdk"),
+                .product(name: "Logging", package: "swift-log"),
             ],
             path: "Sources/BaseAgentCore",
             resources: [
@@ -84,13 +85,6 @@ let package = Package(
             dependencies: ["BaseAgentCore"],
             path: "Sources/BaseAgentApp",
             resources: [.process("Resources")],
-            swiftSettings: [.swiftLanguageMode(.v5)]
-        ),
-        // MCP stdio 服务入口：同一套 RAG MCP 工具层，走官方 StdioTransport
-        .executableTarget(
-            name: "RAGMCPStdio",
-            dependencies: ["BaseAgentCore"],
-            path: "Sources/RAGMCPStdio",
             swiftSettings: [.swiftLanguageMode(.v5)]
         ),
         .testTarget(
