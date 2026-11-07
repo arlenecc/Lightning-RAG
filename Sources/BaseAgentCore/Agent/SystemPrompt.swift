@@ -73,11 +73,7 @@ Paths are relative to the workspace. `code_run`, `shell_run`, writes under `memo
 """
 
 public enum SystemPromptLimits {
-    public static let maxInjectedFacts = 20
-    public static let maxFactsChars = 2_000
-    public static let maxFactChars = 120
     public static let maxSkillPromptChars = 1_500
-    public static let maxDailyFacts = 200
     /// 工作记忆注入上限：模型自建 key 不受上下文压缩约束，必须在注入侧封顶。
     public static let maxWorkMemoryKeys = 20
     public static let maxWorkMemoryChars = 2_000

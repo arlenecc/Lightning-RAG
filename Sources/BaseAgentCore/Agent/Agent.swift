@@ -157,7 +157,8 @@ private final class AgentKernelHooks: KernelHooks {
     weak var agent: Agent?
     init(agent: Agent) { self.agent = agent }
 
-    /// 只在「上下文占用 >90%」的自动收缩时生成并回注旧上下文摘要。
+    /// 只在「上下文占用 >90%」的自动收缩时回注旧上下文摘要（逐轮自带
+    /// summary 的确定性折叠，不调 LLM）。
     /// 每 8 轮的周期性折叠走丢弃式路径（保留最近 2 轮原文），不经过这里、不回注任何内容。
     func consolidated(_ session: Session, reason: String) async -> Bool {
         guard reason == "context-90" else { return false }
@@ -241,6 +242,9 @@ public final class Agent: @unchecked Sendable {
     private let backgroundTaskLock = NSLock()
     private var backgroundTask: Task<Void, Never>?
     private var backgroundGeneration = 0
+    /// 后台事实抽取的文件游标：每 4 小时一次，增量读当天 raw_session 记录。
+    /// 状态全部持久化在 cursor 文件里，不占用会话内存、与折叠边界无关。
+    private let factExtractionWorker: FactExtractionWorker
     private let autoContinueMax = 4
     public var autoContinue = true
 
@@ -274,6 +278,7 @@ public final class Agent: @unchecked Sendable {
         memoryDir.ensureLayout()
         self.memoryDirectory = memoryDir
         self.rawSessionStore = RawSessionStore(directory: memoryDir)
+        self.factExtractionWorker = FactExtractionWorker(directory: memoryDir)
         let sharedSOPTracker = SOPReadTracker()
         self.sopReadTracker = sharedSOPTracker
         // 内核预算不能超过模型实际生效的上下文，否则消息会撑破 KV 硬上限。
@@ -760,6 +765,8 @@ public final class Agent: @unchecked Sendable {
     }
 
     func onFoldBoundary(reason: String, tools: [JSONValue]) async {
+        // 事实抽取已改为按 4h 增量读落盘的 raw_session 文件，不依赖折叠边界；
+        // 被清掉的旧轮全文早由 RawSessionStore 逐轮落盘，不会丢。
         advanceSystemFoldEpoch()
         freezeRequestSystemPrompt(force: true)
         guard let warmup = llm as? WarmupLLMService else { return }
@@ -841,45 +848,22 @@ public final class Agent: @unchecked Sendable {
         if let cachedDynamicContext { return cachedDynamicContext }
         var sections: [String] = []
 
-        // 工作记忆 + 当天自动抽取事实。
+        // 工作记忆。事实抽取只写 memory graph，不再维护/回注当日 `__auto_facts__`。
         let work = tools.workMemory ?? workMemory
         var compact: [String: String] = [:]
-        var todayFacts: [String] = []
         var workMemoryChars = 0
         for (key, value) in work.list().sorted(by: { $0.key < $1.key }) {
-            if key == "__auto_facts__" {
-                todayFacts = Self.parseDailyFacts(value).1
-                continue
-            }
+            // 旧版本残留的自动事实键直接跳过：事实统一由 memory graph 检索。
+            if key == "__auto_facts__" { continue }
             guard compact.count < SystemPromptLimits.maxWorkMemoryKeys,
                   workMemoryChars < SystemPromptLimits.maxWorkMemoryChars else { continue }
             let capped = value.count > 200 ? String(value.prefix(200)) + "…" : value
             compact[key] = capped
             workMemoryChars += capped.count
         }
-        if !todayFacts.isEmpty || !compact.isEmpty {
-            var workParts: [String] = []
-            if !todayFacts.isEmpty {
-                var capped: [String] = []
-                var used = 0
-                for fact in todayFacts {
-                    if capped.count >= SystemPromptLimits.maxInjectedFacts ||
-                        used >= SystemPromptLimits.maxFactsChars { break }
-                    let item = fact.count <= SystemPromptLimits.maxFactChars
-                        ? fact : String(fact.prefix(SystemPromptLimits.maxFactChars)) + "…"
-                    capped.append(item)
-                    used += item.count
-                }
-                var block = capped.map { "- \($0)" }.joined(separator: "\n")
-                let dropped = todayFacts.count - capped.count
-                if dropped > 0 { block += "\n- (…\(dropped) more omitted)" }
-                workParts.append("# Today's facts (auto-extracted)\n" + block)
-            }
-            if !compact.isEmpty {
-                workParts.append("# Work memory (scratchpad)\n"
-                    + JSONValue.object(compact.mapValues { .string($0) }).jsonString())
-            }
-            sections.append(workParts.joined(separator: "\n\n"))
+        if !compact.isEmpty {
+            sections.append("# Work memory (scratchpad)\n"
+                + JSONValue.object(compact.mapValues { .string($0) }).jsonString())
         }
 
         // 检查点常驻注入：优先 Session（本轮工具实时更新），其次持久化文件。
@@ -936,44 +920,29 @@ public final class Agent: @unchecked Sendable {
 
     // MARK: 上下文 >90% 自动收缩（唯一会回注旧摘要的路径）
 
-    /// 用辅助模型把旧对话压成一条要点摘要，回注到 `<earlier_context>`。
-    /// 旧轮本身直接丢弃（不生成逐轮摘要行），避免摘要越堆越占上下文。
-    /// 周期性折叠不调这里 —— 那条路径直接清空历史、从 system 重新开始。
+    /// 旧轮自带逐轮摘要（`TurnRecord.summary` → `digestLine()`），不再为此
+    /// 额外调一次 LLM：这次调用原本在内核循环里同步 await，上下文已经吃紧
+    /// 时还要等辅助模型（或主模型 isolated 副本）生成几百字，会直接卡住
+    /// 当前轮响应。改为确定性折叠（合并连续重复 + 保留最近若干行）。
+    /// 周期性折叠走 `discardHistory`，连回注都不做，两条路径都不调模型。
     func shrinkSession(reason: String) async -> Bool {
         guard session.turns.count > 1 else { return false }
         let old = Array(session.turns.dropLast())
-        let transcript = old.map { turn in
-            let results = turn.toolResults.map { String($0.content.prefix(400)) }.joined()
-            return "\(turn.digestLine())\n\(turn.assistantText.prefix(600))\(results)"
-        }.joined(separator: "\n")
-
-        let prompt = """
-        把下面的对话压缩成要点摘要，只保留：
-        1. 用户的核心需求与当前目标 2. 已做的决定及原因
-        3. 已完成的步骤与结果（含工具关键输出） 4. 未完成的子任务与下一步
-        5. 具体路径、数值、标识符、配置值、偏好、URL 6. 错误/警告等需注意的事项
-
-        要求：只输出要点列表，不要前言或解释；不要复述对话；不要编造。
-
-        对话历史:
-        \(transcript)
-        """
-        let summary = await collectChat([
-            ChatMessage(role: .system,
-                        content: "你是精确的对话摘要器，用中文输出要点列表，不加前言和解释。"),
-            ChatMessage(role: .user, content: prompt),
-        ], temperature: 0.2)
-        let final = summary.isEmpty
-            ? old.map { $0.digestLine() }.joined(separator: "; ")
-            : summary
+        let final = l3Fold(old.map { $0.digestLine() },
+                           maxLines: session.maxDigestLines)
+        guard !final.isEmpty else { return false }
         appendMemorySummary(final, reason: reason)
         let folded = session.discardTurns(old.count)
-        let digestLine = "[摘要 \(Self.timeString())] \(final.prefix(400))"
+        // 回注区有字数上限：保头保尾，避免只留最老几轮、丢掉最近的结论。
+        let brief = final.count <= 400
+            ? final
+            : String(final.prefix(200)) + "\n…\n" + String(final.suffix(180))
+        let digestLine = "[摘要 \(Self.timeString())] \(brief)"
         session.appendDigest(digestLine)
-        // 改进2：自动收缩生成的上下文摘要也追加进当天 digest 文件，
-        // 保证"当天对话摘要历史"不因只统计逐轮快照而缺项。
+        // 改进2：折叠摘要也追加进当天 digest 文件，保证"当天对话摘要历史"
+        // 不因只统计逐轮快照而缺项。
         rawSessionStore.appendFoldedDigest([digestLine])
-        log("[context] 自动收缩：丢弃 \(folded) 轮，回注 1 条摘要（reason: \(reason)）")
+        log("[context] 自动收缩：丢弃 \(folded) 轮，回注逐轮自带摘要（reason: \(reason)）")
         callbacks.onContextShrunk(final, reason)
         return true
     }
@@ -985,30 +954,18 @@ public final class Agent: @unchecked Sendable {
         try? AtomicFile.write(existing + entry, to: path)
     }
 
-    // MARK: 结束后：事实抽取 + L4 蒸馏
+    // MARK: 结束后：后台事实抽取 + L4 蒸馏
 
+    /// 事实抽取是**文件驱动的后台任务**：每 4 小时最多一次，增量读取当天
+    /// `raw_session/<date>.txt` 里新增的完整 SESSION 块，只用辅助模型、只写
+    /// memory graph。既不逐轮跑、也绝不回退主模型，因此不会与前台抢 GPU。
+    /// 其它后台工作（历史提炼 / 记忆整理 / L4 蒸馏）仍按原策略执行。
     func fireFinished(text: String, distillRequested: Bool? = nil,
                       substantive: Bool = true,
                       isGreeting: Bool = false) {
-        // 与参考实现一致：取最近 6 条 User/Assistant 消息（交替），而不是每轮只取一条。
-        var recentLines: [String] = []
-        for turn in session.turns.reversed() {
-            let prompt = turn.prompt.trimmingCharacters(in: .whitespacesAndNewlines)
-            if !prompt.isEmpty {
-                recentLines.append("User: \(prompt)")
-                if recentLines.count >= 6 { break }
-            }
-            let assistant = turn.assistantText.trimmingCharacters(in: .whitespacesAndNewlines)
-            if !assistant.isEmpty {
-                recentLines.append("Assistant: \(assistant)")
-                if recentLines.count >= 6 { break }
-            }
-        }
-        let recent = recentLines.reversed().joined(separator: "\n\n")
         let user = lastUserText.trimmingCharacters(in: .whitespacesAndNewlines)
-        // 简单请求往往一句话（「查下 xx 文件多少行」+「120 行」），
-        // 阈值放宽到 6/8 字。寒暄不做事实抽取/蒸馏，但仍要消费归档队列。
-        let canExtract = !isGreeting && user.count >= 6 && text.count >= 8 && !recent.isEmpty
+        // 寒暄/能力问询不做蒸馏；此处只判断本轮是否值得做 L4 经验蒸馏。
+        let substantiveTurn = !isGreeting && user.count >= 6 && text.count >= 8
 
         // 改进7：待提炼队列是**持久化**的，寒暄轮、辅助模型暂不可用、后台任务
         // 被下一次 run 取消等情况都不会丢，本轮或下一轮重新拾起即可。
@@ -1017,33 +974,41 @@ public final class Agent: @unchecked Sendable {
         // 后台用辅助引擎产出建议、不改记忆文件。
         let tidyEvery = max(8, config.kernelConsolidateEvery)
         let shouldTidy = !isGreeting && session.currentTurn >= readLastMemoryTidyTurn() + tidyEvery
-        let hasLLMWork = canExtract || hasPending || shouldTidy
+        let shouldDistill = substantiveTurn && substantive
+            && (distillRequested ?? kernel.distillRequested)
+        // 事实抽取必须满足：有辅助模型（唯一允许的模型）+ 距上次成功 ≥4h
+        // + 当天文件有新增的完整 session。
+        let factDue = auxLLM != nil && factExtractionWorker.isDue()
+        let hasLLMWork = factDue || hasPending || shouldTidy || shouldDistill
         guard hasLLMWork else { return }
 
-        // 后台 LLM 工作（事实抽取/经验蒸馏/记忆整理）影响整体功能：
-        // **辅助模型优先，主模型兜底**——兜底必须走 isolated 副本（关闭
-        // thinking、不碰主会话 KV，见 backgroundRequestOptions）；主模型连
-        // isolated 都不支持时才跳过（队列保留待下次消费）。
-        // 注意：章节目录摘要不在此列——它不影响功能，只用辅助模型
-        // （见 BookSummaryCoordinator，辅助不可用即停做）。
+        // 其余后台 LLM 工作影响整体功能：辅助优先、主模型 isolated 兜底；
+        // 主模型连 isolated 都不支持时跳过（持久化队列保留）。事实抽取是
+        // 唯一例外，上面已要求 auxLLM 存在。
         let service = auxLLM ?? llm
-        guard Self.backgroundRequestOptions(for: service, isMain: service === llm) != nil else {
+        if service === llm,
+           Self.backgroundRequestOptions(for: service, isMain: true) == nil {
             log("[memory] 主模型不支持独立会话，跳过后台 LLM；待提炼队列已保留")
             return
         }
 
-        // 没有计划的简单对话不做技能/经验蒸馏；事实抽取仍然保留。
-        let shouldDistill = canExtract && substantive
-            && (distillRequested ?? kernel.distillRequested)
         let transcript = session.allDigestLines().suffix(25).joined(separator: "\n")
         backgroundTaskLock.lock()
-        backgroundTask?.cancel()
+        // 已有后台任务在跑：不 cancel 重建，避免前台每轮多过一次看门狗。
+        if backgroundTask != nil {
+            backgroundTaskLock.unlock()
+            return
+        }
         backgroundGeneration += 1
         let generation = backgroundGeneration
+        // 同步记下这次调度：任务可能被下一次 run 立刻取消，不能在 4h 内
+        // 反复重试（那会重新变成「每轮拉起后台模型」）。游标未推进，
+        // 下一个窗口会把积压增量一次性读完。
+        if factDue { factExtractionWorker.markAttempt() }
         let task = Task.detached(priority: .utility) { [weak self] in
             guard let self else { return }
             defer { self.finishBackgroundTask(generation) }
-            if canExtract { await self.extractFacts(conversation: recent) }
+            if factDue { await self.runFactExtraction() }
             guard !Task.isCancelled else { return }
             if shouldDistill { await self.distillExperience(transcript: transcript) }
             guard !Task.isCancelled else { return }
@@ -1109,8 +1074,11 @@ public final class Agent: @unchecked Sendable {
     /// 取消上一轮的后台辅助任务，并等它让出 GPU（最多 3s）。
     private func cancelBackgroundWork() async {
         guard let task = takeBackgroundTask() else { return }
+        let started = Date()
         task.cancel()
         let exited = await Self.waitForTaskExit(task, timeoutNanos: 3_000_000_000)
+        let waited = Int(Date().timeIntervalSince(started) * 1000)
+        AgentLog.info("[background] 取消上轮后台任务 waited=\(waited)ms exited=\(exited)")
         if !exited {
             AgentLog.warning("[background] 后台任务取消 3s 未退出，主请求不再等待")
         }
@@ -1155,21 +1123,46 @@ public final class Agent: @unchecked Sendable {
         backgroundLock.unlock()
     }
 
-    private func extractFacts(conversation: String) async {
-        guard beginBackgroundIfIdle() else { return }
+    /// 一次后台增量抽取：文件游标取批次 → 辅助模型 → 写 graph → 成功才提交。
+    /// 失败 / 被取消不推进游标，下次重跑（图谱写入本身幂等）。
+    private func runFactExtraction() async {
+        guard let batch = factExtractionWorker.takePending() else { return }
+        let text = batch.transcript.trimmingCharacters(in: .whitespacesAndNewlines)
+        if text.isEmpty {
+            // 整段只有 system/tool、没有 USER/AGENT 正文：也要推进游标，
+            // 否则这些空块会被之后的每一轮反复重读。
+            factExtractionWorker.commit(batch)
+            return
+        }
+        let done = await extractFacts(conversation: text)
+        guard done, !Task.isCancelled else { return }
+        factExtractionWorker.commit(batch)
+        AgentLog.info("[memory] 事实抽取完成 sessions=\(batch.sessionCount) "
+            + "offset=\(batch.newOffset)（4h 节流）")
+    }
+
+    /// 返回 true 表示这批对话已抽取过（模型有响应，无论是否解析出事实），
+    /// 调用方据此推进文件游标；false = 被取消 / 模型无响应，保留待重试。
+    private func extractFacts(conversation: String) async -> Bool {
+        // 事实抽取只允许辅助模型：辅助不可用时直接放弃，绝不回退主模型，
+        // 否则主模型 isolated 副本会全量 prefill 并与前台会话抢 GPU。
+        guard auxLLM != nil else { return false }
+        guard beginBackgroundIfIdle() else { return false }
         defer { endBackground() }
-        let text = String(conversation.prefix(4_000))
+        let text = String(conversation.prefix(FactExtractionWorker.maxTranscriptChars))
+        // collectChat 内部取 `auxLLM ?? llm`；上面的 guard 保证必走辅助模型。
         let raw = await collectChat([
             ChatMessage(role: .system, content: FACT_EXTRACT_SYSTEM),
             ChatMessage(role: .user, content: factExtractPrompt(conversation: text)),
         ], temperature: 0.1)
+        guard !Task.isCancelled, !raw.isEmpty else { return false }
         let json = Self.stripJSONFence(raw)
-        guard let value = JSONValue.parse(json), let data = value.objectValue else { return }
+        guard let value = JSONValue.parse(json), let data = value.objectValue else { return true }
         let entities = data["entities"]?.arrayValue ?? []
         let relations = data["relations"]?.arrayValue ?? []
         guard !entities.isEmpty || !relations.isEmpty else {
-            log("[memory] 本轮无可持久化事实")
-            return
+            log("[memory] 本批对话无可持久化事实")
+            return true
         }
 
         let graph = GraphMemoryStore.shared(
@@ -1199,8 +1192,9 @@ public final class Agent: @unchecked Sendable {
                   !source.isEmpty, !target.isEmpty, !label.isEmpty else { continue }
             graph.createRelation(source: source, target: target, label: label)
         }
-        if !observations.isEmpty { appendDailyFacts(observations) }
-        log("[memory] 抽取 \(observations.count) 条 observation + \(relations.count) 条 relation")
+        log("[memory] 写入 memory graph：\(observations.count) 条 observation "
+            + "+ \(relations.count) 条 relation")
+        return true
     }
 
     private func distillExperience(transcript: String) async {
@@ -1229,36 +1223,6 @@ public final class Agent: @unchecked Sendable {
                 log("[distill] 技能保存失败: \(error.localizedDescription)")
             }
         }
-    }
-
-    private func appendDailyFacts(_ facts: [String]) {
-        // 必须复用共享实例：新建实例会带着旧快照全量回写，覆盖工具刚写入的键。
-        let work = tools.workMemory ?? workMemory
-        let today = Self.dayString()
-        var (bucketDate, bucketFacts) = Self.parseDailyFacts(work.get("__auto_facts__") ?? "")
-        if bucketDate != today { bucketFacts = [] }
-        var seen = Set(bucketFacts)
-        for fact in facts where !fact.isEmpty && !seen.contains(fact) {
-            bucketFacts.append(fact)
-            seen.insert(fact)
-        }
-        if bucketFacts.count > SystemPromptLimits.maxDailyFacts {
-            bucketFacts = Array(bucketFacts.suffix(SystemPromptLimits.maxDailyFacts))
-        }
-        let payload = JSONValue.object([
-            "date": .string(today),
-            "facts": .array(bucketFacts.map { .string($0) }),
-        ])
-        work.set("__auto_facts__", payload.jsonString())
-    }
-
-    static func parseDailyFacts(_ raw: String) -> (String, [String]) {
-        guard let value = JSONValue.parse(raw),
-              let data = value.objectValue else { return ("", []) }
-        let date = data["date"]?.stringValue ?? ""
-        let facts = (data["facts"]?.arrayValue ?? []).compactMap(\.stringValue)
-            .filter { !$0.trimmingCharacters(in: .whitespaces).isEmpty }
-        return (date, facts)
     }
 
     // MARK: 模型辅助
@@ -1310,8 +1274,9 @@ public final class Agent: @unchecked Sendable {
         return LLMRequestOptions(enableThinking: false, isolated: true)
     }
 
-    /// 后台辅助任务的统一 LLM 入口（折叠摘要 / 事实抽取 / 经验蒸馏 /
-    /// 记忆整理 / RAG 检索浓缩）。
+    /// 后台辅助任务的统一 LLM 入口（事实抽取 / 经验蒸馏 / 记忆整理 /
+    /// RAG 检索浓缩）。折叠摘要已改为逐轮自带 summary 的确定性折叠；
+    /// 事实抽取额外要求 `auxLLM` 存在（见 `extractFacts`），不会回退主模型。
     ///
     /// 这些任务影响整体功能（记忆/检索质量），因此**辅助模型优先、主模型
     /// 兜底**：辅助不可用时走主模型 isolated 副本（关闭 thinking、不碰主

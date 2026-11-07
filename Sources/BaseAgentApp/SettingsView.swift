@@ -1222,7 +1222,7 @@ struct SettingsView: View {
                         .fixedSize()
                         .help("开启后模型会先生成思考内容，显著增加延迟与 token；"
                             + "主模型默认开启，辅助模型默认关闭；"
-                            + "后台摘要/事实抽取始终强制关闭")
+                            + "后台事实抽取/蒸馏始终强制关闭")
                 }
                 if let kvReuse {
                     Toggle("KV复用", isOn: kvReuse)

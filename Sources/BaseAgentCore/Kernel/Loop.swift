@@ -273,7 +273,8 @@ public final class KernelLoop {
     /// 执行一段内核循环。
     ///
     /// `emitFinished=false` 供「自动续跑」使用：续跑段是同一个用户轮次的一部分，
-    /// 不能触发 `hooks.finished`（它会做事实抽取与 L4 蒸馏）。
+    /// 不能重复触发 `hooks.finished`（它会启动 L4 蒸馏等请求收尾任务）。
+    /// 事实抽取已改为按 4 小时文件游标在请求收尾调度，不在这里按轮触发。
     /// `toolsEnabled=false` 供寒暄轮使用：不提供任何工具 schema，
     /// 模型只能直接给出文本回复。
     public func run(_ userInput: String,
@@ -343,7 +344,8 @@ public final class KernelLoop {
                 lastConsolidatedTurn = session.currentTurn
                 let foldReason: String
                 // needsAutoShrink = 已用超过 90% 最大上下文：唯一允许把旧
-                // 上下文摘要回注到 <earlier_context> 的路径（LLM 自动收缩）。
+                // 上下文摘要回注到 <earlier_context> 的路径（逐轮自带
+                // summary 的确定性折叠，不调 LLM）。
                 // 注意不用 totalOver（79% 输出预留线），那是预算分配量。
                 if budget.needsAutoShrink, shrinkGuard < 3 {
                     foldReason = "context-90"
@@ -914,7 +916,14 @@ public final class KernelLoop {
                         break
                     }
                     let now = Date()
-                    if ttfb == nil { ttfb = now }
+                    if ttfb == nil {
+                        ttfb = now
+                        // 首字节延迟是「每句回复很慢」最直接的量化指标：
+                        // 包含发送前的后台等待之外的全部 LLM 侧耗时。
+                        AgentLog.info("[ttfb] 首字节 \(Int(now.timeIntervalSince(t0) * 1000))ms "
+                            + "kind=\(event.kind) attempt=\(attempt) "
+                            + "messages=\(messages.count) tools=\(toolSchemas.count)")
+                    }
                     switch event.kind {
                     case .content:
                         contentBuf.append(event.content)
