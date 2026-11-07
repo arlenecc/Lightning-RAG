@@ -10,6 +10,17 @@ import MLX
 public final class LocalModelFactory: @unchecked Sendable {
     public static let shared = LocalModelFactory()
 
+    /// x86_64 Mac 没有可用的 Metal/MLX 设备：触碰 MLX 的全局内存/设备接口会
+    /// 抛出 `Unable to construct residency set` 并终止进程。Intel 构建里凡是
+    /// 不依赖 MLX 模型的路径都跳过这些调用（ONNX / GGUF 后端不受影响）。
+    private static let supportsMetal: Bool = {
+        #if arch(arm64)
+        return true
+        #else
+        return false
+        #endif
+    }()
+
     private let embeddings = ModelCache<EmbeddingProvider>()
     private let rerankers = ModelCache<RerankProvider>()
     private let llms = ModelCache<LLMService>()
@@ -34,6 +45,7 @@ public final class LocalModelFactory: @unchecked Sendable {
     /// bundle 里找 `default.metallib`，而 SwiftPM 资源实际位于 Contents/Resources。
     /// 找不到金属库会让首次求值崩溃，因此这里显式指定路径。
     private static func configureMetallibPath() {
+        guard supportsMetal else { return }
         let relative = "mlx-swift_Cmlx.bundle/Contents/Resources/default.metallib"
         let candidates: [String] = [
             Bundle.main.resourceURL?.appendingPathComponent(relative).path,
@@ -54,6 +66,7 @@ public final class LocalModelFactory: @unchecked Sendable {
     /// 允许试到 2GB；实测 embedding 的复用 buffer 工作集约 1.2GB，1GB 已接近
     /// 上限，2GB 基本没有额外提速，只是多留空闲 buffer。
     public func setCacheLimitMB(_ megabytes: Int) {
+        guard Self.supportsMetal else { return }
         let clamped = max(256, min(2_048, megabytes))
         MLX.Memory.cacheLimit = clamped * 1_024 * 1_024
     }
@@ -62,6 +75,7 @@ public final class LocalModelFactory: @unchecked Sendable {
     /// 用于兜底防止泄漏把系统内存吃光；0 表示按 min(物理内存 65%, 9.6GB)
     /// 自动取值，避免大内存机器把上限放得过高。
     public func setMemoryLimitMB(_ megabytes: Int) {
+        guard Self.supportsMetal else { return }
         let physicalMB = Int(ProcessInfo.processInfo.physicalMemory / 1_024 / 1_024)
         let automatic = max(1_024, min(physicalMB * 65 / 100, 9_830))
         let requested = megabytes > 0 ? megabytes : automatic
@@ -96,6 +110,7 @@ public final class LocalModelFactory: @unchecked Sendable {
     /// 退出流程与释放 MLX 全局状态（cache/memory limit、模型容器）前必须调用，
     /// 否则未完成的 asyncEval 会与 command buffer 的 commit/销毁并发。
     public func synchronizeGPU() {
+        guard Self.supportsMetal else { return }
         MLX.Stream.gpu.synchronize()
     }
 
@@ -120,8 +135,10 @@ public final class LocalModelFactory: @unchecked Sendable {
         for service in vlmValues {
             await service.unload()
         }
-        let activeMB = MLX.Memory.activeMemory / 1_024 / 1_024
-        let cacheMB = MLX.Memory.cacheMemory / 1_024 / 1_024
+        let activeMB = Self.supportsMetal
+            ? MLX.Memory.activeMemory / 1_024 / 1_024 : 0
+        let cacheMB = Self.supportsMetal
+            ? MLX.Memory.cacheMemory / 1_024 / 1_024 : 0
         AgentLog.info("[memory] 释放 OCR \(vlmValues.count) 个模型，"
             + "MLX active=\(activeMB)MB cache=\(cacheMB)MB")
     }
@@ -329,6 +346,17 @@ public final class LocalModelFactory: @unchecked Sendable {
             )
         }
 
+        #if arch(x86_64)
+        // Intel 构建没有 Apple Silicon GPU：MLX 权重加载会卡在 Metal 设备初始化，
+        // 直接返回明确错误，避免表现为「卡住不动」。
+        if backend == "mlx-lm" || backend == "mlx-vlm" {
+            return FailingLLMService(
+                identifier: "local:\(backend):unsupported-on-intel",
+                error: LocalModelError.invalidConfiguration(
+                    "Intel 版不支持 MLX 模型（需要 Apple Silicon）。请把主模型后端改为 GGUF 或 ONNX，并选择对应的本地模型文件。"))
+        }
+        #endif
+
         let factor = config.localLLMModel.isEmpty
             ? (LocalModelRegistry.defaultName(for: .llm) ?? "")
             : config.localLLMModel
@@ -516,6 +544,15 @@ public final class LocalModelFactory: @unchecked Sendable {
                 )
             )
         }
+
+        #if arch(x86_64)
+        if backend == "mlx-lm" || backend == "mlx-vlm" {
+            return FailingLLMService(
+                identifier: "local:\(backend):unsupported-on-intel",
+                error: LocalModelError.invalidConfiguration(
+                    "Intel 版不支持 MLX 辅助模型（需要 Apple Silicon）。请把辅助模型后端改为 GGUF 或 ONNX。"))
+        }
+        #endif
 
         let value = config.auxLocalLLMModel.isEmpty
             ? (LocalModelRegistry.defaultName(for: .aux) ?? "")

@@ -152,7 +152,7 @@ public enum VectorEncoder {
     public static func encodeFloat16(_ vector: [Float]) -> Data {
         var bytes = [UInt8](repeating: 0, count: vector.count * 2)
         for (index, value) in vector.enumerated() {
-            let pattern = Float16(value).bitPattern
+            let pattern = halfBits(from: value)
             bytes[index * 2] = UInt8(pattern & 0xFF)
             bytes[index * 2 + 1] = UInt8((pattern >> 8) & 0xFF)
         }
@@ -167,8 +167,8 @@ public enum VectorEncoder {
         data.withUnsafeBytes { raw in
             guard let base = raw.baseAddress else { return }
             for i in 0..<available {
-                output[i] = Float(Float16(bitPattern: halfPattern(pointer: base,
-                                                                 offset: i * 2)))
+                output[i] = float(fromHalfBits: halfPattern(pointer: base,
+                                                           offset: i * 2))
             }
         }
         return output
@@ -179,10 +179,75 @@ public enum VectorEncoder {
         guard count > 0 else { return [] }
         var output = [Float](repeating: 0, count: count)
         for i in 0..<count {
-            output[i] = Float(Float16(bitPattern: halfPattern(pointer: pointer,
-                                                             offset: i * 2)))
+            output[i] = float(fromHalfBits: halfPattern(pointer: pointer,
+                                                        offset: i * 2))
         }
         return output
+    }
+
+    /// Float → IEEE 754 binary16 位模式（round-to-nearest-even）。
+    ///
+    /// `Float16` 在 x86_64 Apple 平台上类型存在但成员不可用，无法用于 Intel
+    /// 构建；这里用纯位运算实现，位模式与 `Float16(value).bitPattern` 一致，
+    /// 落盘格式与 arm64 版本完全相同。
+    private static func halfBits(from value: Float) -> UInt16 {
+        let bits = value.bitPattern
+        let sign = UInt16((bits >> 16) & 0x8000)
+        let exponent = Int32((bits >> 23) & 0xFF) - 127 + 15
+        let fraction = bits & 0x007F_FFFF
+        if (bits & 0x7F80_0000) == 0x7F80_0000 {
+            if fraction == 0 { return sign | 0x7C00 }
+            return sign | 0x7C00 | UInt16(fraction >> 13) | 0x0200
+        }
+        if exponent >= 0x1F { return sign | 0x7C00 }
+        if exponent <= 0 {
+            if exponent < -10 { return sign }
+            let significand = fraction | 0x0080_0000
+            let shift = UInt32(14 - exponent)
+            let leading = significand >> shift
+            let remainder = significand & ((UInt32(1) << shift) - 1)
+            let halfway = UInt32(1) << (shift - 1)
+            var result = leading
+            if remainder > halfway || (remainder == halfway && (leading & 1) == 1) {
+                result += 1
+            }
+            return sign | UInt16(result)
+        }
+        let leading = fraction >> 13
+        let remainder = fraction & 0x1FFF
+        var result = (UInt32(exponent) << 10) | leading
+        if remainder > 0x1000 || (remainder == 0x1000 && (leading & 1) == 1) {
+            result += 1
+        }
+        return sign | UInt16(result)
+    }
+
+    /// IEEE 754 binary16 位模式 → Float。
+    private static func float(fromHalfBits pattern: UInt16) -> Float {
+        let sign = UInt32(pattern & 0x8000) << 16
+        let exponent = (pattern >> 10) & 0x1F
+        let fraction = UInt32(pattern & 0x03FF)
+        let bits: UInt32
+        switch exponent {
+        case 0:
+            if fraction == 0 {
+                bits = sign
+            } else {
+                var significand = fraction
+                var shift: Int32 = -1
+                repeat {
+                    significand <<= 1
+                    shift += 1
+                } while (significand & 0x400) == 0
+                bits = sign | (UInt32(112 - shift) << 23)
+                    | ((significand & 0x3FF) << 13)
+            }
+        case 0x1F:
+            bits = sign | 0x7F80_0000 | (fraction << 13)
+        default:
+            bits = sign | ((UInt32(exponent) + 112) << 23) | (fraction << 13)
+        }
+        return Float(bitPattern: bits)
     }
 
     private static func halfPattern(pointer: UnsafeRawPointer, offset: Int) -> UInt16 {

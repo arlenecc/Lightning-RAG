@@ -67,8 +67,13 @@ struct SettingsView: View {
 
     @State private var workspace = ""
     @State private var knowledgeBase = ""
+    #if arch(x86_64)
+    @State private var embeddingBackend = "onnx"
+    @State private var embeddingPath = "models/jina-embeddings-v5-text-nano-onnx-int8"
+    #else
     @State private var embeddingBackend = "mlx"
     @State private var embeddingPath = "models/jina-embeddings-v5-text-nano-mlx-int4"
+    #endif
     @State private var rerankerBackend = "onnx"
     @State private var rerankerPath = ""
     /// 当前 Embedding 后端下「切片实际生效值」的 token 上限（nil = 无精确换算）。

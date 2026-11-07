@@ -65,6 +65,20 @@ public enum PDFEngine: String, Codable, Sendable, CaseIterable {
 
 // MARK: - AgentConfig
 
+#if arch(x86_64)
+// Intel 构建没有 Metal/MLX 后端：默认使用随 App 分发的 ONNX 量化模型。
+private let builtInEmbeddingName = "jina-embeddings-v5-text-nano-onnx-int8"
+private let builtInRerankerName = "jina-reranker-v2-base-multilingual-onnx-int8"
+private let builtInEmbeddingBackend = "onnx"
+// Intel 集显上的 llama.cpp Metal 后端会输出乱码，GGUF 一律走 CPU。
+private let builtInLlamaGpuLayers = 0
+#else
+private let builtInEmbeddingName = "jina-embeddings-v5-text-nano-mlx-int4"
+private let builtInRerankerName = "jina-reranker-v2-base-multilingual-onnx"
+private let builtInEmbeddingBackend = "mlx"
+private let builtInLlamaGpuLayers = 99
+#endif
+
 /// 运行时配置，持久化到 `~/.base-agent/config.json`。
 /// 字段命名对齐原 Python `AgentConfig`（JSON 中为 snake_case）。
 public struct AgentConfig: Sendable {
@@ -186,12 +200,12 @@ public struct AgentConfig: Sendable {
     /// 默认 jina-embeddings-v5-text-nano（MLX int4）：768 原生维，
     /// 业务固定取前 128 维并重新归一化；查询 / 切片分别使用
     /// `Query: ` / `Document: ` 前缀，8192 上下文。
-    public var ragEmbeddingModel: String = "jina-embeddings-v5-text-nano-mlx-int4"
+    public var ragEmbeddingModel: String = builtInEmbeddingName
     /// 默认 ONNX int8 版 jina reranker：CPU 推理吞吐约为 MLX mxfp8 的 2 倍，
     /// 1024 token 上下文。logit 统一经 sigmoid 后，800 字中文目标切片实测
     /// 约 0.53-0.91，无关切片约 0.03-0.27，默认阈值 0.45 有稳定间隔。
     /// 追求排序质量可改回 bge-reranker-v2-m3-mlx-mxfp8（MLX 后端）并上调阈值。
-    public var ragRerankModel: String = "jina-reranker-v2-base-multilingual-onnx"
+    public var ragRerankModel: String = builtInRerankerName
     /// 重排分数过滤阈值（0-1）。全部低于阈值时回退原排序，不会空结果。
     public var ragRerankThreshold: Double = 0.45
     public var ragRerankEnabled: Bool = true
@@ -249,8 +263,8 @@ public struct AgentConfig: Sendable {
     public var ragOCRCoreML: Bool = false
     public var ragOCRPreprocess: Bool = true
     public var ragOCRBinarize: Bool = true
-    /// llama.cpp 的 GPU 层数（-ngl）；内存紧张时可设为 0 改用 CPU。
-    public var llamaGpuLayers: Int = 99
+    /// llama.cpp 的 GPU 层数（-ngl）；Intel 构建默认 0（纯 CPU，Metal 会乱码）。
+    public var llamaGpuLayers: Int = builtInLlamaGpuLayers
     /// 同时处理的文件数（1...10）。解析/OCR 与 embedding 流水线并行；
     /// 纯文本文件不经过 OCR 闸门，多 worker 可把等待空档填满。
     public var ragIngestConcurrency: Int = 10
@@ -396,18 +410,18 @@ public struct AgentConfig: Sendable {
     public var auxLocalLLMEnableThinking: Bool = false
 
     public var embeddingProvider: String = "local"
-    public var localEmbeddingModel: String = "jina-embeddings-v5-text-nano-mlx-int4"
+    public var localEmbeddingModel: String = builtInEmbeddingName
     /// 显式本地目录；非空时优先于模型名。
     /// 使用相对模型根目录的路径，由 LocalModelRegistry 统一解析。
-    public var localEmbeddingModelPath: String = "models/jina-embeddings-v5-text-nano-mlx-int4"
+    public var localEmbeddingModelPath: String = "models/\(builtInEmbeddingName)"
     /// onnx / fastembed / mlx / gguf
-    /// Embedding 后端：mlx（Metal GPU，默认，使用本地 int4/int8 混合量化权重）
-    /// / onnx（CPU int8）/ fastembed / gguf。
-    public var localEmbeddingBackend: String = "mlx"
+    /// Embedding 后端：arm64 默认 mlx（Metal GPU，int4 量化权重）；
+    /// x86_64 无 MLX，默认 onnx（CPU int8）。
+    public var localEmbeddingBackend: String = builtInEmbeddingBackend
 
     public var rerankerProvider: String = "local"
-    public var localRerankerModel: String = "jina-reranker-v2-base-multilingual-onnx"
-    public var localRerankerModelPath: String = "models/jina-reranker-v2-base-multilingual-onnx"
+    public var localRerankerModel: String = builtInRerankerName
+    public var localRerankerModelPath: String = "models/\(builtInRerankerName)"
     /// onnx / fastembed / mlx / gguf
     /// 默认 ONNX：与默认模型 jina-reranker-v2-base-multilingual-onnx 的权重格式一致。
     public var localRerankerBackend: String = "onnx"
@@ -876,6 +890,48 @@ public struct AgentConfig: Sendable {
         if !MatryoshkaDimensions.jinaV5.contains(ragMatryoshkaDim) {
             ragMatryoshkaDim = MatryoshkaDimensions.defaultValue
         }
+
+        #if arch(x86_64)
+        // Intel 构建不提供 Metal/MLX 后端：旧配置里仍指向 MLX 默认权重、
+        // 旧模型名或留空的 embedding/reranker 组合统一切到随包分发的
+        // ONNX 量化模型；用户显式配置的其他模型/路径保持不动。
+        let arm64EmbeddingName = "jina-embeddings-v5-text-nano-mlx-int4"
+        let arm64EmbeddingPath = "models/\(arm64EmbeddingName)"
+        let arm64RerankerName = "jina-reranker-v2-base-multilingual-onnx"
+        let arm64RerankerPath = "models/\(arm64RerankerName)"
+        let legacyRerankNames: Set<String> = [
+            "BAAI/bge-reranker-base",
+            "BAAI/bge-reranker-v2-m3",
+            "BAAI/bge-reranker-v2-m3-int8",
+            "bge-reranker-v2-m3-mlx-mxfp8",
+        ]
+
+        if localEmbeddingBackend == "mlx" { localEmbeddingBackend = "onnx" }
+        if localEmbeddingModel.isEmpty || localEmbeddingModel == arm64EmbeddingName {
+            localEmbeddingModel = builtInEmbeddingName
+        }
+        if localEmbeddingModelPath.isEmpty
+            || localEmbeddingModelPath == arm64EmbeddingPath {
+            localEmbeddingModelPath = "models/\(builtInEmbeddingName)"
+        }
+        if ragEmbeddingModel.isEmpty || ragEmbeddingModel == arm64EmbeddingName
+            || legacyEmbeddingNames.contains(ragEmbeddingModel) {
+            ragEmbeddingModel = builtInEmbeddingName
+        }
+
+        if localRerankerBackend == "mlx" { localRerankerBackend = "onnx" }
+        if localRerankerModel.isEmpty || localRerankerModel == arm64RerankerName {
+            localRerankerModel = builtInRerankerName
+        }
+        if localRerankerModelPath.isEmpty
+            || localRerankerModelPath == arm64RerankerPath {
+            localRerankerModelPath = "models/\(builtInRerankerName)"
+        }
+        if ragRerankModel.isEmpty || ragRerankModel == arm64RerankerName
+            || legacyRerankNames.contains(ragRerankModel) {
+            ragRerankModel = builtInRerankerName
+        }
+        #endif
     }
 
     /// 统一主/辅模型类型：mlx → mlx-lm；llama.cpp / llama_cpp → gguf。

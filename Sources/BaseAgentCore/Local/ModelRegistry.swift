@@ -80,8 +80,18 @@ public enum LocalModelRegistry {
     /// 当调用方没有给出任何模型名时使用的兜底名称。
     public static func defaultName(for kind: LocalModelKind) -> String? {
         switch kind {
-        case .embedding: return "jina-embeddings-v5-text-nano-mlx-int4"
-        case .reranker: return "jina-reranker-v2-base-multilingual-onnx"
+        case .embedding:
+            #if arch(x86_64)
+            return "jina-embeddings-v5-text-nano-onnx-int8"
+            #else
+            return "jina-embeddings-v5-text-nano-mlx-int4"
+            #endif
+        case .reranker:
+            #if arch(x86_64)
+            return "jina-reranker-v2-base-multilingual-onnx-int8"
+            #else
+            return "jina-reranker-v2-base-multilingual-onnx"
+            #endif
         case .llm: return "qwen3.5-4b-agentic-coder-v4-4bit-mlx"
         case .aux: return "Qwen3.5-2B-MLX-4bit"
         case .vlm: return nil

@@ -10,7 +10,12 @@ import Tokenizers
 /// lite 版随 App 资源 bundle 分发；clean 版不带，由启动时的模型自动下载
 /// 流程补齐（落点与 `modelDirectory()` 的回退查找一致）。
 struct PotionSentenceSimilarity {
+    #if arch(x86_64)
+    /// Intel 版随包分发 `models/potion-multilingual-128M-onnx-int4`（ONNX 加载）。
+    static let resourceName = "potion-multilingual-128M-onnx-int4"
+    #else
     static let resourceName = "potion-multilingual-128M-int4"
+    #endif
     /// SwiftPM 资源 bundle 名（potion 是该 bundle 的唯一资源）。
     static let resourceBundleName = "BaseAgent_BaseAgentCore.bundle"
     static let modelFileName = "model.onnx"

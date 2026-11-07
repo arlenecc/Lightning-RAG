@@ -89,7 +89,7 @@ final class LlamaCppVisionRuntime: @unchecked Sendable {
             embeddings: false)
 
         var params = mtmd_context_params_default()
-        params.use_gpu = llama_supports_gpu_offload()
+        params.use_gpu = LlamaCppBackend.supportsGPUOffload
         params.print_timings = false
         params.warmup = false
         params.n_threads = Int32(max(4, min(8, ProcessInfo.processInfo.activeProcessorCount - 2)))

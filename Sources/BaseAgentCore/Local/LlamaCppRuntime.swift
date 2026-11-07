@@ -33,6 +33,19 @@ enum LlamaCppBackend {
     nonisolated(unsafe) private static var initialized = false
     private static let lock = NSLock()
 
+    /// 是否允许把权重 / KV / mmproj 投影放到 Metal GPU。
+    ///
+    /// x86_64 Mac 只有 Intel 集显，llama.cpp 的 `llama_supports_gpu_offload()`
+    /// 仍返回 true，但 Metal kernel（量化权重 + FA）会算出乱码，且设备工作集
+    /// 仅约 1.6GB，4B 级别模型连 prefill 都难以完成。Intel 构建一律走 CPU。
+    static var supportsGPUOffload: Bool {
+        #if arch(arm64)
+        return llama_supports_gpu_offload()
+        #else
+        return false
+        #endif
+    }
+
     static func ensureInitialized() {
         lock.lock()
         defer { lock.unlock() }
@@ -69,7 +82,15 @@ final class LlamaCppModel: @unchecked Sendable {
         LlamaCppBackend.ensureInitialized()
         var params = llama_model_default_params()
         let layers = gpuLayers < 0 ? -1 : max(0, Int32(gpuLayers))
-        params.n_gpu_layers = llama_supports_gpu_offload() ? layers : 0
+        if LlamaCppBackend.supportsGPUOffload {
+            params.n_gpu_layers = layers
+        } else {
+            params.n_gpu_layers = 0
+            if gpuLayers != 0 {
+                AgentLog.info("[llama.cpp] Intel 构建强制 CPU 推理"
+                    + "（忽略 llama_gpu_layers=\(gpuLayers)）")
+            }
+        }
         let loaded = path.withCString { llama_model_load_from_file($0, params) }
         guard let loaded else {
             throw LlamaCppError.modelLoad("无法读取 \(path)")
@@ -423,7 +444,7 @@ enum LlamaCppContext {
         // 仅 LLM（主/辅）开启；embedding/VLM 上下文保持 f16。
         params.type_k = kvInt8 ? GGML_TYPE_Q8_0 : GGML_TYPE_F16
         params.type_v = kvInt8 ? GGML_TYPE_Q8_0 : GGML_TYPE_F16
-        params.offload_kqv = true
+        params.offload_kqv = LlamaCppBackend.supportsGPUOffload
         params.no_perf = true
         // 滑动窗口注意力的模型默认只保留窗口内 KV，无法按前缀裁剪；
         // 这里保留完整 KV，跨轮才能用 seq_rm 复用 system 前缀。
