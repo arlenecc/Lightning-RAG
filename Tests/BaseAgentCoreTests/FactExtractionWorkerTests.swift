@@ -18,7 +18,10 @@ final class FactExtractionWorkerTests: XCTestCase {
         dir = MemoryDirectory(workspace: workspace.path)
         dir.ensureLayout()
         worker = FactExtractionWorker(directory: dir)
-        now = Date()
+        // 固定到当天中午 12:00：用例会构造 now + 4h 的「下个窗口」。若直接用
+        // 墙上时钟，晚间跑测试时 4h 后会跨到次日，takePending 转去读次日的空
+        // raw_session 文件，误判为「满 4h 也没有新增内容」。
+        now = Calendar.current.startOfDay(for: Date()).addingTimeInterval(12 * 3_600)
         addTeardownBlock { [workspace] in
             if let workspace { try? FileManager.default.removeItem(at: workspace) }
         }
