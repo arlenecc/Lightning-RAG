@@ -124,7 +124,8 @@ public final class SkillManager {
 
     /// 能力/身份问询：「你能做什么」「有哪些工具/能力」「介绍一下自己」等。
     ///
-    /// 答案就写在 system prompt 的工具清单里，不需要调用任何工具。与 `isGreeting`
+    /// 答案由内核按真实注册的 tool schema 本地生成，不调用任何工具、也不问模型
+    /// （轻量轮看不到工具 schema，让模型猜只会得到空泛套话）。与 `isGreeting`
     /// 同级走轻量通道（无工具 schema、maxTurns=2、不输出 summary）；否则模型会
     /// 为了「列出可用技能 / 知识库文档 / RAG 索引状态」连调多个工具，并在每轮
     /// `<summary>` 里反复写「工具调用已完成」的元陈述，实测每轮拖 7-8s。

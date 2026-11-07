@@ -737,7 +737,11 @@ public final class MLXLLMService: LLMService, PreloadableLLMService,
         //    一小段 user 形状的 token 再 decode 两步——编译的是首轮真实形状
         //    （长 KV 偏移 + 增量 prefill + decode/sampler）。旧实现用 2 token
         //    输入 + 独立空缓存，编译的是完全不同的 kernel，首句仍要现场编译
-        //    20~30s。独立副本不污染主前缀快照；LMOutput.State 是值类型，传值安全。
+        //    20~30s。
+        //    【必须 state: nil】主前缀的 LMOutput.State 里携带模型前向状态，
+        //    MLXArray 是引用类型；把它交给 scratch 再跑几十步 decode 会写回并
+        //    污染 warmupStateSnapshot / rawState，首轮虽用新缓存，模型侧残留
+        //    状态仍可能把生成带偏。副本缓存 + 独立 state 才是真正的隔离。
         do {
             let inferParameters = Self.parameters(
                 maxTokens: 2, temperature: 0.7, topP: topP, topK: topK,
@@ -747,13 +751,13 @@ public final class MLXLLMService: LLMService, PreloadableLLMService,
             let extra = Array(tokens.prefix(min(32, tokens.count)))
             var scratch = try TokenIterator(
                 input: LMInput(tokens: MLXArray(extra)),
-                model: model, cache: decodeCache, state: wrapped.state,
+                model: model, cache: decodeCache, state: nil,
                 parameters: inferParameters)
             var steps = 0
             while steps < extra.count + 2, scratch.next() != nil { steps += 1 }
             eval(decodeCache.flatMap { $0.state })
             AgentLog.info("[mlx-warmup] decode kernel 预热 shape=\(extra.count) "
-                + "steps=\(steps) kv_offset=\(cache.first?.offset ?? 0)")
+                + "steps=\(steps)")
         } catch {
             // kernel 预热失败不该让整个预热失效：主前缀缓存仍可用。
             AgentLog.info("[mlx-warmup] decode kernel 预热跳过：\(error.localizedDescription)")
