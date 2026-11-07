@@ -196,6 +196,9 @@ public final class Agent: @unchecked Sendable {
     public let ragEngine: RAGEngine
     public let workMemory: WorkMemory
     public let session: Session
+    /// 协议主体（BASE）system prompt。默认内置常量；应用启动时可由
+    /// `<workspace>/assets/system_prompt.txt` 替换，见 `SystemPromptFile`。
+    public let baseSystemPrompt: String
     /// 多级记忆目录（L0–L4）。与 `.agent/` 下既有 WorkMemory/GraphMemory 并存。
     public let memoryDirectory: MemoryDirectory
     public let rawSessionStore: RawSessionStore
@@ -258,7 +261,9 @@ public final class Agent: @unchecked Sendable {
                 config: AgentConfig,
                 callbacks: AgentCallbacks,
                 toolRegistry: ToolRegistry? = nil,
-                skills: SkillManager? = nil) {
+                skills: SkillManager? = nil,
+                baseSystemPrompt: String = BASE_SYSTEM_PROMPT) {
+        self.baseSystemPrompt = baseSystemPrompt
         self.config = config
         config.ensureWorkspace()
         self.llm = llm
@@ -827,7 +832,7 @@ public final class Agent: @unchecked Sendable {
         }
         let sop = memoryDirectory.loadSOP(maxChars: SystemPromptLimits.maxSOPChars)
         let l1 = memoryDirectory.loadL1(maxChars: SystemPromptLimits.maxL1Chars)
-        var text = BASE_SYSTEM_PROMPT
+        var text = baseSystemPrompt
         if !sop.isEmpty {
             text += "\n\n# [L0 META-SOP: memory_management_sop]\n" + sop
         }

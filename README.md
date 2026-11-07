@@ -52,8 +52,8 @@ VARIANT=lite  scripts/package-app.sh release && VARIANT=lite  scripts/package-dm
 
 | VARIANT | 内置模型 | DMG |
 |---|---|---|
-| `clean`（默认） | 无；potion 语义切片 / jina embedding / jina reranker 均在首次启动时从 hf-mirror 自动下载 | `dist/Lightning-RAG-1.2.24-clean.dmg` |
-| `lite` | potion-multilingual-128M int4（语义切片）+ jina-embeddings-v5-text-nano-mlx-int4 + jina-reranker-v2-base-multilingual-onnx | `dist/Lightning-RAG-1.2.24-lite.dmg` |
+| `clean`（默认） | 无；potion 语义切片 / jina embedding / jina reranker 均在首次启动时从 hf-mirror 自动下载 | `dist/Lightning-RAG-1.2.25-clean.dmg` |
+| `lite` | potion-multilingual-128M int4（语义切片）+ jina-embeddings-v5-text-nano-mlx-int4 + jina-reranker-v2-base-multilingual-onnx | `dist/Lightning-RAG-1.2.25-lite.dmg` |
 
 两个版本共用 `dist/Lightning-RAG.app`（应用本体与显示名不变，只有内置模型不同），
 因此需按「打包 App → 打包 DMG」的顺序逐个构建。两个版本都不含主模型、辅助模型
@@ -120,6 +120,8 @@ HTML 与 Office 解析另有专项覆盖：HTML 保存页的本地 iframe / fram
 - RAG 状态在后台线程查询，不在主线程建库/COUNT；状态只读取来源总数与前 256 个来源名，大知识库不会把全部路径读入内存。连续应用配置只生效最后一次，旧同步完成后只重载它自己的引擎，不会影响新 Agent。
 
 配置保存在 `~/.base-agent/config.json`，可在配置窗口修改；工作区默认 `~/base-agent-workspace`。
+
+**自定义 system prompt**：首次启动会在 `<workspace>/assets/system_prompt.txt` 写出内置的 `BASE_SYSTEM_PROMPT`；之后每次启动读取该文件并替换内置提示词，可直接用文本编辑器调整模型行为规则，**重启（或重新应用配置）后生效**（会话期间保持不变，以免 system 前缀抖动使 KV cache 反复重建）。文件内容空白或不可读时本次回退内置提示词，且不会覆盖文件。它替换的是协议主体，L0 META-SOP 与 L1 全局索引仍按多级记忆机制追加在其后；轻量轮（纯寒暄/能力问询）使用内核的极简提示，不受该文件影响。内置提示词中的 `<summary>` 标签、`rag_outline` 起手式、工具状态词等是内核回注与测试的硬依赖，建议在原文基础上调整，不要整段删除。
 
 ## 核心设计
 
@@ -245,7 +247,7 @@ manifest 条目同时记录 `chunkCount` 与 `complete`：增量跳过前会校�
 - **投机解码**：当前主/辅模型均为 Qwen3.5 hybrid（GDN/Mamba 层），`MambaCache.isTrimmable == false`，mlx-swift-lm 的 `SpeculativeTokenIterator` 会在初始化时直接拒绝；两个模型的实际权重中也没有 MTP 头（config 虽写 `mtp_num_hidden_layers=1`，safetensors 中 `mtp` key 为 0），因此无法复用辅助模型起草。若后续换成全注意力、缓存可裁剪且共享 tokenizer 的主/辅模型，可再接入该路径。
 - **内存上限**：`mlx_memory_limit_mb`（默认 0 = min(物理内存 65%, 9.6GB)）是 MLX 权重+KV+buffer 的总闸门；`mlx_cache_limit_mb`（默认 1024，运行时夹在 256...2048）只限制 MLX 空闲 buffer；1GB 让 decode 快 5–8%，实测 8×784-token 的 jina-v3 embedding 批在 1GB 与 2GB 下耗时基本一致（cache 占用 995MB / 1266MB），512MB 则明显偏小。主模型 `kv_cache_max_tokens`（默认 32768，约 1GB KV）和辅助模型 `aux_kv_cache_max_tokens`（默认 8192，约 100MB）是 KV 硬上限，实际上下文取 `min(配置上下文, 上限)`，内核预算同步收紧。完整 prompt 超过预算时明确报错，不会继续分配 KV。辅助模型默认（`aux_llm_kv_reuse=false`）每次后台摘要/事实抽取后立即失效 KV，开启复用后改为保留前缀缓存跨调用复用；主模型 `llm_kv_reuse` 与辅助模型的复用/量化开关各自独立，量化默认都开（KV 内存约减半）。预热前缀快照只在 ≤8192 token 时保留。RAG 检索 `topK` 封顶 20，避免 reranker 批量被模型参数放大。
 - **模型常驻策略**：主模型与 Reranker 加载后常驻不自动卸载；启动时（以及切换配置后）同时预加载本地 Embedding 与 Reranker 并保持常驻，首问不再现场加载 ONNX session（实测 10~15s）；辅助模型仅在 `aux_enabled=true` 时常驻，关闭时 Agent 的 `auxLLM` 保持 `nil`（RAG 精简跳过，后台记忆/总结回退主模型）；OCR 只在解析/转换时使用（默认 2 个 Ovis 实例，同步期间并行识别）；同步、Markdown 转换或 OCR 测试结束时由 `OCRModelLifecycle` 立即卸载全部 Ovis 权重（两个实例一起释放），下次需要时再按需加载；`LocalModelFactory.unloadIdleOCRWeights()` 仅作为无在途 OCR 任务时的空闲兜底。闲时章节摘要使用更长的 10 分钟空闲窗口，避免与前台抢 GPU。provider 对象保留，不影响任何工具调用。
-- 为提升缓存命中，system prompt 只保留稳定前缀（`BASE_SYSTEM_PROMPT`），工作记忆、当天事实、checkpoint、技能与知识库状态等动态内容拼在 user 消息尾部；同一轮内的动态上下文做缓存，避免工具循环中反复变化。运行日志会输出 `[mlx-kv] reuse=… cached=… delta=…` 与 `[mlx] prompt=… cached=… generated=…`，可直接确认本轮复用了多少 token。
+- 为提升缓存命中，system prompt 只保留稳定前缀（默认 `BASE_SYSTEM_PROMPT`，可由 `<workspace>/assets/system_prompt.txt` 替换），工作记忆、当天事实、checkpoint、技能与知识库状态等动态内容拼在 user 消息尾部；同一轮内的动态上下文做缓存，避免工具循环中反复变化。运行日志会输出 `[mlx-kv] reuse=… cached=… delta=…` 与 `[mlx] prompt=… cached=… generated=…`，可直接确认本轮复用了多少 token。
 - Embedding 输入前缀按模型族统一处理（`EmbeddingPrefixStrategy`，ONNX / MLX / GGUF 行为一致）：nomic 使用 `search_document: ` / `search_query: `；bge-zh 只在 query 侧加 `为这个句子生成表示以用于检索相关文章：`，document 不加，bge-en / bge-m3 不加；jina 使用 `passage: ` / `query: `，并保留 `clustering: ` / `classification: ` 任务前缀；E5 使用 `passage: ` / `query: `；其他模型原样。前缀在 provider 内幂等添加，调用方不要重复拼；切片预算会按 document 前缀预留 token。mean pooling + L2 归一化；MLX embedding 从 `config.json` 读取隐藏维度。
 - 模型查找顺序：配置显式路径 → `<workspace>/models/<name>` → `~/base-agent/models/<name>` → HuggingFace / FastEmbed 缓存。旧配置的 `models/<name>` 相对写法会自动去掉 `models/` 前缀后在这些根目录下查找。
 - 主/辅模型支持**独立预加载与卸载**：启动时按 `auto_preload_main` 与 `llm_provider` 决定是否预加载主模型，辅助模型仅在 `aux_enabled=true` 时预加载；「加载模型」只替换对应槽位的模型实例并读入权重，另一个模型保持常驻；「卸载」只作用于当前模型。加载参数（context / temp / top_p / min_p / top_k / repeat / batch / thinking）进入模型实例缓存键，修改后会创建新实例。

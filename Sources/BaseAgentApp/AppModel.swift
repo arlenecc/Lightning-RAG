@@ -215,6 +215,11 @@ final class AppViewModel: ObservableObject {
     @Published var auxModelLoaded = false
 
     let cancelFlag = CancelFlag()
+    /// 最近一次构建 Agent 时加载的 BASE system prompt
+    /// （来自 `<workspace>/assets/system_prompt.txt`）。只在启动 / 应用配置时刷新，
+    /// 会话进行中不重读，避免 system 前缀抖动导致 KV cache 全量重建；
+    /// 编辑文件后重启（或重新应用配置）生效。
+    private var baseSystemPrompt = BASE_SYSTEM_PROMPT
     private(set) var agent: Agent?
     private var streamingID: UUID?
     private var pendingToolIndices: [String: [Int]] = [:]
@@ -544,6 +549,20 @@ final class AppViewModel: ObservableObject {
     }
 
     private func buildAgent() {
+        // 每次构建 Agent（启动 / 应用配置）都以当前 workspace 的可编辑文件为准：
+        // 首启写出内置提示词；切换工作区时自动改用新目录下的文件。
+        let promptFile = SystemPromptFile.resolve(workspace: config.workspace)
+        baseSystemPrompt = promptFile.text
+        switch promptFile.status {
+        case .created:
+            appendLog("[prompt] 首次启动已生成可编辑 system prompt："
+                + "\(promptFile.path)（编辑后重启生效）")
+        case .loaded:
+            appendLog("[prompt] 已加载自定义 system prompt：\(promptFile.path)"
+                + "（\(promptFile.text.count) 字符）")
+        case .fallback:
+            appendLog("[prompt] \(promptFile.note)；文件：\(promptFile.path)")
+        }
         // 新 Agent 的模型服务尚未预加载；成功 preload 后再置为已加载。
         mainModelLoaded = false
         auxModelLoaded = false
@@ -559,7 +578,8 @@ final class AppViewModel: ObservableObject {
         }
         let llm = LocalModelFactory.shared.makeLLM(config: config)
         let callbacks = UICallbacks(model: self, cancel: cancelFlag)
-        let newAgent = Agent(llm: llm, config: config, callbacks: callbacks)
+        let newAgent = Agent(llm: llm, config: config, callbacks: callbacks,
+                             baseSystemPrompt: baseSystemPrompt)
         // 未启用时保持 auxLLM 为 nil：RAG 精简会直接跳过，后台任务回退主模型，
         // 也不会被同步前后的恢复逻辑误加载。
         newAgent.auxLLM = config.auxEnabled
