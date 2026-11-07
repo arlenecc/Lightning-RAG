@@ -896,9 +896,7 @@ public final class Agent: @unchecked Sendable {
                     .joined(separator: ", ")
                 if sourceCount > shown { names += " (and \(sourceCount - shown) more)" }
                 sections.append("# Knowledge base\n\(chunks) chunks in \(sourceCount) file(s): "
-                    + "\(names). 这些是向量库索引标识，不是磁盘可读文件路径；"
-                    + "知识库问答只用 rag_outline/rag_search/rag_status，"
-                    + "禁止用文件工具读源文件。"
+                    + "\(names). " + KNOWLEDGE_BASE_HINT
                     + " Follow the knowledge-base strategy in the system prompt.")
             } else {
                 sections.append("# Knowledge base\nConfigured but empty. Use `rag_ingest` to index.")
@@ -906,9 +904,7 @@ public final class Agent: @unchecked Sendable {
         } else if FileManager.default.fileExists(atPath: ragEngine.indexDBPath) {
             // 启动后状态快照还没生成（由 UI 在后台刷新）：先给一个无统计的轻提示，
             // 仍可正常检索，不阻塞本轮。
-            sections.append("# Knowledge base\nIndexed locally. "
-                + "文档名是索引标识、不是磁盘路径，只用 rag_* 工具检索，"
-                + "不要用文件工具读源文件。"
+            sections.append("# Knowledge base\nIndexed locally. " + KNOWLEDGE_BASE_HINT
                 + " Follow the knowledge-base strategy in the system prompt to retrieve passages.")
         }
 

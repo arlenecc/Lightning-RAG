@@ -82,40 +82,37 @@ final class WebRenderer: @unchecked Sendable {
         func store(_ box: RuleBox, for key: Bool) { lists[key] = box }
     }
 
+    /// 规则编译必须在 MainActor 上发起：`WKContentRuleListStore.default()` 被
+    /// 标注为 @MainActor，从 TaskGroup 的非隔离子任务里隐式异步调用会触发
+    /// actor isolation 断言 —— 实测 web_scan 自动渲染时整个进程直接崩溃。
+    /// 用 continuation 让出主线程，WebKit 的回调仍能在主 runloop 上投递回来。
+    @MainActor
+    private static func compileRuleList(allowLoopback: Bool) async -> RuleBox {
+        await withCheckedContinuation { cont in
+            WKContentRuleListStore.default().compileContentRuleList(
+                forIdentifier: "base-agent-webrender-"
+                    + (allowLoopback ? "loopback" : "strict"),
+                encodedContentRuleList: Self.blockRulesJSON(
+                    allowLoopback: allowLoopback)) { list, _ in
+                cont.resume(returning: RuleBox(list))
+            }
+        }
+    }
+
     /// 异步编译 + 进程内缓存。
     ///
-    /// **绝不能用 `DispatchSemaphore.wait()` 等编译结果**：`compileContentRuleList`
-    /// 的回调经主 runloop 投递，在主线程同步阻塞会让回调永远不回来（实测两套规则
-    /// 在阻塞版恒定超时，放开 runloop 后立刻编译成功），规则集恒为 nil、
-    /// 网络层防护静默失效。这里用 continuation 让出主线程，再与超时任务赛跑。
+    /// **绝不能用 `DispatchSemaphore.wait()` 等编译结果**：回调经主 runloop 投递，
+    /// 同步阻塞主线程会让回调永远不回来（实测阻塞版恒定超时、规则集恒为 nil）。
+    /// `await` 不阻塞主线程，编译成功或失败都会回调，因此不再需要「与超时任务
+    /// 赛跑」——那个 TaskGroup 既会隐式等待挂起的子任务，又是本次崩溃的来源。
     private static func rules(allowLoopback: Bool) async -> RuleBox {
         let cache = RuleCache.shared
         if let cached = await cache.cached(allowLoopback) { return cached }
-        let box: RuleBox = await withTaskGroup(
-            of: RuleBox.self, returning: RuleBox.self) { group in
-            group.addTask {
-                await withCheckedContinuation { cont in
-                    WKContentRuleListStore.default().compileContentRuleList(
-                        forIdentifier: "base-agent-webrender-"
-                            + (allowLoopback ? "loopback" : "strict"),
-                        encodedContentRuleList: Self.blockRulesJSON(
-                            allowLoopback: allowLoopback)) { list, _ in
-                        cont.resume(returning: RuleBox(list))
-                    }
-                }
-            }
-            group.addTask {
-                try? await Task.sleep(nanoseconds: 5_000_000_000)
-                return RuleBox(nil)
-            }
-            let first = await group.next() ?? RuleBox(nil)
-            group.cancelAll()
-            return first
-        }
+        let box = await compileRuleList(allowLoopback: allowLoopback)
         if box.list != nil {
             await cache.store(box, for: allowLoopback)
         } else {
-            AgentLog.warning("WKContentRuleList 编译失败/超时：页内 XHR 网络层防护降级，"
+            AgentLog.warning("WKContentRuleList 编译失败：页内 XHR 网络层防护降级，"
                 + "导航策略仍然生效")
         }
         return box

@@ -103,11 +103,10 @@ final class WebRenderTests: XCTestCase {
     }
 
     func testRenderTextAndScript() async throws {
-        // xctest 宿主进程里创建 WKWebView 会直接崩溃（signal 5），
-        // 渲染机制由独立 CLI probe（/tmp/webkit_probe.swift）与 GUI app 实测验证；
-        // 此处保留用例供未来在 GUI 测试宿主中启用。
-        try XCTSkipUnless(ProcessInfo.processInfo.environment["ENABLE_WEBKIT_RENDER_TESTS"] == "1",
-                          "WKWebView 无法在 xctest 宿主中创建")
+        // 曾因 `rules()` 在非隔离 TaskGroup 子任务里调用 @MainActor 的
+        // WKContentRuleListStore 而在 xctest / GUI 里直接崩（signal 5），被误判为
+        // 「WKWebView 无法在 xctest 宿主中创建」而长期 skip。根因修复后默认启用，
+        // 这两个渲染用例同时充当该崩溃的回归保护。
         let url = try startServer(body: """
         <html><body><h1>Static Heading</h1>
         <div id="late"></div>
@@ -119,7 +118,8 @@ final class WebRenderTests: XCTestCase {
         let tool = WebRenderTool(config: testConfig, callbacks: nil)
         let result = try await tool.run([
             "url": .string(url.absoluteString),
-            "wait_selector": .string("#late"),
+            // `#late` 容器一开始就存在，等元素本身会立即返回；要等它填充完成。
+            "wait_selector": .string("#late:not(:empty)"),
             "wait_ms": .string("0"),
             "script": .string("document.getElementById('late').textContent"),
         ])
@@ -130,8 +130,6 @@ final class WebRenderTests: XCTestCase {
     }
 
     func testAlertDoesNotBlockRender() async throws {
-        try XCTSkipUnless(ProcessInfo.processInfo.environment["ENABLE_WEBKIT_RENDER_TESTS"] == "1",
-                          "WKWebView 无法在 xctest 宿主中创建")
         let url = try startServer(body: """
         <html><body><p>alert-page-ok</p>
         <script>alert('blocking?'); document.title='survived';</script>

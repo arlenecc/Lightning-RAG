@@ -14,11 +14,10 @@ final class KnowledgeBaseToolPolicyTests: XCTestCase {
     // MARK: - RAG 结果文本契约
 
     func testRagUsageNoteDeclaresPassagesAreTheContent() {
-        XCTAssertTrue(ragUsageNote.contains("以上即知识库返回的全部可用内容"))
+        XCTAssertTrue(ragUsageNote.contains("以上即本次检索返回的全部可用内容"))
         XCTAssertTrue(ragUsageNote.contains("不是磁盘文件路径"))
-        XCTAssertTrue(ragUsageNote.contains("禁止用 `file_read`"))
-        XCTAssertTrue(ragUsageNote.contains("`shell_run`"))
-        XCTAssertTrue(ragUsageNote.contains("`cat`"))
+        XCTAssertTrue(ragUsageNote.contains("仅适用于读取已索引文档"))
+        XCTAssertTrue(ragUsageNote.contains("本规则不限制其它工具"))
     }
 
     func testRagToolOKAppendsUsageNoteToEveryResult() {
@@ -28,10 +27,39 @@ final class KnowledgeBaseToolPolicyTests: XCTestCase {
         XCTAssertTrue(result.output.contains("不是磁盘文件路径"))
     }
 
-    func testSystemPromptForbidsFileToolsForKnowledgeBaseQueries() {
-        XCTAssertTrue(BASE_SYSTEM_PROMPT.contains("知识库问答只用 rag_ 系列工具"))
-        XCTAssertTrue(BASE_SYSTEM_PROMPT.contains("不是磁盘文件路径"))
-        XCTAssertTrue(BASE_SYSTEM_PROMPT.contains("禁止用 `file_read`/`shell_run`/`code_run`/`cat`"))
+    func testSystemPromptKeepsKnowledgeBaseRuleNarrow() {
+        XCTAssertTrue(BASE_SYSTEM_PROMPT.contains("不是磁盘"))
+        XCTAssertTrue(BASE_SYSTEM_PROMPT.contains("以上仅约束「读取已索引文档」"))
+        XCTAssertTrue(BASE_SYSTEM_PROMPT.contains("给网址/要实时信息用 `web_scan`"))
+        XCTAssertFalse(BASE_SYSTEM_PROMPT.contains("知识库问答只用 rag_"),
+                       "全局禁令会让模型连联网工具都不敢调用")
+    }
+
+    /// 用户实测：问 CNN / 招聘网站，模型回「作为本地 agent 我没有访问外部
+    /// 网站的权限」，并把知识库规则当成全局能力边界。所有注入文本都不得
+    /// 再出现「只用 rag_* / 禁止用文件工具」这类可被泛化的措辞。
+    func testKnowledgeBaseRulesNeverDisableOtherTools() {
+        let texts = [
+            ("system", BASE_SYSTEM_PROMPT),
+            ("dynamic context", KNOWLEDGE_BASE_HINT),
+            ("rag result", ragUsageNote),
+        ]
+        let globalBans = ["知识库问答只用", "只用 rag_", "禁止用文件工具", "不能改用文件工具绕过"]
+        for (label, text) in texts {
+            for ban in globalBans {
+                XCTAssertFalse(text.contains(ban), "\(label) 不得含全局禁令：\(ban)")
+            }
+            XCTAssertTrue(text.contains("web_scan"), "\(label) 必须正向提到联网工具")
+            XCTAssertTrue(text.contains("不受限制") || text.contains("不限制其它工具")
+                || text.contains("均不受限制") || text.contains("照常用"),
+                          "\(label) 必须显式声明其它工具不受限制")
+        }
+    }
+
+    func testSystemPromptAffirmsNetworkAccess() {
+        XCTAssertTrue(BASE_SYSTEM_PROMPT.contains("联网抓取"))
+        XCTAssertTrue(BASE_SYSTEM_PROMPT.contains("不要声称"))
+        XCTAssertTrue(BASE_SYSTEM_PROMPT.contains("不要用知识库检索代替联网"))
     }
 
     // MARK: - 内核：已失败的相同调用不得重发执行

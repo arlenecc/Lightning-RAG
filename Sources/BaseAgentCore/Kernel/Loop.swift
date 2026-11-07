@@ -731,8 +731,8 @@ public final class KernelLoop {
                     preset[i] = .fail(
                         "该调用此前已用完全相同的参数失败过，已跳过（原样重试不会改变结果）。"
                         + "请换参数/换工具，或直接依据已获得的信息作答；"
-                        + "知识库内容只能用 rag_outline/rag_search 获取，"
-                        + "不要改用文件工具去读源文件。")
+                        + "已索引文档的内容用 rag_* 获取，不要重复读不存在的路径。"
+                        + "外部网站与本地文件任务请改用 web_scan / file_* / shell_run 等对应工具。")
                     continue
                 }
                 switch tc.name {

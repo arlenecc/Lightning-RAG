@@ -17,16 +17,19 @@ private extension Dictionary where Key == String, Value == JSONValue {
 
 /// 贴在每条 RAG 结果尾部：知识库问答是「向量库检索」，不是「读文件」。
 /// 旧版模型把 `来源: 猫图鉴.pdf` + `章节: 6 猫图鉴` 当成磁盘上的章节文件，
-/// 臆造 `memory/猫图鉴.pdf/6 猫图鉴.md` 反复用 file_read / shell_run cat 读取，
-/// 全失败后仍不作答。规则贴着结果给，比只写在 system prompt 有效得多。
+/// 臆造 `memory/猫图鉴.pdf/6 猫图鉴.md` 反复用 file_read / shell_run cat 读取。
+/// 但规则必须**精确限定在读取已索引文档这一件事**：曾有一版写成
+/// 「知识库问答只用 rag_*，禁止用文件工具」，模型泛化成全局能力边界，
+/// 连 `web_scan` 抓外部网站都不敢调用，反问用户「我没有访问外网的权限」。
 let ragUsageNote = """
 
 ---
-【知识库读取规则】以上即知识库返回的全部可用内容，请直接据此作答（需要更多细节就再用
-`rag_search` 换措辞/换章节，或用 `rag_outline` 看大纲）。「来源 / 章节 / 文档名 / 文档 ID」
-只是向量库的索引标识，**不是磁盘文件路径**；源文件（PDF、扫描件等）已切片入库，磁盘上
-不存在由它们拼出的 `.md` 文本。禁止用 `file_read`、`file_patch`、`shell_run`、`code_run`
-或 `cat` 去读知识库文档或臆造路径——这类调用必然失败，也不能改用文件工具绕过。
+【知识库读取规则（仅适用于读取已索引文档）】以上即本次检索返回的全部可用内容，
+请直接据此作答（需要更多细节就再用 `rag_search` 换措辞/换章节，或 `rag_outline`
+看大纲）。「来源 / 章节 / 文档名 / 文档 ID」是向量库索引标识、不是磁盘文件路径；
+源文件（PDF、扫描件等）已切片入库，磁盘上不存在由它们拼出的 `.md`，去读必然失败、
+无需尝试。本规则不限制其它工具：访问外部网站用 `web_scan`/`web_render`，读写本地文件、
+执行命令用 `file_*`/`shell_run`/`code_run`，均照常可用。
 """
 
 func ragToolOK(_ text: String) -> ToolResult {
@@ -38,7 +41,7 @@ func ragToolOK(_ text: String) -> ToolResult {
 /// 知识库检索工具：等价于 Python `RagSearchTool`。
 public final class RagSearchTool: AgentTool {
     public let name = "rag_search"
-    public let description = "从本地知识库（RAG）检索与 query 相关的内容，可限定来源文件。query 请使用用户原始措辞，不要翻译或音译。返回带来源的 Markdown 片段，片段即正文、请直接据此作答；来源/章节只是索引标识、不是磁盘文件路径，禁止用 file_read/shell_run/code_run 读取源文件。"
+    public let description = "从本地知识库（RAG）检索与 query 相关的内容，可限定来源文件。query 请使用用户原始措辞，不要翻译或音译。返回带来源的 Markdown 片段，片段即正文、请直接据此作答；来源/章节只是索引标识、不是磁盘文件路径，无需再找原文件。此说明只针对知识库文档，不影响 web_scan / file_* / shell_run 等其它工具。"
     public let parameters: JSONValue = .object([
         "type": .string("object"),
         "properties": .object([
@@ -90,7 +93,7 @@ public final class RagSearchTool: AgentTool {
 /// 文档大纲工具：等价于 Python `RagOutlineTool`。
 public final class RagOutlineTool: AgentTool {
     public let name = "rag_outline"
-    public let description = "查看已索引文档的章节结构（目录）与内容摘要，用于先整体了解一本书再定位细节；不传 book_name 时列出全部已索引文档。章节标题/摘要是向量库索引内容，不是磁盘文件路径，禁止用文件工具读取。"
+    public let description = "查看已索引文档的章节结构（目录）与内容摘要，用于先整体了解一本书再定位细节；不传 book_name 时列出全部已索引文档。章节标题/摘要是向量库索引内容、不是磁盘文件路径，无需再找原文件。此说明只针对知识库文档，不影响 web_scan / file_* / shell_run 等其它工具。"
     public let parameters: JSONValue = .object([
         "type": .string("object"),
         "properties": .object([
