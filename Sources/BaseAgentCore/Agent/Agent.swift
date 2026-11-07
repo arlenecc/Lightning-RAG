@@ -1020,8 +1020,12 @@ public final class Agent: @unchecked Sendable {
         let hasLLMWork = canExtract || hasPending || shouldTidy
         guard hasLLMWork else { return }
 
-        // 主模型无法提供独立会话时，后台请求会清空并覆盖主会话 KV；
-        // 此时**只跳过 LLM 工作**（归档/入队已在同步阶段完成，队列保留待下次消费）。
+        // 后台 LLM 工作（事实抽取/经验蒸馏/记忆整理）影响整体功能：
+        // **辅助模型优先，主模型兜底**——兜底必须走 isolated 副本（关闭
+        // thinking、不碰主会话 KV，见 backgroundRequestOptions）；主模型连
+        // isolated 都不支持时才跳过（队列保留待下次消费）。
+        // 注意：章节目录摘要不在此列——它不影响功能，只用辅助模型
+        // （见 BookSummaryCoordinator，辅助不可用即停做）。
         let service = auxLLM ?? llm
         guard Self.backgroundRequestOptions(for: service, isMain: service === llm) != nil else {
             log("[memory] 主模型不支持独立会话，跳过后台 LLM；待提炼队列已保留")
@@ -1306,6 +1310,13 @@ public final class Agent: @unchecked Sendable {
         return LLMRequestOptions(enableThinking: false, isolated: true)
     }
 
+    /// 后台辅助任务的统一 LLM 入口（折叠摘要 / 事实抽取 / 经验蒸馏 /
+    /// 记忆整理 / RAG 检索浓缩）。
+    ///
+    /// 这些任务影响整体功能（记忆/检索质量），因此**辅助模型优先、主模型
+    /// 兜底**：辅助不可用时走主模型 isolated 副本（关闭 thinking、不碰主
+    /// 会话 KV）；主模型连 isolated 都不支持时任务跳过。章节目录摘要不属
+    /// 于此类——它是锦上添花，只用辅助模型（见 BookSummaryCoordinator）。
     private func collectChat(_ messages: [ChatMessage], temperature: Double) async -> String {
         let service = auxLLM ?? llm
         guard let options = Self.backgroundRequestOptions(for: service,
@@ -1334,7 +1345,7 @@ public final class Agent: @unchecked Sendable {
         // 辅助模型默认（`aux_llm_kv_reuse=false`）在调用结束后丢弃 KV：后台摘要 /
         // 事实抽取的内容每次都不同、跨调用命中率低，长 KV 常驻不划算；
         // 开启复用后保留缓存，相同前缀（system prompt）可跨调用复用。
-        // 主模型缓存始终不能在这里清。
+        // 主模型（兜底路径）的常驻会话缓存始终不能在这里清。
         if service !== llm, !config.auxKvReuse {
             (service as? KVCacheInvalidating)?.invalidateKVCache()
         }

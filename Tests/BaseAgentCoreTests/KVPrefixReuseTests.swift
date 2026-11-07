@@ -232,9 +232,10 @@ final class KVPrefixReuseTests: XCTestCase {
         XCTAssertEqual(loop.consolidateEvery, 2)
     }
 
-    // MARK: - 后台任务隔离
+    // MARK: - 后台任务模型选择
 
-    /// 不支持独立会话的主模型：后台事实抽取必须整体跳过，不能改写主会话 KV。
+    /// 不支持独立会话的主模型（且无辅助模型）：后台事实抽取必须整体跳过，
+    /// 不能改写主会话 KV。
     func testBackgroundWorkSkippedWhenMainModelCannotIsolate() async {
         let llm = RecordingLLM(supportsIsolated: false, reply: "Hello there!")
         let agent = makeAgent(llm: llm)
@@ -248,8 +249,8 @@ final class KVPrefixReuseTests: XCTestCase {
         XCTAssertEqual(llm.optionCallCount, 0, "不支持独立会话时不应发起后台请求")
     }
 
-    /// 支持独立会话的主模型：后台请求必须走 isolated 且关闭 thinking，
-    /// 否则一次事实抽取就会把主会话的 KV/历史整段换掉。
+    /// 支持独立会话的主模型（且无辅助模型）：后台兜底请求必须走 isolated
+    /// 且关闭 thinking，否则一次事实抽取就会把主会话的 KV/历史整段换掉。
     func testBackgroundCallUsesIsolatedSessionWhenSupported() async {
         let llm = RecordingLLM(supportsIsolated: true, reply: "Hello there!")
         let agent = makeAgent(llm: llm)
@@ -266,15 +267,22 @@ final class KVPrefixReuseTests: XCTestCase {
         XCTAssertEqual(llm.defaultCallCount, 1)
     }
 
-    func testBackgroundRequestOptionsRouting() {
-        let isolating = RecordingLLM(supportsIsolated: true, reply: "")
-        let serial = RecordingLLM(supportsIsolated: false, reply: "")
+    /// 辅助模型可用：后台请求走辅助模型（默认选项），主模型只服务前台对话。
+    func testBackgroundCallPrefersAux() async {
+        let llm = RecordingLLM(supportsIsolated: true, reply: "Hello there!")
+        let aux = RecordingLLM(supportsIsolated: false, reply: "facts")
+        let agent = makeAgent(llm: llm)
+        defer { agent.close() }
+        agent.auxLLM = aux
 
-        XCTAssertEqual(Agent.backgroundRequestOptions(for: isolating, isMain: true),
-                       LLMRequestOptions(enableThinking: false, isolated: true))
-        XCTAssertNil(Agent.backgroundRequestOptions(for: serial, isMain: true))
-        XCTAssertEqual(Agent.backgroundRequestOptions(for: serial, isMain: false),
-                       LLMRequestOptions.default)
+        _ = await agent.run("please remember my editor is vim")
+        let idle = await waitForBackgroundIdle(agent)
+        XCTAssertTrue(idle, "后台任务应在超时前结束")
+
+        XCTAssertEqual(llm.defaultCallCount, 1, "主模型只应服务前台对话")
+        XCTAssertEqual(llm.optionCallCount, 0, "辅助可用时主模型不得被后台调用")
+        XCTAssertGreaterThanOrEqual(aux.defaultCallCount + aux.optionCallCount, 1,
+            "后台任务应调用辅助模型")
     }
 
     // MARK: - 工具预算

@@ -137,6 +137,17 @@ public final class MLXLLMService: LLMService, PreloadableLLMService,
             // 取消时直接终止底层 MLX 生成，避免用户点「终止」后还要等下一个 token。
             let innerTask = InnerTaskBox()
             let task = Task {
+                // 生成中断抢救记账：截断/取消发生时，prompt 段的 KV 仍然
+                // 有效（内核重试只在历史末尾追加纠错提示）。可裁剪缓存
+                // 裁掉已生成部分保留 prompt，重试的 prefill 只剩增量；
+                // 不可裁剪缓存（Qwen3.5 MambaCache）无法撤销生成段，
+                // 只能整体丢弃（维持旧行为）。
+                var activeCache: [KVCache]?
+                var activePromptTokens = 0
+                var activePromptTokenIDs: [Int]?
+                var activeTranscript: [ChatMessage] = []
+                var activeToolsKey: String?
+                var activeIterator: StatefulTokenIterator?
                 do {
                     try Task.checkCancellation()
                     let container = try await state.container(directory: directory)
@@ -391,6 +402,12 @@ public final class MLXLLMService: LLMService, PreloadableLLMService,
                     let wrapped = StatefulTokenIterator(iterator: iterator)
                     // 预填充后、生成前的状态，供下一次调用接续。
                     rawState = wrapped.state
+                    activeCache = cache
+                    activePromptTokens = totalPromptTokens
+                    activePromptTokenIDs = promptTokensForCache
+                    activeTranscript = transcriptAfter
+                    activeToolsKey = toolsKey
+                    activeIterator = wrapped
                     let (stream, generationTask) = MLXLMCommon.generateTask(
                         promptTokenCount: input.text.tokens.size,
                         modelConfiguration: modelConfiguration,
@@ -502,8 +519,31 @@ public final class MLXLLMService: LLMService, PreloadableLLMService,
                     innerTask.task = nil
                     if truncated {
                         // 半截工具调用不会进入消息轨迹，继续复用这段缓存会让
-                        // 下一轮从残缺 payload 之后接着生成，直接丢弃重建。
-                        invalidateKVCache()
+                        // 下一轮从残缺 payload 之后接着生成。但 prompt 段的 KV
+                        // 仍然有效：可裁剪缓存裁掉已生成的部分保留 prompt，
+                        // 内核重试（相同历史 + 末尾追加纠错提示）经 token 级
+                        // 前缀匹配命中整段 prompt，重试 prefill 只剩增量。
+                        let generated = activeIterator?.tokenCount ?? 0
+                        if let salvage = activeCache, generated > 0,
+                           salvage.allSatisfy({ $0.isTrimmable }) {
+                            let trimmed = salvage.map { $0.trim(generated) }
+                            if trimmed.allSatisfy({ $0 == generated }) {
+                                rawCache = salvage
+                                rawState = nil
+                                cachedTokenCount = activePromptTokens
+                                cachedTokens = activePromptTokenIDs ?? []
+                                sessionTranscript = activeTranscript
+                                pendingGeneratedAssistant = false
+                                cachedToolsKey = activeToolsKey
+                                AgentLog.info("[mlx-kv] truncated 抢救：保留 "
+                                    + "prompt=\(activePromptTokens) 裁生成=\(generated)")
+                            } else {
+                                invalidateKVCache()
+                            }
+                        } else {
+                            // 不可裁剪缓存（Qwen3.5 MambaCache）无法撤销生成段。
+                            invalidateKVCache()
+                        }
                     } else {
                         // 成功后才提交缓存与轨迹；下一次调用可直接在其后追加。
                         rawCache = cache
@@ -531,8 +571,32 @@ public final class MLXLLMService: LLMService, PreloadableLLMService,
                     ))
                     continuation.finish()
                 } catch {
-                    // 取消/失败后缓存可能已部分推进，丢弃会话让下次重建。
                     innerTask.cancel()
+                    // 取消/失败时缓存已部分推进。prompt 段 KV 仍然有效：
+                    // 可裁剪缓存裁掉已生成的部分保留 prompt（内核重试/下一轮
+                    // 消息 = 原历史 + 新输入，token 级前缀命中 prompt，只补
+                    // 增量）；不可裁剪缓存只能整体丢弃重建。
+                    let generated = activeIterator?.tokenCount ?? 0
+                    if let salvage = activeCache, generated > 0,
+                       salvage.allSatisfy({ $0.isTrimmable }) {
+                        let trimmed = salvage.map { $0.trim(generated) }
+                        if trimmed.allSatisfy({ $0 == generated }) {
+                            rawCache = salvage
+                            rawState = nil
+                            cachedTokenCount = activePromptTokens
+                            cachedTokens = activePromptTokenIDs ?? []
+                            sessionTranscript = activeTranscript
+                            pendingGeneratedAssistant = false
+                            cachedToolsKey = activeToolsKey
+                            AgentLog.info("[mlx-kv] 中断抢救：保留 prompt=\(activePromptTokens) "
+                                + "裁生成=\(generated)（\(String(describing: type(of: error))))")
+                            continuation.finish(throwing: Self.mapError(error, modelName: modelName))
+                            return
+                        }
+                    }
+                    AgentLog.warning("[mlx-kv] 中断丢弃缓存重建: "
+                        + "\(String(describing: type(of: error))) "
+                        + "\(String(describing: error).prefix(160))")
                     rawCache = nil
                     rawState = nil
                     cachedTokenCount = 0
@@ -591,7 +655,12 @@ public final class MLXLLMService: LLMService, PreloadableLLMService,
         try Task.checkCancellation()
         let container = try await state.container(directory: directory)
         let tokenizer = await container.tokenizer
-        guard let bridge = tokenizer as? MLXTokenizerBridge else { return }
+        guard let bridge = tokenizer as? MLXTokenizerBridge else {
+            // 诊断：container 的 tokenizer 若不是应用的 bridge 包装，预热静默失效。
+            AgentLog.warning("[mlx-warmup] 跳过：tokenizer 类型 \(type(of: tokenizer)) "
+                + "不是 MLXTokenizerBridge")
+            return
+        }
 
         let toolSpecs = Self.makeToolSpecs(tools)
         let context: [String: any Sendable] = ["enable_thinking": enableThinking]
@@ -610,9 +679,11 @@ public final class MLXLLMService: LLMService, PreloadableLLMService,
             kvInt8: kvInt8)
 
         // system-only 渲染被模板拒绝（Qwen3.5 等要求消息里有 user）时，
-        // 改用两条不同占位 user 渲染并差分求出 system 段 token 边界；预填
-        // 含占位的序列后裁掉占位段，缓存与快照只保留 system 段 —— 与正式
-        // 请求的前缀逐 token 一致。差分要求缓存可裁剪，否则放弃预热。
+        // 用两条不同占位 user 渲染并差分求出 system 段 token 边界。
+        // 【关键】prefill 只喂公共前缀段（system 段），从不 prefill 占位
+        // 内容再裁剪——旧实现依赖 KVCache.trim，把 MambaCache（Qwen3.5 的
+        // SSM 递归状态不可回退）整体挡在预热之外；改为按边界 prefill 后，
+        // 可裁剪与不可裁剪缓存统一适用，且省掉占位段的多余计算。
         var tokens: [Int]
         var keepCount: Int
         do {
@@ -624,10 +695,6 @@ public final class MLXLLMService: LLMService, PreloadableLLMService,
             tokens = rendered
             keepCount = rendered.count
         } catch {
-            guard cache.allSatisfy({ $0.isTrimmable }) else {
-                AgentLog.info("[mlx-warmup] 跳过：模板要求 user 消息且缓存不可裁剪")
-                return
-            }
             func render(_ dummy: String) throws -> [Int] {
                 try bridge.applyChatTemplate(
                     messages: DefaultMessageGenerator().generate(messages: [
@@ -650,8 +717,11 @@ public final class MLXLLMService: LLMService, PreloadableLLMService,
             return
         }
 
+        // 只预填前缀段：缓存推进长度精确等于 keepCount，快照与正式请求
+        // 的前缀逐 token 对齐，无需任何 trim。
+        let prefixTokens = Array(tokens.prefix(keepCount))
         let iterator = try TokenIterator(
-            input: LMInput(tokens: MLXArray(tokens)),
+            input: LMInput(tokens: MLXArray(prefixTokens)),
             model: model, cache: cache, state: nil, parameters: parameters)
         let wrapped = StatefulTokenIterator(iterator: iterator)
 
@@ -688,18 +758,6 @@ public final class MLXLLMService: LLMService, PreloadableLLMService,
         Stream.defaultStream.synchronize()
         try Task.checkCancellation()
 
-        // 裁掉占位 user 段：后续 KV 与快照都只保留与正式请求对齐的 system 段。
-        // 占位路径仅用于可裁剪缓存（上面已校验）；system-only 路径 drop=0。
-        let drop = tokens.count - keepCount
-        if drop > 0 {
-            let trimmed = cache.map { $0.trim(drop) }
-            guard trimmed.allSatisfy({ $0 == drop }) else {
-                AgentLog.info("[mlx-warmup] 占位段裁剪失败（期望 \(drop)，实际 "
-                    + "\(trimmed)），放弃预热")
-                return
-            }
-        }
-
         let toolsKey = Self.toolsKey(tools)
         // 保留一份未推进的前缀快照；历史折叠/滑窗需要重建时从它复制，
         // 只 prefill 动态历史，避免再次计算整段 system + tools。
@@ -714,13 +772,13 @@ public final class MLXLLMService: LLMService, PreloadableLLMService,
         }
 
         rawCache = cache
-        rawState = drop > 0 ? nil : wrapped.state
+        rawState = wrapped.state
         cachedTokenCount = keepCount
         cachedTokens = Array(tokens.prefix(keepCount))
         sessionTranscript = [ChatMessage(role: .system, content: systemPrompt)]
         pendingGeneratedAssistant = false
         cachedToolsKey = toolsKey
-        AgentLog.info("[mlx-warmup] prefill tokens=\(tokens.count) kept=\(keepCount) "
+        AgentLog.info("[mlx-warmup] prefill tokens=\(keepCount) kept=\(keepCount) "
             + "tools=\(tools.count) "
             + "gpu_ready_ms=\(Int(Date().timeIntervalSince(warmupStarted) * 1000))")
     }
@@ -747,6 +805,12 @@ public final class MLXLLMService: LLMService, PreloadableLLMService,
 
     /// 历史被折叠/回滚或换模型时丢弃跨轮会话与 KV cache。
     public func invalidateKVCache() {
+        // 缓存非空时被清空意味着下一轮要全量重建（可能十几秒），留痕便于
+        // 事后从日志定位「每句回复都慢」的触发源。
+        if rawCache != nil || !sessionTranscript.isEmpty {
+            AgentLog.info("[mlx-kv] invalidate 丢弃缓存 cached=\(cachedTokenCount) "
+                + "transcript=\(sessionTranscript.count)")
+        }
         rawCache = nil
         rawState = nil
         cachedTokenCount = 0

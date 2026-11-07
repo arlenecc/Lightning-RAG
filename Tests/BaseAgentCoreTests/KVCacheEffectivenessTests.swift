@@ -115,7 +115,9 @@ final class KVCacheEffectivenessTests: XCTestCase {
         XCTAssertGreaterThan(firstCached, 3_000,
             "首轮 cached 应≈system+tools 前缀（>3k token），实际：\(first)")
         if let ms = prefillMS(first) {
-            XCTAssertLessThan(ms, 5_000,
+            // 只区分「快照命中（只 prefill 用户增量）」与「全量重建」：
+            // 全量是 17~20s 量级，阈值取 10s 留足机器负载波动的余量。
+            XCTAssertLessThan(ms, 10_000,
                 "首轮只应预填用户消息部分（快照命中），实际 prefill \(ms)ms")
         }
         let rebuildLines = kv.filter { $0.contains("[mlx-kv] rebuild reason=") }
