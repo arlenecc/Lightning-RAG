@@ -733,22 +733,31 @@ public final class MLXLLMService: LLMService, PreloadableLLMService,
         // 1) 强制求值：让「已 prefill」的 KV 状态不再是欠条。
         eval(cache.flatMap { $0.state })
 
-        // 2) 牺牲性 decode：用独立 KV cache + 与正式请求一致的采样参数跑一步生成，
-        //    提前编译 decode/采样路径的 kernel。独立 cache 保证不污染主前缀快照。
+        // 2) 牺牲性 decode：从「已 prefill 的 system 前缀缓存」复制一份，追加
+        //    一小段 user 形状的 token 再 decode 两步——编译的是首轮真实形状
+        //    （长 KV 偏移 + 增量 prefill + decode/sampler）。旧实现用 2 token
+        //    输入 + 独立空缓存，编译的是完全不同的 kernel，首句仍要现场编译
+        //    20~30s。
+        //    【必须 state: nil】主前缀的 LMOutput.State 里携带模型前向状态，
+        //    MLXArray 是引用类型；把它交给 scratch 再跑几十步 decode 会写回并
+        //    污染 warmupStateSnapshot / rawState，首轮虽用新缓存，模型侧残留
+        //    状态仍可能把生成带偏。副本缓存 + 独立 state 才是真正的隔离。
         do {
             let inferParameters = Self.parameters(
                 maxTokens: 2, temperature: 0.7, topP: topP, topK: topK,
                 minP: minP, repetitionPenalty: repetitionPenalty,
                 promptBatchSize: promptBatchSize, kvInt8: kvInt8)
-            let decodeCache = Self.stabilizeQuantizedCache(
-                try model.newCache(parameters: inferParameters), kvInt8: kvInt8)
+            let decodeCache = cache.map { $0.copy() }
+            let extra = Array(tokens.prefix(min(32, tokens.count)))
             var scratch = try TokenIterator(
-                input: LMInput(tokens: MLXArray(Array(tokens.prefix(2)))),
+                input: LMInput(tokens: MLXArray(extra)),
                 model: model, cache: decodeCache, state: nil,
                 parameters: inferParameters)
-            if scratch.next() != nil {
-                eval(decodeCache.flatMap { $0.state })
-            }
+            var steps = 0
+            while steps < extra.count + 2, scratch.next() != nil { steps += 1 }
+            eval(decodeCache.flatMap { $0.state })
+            AgentLog.info("[mlx-warmup] decode kernel 预热 shape=\(extra.count) "
+                + "steps=\(steps)")
         } catch {
             // kernel 预热失败不该让整个预热失效：主前缀缓存仍可用。
             AgentLog.info("[mlx-warmup] decode kernel 预热跳过：\(error.localizedDescription)")

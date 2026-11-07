@@ -349,7 +349,8 @@ public final class Session: @unchecked Sendable {
     // 说明：`forceFold` / `foldForConsolidation` 是「摘要式折叠」的兼容 API，
     // 保留给测试与诊断观察。生产 CONSOLIDATE 已改用下面的
     // `discardHistory(keepingRecent: 2)`：丢弃旧轮、保留最近 2 轮原文、
-    // 不回注摘要；只有占用 >90% 才由 Agent 侧 appendDigest 写入一条 LLM 摘要。
+    // 不回注摘要；只有占用 >90% 才由 Agent 侧 appendDigest 写入一条由逐轮
+    // 自带 summary 折成的文本（确定性折叠，不调 LLM）。
     // `resetForFreshContext()` 只用于 context-limit 异常重试。
 
     /// 把最老的 n 轮从 `turns` 摘掉，摘要行留进 `extraDigest`。
@@ -471,7 +472,8 @@ public final class Session: @unchecked Sendable {
     ///   仅当越过 `rawTurns`/`rawCeiling` 时最老轮滑入 `old` 被直接丢弃（不回注）。
     /// - 大裁是 CONSOLIDATE：每 `consolidateEvery` 轮 `discardHistory(keepingRecent: 2)`
     ///   丢旧轮、保留最近 2 轮原文 → 该轮前缀变化、KV 重建一次，之后段内重新稳定；
-    ///   仅 `needsAutoShrink`（占用 >90%）才走 LLM 摘要收缩并回注 `extraDigest`。
+    ///   仅 `needsAutoShrink`（占用 >90%）才把逐轮自带摘要折成一行回注
+    ///   `extraDigest`（确定性折叠，不调 LLM）。
     func windows() -> (old: [TurnRecord], raw: [TurnRecord]) {
         guard let current = turns.last else { return ([], []) }
         let completed = Array(turns.dropLast())

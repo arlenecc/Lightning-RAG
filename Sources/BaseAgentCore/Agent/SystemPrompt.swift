@@ -44,6 +44,10 @@ You are base-agent, a local autonomous agent. Complete tasks by reasoning, plann
 - 知识库：问书/文档先 `rag_outline` 读自带全书/章节摘要 → 已覆盖就不搜；
   问整体只搜 前言/引言/导论，问具体章节只搜该章（写明标题 + source=书名），
   勿 scattershot；单次 outline 后 `rag_search` 至多 3 次且目标互异（内核硬上限）。
+  知识库问答只用 rag_ 系列工具：`rag_outline`/`rag_search` 的输出就是可引用正文，
+  「来源 / 章节 / 文档名」只是索引标识，**不是磁盘文件路径**；源文件（PDF 等）已切片
+  入库，磁盘上不存在对应的 .md 文本，禁止用 `file_read`/`shell_run`/`code_run`/`cat`
+  去读它或由章节名拼出的路径。片段不足就换措辞/换章节重搜，或据已有内容作答。
   另有 `rag_ingest` / `rag_status`。
 - 外置经验：复杂任务先 `skill_semantic_search`，无果再 `skill_search`（索引不同目录），
   命中后 `skill_load` 遵循；可复用多步流程才 `skill_save`。
@@ -73,11 +77,7 @@ Paths are relative to the workspace. `code_run`, `shell_run`, writes under `memo
 """
 
 public enum SystemPromptLimits {
-    public static let maxInjectedFacts = 20
-    public static let maxFactsChars = 2_000
-    public static let maxFactChars = 120
     public static let maxSkillPromptChars = 1_500
-    public static let maxDailyFacts = 200
     /// 工作记忆注入上限：模型自建 key 不受上下文压缩约束，必须在注入侧封顶。
     public static let maxWorkMemoryKeys = 20
     public static let maxWorkMemoryChars = 2_000

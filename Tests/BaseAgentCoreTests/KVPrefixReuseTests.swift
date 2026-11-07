@@ -127,6 +127,9 @@ final class KVPrefixReuseTests: XCTestCase {
         config.llmProvider = "api"
         config.embeddingProvider = "local"
         config.maxIterations = 3
+        // 每 2 轮折叠：第 3 次 run 的循环开头就会命中一次周期性折叠，
+        // 让后台任务测试能走真实的 didFold → onFoldBoundary 链路。
+        config.kernelConsolidateEvery = 2
         return Agent(llm: llm, config: config, callbacks: NoopCallbacks())
     }
 
@@ -232,57 +235,89 @@ final class KVPrefixReuseTests: XCTestCase {
         XCTAssertEqual(loop.consolidateEvery, 2)
     }
 
-    // MARK: - 后台任务模型选择
+    // MARK: - 后台事实抽取（4h 文件游标 / 仅辅助模型）
 
-    /// 不支持独立会话的主模型（且无辅助模型）：后台事实抽取必须整体跳过，
+    /// 不支持独立会话的主模型（且无辅助模型）：后台 LLM 工作整体跳过，
     /// 不能改写主会话 KV。
     func testBackgroundWorkSkippedWhenMainModelCannotIsolate() async {
         let llm = RecordingLLM(supportsIsolated: false, reply: "Hello there!")
         let agent = makeAgent(llm: llm)
         defer { agent.close() }
 
-        _ = await agent.run("please remember my editor is vim")
+        for _ in 1...3 { _ = await agent.run("please remember my editor is vim") }
         let idle = await waitForBackgroundIdle(agent)
         XCTAssertTrue(idle, "后台任务应在超时前结束")
 
-        XCTAssertEqual(llm.defaultCallCount, 1, "后台任务不应再调用主模型")
+        XCTAssertEqual(llm.defaultCallCount, 3, "后台任务不应再调用主模型")
         XCTAssertEqual(llm.optionCallCount, 0, "不支持独立会话时不应发起后台请求")
     }
 
-    /// 支持独立会话的主模型（且无辅助模型）：后台兜底请求必须走 isolated
-    /// 且关闭 thinking，否则一次事实抽取就会把主会话的 KV/历史整段换掉。
-    func testBackgroundCallUsesIsolatedSessionWhenSupported() async {
+    /// 事实抽取**只允许辅助模型**：没有 aux 时即便主模型支持 isolated，
+    /// 也不得回退主模型做全量 prefill（那会与前台抢 GPU）。
+    func testFactExtractionRequiresAuxModel() async {
         let llm = RecordingLLM(supportsIsolated: true, reply: "Hello there!")
         let agent = makeAgent(llm: llm)
         defer { agent.close() }
 
-        _ = await agent.run("please remember my editor is vim")
+        for _ in 1...3 { _ = await agent.run("please remember my editor is vim") }
         let idle = await waitForBackgroundIdle(agent)
-        XCTAssertTrue(idle, "后台任务应在超时前结束")
+        XCTAssertTrue(idle)
 
-        let background = llm.recordedOptions
-        XCTAssertEqual(background.count, 1, "一次事实抽取")
-        XCTAssertTrue(background.allSatisfy(\.isolated))
-        XCTAssertTrue(background.allSatisfy { $0.enableThinking == false })
-        XCTAssertEqual(llm.defaultCallCount, 1)
+        XCTAssertEqual(llm.defaultCallCount, 3, "主模型只服务前台对话")
+        XCTAssertEqual(llm.optionCallCount, 0, "不得回退主模型做事实抽取")
+        XCTAssertNil(agent.workMemory.get("__auto_facts__"),
+                     "当日工作记忆不再维护")
     }
 
-    /// 辅助模型可用：后台请求走辅助模型（默认选项），主模型只服务前台对话。
-    func testBackgroundCallPrefersAux() async {
+    /// 有辅助模型时按 4h 文件游标抽取：多轮（含周期性折叠）只跑一次，
+    /// 且只写 memory graph，不写当日工作记忆。
+    func testFactExtractionUsesFileCursorAndAuxOnly() async {
         let llm = RecordingLLM(supportsIsolated: true, reply: "Hello there!")
         let aux = RecordingLLM(supportsIsolated: false, reply: "facts")
         let agent = makeAgent(llm: llm)
         defer { agent.close() }
         agent.auxLLM = aux
 
-        _ = await agent.run("please remember my editor is vim")
-        let idle = await waitForBackgroundIdle(agent)
-        XCTAssertTrue(idle, "后台任务应在超时前结束")
+        // 每轮之间等后台空闲，模拟用户正常的交互间隔；否则前台新请求会
+        // 立刻取消上一轮的抽取任务。
+        for _ in 1...4 {
+            _ = await agent.run("please remember my editor is vim")
+            let idle = await waitForBackgroundIdle(agent)
+            XCTAssertTrue(idle, "后台任务应在超时前结束")
+        }
 
-        XCTAssertEqual(llm.defaultCallCount, 1, "主模型只应服务前台对话")
+        XCTAssertEqual(llm.defaultCallCount, 4, "主模型只服务前台对话")
         XCTAssertEqual(llm.optionCallCount, 0, "辅助可用时主模型不得被后台调用")
-        XCTAssertGreaterThanOrEqual(aux.defaultCallCount + aux.optionCallCount, 1,
-            "后台任务应调用辅助模型")
+        XCTAssertEqual(aux.defaultCallCount + aux.optionCallCount, 1,
+            "4 小时内只抽一次，折叠边界不额外触发")
+        XCTAssertNil(agent.workMemory.get("__auto_facts__"),
+                     "事实只写 memory graph，不再维护当日工作记忆")
+    }
+
+    /// 上下文 >90% 的自动收缩也必须零 LLM 调用：被折掉的每一轮自带
+    /// `TurnRecord.summary`，直接折成 `<earlier_context>` 即可。旧实现在
+    /// 内核循环里同步 await 一次摘要模型，会直接卡住当前轮响应。
+    func testShrinkSessionUsesPerTurnSummariesWithoutLLM() async {
+        let llm = RecordingLLM(supportsIsolated: true, reply: "Hello there!")
+        let agent = makeAgent(llm: llm)
+        defer { agent.close() }
+
+        for index in 1...3 {
+            let rec = agent.session.startTurn(prompt: "u\(index)")
+            agent.session.finishTurn(rec, assistantText: "a\(index)",
+                                     summary: "要点-\(index)")
+        }
+        let shrunk = await agent.shrinkSession(reason: "context-90")
+
+        XCTAssertTrue(shrunk)
+        XCTAssertEqual(llm.defaultCallCount, 0, "收缩不得再调用主模型")
+        XCTAssertEqual(llm.optionCallCount, 0, "收缩不得再发起后台模型请求")
+        XCTAssertEqual(agent.session.turns.count, 1, "旧轮应被丢弃")
+        let digest = agent.session.extraDigest.joined(separator: "\n")
+        XCTAssertTrue(digest.contains("要点-1"), digest)
+        XCTAssertTrue(digest.contains("要点-2"), digest)
+        XCTAssertEqual(agent.session.turns.last?.summary, "要点-3",
+                       "最近一轮保留原文，不需要回注自己的摘要")
     }
 
     // MARK: - 工具预算

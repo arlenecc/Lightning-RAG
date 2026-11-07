@@ -569,6 +569,34 @@ public func expandPath(_ path: String) -> String {
 /// 进程内简单日志（UI 通过 AgentCallbacks.onLog 接管展示）。
 public enum AgentLog {
     private static let queue = DispatchQueue(label: "base-agent.log")
+    /// GUI 启动时 stderr 不落盘，性能问题无法事后定位；所有日志同步追加到
+    /// `~/Library/Logs/Lightning-RAG/agent-yyyyMMdd.log`（按天切分）。
+    private static let logDirectory: URL = {
+        let home = FileManager.default.homeDirectoryForCurrentUser
+        return home.appendingPathComponent("Library/Logs/Lightning-RAG")
+    }()
+    /// 当前日志文件句柄与日期（只在 queue 内访问，天然串行）。
+    nonisolated(unsafe) private static var logHandle: FileHandle?
+    nonisolated(unsafe) private static var logDate: String = ""
+
+    private static func appendToFile(_ line: String) {
+        let f = DateFormatter()
+        f.dateFormat = "yyyyMMdd"
+        let day = f.string(from: Date())
+        if day != logDate || logHandle == nil {
+            try? FileManager.default.createDirectory(at: logDirectory,
+                                                     withIntermediateDirectories: true)
+            let path = logDirectory.appendingPathComponent("agent-\(day).log")
+            if !FileManager.default.fileExists(atPath: path.path) {
+                FileManager.default.createFile(atPath: path.path, contents: nil)
+            }
+            try? logHandle?.close()
+            logHandle = try? FileHandle(forWritingTo: path)
+            logHandle?.seekToEndOfFile()
+            logDate = day
+        }
+        logHandle?.write(Data((line + "\n").utf8))
+    }
     /// 进程级兜底 sink：没有任务级 sink 时才生效（App 启动时接一次）。
     nonisolated(unsafe) public static var sink: ((String) -> Void)?
 
@@ -589,6 +617,7 @@ public enum AgentLog {
         queue.sync {
             let line = "[\(Self.timestamp())] \(message)"
             FileHandle.standardError.write((line + "\n").data(using: .utf8)!)
+            Self.appendToFile(line)
             if let local { local(line) } else { sink?(line) }
         }
     }
