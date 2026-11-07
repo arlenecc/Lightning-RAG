@@ -391,7 +391,8 @@ public final class LocalModelFactory: @unchecked Sendable {
             }
         }
         if backend == "gguf" {
-            let key = "llm-gguf:\(factor):\(config.effectiveMainContextTokens):\(config.maxTokens):\(config.llmKVReuse)"
+            // GGUF 的 FA 可与 q8_0 KV 叠加，故用原始 kvCacheInt8（不套 effective）。
+            let key = "llm-gguf:\(factor):\(config.effectiveMainContextTokens):\(config.maxTokens):\(config.llmKVReuse):\(config.kvCacheInt8):\(config.flashAttention)"
             return llms.value(for: key) {
                 do {
                     let file = try GGUFFileResolver.resolve(
@@ -411,7 +412,8 @@ public final class LocalModelFactory: @unchecked Sendable {
                             explicit: config.llmMmprojPath.isEmpty
                                 ? nil : config.llmMmprojPath),
                         kvReuse: config.llmKVReuse,
-                        kvInt8: config.kvCacheInt8
+                        kvInt8: config.kvCacheInt8,
+                        flashAttention: config.flashAttention
                     )
                 } catch {
                     AgentLog.warning("本地 GGUF LLM 不可用：\(error.localizedDescription)")
@@ -434,7 +436,7 @@ public final class LocalModelFactory: @unchecked Sendable {
             contextWindow: config.effectiveMainContextTokens,
             promptBatchSize: config.promptBatchSize,
             kvReuse: config.llmKVReuse,
-            kvInt8: config.kvCacheInt8
+            kvInt8: config.effectiveMainKVInt8
         )
 
         return llms.value(for: key) {
@@ -456,7 +458,7 @@ public final class LocalModelFactory: @unchecked Sendable {
                     contextWindow: config.effectiveMainContextTokens,
                     promptBatchSize: config.promptBatchSize,
                     kvReuse: config.llmKVReuse,
-                    kvInt8: config.kvCacheInt8
+                    kvInt8: config.effectiveMainKVInt8
                 )
             } catch {
                 AgentLog.warning("本地 LLM 不可用：\(error.localizedDescription)")
@@ -577,7 +579,7 @@ public final class LocalModelFactory: @unchecked Sendable {
             }
         }
         if backend == "gguf" {
-            let key = "aux-gguf:\(value):\(config.effectiveAuxContextTokens):\(config.auxMaxTokens):\(config.auxKvReuse):\(config.auxKvCacheInt8)"
+            let key = "aux-gguf:\(value):\(config.effectiveAuxContextTokens):\(config.auxMaxTokens):\(config.auxKvReuse):\(config.auxKvCacheInt8):\(config.flashAttention)"
             return auxValue(key: key, sharedCache: sharedCache) {
                 do {
                     let file = try GGUFFileResolver.resolve(
@@ -597,7 +599,8 @@ public final class LocalModelFactory: @unchecked Sendable {
                             explicit: config.auxMmprojPath.isEmpty
                                 ? nil : config.auxMmprojPath),
                         kvReuse: config.auxKvReuse,
-                        kvInt8: config.auxKvCacheInt8
+                        kvInt8: config.auxKvCacheInt8,
+                        flashAttention: config.flashAttention
                     )
                 } catch {
                     AgentLog.warning("本地 GGUF 辅助模型不可用：\(error.localizedDescription)")
@@ -620,7 +623,7 @@ public final class LocalModelFactory: @unchecked Sendable {
             contextWindow: config.effectiveAuxContextTokens,
             promptBatchSize: config.auxPromptBatchSize,
             kvReuse: config.auxKvReuse,
-            kvInt8: config.auxKvCacheInt8
+            kvInt8: config.effectiveAuxKVInt8
         )
 
         return auxValue(key: key, sharedCache: sharedCache) {
@@ -642,7 +645,7 @@ public final class LocalModelFactory: @unchecked Sendable {
                     contextWindow: config.effectiveAuxContextTokens,
                     promptBatchSize: config.auxPromptBatchSize,
                     kvReuse: config.auxKvReuse,
-                    kvInt8: config.auxKvCacheInt8
+                    kvInt8: config.effectiveAuxKVInt8
                 )
             } catch {
                 AgentLog.warning("本地辅助 LLM 不可用：\(error.localizedDescription)")

@@ -127,4 +127,67 @@ final class PrefillBenchmarkTests: XCTestCase {
         let digits = line[range.upperBound...].prefix { $0.isNumber }
         return Int(digits)
     }
+
+    private func metric(_ line: String, _ key: String) -> Double? {
+        guard let range = line.range(of: key) else { return nil }
+        let rest = line[range.upperBound...]
+        let number = rest.prefix { $0.isNumber || $0 == "." || $0 == "-" }
+        return Double(number)
+    }
+
+    /// Flash attention A/B：
+    /// - `kvInt8=true`（`flash_attention=false` 时）：量化 KV 缓存走自实现的
+    ///   `quantizedScaledDotProductAttention`，绕过 MLX fused flash SDPA；
+    /// - `kvInt8=false`（`flash_attention=true` 默认时）：普通 KV 缓存走
+    ///   `MLXFast.scaledDotProductAttention`（Metal fused/flash attention）。
+    ///
+    /// 8k token 长 prompt 放大 attention 占比，96 token 生成测 decode tps；
+    /// 各跑 3 轮取中位数，输出 `[flash-ab]`。
+    func testFlashAttentionAB() async throws {
+        let modelDir = try modelDirectory()
+        let longSystem = String(repeating:
+            "知识库检索系统把文档切片编码为向量，建立近似最近邻索引以加速召回。", count: 220)
+        let messages: [ChatMessage] = [
+            ChatMessage(role: .system, content: longSystem),
+            ChatMessage(role: .user, content: "请用一句话说明这个系统的用途。"),
+        ]
+
+        for (label, kvInt8) in [("kvint8-no-flash", true), ("kvfp16-flash", false)] {
+            var prefillSamples: [Double] = []
+            var tpsSamples: [Double] = []
+
+            for run in 1...3 {
+                let service = MLXLLMService(
+                    directory: modelDir,
+                    modelName: "flash-ab-\(label)-\(run)",
+                    maxTokens: 96,
+                    enableThinking: false,
+                    contextWindow: 32_768,
+                    kvReuse: false,
+                    kvInt8: kvInt8)
+                defer { service.close() }
+
+                let collector = LogCollector()
+                try await AgentLog.withTaskSink({ collector.append($0) }) {
+                    for try await _ in service.chatStream(
+                        messages: messages, tools: [], temperature: 0.1) {}
+                }
+                let kvLine = collector.lines.first { $0.contains("[mlx-kv] reuse=") } ?? ""
+                let tpsLine = collector.lines.first { $0.contains("[mlx] prompt=") } ?? ""
+                if let ms = prefillMS(kvLine) { prefillSamples.append(Double(ms)) }
+                if let tps = metric(tpsLine, "tps=") { tpsSamples.append(tps) }
+                print("[flash-ab] \(label) run\(run): \(kvLine) | \(tpsLine)")
+            }
+
+            func median(_ values: [Double]) -> Double {
+                guard !values.isEmpty else { return -1 }
+                let sorted = values.sorted()
+                return sorted[sorted.count / 2]
+            }
+            XCTAssertEqual(prefillSamples.count, 3, "\(label) 应采集到 3 轮 prefill 数据")
+            XCTAssertEqual(tpsSamples.count, 3, "\(label) 应采集到 3 轮 tps 数据")
+            print("[flash-ab] RESULT \(label): prefill_median=\(median(prefillSamples))ms "
+                + "tps_median=\(median(tpsSamples))")
+        }
+    }
 }

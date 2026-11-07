@@ -26,6 +26,25 @@ final class GGUFKVReuseTests: XCTestCase {
 
     // MARK: - 集成（需真实 GGUF 模型）
 
+    /// Flash Attention (ENABLED) 与 q8_0 KV 量化叠加：
+    /// llama.cpp 必须能初始化并正常生成，不因组合报错/回退为不可用。
+    func testFlashAttentionWithQuantizedKV() async throws {
+        let modelURL = try modelURL()
+        let service = LlamaCppLLMService(
+            modelPath: modelURL.path,
+            contextWindow: 8_192, maxTokens: 32,
+            topP: 1, minP: 0, topK: 0, repetitionPenalty: 1,
+            enableThinking: false, gpuLayers: 0,
+            kvInt8: true, flashAttention: true)
+        defer { service.close() }
+
+        let output = try await collect(service, messages: [
+            ChatMessage(role: .system, content: "你是测试助手，回答必须极简。"),
+            ChatMessage(role: .user, content: "一句话说明向量检索的用途。"),
+        ])
+        XCTAssertFalse(output.isEmpty, "ENABLED + q8_0 KV 组合应能正常生成")
+    }
+
     private func modelURL() throws -> URL {
         let path = ProcessInfo.processInfo.environment["GGUF_KV_TEST_MODEL"] ?? ""
         guard !path.isEmpty, FileManager.default.fileExists(atPath: path) else {

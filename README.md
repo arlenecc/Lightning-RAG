@@ -52,8 +52,8 @@ VARIANT=lite  scripts/package-app.sh release && VARIANT=lite  scripts/package-dm
 
 | VARIANT | 内置模型 | DMG |
 |---|---|---|
-| `clean`（默认） | 无；potion 语义切片 / jina embedding / jina reranker 均在首次启动时从 hf-mirror 自动下载 | `dist/Lightning-RAG-1.2.20-clean.dmg` |
-| `lite` | potion-multilingual-128M int4（语义切片）+ jina-embeddings-v5-text-nano-mlx-int4 + jina-reranker-v2-base-multilingual-onnx | `dist/Lightning-RAG-1.2.20-lite.dmg` |
+| `clean`（默认） | 无；potion 语义切片 / jina embedding / jina reranker 均在首次启动时从 hf-mirror 自动下载 | `dist/Lightning-RAG-1.2.21-clean.dmg` |
+| `lite` | potion-multilingual-128M int4（语义切片）+ jina-embeddings-v5-text-nano-mlx-int4 + jina-reranker-v2-base-multilingual-onnx | `dist/Lightning-RAG-1.2.21-lite.dmg` |
 
 两个版本共用 `dist/Lightning-RAG.app`（应用本体与显示名不变，只有内置模型不同），
 因此需按「打包 App → 打包 DMG」的顺序逐个构建。两个版本都不含主模型、辅助模型
@@ -109,7 +109,7 @@ HTML 与 Office 解析另有专项覆盖：HTML 保存页的本地 iframe / fram
 - **右上角按钮**：「配置」和「日志」各自打开独立窗口；日志窗口含日志/工具调用两个页签。
 - **配置窗口（Agent 模型配置）**：
   - 主模型：本地模式 / OpenAI 兼容接口二选一，默认本地模式。
-  - 本地模式：模型类型（MLX-LM / MLX-VLM / ONNX / GGUF）、本地路径与目录选择、`context`/`KV 上限`/`temp`/`top_p`/`min_p`/`top_k`/`repeat`/`batch`/超时/「思考」「KV复用」「KV量化」开关，以及「启动时预加载」复选框、「加载模型」「卸载」。`KV 上限` 对应 `kv_cache_max_tokens` / `aux_kv_cache_max_tokens`，设为 0 表示跟随 Context；`batch` 对应 `prompt_batch_size`（辅助模型为 `aux_prompt_batch_size`），控制 prefill 每次前向的 token 上限，`0` 表示使用 MLX 默认值。「思考」「KV复用」「KV量化」紧跟在参数后面同一行（窗口较窄时整组开关换到参数行下一行，仍同行显示），仅在消费它们的后端（MLX-LM / GGUF）出现：`KV复用` = `llm_kv_reuse`（辅助模型 `aux_llm_kv_reuse`），`KV量化` = `kv_cache_int8`（辅助模型 `aux_kv_cache_int8`）。主/辅助两套开关各自独立：主模型默认思考开、复用开、量化开；辅助模型默认思考关、复用关（后台摘要/事实抽取用后即清，避免长 KV 常驻）、量化跟随主模型。主模型思考模式是主引擎推理与工具决策的前提，不能为了降低工具路由延迟而默认关闭；后台摘要/事实抽取始终请求级强制关闭。
+  - 本地模式：模型类型（MLX-LM / MLX-VLM / ONNX / GGUF）、本地路径与目录选择、`context`/`KV 上限`/`temp`/`top_p`/`min_p`/`top_k`/`repeat`/`batch`/超时/「思考」「KV复用」「KV量化」「Flash Attention」开关，以及「启动时预加载」复选框、「加载模型」「卸载」。`KV 上限` 对应 `kv_cache_max_tokens` / `aux_kv_cache_max_tokens`，设为 0 表示跟随 Context；`batch` 对应 `prompt_batch_size`（辅助模型为 `aux_prompt_batch_size`），控制 prefill 每次前向的 token 上限，`0` 表示使用 MLX 默认值。「思考」「KV复用」「KV量化」紧跟在参数后面同一行（窗口较窄时整组开关换到参数行下一行，仍同行显示），仅在消费它们的后端（MLX-LM / GGUF）出现：`KV复用` = `llm_kv_reuse`（辅助模型 `aux_llm_kv_reuse`），`KV量化` = `kv_cache_int8`（辅助模型 `aux_kv_cache_int8`）。`Flash Attention` = `flash_attention`（默认开启，主/辅共用）：MLX 使用未量化 KV 走 Metal fused attention、`GGUF` 强制 `flash_attn_type=ENABLED`；`GGUF` 可与 `KV量化` 叠加（llama.cpp 提供 `fa_q8_0` kernel，实测组合正常），`MLX` 因上游量化缓存不走 fused kernel，二者只能取其一（开启时 KV 量化自动停用）。M3+/M4 或纯注意力模型收益更明显。主/辅助两套开关各自独立：主模型默认思考开、复用开、量化开；辅助模型默认思考关、复用关（后台摘要/事实抽取用后即清，避免长 KV 常驻）、量化跟随主模型。主模型思考模式是主引擎推理与工具决策的前提，不能为了降低工具路由延迟而默认关闭；后台摘要/事实抽取始终请求级强制关闭。
   - API 模式：Base URL、API Key、模型下拉与「获取模型」，同一组参数与「应用配置」。
   - 辅助模型：标题后带「启用」复选框（对应 `aux_enabled`，默认关闭）。本地模式同主模型布局（含独立的「KV复用」「KV量化」开关），默认 `models/Qwen3.5-2B-MLX-4bit`；未启用时「加载模型 / 重新加载」按钮禁用。
   - 启动时按 `auto_preload_main`（默认开启）预加载主模型；辅助模型仅在 `aux_enabled=true` 时加载。关闭主模型启动预加载后，需在配置窗口手动点「加载模型」；同步结束后的模型恢复不受影响。未指定模型时使用默认主模型 `models/qwen3.5-4b-agentic-coder-v4-4bit-mlx`。加载会真正把参数应用到新创建的模型实例。

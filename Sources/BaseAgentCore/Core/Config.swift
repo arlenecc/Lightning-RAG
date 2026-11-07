@@ -114,6 +114,20 @@ public struct AgentConfig: Sendable {
     public var kvCacheInt8: Bool = true
     /// 辅助模型的 KV cache int8 量化开关（缺省跟随 `kv_cache_int8`）。
     public var auxKvCacheInt8: Bool = true
+    /// Flash Attention（默认开启，作用于 MLX 与 GGUF 的主/辅模型）：
+    /// - MLX：使用未量化 KV 缓存，让 attention 走 `MLXFast.scaledDotProductAttention`
+    ///   （Metal fused kernel）。上游 `QuantizedKVCache` 走手写反量化 attention，
+    ///   不经过 fused kernel，故 MLX 上 flash 与 int8 KV 二者只能取其一（flash 优先）。
+    /// - GGUF：`flash_attn_type = ENABLED`；llama.cpp 提供 `fa_q8_0` /
+    ///   `fa_vec_q8_0` 专用 kernel，**可与 q8_0 KV 量化叠加**（实测组合正常生成）。
+    /// 注意：本机 M1 + Qwen3.5（head_dim 256、无 NAX）实测提升在噪声范围内，
+    /// 但 M3+/M4 或纯 attention 模型可受益，故默认开启。
+    public var flashAttention: Bool = true
+
+    /// 仅 MLX 使用：flash 开启时必须用未量化 KV，否则 flash 路径不会生效。
+    /// GGUF 直接用 `kvCacheInt8` / `auxKvCacheInt8`（可与 flash 叠加）。
+    public var effectiveMainKVInt8: Bool { kvCacheInt8 && !flashAttention }
+    public var effectiveAuxKVInt8: Bool { auxKvCacheInt8 && !flashAttention }
     /// 预留（当前未接线）：上下文收缩由 L3 CONSOLIDATE 与 context-limit 重建处理，
     /// 不由本比例触发；保留字段以兼容旧配置文件。
     public var contextShrinkRatio: Double = 0.9
@@ -522,6 +536,7 @@ public struct AgentConfig: Sendable {
         if let v = int("kv_cache_max_tokens") { kvCacheMaxTokens = v }
         if let v = bool("llm_kv_reuse") { llmKVReuse = v }
         if let v = bool("kv_cache_int8") { kvCacheInt8 = v }
+        if let v = bool("flash_attention") { flashAttention = v }
         // 旧配置没有辅助模型的 KV 键：复用默认关闭（与改造前「用后即清」一致），
         // 量化跟随主模型。
         auxKvReuse = bool("aux_llm_kv_reuse") ?? false
@@ -912,6 +927,7 @@ public struct AgentConfig: Sendable {
             "kv_cache_max_tokens": kvCacheMaxTokens,
             "llm_kv_reuse": llmKVReuse,
             "kv_cache_int8": kvCacheInt8,
+            "flash_attention": flashAttention,
             "aux_kv_cache_max_tokens": auxKvCacheMaxTokens,
             "aux_llm_kv_reuse": auxKvReuse,
             "aux_kv_cache_int8": auxKvCacheInt8,
@@ -1045,7 +1061,7 @@ public struct AgentConfig: Sendable {
         "local_llm_model", "local_llm_backend", "local_llm_enable_thinking",
         "llm_tokenizer_path", "llm_mmproj_path",
         "max_context_tokens", "context_shrink_ratio", "prompt_batch_size",
-        "kv_cache_max_tokens", "llm_kv_reuse", "kv_cache_int8",
+        "kv_cache_max_tokens", "llm_kv_reuse", "kv_cache_int8", "flash_attention",
         "auto_preload_main",
     ]
 
@@ -1056,7 +1072,7 @@ public struct AgentConfig: Sendable {
         "aux_temperature", "aux_max_tokens", "aux_top_p", "aux_min_p", "aux_top_k",
         "aux_repetition_penalty", "aux_request_timeout",
         "aux_max_context_tokens", "aux_prompt_batch_size", "aux_kv_cache_max_tokens",
-        "aux_llm_kv_reuse", "aux_kv_cache_int8",
+        "aux_llm_kv_reuse", "aux_kv_cache_int8", "flash_attention",
         "aux_tokenizer_path", "aux_mmproj_path",
     ]
 

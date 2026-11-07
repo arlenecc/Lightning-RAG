@@ -400,9 +400,17 @@ enum LlamaCppContext {
         contextWindow: Int,
         batchSize: Int,
         embeddings: Bool,
-        kvInt8: Bool = false
+        kvInt8: Bool = false,
+        /// nil = 保持 llama.cpp 默认 AUTO（embedding/VLM 路径）；
+        /// true = 强制 ENABLED，false = 显式 DISABLED（LLM 路径由配置驱动）。
+        flashAttention: Bool? = nil
     ) throws -> OpaquePointer {
         var params = llama_context_default_params()
+        if let flashAttention {
+            params.flash_attn_type = flashAttention
+                ? LLAMA_FLASH_ATTN_TYPE_ENABLED
+                : LLAMA_FLASH_ATTN_TYPE_DISABLED
+        }
         let window = max(512, contextWindow)
         let batch = max(64, min(batchSize, window))
         params.n_ctx = UInt32(window)

@@ -25,6 +25,8 @@ public final class LlamaCppLLMService: LLMService, PreloadableLLMService,
     private let kvReuse: Bool
     /// KV cache int8 量化（ggml q8_0），KV 内存约减半。
     private let kvInt8: Bool
+    /// 是否让 llama.cpp 强制启用 Flash Attention（可与 q8_0 KV 叠加）。
+    private let flashAttention: Bool
 
     private let gate = AsyncGate()
     private let lock = NSLock()
@@ -48,7 +50,8 @@ public final class LlamaCppLLMService: LLMService, PreloadableLLMService,
          gpuLayers: Int,
          mmprojPath: String? = nil,
          kvReuse: Bool = true,
-         kvInt8: Bool = true) {
+         kvInt8: Bool = true,
+         flashAttention: Bool = true) {
         self.modelPath = modelPath
         self.identifier = "llama.cpp:\((modelPath as NSString).lastPathComponent)"
         self.contextWindow = max(1_024, contextWindow)
@@ -62,6 +65,7 @@ public final class LlamaCppLLMService: LLMService, PreloadableLLMService,
         self.mmprojPath = mmprojPath
         self.kvReuse = kvReuse
         self.kvInt8 = kvInt8
+        self.flashAttention = flashAttention
     }
 
     // MARK: - LLMService
@@ -146,7 +150,8 @@ public final class LlamaCppLLMService: LLMService, PreloadableLLMService,
                                    contextWindow: contextWindow,
                                    gpuLayers: gpuLayers,
                                    mmprojPath: mmprojPath,
-                                   kvInt8: kvInt8)
+                                   kvInt8: kvInt8,
+                                   flashAttention: flashAttention)
             loaded = value
             return value
         } catch {
@@ -598,7 +603,7 @@ public final class LlamaCppLLMService: LLMService, PreloadableLLMService,
         let vision: OpaquePointer?
 
         init(modelPath: String, contextWindow: Int, gpuLayers: Int,
-             mmprojPath: String?, kvInt8: Bool) throws {
+             mmprojPath: String?, kvInt8: Bool, flashAttention: Bool) throws {
             model = try LlamaCppModel(path: modelPath, gpuLayers: gpuLayers)
             batchSize = min(2_048, max(64, contextWindow))
             context = try LlamaCppContext.make(
@@ -606,7 +611,8 @@ public final class LlamaCppLLMService: LLMService, PreloadableLLMService,
                 contextWindow: contextWindow,
                 batchSize: batchSize,
                 embeddings: false,
-                kvInt8: kvInt8)
+                kvInt8: kvInt8,
+                flashAttention: flashAttention)
             memory = llama_get_memory(context)
             let modelPointer = model.raw
 

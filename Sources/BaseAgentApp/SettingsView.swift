@@ -16,6 +16,7 @@ struct SettingsView: View {
     @State private var mainContext = 32768
     @State private var mainKVCache = 32_768
     @State private var kvInt8Enabled = true
+    @State private var flashAttentionEnabled = true
     @State private var mainTokenizer = ""
     @State private var auxTokenizer = ""
     @State private var mainTemperature = 0.7
@@ -237,7 +238,8 @@ struct SettingsView: View {
                     promptBatch: $mainPromptBatch,
                     thinking: $mainThinking,
                     kvReuse: $mainKVReuse,
-                    kvInt8: $kvInt8Enabled
+                    kvInt8: $kvInt8Enabled,
+                    flashAttention: $flashAttentionEnabled
                 ) {
                     HStack(spacing: 8) {
                         if model.mainModelLoaded {
@@ -335,7 +337,8 @@ struct SettingsView: View {
                 promptBatch: $auxPromptBatch,
                 thinking: $auxThinking,
                 kvReuse: $auxKVReuse,
-                kvInt8: $auxKVInt8Enabled
+                kvInt8: $auxKVInt8Enabled,
+                flashAttention: $flashAttentionEnabled
             ) {
                 HStack(spacing: 8) {
                     if model.auxModelLoaded {
@@ -410,6 +413,7 @@ struct SettingsView: View {
         thinking: Binding<Bool>,
         kvReuse: Binding<Bool>,
         kvInt8: Binding<Bool>,
+        flashAttention: Binding<Bool>,
         @ViewBuilder actions: () -> some View
     ) -> some View {
         VStack(alignment: .leading, spacing: 6) {
@@ -472,7 +476,9 @@ struct SettingsView: View {
                         // ONNX 自动复用 past_key_values、MLX-VLM 每轮重建 prompt，
                         // 都不消费这两个开关，故仅在支持的后端上显示。
                         kvReuse: supportsKVToggles(backend.wrappedValue) ? kvReuse : nil,
-                        kvInt8: supportsKVToggles(backend.wrappedValue) ? kvInt8 : nil
+                        kvInt8: supportsKVToggles(backend.wrappedValue) ? kvInt8 : nil,
+                        flashAttention: supportsKVToggles(backend.wrappedValue)
+                            ? flashAttention : nil
                     )
                     Spacer(minLength: 4)
                     actions()
@@ -489,7 +495,9 @@ struct SettingsView: View {
                         promptBatch: backend.wrappedValue == "mlx-lm" ? promptBatch : nil,
                         thinking: thinking,
                         kvReuse: supportsKVToggles(backend.wrappedValue) ? kvReuse : nil,
-                        kvInt8: supportsKVToggles(backend.wrappedValue) ? kvInt8 : nil
+                        kvInt8: supportsKVToggles(backend.wrappedValue) ? kvInt8 : nil,
+                        flashAttention: supportsKVToggles(backend.wrappedValue)
+                            ? flashAttention : nil
                     )
                     HStack(spacing: 6) {
                         Spacer(minLength: 4)
@@ -1135,7 +1143,8 @@ struct SettingsView: View {
         promptBatch: Binding<Int>? = nil,
         thinking: Binding<Bool>? = nil,
         kvReuse: Binding<Bool>? = nil,
-        kvInt8: Binding<Bool>? = nil
+        kvInt8: Binding<Bool>? = nil,
+        flashAttention: Binding<Bool>? = nil
     ) -> some View {
         ViewThatFits(in: .horizontal) {
             HStack(alignment: .center, spacing: 6) {
@@ -1144,7 +1153,8 @@ struct SettingsView: View {
                     topP: topP, minP: minP, topK: topK,
                     repetitionPenalty: repetitionPenalty, promptBatch: promptBatch
                 )
-                parameterToggles(thinking: thinking, kvReuse: kvReuse, kvInt8: kvInt8)
+                parameterToggles(thinking: thinking, kvReuse: kvReuse, kvInt8: kvInt8,
+                                 flashAttention: flashAttention)
             }
             VStack(alignment: .leading, spacing: 3) {
                 numberFields(
@@ -1152,7 +1162,8 @@ struct SettingsView: View {
                     topP: topP, minP: minP, topK: topK,
                     repetitionPenalty: repetitionPenalty, promptBatch: promptBatch
                 )
-                parameterToggles(thinking: thinking, kvReuse: kvReuse, kvInt8: kvInt8)
+                parameterToggles(thinking: thinking, kvReuse: kvReuse, kvInt8: kvInt8,
+                                 flashAttention: flashAttention)
             }
         }
     }
@@ -1184,15 +1195,26 @@ struct SettingsView: View {
         }
     }
 
-    /// 「思考 / KV复用 / KV量化」开关组；不支持的组合（nil）不渲染。
+    /// 「思考 / KV复用 / KV量化 / Flash Attention」开关组；不支持的组合（nil）不渲染。
     @ViewBuilder
     private func parameterToggles(
         thinking: Binding<Bool>?,
         kvReuse: Binding<Bool>?,
-        kvInt8: Binding<Bool>?
+        kvInt8: Binding<Bool>?,
+        flashAttention: Binding<Bool>? = nil
     ) -> some View {
-        if thinking != nil || kvReuse != nil || kvInt8 != nil {
+        if thinking != nil || kvReuse != nil || kvInt8 != nil || flashAttention != nil {
             HStack(alignment: .center, spacing: 10) {
+                if let flashAttention {
+                    Toggle("Flash Attention", isOn: flashAttention)
+                        .toggleStyle(.checkbox)
+                        .font(.caption2)
+                        .fixedSize()
+                        .help("默认开启：MLX 使用未量化 KV 走 Metal fused attention，"
+                            + "GGUF 强制启用 Flash Attention；M3+/M4 或纯注意力模型收益更明显。"
+                            + "GGUF 可与 KV量化 叠加（fa_q8_0 kernel 省显存）；"
+                            + "MLX 上游限制二者只能取其一，开启时 KV量化 自动停用")
+                }
                 if let thinking {
                     Toggle("思考", isOn: thinking)
                         .toggleStyle(.checkbox)
@@ -1282,6 +1304,7 @@ struct SettingsView: View {
         mainKVCache = config.kvCacheMaxTokens > 0
             ? config.kvCacheMaxTokens : config.maxContextTokens
         kvInt8Enabled = config.kvCacheInt8
+        flashAttentionEnabled = config.flashAttention
         mainTemperature = config.temperature
         mainTopP = config.topP
         mainMinP = config.minP
@@ -1592,6 +1615,7 @@ struct SettingsView: View {
         config.maxContextTokens = max(8192, mainContext)
         config.kvCacheMaxTokens = max(0, mainKVCache)
         config.kvCacheInt8 = kvInt8Enabled
+        config.flashAttention = flashAttentionEnabled
         config.temperature = clamp(mainTemperature, 0, 2)
         config.topP = clamp(mainTopP, 0, 1)
         config.minP = clamp(mainMinP, 0, 1)
