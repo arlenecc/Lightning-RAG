@@ -517,9 +517,12 @@ public final class KernelLoop {
             // 一遍，而 pending 会写进 rec.prompt 永久留在历史里，越重试
             // 上下文越长（实测 3614→5689 字符）。意图空转期间也不注入，
             // 避免与「直接调用工具」的指令互相打架。
+            // 内核代建计划后的「立即执行」强指令：专治「反复描述计划不调工具」
+            // 的空转。isMultistep 任务已由代建分支接管，这里不再注入 planGateHint，
+            // 避免「先登记」提示诱发规划焦虑。
             if toolsEnabled && session.getPlan() == nil && !didWork
                 && intentStall == 0 && !planGateHintInjected
-                && !isSimpleInput(userInput) {
+                && !isSimpleInput(userInput) && !isMultistep(userInput) {
                 pending += planGateHint
                 planGateHintInjected = true
             }
@@ -729,6 +732,26 @@ public final class KernelLoop {
                 if toolsEnabled, !didWork,
                    Self.looksLikeIntentOnly(resp.content) {
                     intentStall += 1
+                    // 空转场景也要保证计划面板有内容：多步任务模型零工具调用、
+                    // 只描述计划，面板会一直空着，用户只看到「直接失败」。这里
+                    // 补建最小计划（不拦截执行），让卡点可见、可恢复。
+                    if session.getPlan() == nil, isMultistep(userInput) {
+                        let plan = Plan(goal: String(userInput.prefix(80)), steps: [
+                            PlanStep(id: "1",
+                                     title: "立即调用工具获取真实数据（如 web_scan / rag_search）",
+                                     status: "doing"),
+                            PlanStep(id: "2", title: "基于工具结果整理并给出最终答复",
+                                     status: "pending"),
+                        ])
+                        session.setPlan(plan)
+                        do {
+                            try PlanStore.save(plan, config: config)
+                        } catch {
+                            AgentLog.warning("[kernel] 计划落盘失败: \(error.localizedDescription)")
+                        }
+                        callbacks.onPlanUpdated(plan)
+                        log("[kernel] 意图空转场景内核补建最小计划（不拦截工具执行）")
+                    }
                     session.finishTurn(rec, assistantText: resp.content,
                                        summary: l2Summary(resp.content),
                                        rawContent: resp.rawContent)
@@ -863,18 +886,17 @@ public final class KernelLoop {
             // ---- 规划前置门：先于执行 ----
             let hasActual = toolCalls.contains { $0.name != "update_plan" }
             let hasPlanOp = toolCalls.contains { $0.name == "update_plan" }
-            // 计划面板保障：模型没有自觉创建计划而实际工具调用已开始时，内核
-            // 代建一条最小计划并同步面板/落盘。旧规划门在这里把已生成的工具
-            // 调用整体丢弃（浪费一轮、且模型不自觉时计划永远建不起来，用户
-            // 只看到空面板和「直接结束」）；代建**不拦截执行**，只保证计划
-            // 面板有内容、进度可见、反思门与收尾判定有据可依。
-            // 不按 isMultistep 过滤：真机实测「从 cnn.com 获取今天的新闻并
-            // 进行总结」不命中任何关键词，导致计划面板始终为空；能发出实际
-            // 工具调用本身就说明这是需要外部信息的任务。模型随后仍可
-            // update_plan(op="create"/"patch") 覆盖或细化这份计划。
-            if toolsEnabled, session.getPlan() == nil, hasActual, !hasPlanOp {
+            // 计划面板保障：多步任务（isMultistep 命中，或已实际发出工具调用）
+            // 而模型尚未自觉建计划时，内核代建一条最小计划并同步面板/落盘。
+            // 旧实现只在「已发工具调用」后才代建，导致「先规划」提示诱发
+            // 的空转场景（模型反复描述计划却零工具调用）永远建不起计划、面板
+            // 始终为空。代建**不拦截执行**，只保证面板有内容、进度可见、反思
+            // 门与收尾判定有据可依；模型随后仍可 update_plan 覆盖或细化。
+            if toolsEnabled, session.getPlan() == nil,
+               (hasActual || isMultistep(userInput)), !hasPlanOp {
                 let plan = Plan(goal: String(userInput.prefix(80)), steps: [
-                    PlanStep(id: "1", title: "收集所需信息（调用工具获取真实数据）",
+                    PlanStep(id: "1",
+                             title: "立即调用工具获取真实数据（如 web_scan / rag_search）",
                              status: "doing"),
                     PlanStep(id: "2", title: "基于工具结果整理并给出最终答复",
                              status: "pending"),
@@ -1525,9 +1547,16 @@ public final class KernelLoop {
         guard !text.isEmpty, text.count <= 800 else { return false }
         let markers = [
             "我需要先", "我先", "让我", "接下来我", "现在我开始", "现在开始执行",
-            "创建任务计划", "创建计划", "将任务分解", "制定并执行", "开始执行第一步",
+            "创建任务计划", "创建计划", "建立计划", "建立任务", "重新执行", "同步执行",
+            "同步发出", "将任务分解", "制定并执行", "开始执行第一步", "立即执行第一步",
             "紧接着发出", "步骤：", "目标：", "我需要：", "请立即：",
             "执行计划", "可验证的步骤", "创建 2~7", "开始执行计划",
+            "获取", "并总结", "抓取", "并总结", "查询", "并总结",
+            "我将", "我打算", "计划如下", "同步执行", "重新执行工具",
+            // 虚假进度声明：模型没调工具却声称「已拿到 / 本步完成 / 可继续」，
+            // 这类空转若不拦，会被当正常正文收下、反复刷屏到轮次耗尽。
+            "已拿到", "已获取", "已读取", "本步完成", "证实", "推翻",
+            "可继续提取", "可继续下一步", "下一步是", "我将获取", "我将抓取",
         ]
         return markers.filter { text.contains($0) }.count >= 2
     }

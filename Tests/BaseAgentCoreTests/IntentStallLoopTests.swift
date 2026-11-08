@@ -251,19 +251,22 @@ final class IntentStallLoopTests: XCTestCase {
             "应基于工具结果收尾：\(result.text)")
     }
 
-    /// 规划提示一段只注入一次。为保持 KV 对齐，已注入轮仍原样留在历史里，
-    /// 因此检查的是每轮「当前 user 消息」，而不是整个 messages 拼接。
-    func testPlanGateHintInjectedOnlyOnce() async {
+    /// 多步任务模型空转（只描述计划、零工具调用）时，意图空转分支在强制
+    /// 「直接调工具」之外，还会补建最小计划，保证计划面板不一直为空——
+    /// 这正是「反复描述计划却像什么都没做就失败」的根因修复点。
+    func testIntentStallStillCreatesPlanPanel() async {
         let state = State()
-        let call = ToolCall(id: "call-1", name: "web_scan",
-                            arguments: ["url": .string("https://cnn.com")])
-        let loop = makeLoop(state) { index in
-            index <= 2 ? self.callStream(call) : self.textStream("完成。")
-        }
-        _ = await loop.run("请按步骤获取 cnn.com 今日新闻并总结", toolsEnabled: true)
-        let hints = state.prompts.filter { $0.contains("非平凡任务先 update_plan") }
-        XCTAssertEqual(hints.count, 1,
-            "规划提示不能逐轮重复注入：出现 \(hints.count) 次")
+        let collector = PlanCollector()
+        let callbacks = PlanRecordingCallbacks(plans: collector)
+        // 纯文本空转：模型反复声称要建立计划，但不发任何工具调用。
+        let loop = makeLoop(state,
+                            reply: { _ in self.textStream("建立计划：2 步获取并总结") },
+                            maxTurns: 6, callbacks: callbacks)
+        _ = await loop.run("获取 cnn.com 今日新闻并总结", toolsEnabled: true)
+        let plans = collector.snapshot()
+        XCTAssertFalse(plans.isEmpty,
+            "空转场景内核应补建计划面板，不该一直为空")
+        XCTAssertEqual(plans.last?.steps.first?.status, "doing")
     }
 
     /// resume（自动续跑）段也必须保留意图空转检测。

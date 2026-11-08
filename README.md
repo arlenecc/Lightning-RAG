@@ -52,8 +52,8 @@ VARIANT=lite  scripts/package-app.sh release && VARIANT=lite  scripts/package-dm
 
 | VARIANT | 内置模型 | DMG |
 |---|---|---|
-| `clean`（默认） | 无；potion 语义切片 / jina embedding / jina reranker 均在首次启动时从 hf-mirror 自动下载 | `dist/Lightning-RAG-1.2.28-clean.dmg` |
-| `lite` | potion-multilingual-128M int4（语义切片）+ jina-embeddings-v5-text-nano-mlx-int4 + jina-reranker-v2-base-multilingual-onnx | `dist/Lightning-RAG-1.2.28-lite.dmg` |
+| `clean`（默认） | 无；potion 语义切片 / jina embedding / jina reranker 均在首次启动时从 hf-mirror 自动下载 | `dist/Lightning-RAG-1.2.29-clean.dmg` |
+| `lite` | potion-multilingual-128M int4（语义切片）+ jina-embeddings-v5-text-nano-mlx-int4 + jina-reranker-v2-base-multilingual-onnx | `dist/Lightning-RAG-1.2.29-lite.dmg` |
 
 两个版本共用 `dist/Lightning-RAG.app`（应用本体与显示名不变，只有内置模型不同），
 因此需按「打包 App → 打包 DMG」的顺序逐个构建。两个版本都不含主模型、辅助模型
@@ -126,6 +126,8 @@ HTML 与 Office 解析另有专项覆盖：HTML 保存页的本地 iframe / fram
 **v1.2.26**：`web_scan` 现在能独立处理动态 JS 列表页——注入脚本捕获页面自身发出的 XHR/fetch，同源 GET 重放数据接口，把 JSON/HTML 响应结构化精简，并自动合并当天分页；XHR 响应体捕获补齐 `readystatechange`/`loadend` 双时机，扫描版 PDF 无文本层时的渲染全白也有流级兜底。KV/预热方面：MLX 折叠边界改为复用已有前缀快照（不再每 8 轮重跑约 18s 全量 prefill），轻量轮（寒暄/能力问询）改为本地直答且不进 LLM 上下文、跳过周期性折叠，启动预热期间允许发送并排队，正式请求复用刚建好的 system+tools 前缀；GGUF 侧修正生成计时起点（`tps` 日志不再失真）、缓存完好时跳过重复预热、卸载时重置 `seq_rm` 能力探测。真机模拟正式用户与双后端回归用例已补齐；hybrid/recurrent GGUF 的 `llama_memory_seq_rm` 不支持 partial sequence 裁剪，这类模型仍会在分叉轮整段重建。全量 842 项测试与 release 构建通过。
 
 **v1.2.27**：围绕「交互延迟」做了一轮系统治理。**GGUF hybrid KV**：`llama_memory_seq_rm` 不支持 partial sequence 裁剪时改走消息级增量 append（锚点差分求新消息 token，不重渲染 assistant），Qwen3.5 GGUF 真机用户流程 59.6s → 31.5s、正式轮 17.2/8.7/25.9s → 2.2/2.0/14.6s；任何一步不匹配都回退原路径。**内核门控**：修复「创建计划」元陈述被当最终答复的死循环（有界收敛 + 明确失败说明）；规划前置门不再丢弃模型已生成的工具调用，改当轮执行；`planFinish` 门识别结果性答复直接收下，不再逼模型重答 3 次；反思门上限与 `autoContinue` 段数收紧；`planGateHint` 一段只注入一次、文案精简，消除逐轮重复训诫造成的上下文膨胀——**已写入历史的内容一个字节不改**，MLX 消息级 delta / token 级前缀匹配与 GGUF delta-append 的 KV 对齐保持不变；轮次耗尽时汇总已取得的工具结果并交付用户，不再只回模板句。**体验与工具**：维护态（同步/去重/ANN）期间输入排队并明确提示，闲时摘要让出 GPU 的有界等待，历史归档移出请求关键路径，UI 首 chunk 立即上屏，`web_scan` 当天分页改并发。全量 851 项测试（含 GGUF 真机）、release 构建通过。
+
+**v1.2.29**：以 cnn.com 新闻任务做了端到端真机验证，定位并修复「计划任务推进不了」的**真正根因**——不是规划门，而是 `looksLikeIntentOnly` 的识别词过窄：「建立计划 / 同步执行 / 获取…并总结 / 已拿到…可继续提取」这类**计划性元陈述与虚假进度声明**只命中 1 个关键词，被当成正常正文收下，于是「没执行工具就判定结束」「反复刷屏到轮次耗尽」。扩展识别词覆盖上述模式（阈值 ≥2），并在意图空转分支内**补建最小计划**，确保计划面板在空转场景也不一直为空；空转达上限返回明确失败说明。撤销了上一轮冗余的 `executeNowHint` 机制（与既有意图空转强令调工具重复且被 `continue` 跳过，从未生效）。cnn.com 真机验证：计划面板正常建立、模型真实调用 web_scan 拿到头条、重复调用被终止并标 blocked + 进展汇总、有界结束。全量 856 项测试 0 失败、release 构建通过。
 
 **v1.2.28**：以 cnn.com 新闻任务做了端到端真机验证（MLX 2B + 真实网络），修复并强化了「计划全链路」与 web 工具。**计划面板保障**：模型不自觉建计划时内核代建最小计划（不拦截工具执行，模型可随时 create/patch 覆盖）；未执行工具的「已完成」不再被当最终答复；多步任务识别词表补上「获取/查询/搜索」类动作；轮次耗尽把 doing 步骤标 blocked、最后一段自动续跑强制「不再调工具、立即作答」；空正文/重复调用耗尽时汇总已取得进展并明确失败原因，绝不空手退出。**GGUF hybrid KV**：`seq_rm` 不支持裁剪时改走消息级增量 append，真机用户流程 59.6s → 31.5s。**空正文自愈**：thinking 长思考耗尽预算/未闭合 `</think>` 导致正文为空时，重试自动请求级关闭 thinking；生成预算不足时抛 context 错误触发历史收缩。**web_scan 增强**：全部请求带浏览器 UA；超长页面从 `<body>` 起提取（cnn.com 首页 5.9MB 静态提取 0 → 749 字符，不再误判纯动态）；素材目录下的伪数据接口（如价格素材 JSON）不再顶到结果头部；`raw` 输出跳过超长 head；schema 引导模型优先用 web_scan 而非自写爬虫。**交互治理**：维护态输入排队、闲时摘要有界等待、历史归档后台化、UI 首 chunk 立即上屏、当天分页并发、启动去除人为 sleep、动态上下文/规划提示一次请求只注入一次（保持 KV 对齐）。新增 cnn.com 端到端真机回归；全量 856 项测试、release 构建通过。
 
