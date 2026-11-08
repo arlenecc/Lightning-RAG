@@ -284,11 +284,14 @@ final class IntentStallLoopTests: XCTestCase {
     }
 
     /// 轮次耗尽时应把已取得的工具结果交付给用户，而不是只给模板句。
+    /// 每轮发不同 URL，避免触发「相同调用重复终止」的提前退出，确保走 maxTurns。
     func testMaxTurnsReturnsToolHighlights() async {
         let state = State()
-        let call = ToolCall(id: "call-1", name: "web_scan",
-                            arguments: ["url": .string("https://cnn.com")])
-        let loop = makeLoop(state, reply: { _ in self.callStream(call) }, maxTurns: 4)
+        let loop = makeLoop(state, reply: { index in
+            let call = ToolCall(id: "call-\(index)", name: "web_scan",
+                                arguments: ["url": .string("https://cnn.com/\(index)")])
+            return self.callStream(call)
+        }, maxTurns: 4)
         let result = await loop.run("请按步骤获取 cnn.com 今日新闻并总结",
                                     toolsEnabled: true)
         XCTAssertEqual(result.reason, .maxTurns)

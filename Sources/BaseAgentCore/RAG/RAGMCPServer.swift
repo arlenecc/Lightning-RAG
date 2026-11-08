@@ -846,5 +846,5 @@ extension NSString {
 
 /// App 版本号（Info.plist 优先，回退脚本维护的发布版本）。
 public enum AppVersion {
-    public static var current: String = "1.2.29"
+    public static var current: String = "1.2.30"
 }

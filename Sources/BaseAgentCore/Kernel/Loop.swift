@@ -146,8 +146,8 @@ private let maxIntentStall = 2
 private let maxFailSigs = 8
 private let minAttemptsBeforeBlock = 3
 private let blockNudgeMax = 2
-private let repeatCallWarn = 2
-private let repeatCallLimit = 4
+private let repeatCallWarn = 1
+private let repeatCallLimit = 3
 /// 单次大纲（rag_outline）之后允许的 rag_search 次数硬上限。
 /// 超过后内核直接把多余检索预置为失败，逼模型基于已有结果 + 大纲摘要作答，
 /// 杜绝「同一问题反复换关键词 scatter 检索」的无效搜索。
@@ -225,6 +225,10 @@ public final class KernelLoop {
     private var dynamicContextInjected = false
     private var repeatStreak = 0
     private var lastCallSigs: [String] = []
+    /// 成功返回过结果的调用签名：完全相同参数再发一次，结果不会变。
+    /// 模型常「拿到 web_scan 结果却原样重发刷屏」，用它在 preset 阶段直接
+    /// 拦截，强令基于已有结果作答或换参数，而不是等 4 次重复才终止。
+    private var successSigs: Set<String> = []
     private var toolCallCounter = 0
     /// 当前「大纲后检索预算」已用次数；每次 rag_outline 清零，每次 run() 也清零。
     private var ragSearchCount = 0
@@ -426,6 +430,7 @@ public final class KernelLoop {
         dynamicContextInjected = false
         repeatStreak = 0
         lastCallSigs = []
+        successSigs.removeAll()
         ragSearchCount = 0
         self.resume = resume
         if let seed = pendingSeed {
@@ -918,15 +923,31 @@ public final class KernelLoop {
             var preset: [Int: ToolResult] = [:]
             var liveCount = ragSearchCount
             for (i, tc) in toolCalls.enumerated() {
+                let sig = callSig(tc)
                 // 已经以完全相同参数失败过的调用，再执行必然还是失败。旧版只在
                 // 事后给软提示，模型仍把同一个 file_read / shell_run cat 原样
                 // 重发三次（知识库问答里读臆造的 .md 路径），整轮被耗空。
-                if failSigs.contains(callSig(tc)) {
+                if failSigs.contains(sig) {
                     preset[i] = .fail(
                         "该调用此前已用完全相同的参数失败过，已跳过（原样重试不会改变结果）。"
                         + "请换参数/换工具，或直接依据已获得的信息作答；"
                         + "已索引文档的内容用 rag_* 获取，不要重复读不存在的路径。"
                         + "外部网站与本地文件任务请改用 web_scan / file_* / shell_run 等对应工具。")
+                    continue
+                }
+                // 成功过的调用原样重发：结果已在上一轮返回、不会再变。模型常
+                // 「拿到 web_scan 结果却反复重发相同 URL 刷屏」，旧逻辑只给软
+                // 提示，模型无视后连刷 4~5 次才被终止。这里直接拦截，逼它基于
+                // 已有结果作答，或换参数/换工具获取其它内容。
+                // 排除控制类工具：rag_outline 重复调用会重置检索预算、update_plan
+                // 会更新计划状态，重复执行是必要的，不能被「成功过」拦掉。
+                if successSigs.contains(sig),
+                   tc.name != "rag_outline", tc.name != "update_plan" {
+                    preset[i] = .fail(
+                        "该调用此前已成功返回过结果（内容见上一轮历史）。完全相同参数"
+                        + "再调一次不会带来任何新信息——请直接基于已获得的结果作答、"
+                        + "给出最终总结；若确需其它内容，请换参数 / 换工具（如翻页、"
+                        + "换 URL、用 rag_search / ask_user 等），不要原样重发。")
                     continue
                 }
                 switch tc.name {
@@ -972,6 +993,12 @@ public final class KernelLoop {
             // 把它重置之前，被「未充分尝试就 blocked」的守卫读走。
             let stepFailsBefore = stepFails
             let batch = trackFailures(toolCalls, rawResults)
+            // 记录成功签名：成功返回的调用，下次原样重发时在 preset 阶段直接拦截。
+            for (i, tc) in toolCalls.enumerated() {
+                if i < rawResults.count, rawResults[i].success {
+                    successSigs.insert(callSig(tc))
+                }
+            }
             // 建计划（create）不算开工；但 patch 实际改变了步骤状态（尤其标 done）
             // 算「做过事」——避免「只调了 update_plan 却被判定为一次工具都没调用」的
             // 误导，也让纯文字收尾时把已 patch 完成的计划正确视为已完成。

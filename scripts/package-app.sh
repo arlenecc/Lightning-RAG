@@ -2,7 +2,7 @@
 # 把 SwiftPM 产物打包成可分发的 Lightning-RAG.app。
 #
 # 用法：scripts/package-app.sh [debug|release]（默认 release）
-# 版本：VERSION 环境变量可覆盖，默认 1.2.29
+# 版本：VERSION 环境变量可覆盖，默认 1.2.30
 # 版本形态：VARIANT=clean|lite（默认 clean）
 #   clean     不包含任何依赖模型（potion 资源 bundle 也不打），应用启动时
 #             通过模型自动下载流程补齐（语义切片 / embedding / reranker 等）
@@ -13,7 +13,7 @@
 set -euo pipefail
 
 CONFIG="${1:-release}"
-VERSION="${VERSION:-1.2.29}"
+VERSION="${VERSION:-1.2.30}"
 VARIANT="${VARIANT:-clean}"
 case "$VARIANT" in
   clean|lite) ;;
