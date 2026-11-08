@@ -30,6 +30,10 @@ public final class ShellRunTool: AgentTool {
                     "Timeout in seconds (default \(defaultTimeout))."),
                 "workdir": ToolSupport.stringProperty(
                     "Optional working directory inside the workspace (default: workspace root)."),
+                "shell": ToolSupport.stringProperty(
+                    "Interpreter: \"sh\" (default, POSIX) or \"bash\" (enables [[ ]], arrays)."),
+                "env": ToolSupport.objectProperty(
+                    "Extra environment variables for this command, e.g. {\"FOO\": \"1\"}."),
             ],
             required: ["command"])
     }
@@ -69,11 +73,41 @@ public final class ShellRunTool: AgentTool {
                 return .fail("workdir does not exist: \(workdirArg)")
             }
 
+            // 解释器选择：默认 POSIX sh（保持历史行为兼容）；模型显式要 bash
+            // 语法（[[ ]]、关联数组）时给 bash，避免「bash 语法在 sh 下静默失败」。
+            let shellName = ToolSupport.optionalString(args, "shell") ?? "sh"
+            let executable: String
+            switch shellName.lowercased() {
+            case "bash", "/bin/bash": executable = "/bin/bash"
+            case "sh", "/bin/sh", "": executable = "/bin/sh"
+            default:
+                return .fail("Unsupported shell \"\(shellName)\"（仅支持 sh / bash）")
+            }
+
+            // 附加环境变量：合并到 ToolProcessRunner 的净化环境之上。
+            // 值一律按字符串处理（对齐 JSON 语义），非法条目直接拒绝。
+            var extraEnv: [String: String] = [:]
+            if case .object(let dict)? = args["env"] {
+                for (key, value) in dict {
+                    let trimmed = key.trimmingCharacters(in: .whitespacesAndNewlines)
+                    guard !trimmed.isEmpty, trimmed.allSatisfy({
+                        $0.isLetter || $0.isNumber || $0 == "_"
+                    }), !trimmed.first!.isNumber else {
+                        return .fail("Invalid env key: \(key)（仅允许字母/数字/下划线，且不以数字开头）")
+                    }
+                    extraEnv[trimmed] = ToolSupport.coerceString(value)
+                }
+            }
+
             let callbacks = self.callbacks
             let outcome = await ToolProcessRunner.run(
-                executable: "/bin/sh",
+                executable: executable,
                 arguments: ["-c", command],
                 currentDirectory: workdir,
+                // 合并到净化环境之上：不能用裸 extraEnv 替换（会丢 PATH/UTF-8 设置）。
+                environment: extraEnv.isEmpty
+                    ? nil
+                    : ToolSupport.sanitizedEnvironment(overrides: extraEnv),
                 timeout: timeout,
                 shouldCancel: { callbacks?.isCancelled() ?? false })
 

@@ -52,8 +52,8 @@ VARIANT=lite  scripts/package-app.sh release && VARIANT=lite  scripts/package-dm
 
 | VARIANT | 内置模型 | DMG |
 |---|---|---|
-| `clean`（默认） | 无；potion 语义切片 / jina embedding / jina reranker 均在首次启动时从 hf-mirror 自动下载 | `dist/Lightning-RAG-1.2.31-clean.dmg` |
-| `lite` | potion-multilingual-128M int4（语义切片）+ jina-embeddings-v5-text-nano-mlx-int4 + jina-reranker-v2-base-multilingual-onnx | `dist/Lightning-RAG-1.2.31-lite.dmg` |
+| `clean`（默认） | 无；potion 语义切片 / jina embedding / jina reranker 均在首次启动时从 hf-mirror 自动下载 | `dist/Lightning-RAG-1.3.0-clean.dmg` |
+| `lite` | potion-multilingual-128M int4（语义切片）+ jina-embeddings-v5-text-nano-mlx-int4 + jina-reranker-v2-base-multilingual-onnx | `dist/Lightning-RAG-1.3.0-lite.dmg` |
 
 两个版本共用 `dist/Lightning-RAG.app`（应用本体与显示名不变，只有内置模型不同），
 因此需按「打包 App → 打包 DMG」的顺序逐个构建。两个版本都不含主模型、辅助模型
@@ -126,6 +126,8 @@ HTML 与 Office 解析另有专项覆盖：HTML 保存页的本地 iframe / fram
 **v1.2.26**：`web_scan` 现在能独立处理动态 JS 列表页——注入脚本捕获页面自身发出的 XHR/fetch，同源 GET 重放数据接口，把 JSON/HTML 响应结构化精简，并自动合并当天分页；XHR 响应体捕获补齐 `readystatechange`/`loadend` 双时机，扫描版 PDF 无文本层时的渲染全白也有流级兜底。KV/预热方面：MLX 折叠边界改为复用已有前缀快照（不再每 8 轮重跑约 18s 全量 prefill），轻量轮（寒暄/能力问询）改为本地直答且不进 LLM 上下文、跳过周期性折叠，启动预热期间允许发送并排队，正式请求复用刚建好的 system+tools 前缀；GGUF 侧修正生成计时起点（`tps` 日志不再失真）、缓存完好时跳过重复预热、卸载时重置 `seq_rm` 能力探测。真机模拟正式用户与双后端回归用例已补齐；hybrid/recurrent GGUF 的 `llama_memory_seq_rm` 不支持 partial sequence 裁剪，这类模型仍会在分叉轮整段重建。全量 842 项测试与 release 构建通过。
 
 **v1.2.27**：围绕「交互延迟」做了一轮系统治理。**GGUF hybrid KV**：`llama_memory_seq_rm` 不支持 partial sequence 裁剪时改走消息级增量 append（锚点差分求新消息 token，不重渲染 assistant），Qwen3.5 GGUF 真机用户流程 59.6s → 31.5s、正式轮 17.2/8.7/25.9s → 2.2/2.0/14.6s；任何一步不匹配都回退原路径。**内核门控**：修复「创建计划」元陈述被当最终答复的死循环（有界收敛 + 明确失败说明）；规划前置门不再丢弃模型已生成的工具调用，改当轮执行；`planFinish` 门识别结果性答复直接收下，不再逼模型重答 3 次；反思门上限与 `autoContinue` 段数收紧；`planGateHint` 一段只注入一次、文案精简，消除逐轮重复训诫造成的上下文膨胀——**已写入历史的内容一个字节不改**，MLX 消息级 delta / token 级前缀匹配与 GGUF delta-append 的 KV 对齐保持不变；轮次耗尽时汇总已取得的工具结果并交付用户，不再只回模板句。**体验与工具**：维护态（同步/去重/ANN）期间输入排队并明确提示，闲时摘要让出 GPU 的有界等待，历史归档移出请求关键路径，UI 首 chunk 立即上屏，`web_scan` 当天分页改并发。全量 851 项测试（含 GGUF 真机）、release 构建通过。
+
+**v1.3.0**：基础工具层架构级增强（新增 2 个工具 + 6 项能力补齐）。**新增 `file_list`**：workspace 目录枚举（glob 过滤 / 递归深度 / 条目上限，隐藏目录自动跳过），agent 不再依赖 shell_run 才能看到工作区结构。**新增 `file_search`**：grep 式正则内容搜索（`path:line: text` 输出、glob 收窄、上下文行、二进制与超大文件自动跳过、扫描字节预算），行号可直接用于 file_modify 定位。**file_read**：新增按行分页（offset/limit）与 `line_numbers=true` 行号输出；编码回退 UTF-8 → GB18030（中文场景常见，带控制字符占比防误判）→ 二进制 base64。**file_modify**：成功报告替换处数；`old` 未命中给出缩进/CRLF/内容已变的排查指引而非裸报错。**shell_run**：新增 `shell` 参数（sh/bash，bash 语法不再静默失败）与 `env` 参数（键名校验、合并进净化环境保留 PATH）。**web_scan**：429/503 按 Retry-After 自动重试一次；403/412 给出反爬降级指引（改用 web_render / RSS / 移动版）；**RSS/Atom feed 结构化解析**（标题/链接/日期列表、CDATA 剥离、自闭合 link href 回退），feed 从二等公民转正。**code_run**：Python 预置 OS 级资源限额（RLIMIT_CPU / RLIMIT_FSIZE，macOS 可靠的两项）。全量 874 项测试 0 失败（新增 16 项工具回归）、release 构建通过。
 
 **v1.2.31**：新增**成果核验反思**环节，补齐「执行后质量把关」——以从业 10 年的领域资深专家身份审视最终结果（完整性/真实性/准确性/表达四个维度），质量不达标最多打回 2 次完善。只在「多步任务 + 有实质工作」时开启（轻量轮/单步操作不核验）；核验轮关闭思考模式并明确要求直接输出，避免 2B 模型被「专家审视」诱发长思考空正文；反思未带来实质改进（只把结论重复堆叠）时直接收下干净候选，不再为「完善」反复刷屏。至此反思链路完整覆盖：规划门（建计划）→ planFinish 门（未动手强制）→ finishNudge 反思门（计划未完继续）→ 意图空转/重复调用/成功复用拦截（防空转）→ 成果核验（专家把关）。全量 858 项测试 0 失败、release 构建通过。
 

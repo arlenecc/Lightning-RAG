@@ -3,9 +3,16 @@ import Foundation
 // MARK: - 文件读取
 
 /// `file_read`：读取 workspace 内文本文件。
+///
+/// 支持按行分页（offset/limit）与行号输出（line_numbers），大文件无需再绕道
+/// shell_run tail/sed；UTF-8 解码失败时尝试 GB18030（中文场景常见编码），
+/// 仍失败才按二进制 base64 处理。
 public final class FileReadTool: AgentTool {
     public let name = "file_read"
-    public let description = "Read the textual contents of a file inside the workspace."
+    public let description =
+        "Read a text file inside the workspace. Optional line pagination: offset "
+        + "(1-based first line) + limit (max lines) with line_numbers=true returns "
+        + "editor-style numbered lines for precise file_modify targeting."
 
     private let config: AgentConfig
     /// 改进5：SOP 只读一次的去重记录器，由 ToolFactory 注入（与 Agent 同生命周期）。
@@ -16,6 +23,12 @@ public final class FileReadTool: AgentTool {
             properties: [
                 "path": ToolSupport.stringProperty(
                     "Relative path within the workspace (or absolute inside it)."),
+                "offset": ToolSupport.numberProperty(
+                    "First line to return, 1-based (default: from the start)."),
+                "limit": ToolSupport.numberProperty(
+                    "Max number of lines to return (default: all, capped by size limits)."),
+                "line_numbers": ToolSupport.boolProperty(
+                    "Prefix each line with \"N: \" for precise patch targeting."),
             ],
             required: ["path"])
     }
@@ -31,6 +44,9 @@ public final class FileReadTool: AgentTool {
     public func run(_ args: [String: JSONValue]) async throws -> ToolResult {
         do {
             let path = try ToolSupport.requireString(args, "path")
+            let offset = Int(ToolSupport.optionalDouble(args, "offset") ?? 0)
+            let limit = Int(ToolSupport.optionalDouble(args, "limit") ?? 0)
+            let lineNumbers = ToolSupport.optionalBool(args, "line_numbers") ?? false
             let full = try ToolSupport.resolveWorkspacePath(path, workspace: config.workspace)
 
             var isDirectory: ObjCBool = false
@@ -47,8 +63,13 @@ public final class FileReadTool: AgentTool {
             let byteCap = ToolSupport.maxReadChars * 4 + 4
             let raw = (try handle.read(upToCount: byteCap)) ?? Data()
 
-            if let text = ToolSupport.decodeUTF8Prefix(raw) {
-                var output = text
+            // 编码判定：UTF-8 → GB18030（中文场景常见）→ 二进制。
+            let utf8Text = ToolSupport.decodeUTF8Prefix(raw)
+            let gbText = (utf8Text == nil) ? Self.decodeGB18030(raw) : nil
+            let encodingText = utf8Text ?? gbText
+
+            if let decoded = encodingText {
+                var output = decoded
                 // 两个维度都可能截断：字符数超过上限，或文件比实际读入的字节多
                 // （宽字符场景下 20 万字符恰好用满了字节预算）。
                 let truncatedByChars = output.count > ToolSupport.maxReadChars
@@ -56,16 +77,45 @@ public final class FileReadTool: AgentTool {
                 if truncatedByChars {
                     output = String(output.prefix(ToolSupport.maxReadChars))
                 }
-                if truncatedByChars || truncatedByBytes {
+
+                // 按行分页：offset/limit/line_numbers 一起处理。
+                let wantsPagination = offset > 0 || limit > 0 || lineNumbers
+                if wantsPagination {
+                    var lines = output.components(separatedBy: "\n")
+                    // 逐行编号前先去掉可能带出的行尾 \r（CRLF 文件）。
+                    lines = lines.map { $0.hasSuffix("\r") ? String($0.dropLast()) : $0 }
+                    let start = max(0, offset - (offset > 0 ? 1 : 0))
+                    let end = limit > 0 ? min(lines.count, start + limit) : lines.count
+                    guard start < lines.count else {
+                        return .ok("(offset \(offset) 超出文件行数 \(lines.count))")
+                    }
+                    let slice = Array(lines[start..<end])
+                    var paged = slice.enumerated().map { idx, line in
+                        lineNumbers ? "\(start + idx + 1): \(line)" : line
+                    }.joined(separator: "\n")
+                    if end < lines.count || truncatedByBytes {
+                        paged += "\n… [文件共 \(lines.count) 行 / \(size) 字节，"
+                            + "显示第 \(start + 1)–\(end) 行]"
+                            + (truncatedByBytes && end >= lines.count
+                               ? "（文件超出读取上限，尾部未载入）" : "")
+                    }
+                    output = paged
+                } else if truncatedByChars || truncatedByBytes {
                     output += "\n… [文件共 \(size) 字节，仅显示前 "
                         + "\(ToolSupport.maxReadChars) 字符]"
+                }
+
+                var result = output
+                if gbText != nil {
+                    // GB18030 路径：提示编码，避免模型把乱码当内容。
+                    result = "[encoding: GB18030]\n" + result
                 }
                 // 改进5：L1 索引定位到的 SOP 全文进入当前轮（内核 L1 会把它裁到
                 // remainingForTool 的最大长度）。追加"只提炼一次"的指令，让模型
                 // 立即把要点沉淀为 key_info，此后每轮靠 key_info 回注，不再重读全文。
                 if isMemorySOP(full) {
                     let first = sopTracker.markIfFirst(full)
-                    output += first
+                    result += first
                         ? "\n\n[SOP 已全文载入] 立即调用 update_working_checkpoint(key_info=...) "
                             + "把本 SOP 的关键前置条件与典型坑提炼进去；key_info 每轮自动回注，"
                             + "正常情况下本次会话无需再次 file_read 本文件。"
@@ -73,16 +123,32 @@ public final class FileReadTool: AgentTool {
                             + "若 key_info 仍含要点请直接据此行动；若已被覆盖/清空导致要点丢失，"
                             + "应立即重新读取全文并再次提炼，不要凭印象继续。"
                 }
-                return .ok(output)
+                return .ok(result)
             }
 
-            // 非 UTF-8：按二进制处理，base64 同样限制体积（会再放大 4/3）。
+            // 非 UTF-8/GB18030：按二进制处理，base64 同样限制体积（会再放大 4/3）。
             try handle.seek(toOffset: 0)
             let binary = (try handle.read(upToCount: ToolSupport.maxReadChars / 2)) ?? Data()
             return .ok("(binary) " + binary.base64EncodedString())
         } catch {
             return ToolSupport.failure(error)
         }
+    }
+
+    /// GB18030 解码（含 GBK/GB2312 超集）。仅当解码结果「看起来是文本」
+    /// （含可打印 CJK/ASCII 内容且控制字符占比低）才返回，否则视为二进制。
+    static func decodeGB18030(_ data: Data) -> String? {
+        let encoding = String.Encoding(
+            rawValue: CFStringConvertEncodingToNSStringEncoding(
+                CFStringEncoding(CFStringEncodings.GB_18030_2000.rawValue)))
+        guard let text = String(data: data, encoding: encoding) else { return nil }
+        // 防误判：GB18030 是双字节编码，几乎任何字节流都能"解出来"。
+        // 用控制字符占比与可打印率做二次校验。
+        let sample = text.prefix(2000)
+        let control = sample.filter { $0.unicodeScalars.allSatisfy {
+            $0.value < 0x20 && $0 != "\n" && $0 != "\t" && $0 != "\r"
+        } }.count
+        return Double(control) / Double(max(1, sample.count)) < 0.05 ? text : nil
     }
 
     /// 只识别**本工作区 memory/ 根目录正下方**的 L3 SOP（`*_sop.md`）与 L0
@@ -239,7 +305,14 @@ public final class FileModifyTool: AgentTool {
 
             let occurrences = text.components(separatedBy: old).count - 1
             guard occurrences > 0 else {
-                return .fail("'old' string not found in \(path)")
+                // 未命中是 file_modify 最常见失败：大概率是缩进/空白/CRLF 差异。
+                // 给出可操作的排查路径，而不是让模型盲试。
+                let hasCR = text.contains("\r\n")
+                return .fail("'old' string not found in \(path). "
+                    + "常见原因：① 缩进/空白与文件实际内容不一致；"
+                    + "② 文件为 CRLF 行尾\(hasCR ? "（本文件确为 CRLF）" : "")；"
+                    + "③ 内容已被之前的操作改过。"
+                    + "请用 file_read(path, line_numbers=true) 重新确认精确文本后再试。")
             }
 
             let updated: String
@@ -254,7 +327,8 @@ public final class FileModifyTool: AgentTool {
             }
 
             try AtomicFile.write(updated, to: full)
-            return .ok("Modified \(path)")
+            // 报告替换处数：replace_all 时模型需要知道实际生效了几处。
+            return .ok("Modified \(path)（替换 \(replaceAll ? occurrences : 1) 处）")
         } catch {
             return ToolSupport.failure(error)
         }

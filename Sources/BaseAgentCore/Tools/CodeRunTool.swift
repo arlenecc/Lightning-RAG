@@ -165,7 +165,17 @@ public final class CodeRunTool: AgentTool {
 
     /// sitecustomize 写护栏：拦截 builtins.open / io.open / os.open 的写模式，
     /// 阻止 Python 代码把工作区外的文件改写。允许 int fd（subprocess 管道需要）。
+    /// 顶部预置资源限额（CPU / 单文件写大小）：macOS 对 RLIMIT_AS 不生效，
+    /// 但 CPU 与 FSIZE 两个 rlimit 可用——死循环的 CPU 与写爆磁盘的文件
+    /// 在内核超时兜底之外再多一层 OS 级闸门。
     private static let pythonWriteGuard = """
+    try:
+        import resource
+        resource.setrlimit(resource.RLIMIT_CPU, (600, 600))
+        resource.setrlimit(resource.RLIMIT_FSIZE, (256 * 1024 * 1024,) * 2)
+    except Exception:
+        pass
+
     import builtins
     import io
     import os

@@ -91,6 +91,14 @@ public enum ToolSupport {
         ])
     }
 
+    /// `{"type":"object","description":...}` 参数项（自由键值对，如 env 变量表）。
+    public static func objectProperty(_ description: String) -> JSONValue {
+        .object([
+            "type": .string("object"),
+            "description": .string(description),
+        ])
+    }
+
     /// `{"type":"array","description":...,"items":...}` 参数项。
     public static func arrayProperty(_ description: String,
                                      items: JSONValue) -> JSONValue {

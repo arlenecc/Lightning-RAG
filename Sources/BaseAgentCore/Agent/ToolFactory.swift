@@ -27,6 +27,8 @@ public enum AgentToolFactory {
                          sopTracker: sharedSOPTracker),
             FileWriteTool(config: config, callbacks: callbacks, registry: registry),
             FileModifyTool(config: config, callbacks: callbacks, registry: registry),
+            FileListTool(config: config, callbacks: callbacks, registry: registry),
+            FileSearchTool(config: config, callbacks: callbacks, registry: registry),
             CodeRunTool(config: config, callbacks: callbacks, registry: registry),
             ShellRunTool(config: config, callbacks: callbacks, registry: registry),
             WebScanTool(config: config, callbacks: callbacks, registry: registry),

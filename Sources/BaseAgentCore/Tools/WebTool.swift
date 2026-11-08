@@ -108,14 +108,41 @@ public final class WebScanTool: AgentTool, ShutdownableTool {
             var mainRequest = URLRequest(url: url)
             mainRequest.setValue(ToolSupport.browserUserAgent,
                                  forHTTPHeaderField: "User-Agent")
-            let result = try await redirectGuard.fetch(session: session,
+            var result = try await redirectGuard.fetch(session: session,
                                                        request: mainRequest,
                                                        limit: ToolSupport.maxFetchBytes)
+            // 限流/瞬时不可用重试：429/503 是最常见的「等一等就好」，按
+            // Retry-After（钳到 5s）等待后重试一次；重试失败按原始状态报告。
+            if let http = result.response, [429, 503].contains(http.statusCode) {
+                let retryAfter = http.value(forHTTPHeaderField: "Retry-After")
+                    .flatMap { Double($0.trimmingCharacters(in: .whitespaces)) }
+                let wait = min(max(retryAfter ?? 1.0, 0.5), 5.0)
+                AgentLog.warning("[web_scan] HTTP \(http.statusCode)，\(Int(wait))s 后重试一次")
+                try await Task.sleep(nanoseconds: UInt64(wait * 1_000_000_000))
+                result = try await redirectGuard.fetch(session: session,
+                                                       request: mainRequest,
+                                                       limit: ToolSupport.maxFetchBytes)
+            }
             guard let http = result.response else {
                 return .fail("Request failed: invalid HTTP response")
             }
             guard http.statusCode < 400 else {
-                return .fail("HTTP \(http.statusCode)")
+                // 403/412 是典型的反爬/权限拦截：给出降级路径，而不是让模型
+                // 拿着裸状态码原地重试（真机反复「HTTP 403」空转的教训）。
+                let hint: String
+                switch http.statusCode {
+                case 403, 412:
+                    hint = "（疑似反爬或权限拦截：建议改用 web_render 用内置 WebKit "
+                        + "渲染重试；或改抓取该站的 RSS/feed / 移动版 URL）"
+                case 429, 503:
+                    hint = "（限流/暂不可用：已按 Retry-After 重试仍失败，"
+                        + "请稍后再试或换 URL）"
+                case 404:
+                    hint = "（资源不存在：检查路径/域名，或尝试该站的镜像/备用入口）"
+                default:
+                    hint = ""
+                }
+                return .fail("HTTP \(http.statusCode)\(hint)")
             }
             if (300..<400).contains(http.statusCode) {
                 return .fail(
@@ -151,6 +178,13 @@ public final class WebScanTool: AgentTool, ShutdownableTool {
                 }
                 if mimeType.contains("xml") || mimeType.contains("csv")
                     || mimeType.contains("text/plain") {
+                    // RSS/Atom feed 是一等公民：解析成结构化条目列表，
+                    // 而不是把整份 XML 直通给模型（item 里的 CDATA/命名空间
+                    // 会占满输出窗口，标题/链接才是模型真正需要的）。
+                    if let feed = Self.summarizeFeed(bodyText) {
+                        return .ok("[RSS/Atom 订阅源，\(mimeType)，\(body.count) 字节]\n"
+                                   + feed + truncationNote)
+                    }
                     return .ok("[数据源 \(mimeType)，\(body.count) 字节]\n"
                                + String(bodyText.prefix(20_000)) + truncationNote)
                 }
@@ -486,6 +520,83 @@ public final class WebScanTool: AgentTool, ShutdownableTool {
         let cfEncoding = CFStringConvertIANACharSetNameToEncoding(name as CFString)
         guard cfEncoding != kCFStringEncodingInvalidId else { return nil }
         return String.Encoding(rawValue: CFStringConvertEncodingToNSStringEncoding(cfEncoding))
+    }
+
+    /// RSS 2.0 / Atom feed 解析：提取条目的标题/链接/日期为紧凑列表。
+    ///
+    /// feed 的价值在「条目元数据」而非原始 XML（CDATA/命名空间会占满输出），
+    /// 与 JSON 分支的 summarize 管道对齐。识别 `<item>`（RSS）与 `<entry>`
+    /// （Atom）两种容器；链接取 `<link>` 文本或 `href` 属性；日期取
+    /// `<pubDate>`/`<updated>`/`<published>`。
+    static func summarizeFeed(_ xml: String) -> String? {
+        let lowered = xml.prefix(2000).lowercased()
+        guard lowered.contains("<rss") || lowered.contains("<feed")
+            || lowered.contains("<rdf:rdf") else { return nil }
+
+        func extract(_ tag: String, in text: String) -> String? {
+            guard let start = text.range(of: "<\(tag)", options: [.caseInsensitive]) else {
+                return nil
+            }
+            guard let gt = text[start.lowerBound...].range(of: ">",
+                                                           options: [.caseInsensitive])
+            else { return nil }
+            let closeTag = "</\(tag)"
+            guard let close = text[gt.lowerBound...].range(of: closeTag,
+                                                           options: [.caseInsensitive])
+            else { return nil }
+            var inner = String(text[gt.lowerBound..<close.lowerBound])
+            // CDATA 包裹的标题/链接：剥掉包裹层。
+            if inner.hasPrefix("<![CDATA[") {
+                inner = String(inner.dropFirst(9))
+                if let end = inner.range(of: "]]>") {
+                    inner = String(inner[..<end.lowerBound])
+                }
+            }
+            return inner.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+
+        // 切分条目：RSS 用 <item>，Atom 用 <entry>。
+        let openTag = xml.lowercased().contains("<entry") ? "entry" : "item"
+        var entries: [String] = []
+        var searchRange = xml.startIndex..<xml.endIndex
+        while entries.count < 40 {
+            guard let open = xml.range(of: "<\(openTag)", options: [.caseInsensitive],
+                                       range: searchRange) else { break }
+            guard let close = xml.range(of: "</\(openTag)>", options: [.caseInsensitive],
+                                        range: open.lowerBound..<xml.endIndex)
+            else { break }
+            let body = String(xml[open.lowerBound..<close.lowerBound])
+            var line = ""
+            if let title = extract("title", in: body) {
+                line += title.prefix(120).replacingOccurrences(of: "\n", with: " ")
+            }
+            if let link = extract("link", in: body), !link.isEmpty {
+                line += " | \(String(link.prefix(200)))"
+            } else {
+                // Atom 的 <link href="..."/> 是自闭合标签，extract 抓不到内文，
+                // 回退到 href 属性正则。
+                if let m = body.range(of: "href=\"([^\"]+)\"",
+                                      options: [.regularExpression, .caseInsensitive]) {
+                    let href = String(body[m])
+                        .replacingOccurrences(of: "href=\"", with: "")
+                        .replacingOccurrences(of: "\"", with: "")
+                    if !href.isEmpty { line += " | \(String(href.prefix(200)))" }
+                }
+            }
+            let date = extract("pubDate", in: body) ?? extract("updated", in: body)
+                ?? extract("published", in: body)
+            if let date { line += " | \(date.prefix(40))" }
+            if !line.isEmpty { entries.append("\(entries.count + 1). \(line)") }
+            searchRange = close.upperBound..<xml.endIndex
+        }
+
+        guard !entries.isEmpty else { return nil }
+        let total = xml.components(separatedBy: "<\(openTag)").count - 1
+        var output = "共 \(total) 条，列出前 \(entries.count) 条：\n" + entries.joined(separator: "\n")
+        if total > entries.count {
+            output += "\n… [其余 \(total - entries.count) 条未列出；用 raw=true 获取原始 XML]"
+        }
+        return output
     }
 
     /// Content-Type 缺失时按内容嗅探 JSON（顶层对象或数组）。
