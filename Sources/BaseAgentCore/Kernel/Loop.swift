@@ -148,6 +148,9 @@ private let minAttemptsBeforeBlock = 3
 private let blockNudgeMax = 2
 private let repeatCallWarn = 1
 private let repeatCallLimit = 3
+/// 成果核验反思的最多打回次数：以资深专家身份审视最终结果，质量不达标
+/// 最多打回完善 2 次，之后无论是否完美都收下，避免无限自我批评死循环。
+private let reviewMax = 2
 /// 单次大纲（rag_outline）之后允许的 rag_search 次数硬上限。
 /// 超过后内核直接把多余检索预置为失败，逼模型基于已有结果 + 大纲摘要作答，
 /// 杜绝「同一问题反复换关键词 scatter 检索」的无效搜索。
@@ -225,6 +228,9 @@ public final class KernelLoop {
     private var dynamicContextInjected = false
     private var repeatStreak = 0
     private var lastCallSigs: [String] = []
+    /// 成果核验反思：已进行的核验轮数（0=尚未核验）与当前候选答复。
+    private var reviewRounds = 0
+    private var reviewCandidate = ""
     /// 成功返回过结果的调用签名：完全相同参数再发一次，结果不会变。
     /// 模型常「拿到 web_scan 结果却原样重发刷屏」，用它在 preset 阶段直接
     /// 拦截，强令基于已有结果作答或换参数，而不是等 4 次重复才终止。
@@ -431,6 +437,8 @@ public final class KernelLoop {
         repeatStreak = 0
         lastCallSigs = []
         successSigs.removeAll()
+        reviewRounds = 0
+        reviewCandidate = ""
         ragSearchCount = 0
         self.resume = resume
         if let seed = pendingSeed {
@@ -875,7 +883,51 @@ public final class KernelLoop {
                     log("[kernel] 反思门：还有 \(openSteps.count) 步未完成，提醒继续")
                     continue
                 }
-                finalText = resp.content
+                // 成果核验反思：以从业 10 年的资深专家身份审视最终结果，质量
+                // 不达标最多打回 2 次完善。只在「多步任务 + 有实质工作」时开启
+                // ——轻量轮、单步工具操作、简单问答不核验，避免每次收尾白多一轮。
+                if toolsEnabled && didWork && isMultistep(userInput) {
+                    if reviewRounds == 0 {
+                        // 第一轮核验：把当前答复记为候选，注入专家核验提示。
+                        // 关闭思考：2B 模型被「专家审视」诱发长思考后常只输出
+                        // thinking 没有正文（真机 3 轮全空），直接出结论更稳。
+                        reviewCandidate = resp.content
+                        reviewRounds = 1
+                        forceNoThinking = true
+                        session.finishTurn(rec, assistantText: resp.content,
+                                           summary: l2Summary(resp.content),
+                                           rawContent: resp.rawContent)
+                        pending = Self.expertReviewHint(round: 1, max: reviewMax)
+                        log("[kernel] 成果核验反思 1/\(reviewMax)：专家视角审视结果")
+                        continue
+                    }
+                    if Self.isReviewPass(resp.content) {
+                        // 专家判「通过」：收下上一轮候选，不再纠缠。
+                        finalText = reviewCandidate
+                    } else if Self.isNoImprovement(reviewCandidate, resp.content) {
+                        // 反思没带来实质改进（只是把候选重复堆叠），收下干净的
+                        // 单次候选，不再为「完善」而反复刷屏。
+                        finalText = reviewCandidate
+                        log("[kernel] 成果核验：反思未带来实质改进，收下候选")
+                    } else if reviewRounds < reviewMax {
+                        // 专家给出完善后的答复，再核验一轮。
+                        reviewCandidate = resp.content
+                        reviewRounds += 1
+                        forceNoThinking = true
+                        session.finishTurn(rec, assistantText: resp.content,
+                                           summary: l2Summary(resp.content),
+                                           rawContent: resp.rawContent)
+                        pending = Self.expertReviewHint(round: reviewRounds,
+                                                        max: reviewMax)
+                        log("[kernel] 成果核验反思 \(reviewRounds)/\(reviewMax)：继续完善")
+                        continue
+                    } else {
+                        // 达到上限：收下本轮答复。
+                        finalText = resp.content
+                    }
+                } else {
+                    finalText = resp.content
+                }
                 session.finishTurn(rec, assistantText: resp.content,
                                    summary: l2Summary(resp.content),
                                    rawContent: resp.rawContent)
@@ -1605,6 +1657,43 @@ public final class KernelLoop {
         if markers.contains(where: { text.contains($0) }) { return true }
         return KernelRegex.search("(^|\\n)\\s*[1-9][\\.、\\)]", text)
             && text.contains("。")
+    }
+
+    /// 成果核验反思提示：以从业 10 年的领域资深专家身份，严格审视即将交付
+    /// 的结果，要求完整、有据、准确、清晰。发现不足时直接输出完善后的完整
+    /// 答复（而非只列问题），充分时输出 <review>pass</review> 结束核验。
+    static func expertReviewHint(round: Int, max: Int) -> String {
+        """
+        [System] 成果核验（第 \(round)/\(max) 轮）——请以从业 10 年的领域资深专家身份，严格审视你上一轮给出的最终答复，重点检查：
+        1) 完整性：是否覆盖了用户要求的全部要点，有无遗漏；
+        2) 真实性：结论是否全部来自工具返回的真实数据，而非猜测或常识脑补；
+        3) 准确性：数字、路径、名称、步骤等细节是否准确，有无前后矛盾或夸大；
+        4) 表达：结构是否清晰、语言是否精炼，有无冗余或答非所问。
+        **直接输出结论，不要进入思考模式、不要长篇分析过程。**若发现任何不足：直接输出完善后的完整最终答复（不要只列问题清单、不要复述「作为专家我认为」这类套话、不要再调用工具）；若已经足够好、无需任何改动：只输出 <review>pass</review>。
+        """
+    }
+
+    /// 核验轮模型是否判定「通过」（无需再改）。
+    static func isReviewPass(_ content: String) -> Bool {
+        let text = stripSummaryTags(content)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        if text.contains("<review>pass</review>") { return true }
+        if text.contains("<review>pass") { return true }
+        // 极短的纯 pass 声明也视为通过，避免漏判。
+        return text.count < 40 && text.contains("pass")
+    }
+
+    /// 核验轮输出是否相对候选「没有实质改进」——小模型被要求「完善」时
+    /// 常把同一句结论原样堆叠 N 遍（真机实测 2B 把一句失败说明重复 12 次），
+    /// 而非真正改进。这类重复不能算完善，应直接收下干净的单次候选。
+    static func isNoImprovement(_ candidate: String, _ new: String) -> Bool {
+        let c = candidate.trimmingCharacters(in: .whitespacesAndNewlines)
+        let n = new.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !c.isEmpty, !n.isEmpty else { return false }
+        if c == n { return true }
+        // 新内容只是候选的重复堆叠（长度成倍、且整体包含候选）。
+        return n.count >= c.count * 2 && n.contains(c)
     }
 
     private func isMultistep(_ text: String) -> Bool {

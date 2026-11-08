@@ -183,10 +183,52 @@ final class IntentStallLoopTests: XCTestCase {
 
         XCTAssertEqual(state.executed, ["web_scan"],
             "首个工具调用必须被真正执行：\(state.executed)")
-        XCTAssertEqual(state.calls, 2,
-            "不应有额外的『请先创建计划』重答轮：\(state.calls)")
+        // 工具轮 + 收尾轮 + 核验轮（模型给出相同文本，被判「无实质改进」直接收下）。
+        XCTAssertEqual(state.calls, 3,
+            "不应有额外的『请先创建计划』重答轮，但允许核验反思轮：\(state.calls)")
         XCTAssertTrue(result.text.contains("CNN 今日要闻"),
             "应基于工具结果收尾：\(result.text)")
+    }
+
+    /// 成果核验反思：多步任务收尾时，模型输出 <review>pass</review> 表示通过，
+    /// 内核收下上一轮候选答复，不再多耗轮次，pass 标记本身不成为答案。
+    func testReviewReflectionAcceptsPass() async {
+        let state = State()
+        let call = ToolCall(id: "call-1", name: "web_scan",
+                            arguments: ["url": .string("https://cnn.com")])
+        let loop = makeLoop(state) { index in
+            switch index {
+            case 1: return self.callStream(call)
+            case 2: return self.textStream("CNN 今日要闻：示例标题一、示例标题二。")
+            default: return self.textStream("<review>pass</review>")
+            }
+        }
+        let result = await loop.run("请按步骤获取 cnn.com 今日新闻并总结",
+                                    toolsEnabled: true)
+        XCTAssertEqual(state.calls, 3, "工具 + 收尾 + 一次核验通过：\(state.calls)")
+        XCTAssertTrue(result.text.contains("CNN 今日要闻"),
+            "应收下候选答复：\(result.text)")
+        XCTAssertFalse(result.text.contains("pass"), "pass 标记本身不应成为答案")
+    }
+
+    /// 成果核验反思：模型不给 pass 时最多打回 2 次完善，第 2 次后收下当前答复。
+    func testReviewReflectionMaxTwoRevisions() async {
+        let state = State()
+        let call = ToolCall(id: "call-1", name: "web_scan",
+                            arguments: ["url": .string("https://cnn.com")])
+        let loop = makeLoop(state) { index in
+            switch index {
+            case 1: return self.callStream(call)
+            case 2: return self.textStream("初稿")
+            case 3: return self.textStream("修订一")
+            default: return self.textStream("修订二")
+            }
+        }
+        let result = await loop.run("请按步骤获取 cnn.com 今日新闻并总结",
+                                    toolsEnabled: true)
+        XCTAssertEqual(state.calls, 4, "工具 + 初稿 + 2 次修订收尾：\(state.calls)")
+        XCTAssertTrue(result.text.hasPrefix("修订二"),
+            "达到上限后收下最后一轮：\(result.text)")
     }
 
     // MARK: - 结果性答复 / 上下文膨胀 / 跨段预算
