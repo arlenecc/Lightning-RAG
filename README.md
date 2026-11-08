@@ -52,8 +52,8 @@ VARIANT=lite  scripts/package-app.sh release && VARIANT=lite  scripts/package-dm
 
 | VARIANT | 内置模型 | DMG |
 |---|---|---|
-| `clean`（默认） | 无；potion 语义切片 / jina embedding / jina reranker 均在首次启动时从 hf-mirror 自动下载 | `dist/Lightning-RAG-1.2.25-clean.dmg` |
-| `lite` | potion-multilingual-128M int4（语义切片）+ jina-embeddings-v5-text-nano-mlx-int4 + jina-reranker-v2-base-multilingual-onnx | `dist/Lightning-RAG-1.2.25-lite.dmg` |
+| `clean`（默认） | 无；potion 语义切片 / jina embedding / jina reranker 均在首次启动时从 hf-mirror 自动下载 | `dist/Lightning-RAG-1.2.26-clean.dmg` |
+| `lite` | potion-multilingual-128M int4（语义切片）+ jina-embeddings-v5-text-nano-mlx-int4 + jina-reranker-v2-base-multilingual-onnx | `dist/Lightning-RAG-1.2.26-lite.dmg` |
 
 两个版本共用 `dist/Lightning-RAG.app`（应用本体与显示名不变，只有内置模型不同），
 因此需按「打包 App → 打包 DMG」的顺序逐个构建。两个版本都不含主模型、辅助模型
@@ -122,6 +122,8 @@ HTML 与 Office 解析另有专项覆盖：HTML 保存页的本地 iframe / fram
 配置保存在 `~/.base-agent/config.json`，可在配置窗口修改；工作区默认 `~/base-agent-workspace`。
 
 **自定义 system prompt**：首次启动会在 `<workspace>/assets/system_prompt.txt` 写出内置的 `BASE_SYSTEM_PROMPT`；之后每次启动读取该文件并替换内置提示词，可直接用文本编辑器调整模型行为规则，**重启（或重新应用配置）后生效**（会话期间保持不变，以免 system 前缀抖动使 KV cache 反复重建）。文件内容空白或不可读时本次回退内置提示词，且不会覆盖文件。它替换的是协议主体，L0 META-SOP 与 L1 全局索引仍按多级记忆机制追加在其后；轻量轮（纯寒暄/能力问询）使用内核的极简提示，不受该文件影响。内置提示词中的 `<summary>` 标签、`rag_outline` 起手式、工具状态词等是内核回注与测试的硬依赖，建议在原文基础上调整，不要整段删除。
+
+**v1.2.26**：`web_scan` 现在能独立处理动态 JS 列表页——注入脚本捕获页面自身发出的 XHR/fetch，同源 GET 重放数据接口，把 JSON/HTML 响应结构化精简，并自动合并当天分页；XHR 响应体捕获补齐 `readystatechange`/`loadend` 双时机，扫描版 PDF 无文本层时的渲染全白也有流级兜底。KV/预热方面：MLX 折叠边界改为复用已有前缀快照（不再每 8 轮重跑约 18s 全量 prefill），轻量轮（寒暄/能力问询）改为本地直答且不进 LLM 上下文、跳过周期性折叠，启动预热期间允许发送并排队，正式请求复用刚建好的 system+tools 前缀；GGUF 侧修正生成计时起点（`tps` 日志不再失真）、缓存完好时跳过重复预热、卸载时重置 `seq_rm` 能力探测。真机模拟正式用户与双后端回归用例已补齐；hybrid/recurrent GGUF 的 `llama_memory_seq_rm` 不支持 partial sequence 裁剪，这类模型仍会在分叉轮整段重建。全量 842 项测试与 release 构建通过。
 
 ## 核心设计
 

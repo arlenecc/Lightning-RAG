@@ -85,7 +85,9 @@ final class AgentLogIsolationTests: XCTestCase {
         let agent = Agent(llm: LoggingLLM(), config: config, callbacks: callbacks)
         defer { agent.close() }
 
-        _ = await agent.run("hi")
+        // 寒暄现在是本地直答（不创建 LLM stream），必须用普通任务轮才能
+        // 覆盖「底层组件日志经 taskSink 回到本次请求 callbacks」的链路。
+        _ = await agent.run("请写个脚本")
         XCTAssertTrue(callbacks.lines.contains { $0.contains("LOW_LEVEL_MARKER") },
                       "底层 AgentLog 应经 taskSink 流到本次请求的 callbacks："
                       + "\(callbacks.lines)")

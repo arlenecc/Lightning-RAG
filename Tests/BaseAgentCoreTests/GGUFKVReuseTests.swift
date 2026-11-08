@@ -34,7 +34,7 @@ final class GGUFKVReuseTests: XCTestCase {
             modelPath: modelURL.path,
             contextWindow: 8_192, maxTokens: 32,
             topP: 1, minP: 0, topK: 0, repetitionPenalty: 1,
-            enableThinking: false, gpuLayers: 0,
+            enableThinking: false, gpuLayers: 99,
             kvInt8: true, flashAttention: true)
         defer { service.close() }
 
@@ -72,7 +72,7 @@ final class GGUFKVReuseTests: XCTestCase {
             modelPath: modelURL.path,
             contextWindow: 8_192, maxTokens: 48,
             topP: 1, minP: 0, topK: 0, repetitionPenalty: 1,
-            enableThinking: false, gpuLayers: 0)
+            enableThinking: false, gpuLayers: 99)
         defer { service.close() }
 
         let collector = LogBox()
@@ -114,11 +114,22 @@ final class GGUFKVReuseTests: XCTestCase {
             XCTAssertTrue(mode == "append" || mode == "trim",
                 "后续调用应复用（append/trim），实际 \(modes)")
         }
-        let rebuilds = collector.lines.filter {
+        // llama.h 明确：partial sequence 裁剪在 hybrid/recurrent memory 上
+        // 会返回 false（「Removing a whole sequence never fails」）。混合 SSM
+        // 模型（如 Qwen3.5 GGUF）因此合法降级为整段重建，不能当成账目 bug；
+        // 标准 attention 模型才要求所有非首轮都走 append/trim。
+        let seqRmFailures = collector.lines.filter {
             $0.contains("[gguf-kv] seq_rm") && $0.contains("失败")
         }
-        XCTAssertTrue(rebuilds.isEmpty,
-            "支持 seq_rm 的模型不应出现裁剪失败：\(rebuilds)")
+        if seqRmFailures.isEmpty {
+            for mode in modes.dropFirst() {
+                XCTAssertTrue(mode == "append" || mode == "trim",
+                    "支持 seq_rm 的模型后续应复用，实际 \(modes)")
+            }
+        } else {
+            XCTAssertFalse(collector.lines.contains { $0.contains("llama_decode 返回") },
+                "裁剪降级后不得出现 decode 失败：\(collector.lines)")
+        }
     }
 
     private final class LogBox: @unchecked Sendable {

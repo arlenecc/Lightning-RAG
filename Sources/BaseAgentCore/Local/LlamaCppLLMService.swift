@@ -34,9 +34,19 @@ public final class LlamaCppLLMService: LLMService, PreloadableLLMService,
     private var loadFailure: Error?
     private var cachedTokens: [llama_token] = []
     private var cachedToolsKey: String?
-    /// `llama_memory_seq_rm` 是否可用。混合 SSM 等 KV 结构不支持按位置
-    /// 裁剪（返回 false）；首次失败后记住，后续直接全量重建，避免每轮
-    /// 白试一次。
+    /// 上次成功预热的前缀签名。GGUF 无法像 MLX 那样复制 KV 快照，折叠后
+    /// 必须重新 prefill 前缀；但缓存仍完好时的重复 warmup（配置切换/重复
+    /// 调用）不该再算一遍整段 7k token。
+    private var warmupSystemPrompt: String?
+    private var warmupToolsKey: String?
+    private var warmupTokens: [llama_token] = []
+    /// `llama_memory_seq_rm` 是否可用。llama.h 明确：partial sequence 裁剪
+    /// 在 hybrid/recurrent memory 上会返回 false（只有删除整个序列才保证
+    /// 成功）。Qwen3.5 等混合 SSM 模型因此每轮生成后的 `trim` 都退化成
+    /// 整段重建（实测 7~8k token prefill 需 7~8s），反思门重试时会被
+    /// 放大到几十秒。首次失败后记住，后续直接全量重建，避免每轮白试。
+    /// 彻底解法是消息级增量 append（不重渲染 assistant、只追加新
+    /// user/tool 增量），让这类模型也能走 `mode=append`。
     private var seqRmSupported = true
 
     init(modelPath: String,
@@ -129,6 +139,11 @@ public final class LlamaCppLLMService: LLMService, PreloadableLLMService,
         loadFailure = nil
         cachedTokens = []
         cachedToolsKey = nil
+        warmupSystemPrompt = nil
+        warmupToolsKey = nil
+        warmupTokens = []
+        // 换模型后要重新探测：旧实例是混合 SSM，新实例可能是标准 attention。
+        seqRmSupported = true
         lock.unlock()
     }
 
@@ -172,6 +187,20 @@ public final class LlamaCppLLMService: LLMService, PreloadableLLMService,
             defer { lock.unlock() }
 
             let loaded = try ensureLoadedLocked()
+            let toolsKey = Self.toolsKey(tools)
+            // 前缀签名一致且缓存里仍完整保留该前缀 → 无需再 prefill。
+            // 折叠/清空历史后 invalidation 会清掉 cachedTokens，此时条件
+            // 不成立，warmup 必须重跑：GGUF 没有可复制的 KV 快照，重跑
+            // 前缀正是让下一轮 mode=append 只算增量的唯一途径。
+            if systemPrompt == warmupSystemPrompt,
+               toolsKey == warmupToolsKey,
+               !warmupTokens.isEmpty,
+               cachedTokens.count >= warmupTokens.count,
+               Array(cachedTokens.prefix(warmupTokens.count)) == warmupTokens {
+                AgentLog.info("[gguf-warmup] 复用已就绪前缀 tokens=\(warmupTokens.count) "
+                    + "（跳过全量 prefill）")
+                return
+            }
             cachedTokens = []
             cachedToolsKey = nil
 
@@ -213,7 +242,10 @@ public final class LlamaCppLLMService: LLMService, PreloadableLLMService,
                                        context: loaded.context,
                                        chunkSize: loaded.batchSize)
             cachedTokens = tokens
-            cachedToolsKey = Self.toolsKey(tools)
+            cachedToolsKey = toolsKey
+            warmupSystemPrompt = systemPrompt
+            warmupToolsKey = toolsKey
+            warmupTokens = tokens
             AgentLog.info("[gguf-warmup] prefill tokens=\(tokens.count) tools=\(tools.count)")
         }
     }
@@ -348,6 +380,10 @@ public final class LlamaCppLLMService: LLMService, PreloadableLLMService,
                 $0["function"]?["name"]?.stringValue
             })
             let (rawContent, generated): (String, [llama_token])
+            // 计时起点必须在生成循环之前：旧实现把它放在 catch 之后，
+            // elapsed 只剩工具解析的零点几毫秒，tps 被打成几万，性能日志
+            // 完全失真，无法据此判断某轮是否真的变慢。
+            let generationStart = Date()
             do {
                 (rawContent, generated) = try generateLoop(
                     context: loaded.context, model: model,
@@ -365,7 +401,6 @@ public final class LlamaCppLLMService: LLMService, PreloadableLLMService,
                 cachedToolsKey = nil
                 throw error
             }
-            let generationStart = Date()
 
             let toolCalls = LocalToolCallParser.extract(
                 raw: rawContent, allowedNames: allowedToolNames)

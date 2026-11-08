@@ -56,6 +56,23 @@ public final class MLXLLMService: LLMService, PreloadableLLMService,
     private var warmupStateSnapshot: LMOutput.State?
     private var warmupTokens: [Int] = []
     private var warmupToolsKey: String?
+    /// 上次成功预热对应的 system prompt。折叠边界会用新冻结的 prompt 再次
+    /// 请求预热；逐字节相同时只需丢弃会话 KV，前缀快照可直接给下一轮的
+    /// prefix-reuse 使用，不必重跑 7k token 的 GPU prefill（实测 18~21s）。
+    private var warmupSystemPrompt: String?
+    /// 正在进行的预热任务。启动期间发出的请求先等它完成，就能直接复用刚
+    /// prefill 好的前缀；否则并发 prefill 会踩踏 GPU 并让首轮全量重建。
+    private let warmupLock = NSLock()
+    private var activeWarmup: Task<Void, Error>?
+
+    private func setActiveWarmup(_ task: Task<Void, Error>?) {
+        warmupLock.lock(); activeWarmup = task; warmupLock.unlock()
+    }
+
+    private func currentWarmup() -> Task<Void, Error>? {
+        warmupLock.lock(); defer { warmupLock.unlock() }
+        return activeWarmup
+    }
 
     public init(
         directory: URL,
@@ -149,6 +166,12 @@ public final class MLXLLMService: LLMService, PreloadableLLMService,
                 var activeToolsKey: String?
                 var activeIterator: StatefulTokenIterator?
                 do {
+                    try Task.checkCancellation()
+                    // 启动期间发出的请求排队等预热完成：预热已把 system+tools
+                    // 前缀算好，这里就能直接增量续写，不必全量 prefill 20s。
+                    if let warmup = self.currentWarmup() {
+                        try? await warmup.value
+                    }
                     try Task.checkCancellation()
                     let container = try await state.container(directory: directory)
                     let probe = try await state.templateProbe(
@@ -644,14 +667,51 @@ public final class MLXLLMService: LLMService, PreloadableLLMService,
     /// 只做 prefill、不进入解码；缓存的是正式请求的第一段前缀，因此不能包含
     /// generation prompt。工具清单参与该前缀渲染，所以也必须一起传入。
     public func warmup(systemPrompt: String, tools: [JSONValue]) async throws {
+        // 预热放在独立 Task：它要跑完整段 prefill（首次还含 Metal shader 编译），
+        // chatStream 通过 currentWarmup() 等它结束，就能让启动期间发出的第一句
+        // 排队复用刚建好的前缀，而不是被 UI 丢弃或与预热并发踩踏 GPU。
+        // 注册与创建放在同一把锁内：chatStream 可能在启动瞬间读取
+        // currentWarmup()，先建 Task 后注册会漏掉这次等待，导致正式请求与
+        // 预热并发踩踏 GPU。Task 体异步调度，不会在锁内同步执行。
+        warmupLock.lock()
+        let task = Task {
+            try await self.performWarmup(systemPrompt: systemPrompt, tools: tools)
+        }
+        activeWarmup = task
+        warmupLock.unlock()
+        try await task.value
+    }
+
+    private func performWarmup(systemPrompt: String, tools: [JSONValue]) async throws {
+        // 外层 preload Task 被取消时，这个 GPU 工作仍需跑完并释放引用；
+        // 只在自身结束时清，保证在途请求一定会等到它。
+        defer { setActiveWarmup(nil) }
         guard !systemPrompt.isEmpty else { return }
+        let toolsKey = Self.toolsKey(tools)
+        // 历史折叠/滑窗会丢弃会话 KV，但 system + tools 前缀通常没变。
+        // 此时已有前缀快照可供 chatStream 的 prefix-reuse 复制，重跑整段
+        // prefill 纯属重复劳动：每 8 轮折叠就多花 ~18s，正是「时快时慢」
+        // 的主因。签名一致时只丢会话缓存、保留快照，本轮零 GPU 开销。
+        if systemPrompt == warmupSystemPrompt,
+           toolsKey == warmupToolsKey,
+           warmupCacheSnapshot != nil, !warmupTokens.isEmpty {
+            invalidateKVCache()
+            AgentLog.info("[mlx-warmup] 复用已有前缀快照 tokens=\(warmupTokens.count) "
+                + "（system/tools 未变，跳过全量 prefill）")
+            return
+        }
         let warmupStarted = Date()
+        func stage(_ name: String) {
+            AgentLog.info("[mlx-warmup] stage=\(name) "
+                + "ms=\(Int(Date().timeIntervalSince(warmupStarted) * 1000))")
+        }
         // 预热失败/取消时不能留下旧缓存，否则正式请求会接着旧前缀生成。
         invalidateKVCache()
         warmupCacheSnapshot = nil
         warmupStateSnapshot = nil
         warmupTokens = []
         warmupToolsKey = nil
+        warmupSystemPrompt = nil
         try Task.checkCancellation()
         let container = try await state.container(directory: directory)
         let tokenizer = await container.tokenizer
@@ -712,6 +772,7 @@ public final class MLXLLMService: LLMService, PreloadableLLMService,
                     + "\(keepCount)/\(renderedA.count) tokens")
             }
         }
+        stage("render")
         guard keepCount >= 32, keepCount <= contextWindow - 1024 else {
             AgentLog.warning("[mlx-warmup] 跳过：前缀 token 数 \(keepCount) 不适合预热")
             return
@@ -732,6 +793,7 @@ public final class MLXLLMService: LLMService, PreloadableLLMService,
         // 因此预热必须把 GPU 工作真正做完再返回。
         // 1) 强制求值：让「已 prefill」的 KV 状态不再是欠条。
         eval(cache.flatMap { $0.state })
+        stage("prefill-eval")
 
         // 2) 牺牲性 decode：从「已 prefill 的 system 前缀缓存」复制一份，追加
         //    一小段 user 形状的 token 再 decode 两步——编译的是首轮真实形状
@@ -767,7 +829,6 @@ public final class MLXLLMService: LLMService, PreloadableLLMService,
         Stream.defaultStream.synchronize()
         try Task.checkCancellation()
 
-        let toolsKey = Self.toolsKey(tools)
         // 保留一份未推进的前缀快照；历史折叠/滑窗需要重建时从它复制，
         // 只 prefill 动态历史，避免再次计算整段 system + tools。
         // 快照本身是常驻 KV：前缀过大时不再复制，避免内存直接翻倍。
@@ -776,6 +837,7 @@ public final class MLXLLMService: LLMService, PreloadableLLMService,
             warmupStateSnapshot = wrapped.state
             warmupTokens = Array(tokens.prefix(keepCount))
             warmupToolsKey = toolsKey
+            warmupSystemPrompt = systemPrompt
         } else {
             AgentLog.info("[mlx-warmup] 前缀 \(keepCount) tokens 超过快照上限，跳过副本")
         }
@@ -806,6 +868,7 @@ public final class MLXLLMService: LLMService, PreloadableLLMService,
         warmupStateSnapshot = nil
         warmupTokens = []
         warmupToolsKey = nil
+        warmupSystemPrompt = nil
         // 先排空 GPU 队列，再释放容器，最后再同步一次收尾。
         MLX.Stream.gpu.synchronize()
         await state.unload()

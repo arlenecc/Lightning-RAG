@@ -15,12 +15,79 @@ final class WebRenderer: @unchecked Sendable {
     /// 测试专用：允许渲染 localhost（SSRF 防护由工具层负责，这里只管执行）。
     static var localhostAllowedForTesting = false
 
+    /// 页面脚本实际发出的数据请求（含运行时拼好的查询参数）。
+    /// web_scan 用它重放/复用接口响应，避免从压缩 JS 里猜接口参数。
+    struct CapturedRequest: Sendable {
+        var url: String
+        var status: Int
+        var body: String
+    }
+
     struct Outcome: Sendable {
         var text = ""
         var html: String?
         var scriptResult: String?
         var screenshotPath: String?
+        var capturedRequests: [CapturedRequest] = []
     }
+
+    /// atDocumentStart 注入：记录页面自己发出的 XHR / fetch 的 URL、状态与响应体。
+    /// 很多列表页的接口参数由运行时拼接（压缩 JS 里只有端点路径），只有页面
+    /// 自己知道完整 URL；捕获后由工具层用 URLSession 重放即可拿到结构化数据。
+    /// 数组与单条响应都封顶，避免大 JSON 拖垮 evaluateJavaScript 的跨进程传输。
+    private static let captureScript = """
+    (function () {
+      window.__webScanRequests = [];
+      var MAX = 12, MAXLEN = 180000;
+      function push(url, status, body) {
+        try {
+          window.__webScanRequests.push({url: String(url || ''), status: status || 0,
+                                        body: String(body || '').slice(0, MAXLEN)});
+          if (window.__webScanRequests.length > MAX) window.__webScanRequests.shift();
+        } catch (e) {}
+      }
+      var open = XMLHttpRequest.prototype.open;
+      XMLHttpRequest.prototype.open = function (method, url) {
+        this.__webScanURL = url;
+        return open.apply(this, arguments);
+      };
+      var send = XMLHttpRequest.prototype.send;
+      XMLHttpRequest.prototype.send = function () {
+        var xhr = this;
+        var captured = false;
+        function capture() {
+          if (captured) return;
+          captured = true;
+          var body = '';
+          try { if (!xhr.responseType || xhr.responseType === 'text') body = xhr.responseText; }
+          catch (e) {}
+          push(xhr.__webScanURL, xhr.status, body);
+        }
+        // readyState 4 与 onload 同批触发，比 loadend 更早；两个都挂上去，
+        // 避免 wait_selector 命中时响应体还没被记录。
+        xhr.addEventListener('readystatechange', function () {
+          if (xhr.readyState === 4) capture();
+        });
+        xhr.addEventListener('loadend', capture);
+        return send.apply(this, arguments);
+      };
+      if (window.fetch) {
+        var originalFetch = window.fetch;
+        window.fetch = function () {
+          var input = arguments[0];
+          var url = (input && input.url) ? input.url : input;
+          return originalFetch.apply(this, arguments).then(function (response) {
+            try {
+              response.clone().text().then(function (body) {
+                push(url, response.status, body);
+              });
+            } catch (e) {}
+            return response;
+          });
+        };
+      }
+    })();
+    """
 
     /// 渲染任务串行化（复用同一个 WKWebView；NSLock 不能跨 await 持有）。
     private let serial = AsyncSemaphore(value: 1)
@@ -318,6 +385,22 @@ final class WebRenderer: @unchecked Sendable {
                 webView: webView) as? String
         }) ?? ""
 
+        // 3b. 取回页面自己发出的数据请求（含运行时拼好的参数）。
+        let capturedRaw: String? = try? await withTimeout(10, "XHR 捕获") {
+            try await self.evaluate("JSON.stringify(window.__webScanRequests || [])",
+                                    webView: webView) as? String
+        }
+        if let raw = capturedRaw,
+           let data = raw.data(using: .utf8),
+           let rows = (try? JSONSerialization.jsonObject(with: data)) as? [[String: Any]] {
+            outcome.capturedRequests = rows.compactMap { row in
+                guard let url = row["url"] as? String, !url.isEmpty else { return nil }
+                return CapturedRequest(url: url,
+                                       status: row["status"] as? Int ?? 0,
+                                       body: row["body"] as? String ?? "")
+            }
+        }
+
         // 4. 用户脚本（返回值需为字符串/数字等基础类型）。
         if let script, !script.isEmpty {
             let result = try await withTimeout(30, "脚本执行") {
@@ -360,6 +443,9 @@ final class WebRenderer: @unchecked Sendable {
         if let rules {
             configuration.userContentController.add(rules)
         }
+        configuration.userContentController.addUserScript(
+            WKUserScript(source: Self.captureScript,
+                         injectionTime: .atDocumentStart, forMainFrameOnly: true))
         let webView = WKWebView(frame: CGRect(x: 0, y: 0, width: 1440, height: 900),
                                 configuration: configuration)
         let nav = NavigationBox()

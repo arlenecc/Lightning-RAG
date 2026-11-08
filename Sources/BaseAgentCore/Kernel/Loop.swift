@@ -302,6 +302,21 @@ public final class KernelLoop {
             : "你好！有什么我可以帮你的吗？"
     }
 
+    /// 寒暄的本地直答：这类输入不需要模型，也不该占用 GPU 或换掉 system/tools
+    /// 前缀。启动预热（首次 Metal 编译 + 7k token prefill 约 20s）期间也能
+    /// 立即回复，是「第一句要等 20s」的主要解法。
+    static func greetingAnswer(for userInput: String) -> String {
+        let lower = userInput.lowercased()
+        if ["谢谢", "多谢", "感谢", "thanks", "thank you"]
+            .contains(where: { lower.contains($0) }) {
+            return "不客气，随时找我。"
+        }
+        if ["再见", "拜拜", "bye", "晚安"].contains(where: { lower.contains($0) }) {
+            return "好的，再见！"
+        }
+        return "你好！有什么可以帮你的吗？"
+    }
+
     /// 能力问询的本地答案：直接从真实注册的 tool schema 生成清单。
     ///
     /// 能力问询是确定性信息，不该交给模型猜。轻量轮禁用了工具 schema、又只
@@ -416,7 +431,11 @@ public final class KernelLoop {
             }
 
             // ---- CONSOLIDATE ----
-            if needsConsolidate() {
+            // 轻量轮（寒暄/能力问询）走本地直答、完全不碰 LLM/KV，若在这里
+            // 折叠历史会 invalidateKV 并触发 didFold → warmup：MLX 丢掉刚
+            // 累积的会话缓存，GGUF 更要重跑整段前缀 prefill（实测一句「你好」
+            // 被拖到 7.5s）。折叠推迟到下一个正式轮，保护逻辑不变。
+            if toolsEnabled, needsConsolidate() {
                 state = .consolidate
                 lastConsolidatedTurn = session.currentTurn
                 let foldReason: String
@@ -493,14 +512,22 @@ public final class KernelLoop {
             var respOptional: LLMResponse? = nil
             var localCapabilityAnswer: String?
             do {
-                if !toolsEnabled, SkillManager.isCapabilityQuery(userInput) {
-                    // 能力问询是确定性信息：把真实注册的工具清单直接给用户。
-                    // 轻量轮拿不到工具 schema、又只有极简 system，交给模型只会
-                    // 得到「回答问题/提供信息/进行对话」这类与工具无关的套话。
-                    let answer = Self.capabilityAnswer(from: schemas())
+                // 轻量轮（能力问询 + 寒暄）全部本地直答：零 GPU、零延迟，
+                // 也不换 system/tools 前缀——预热好的 7k token KV 不会因为
+                // 一句「你好」被 tools-changed 全量重建。
+                if !toolsEnabled,
+                   SkillManager.isCapabilityQuery(userInput)
+                    || SkillManager.isGreeting(userInput) {
+                    let answer: String
+                    if SkillManager.isCapabilityQuery(userInput) {
+                        answer = Self.capabilityAnswer(from: schemas())
+                        log("[kernel] 能力问询：按真实工具清单本地直答，跳过 LLM")
+                    } else {
+                        answer = Self.greetingAnswer(for: userInput)
+                        log("[kernel] 寒暄：本地直答，跳过 LLM")
+                    }
                     localCapabilityAnswer = answer
                     respOptional = LLMResponse(content: answer)
-                    log("[kernel] 能力问询：按真实工具清单本地直答，跳过 LLM")
                 } else {
                     respOptional = try await ask(messages, toolsEnabled: toolsEnabled)
                 }
@@ -555,7 +582,8 @@ public final class KernelLoop {
                     finalText = answer
                     session.finishTurn(rec, assistantText: answer,
                                        summary: l2Summary(answer),
-                                       rawContent: answer)
+                                       rawContent: answer,
+                                       excludeFromContext: true)
                     finalTurnNoTool = true
                     exitReason = .done
                     break

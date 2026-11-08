@@ -64,6 +64,12 @@ final class KVReuseFlowTests: XCTestCase {
         let digits = line[range.upperBound...].prefix { $0.isNumber }
         return Int(digits)
     }
+    /// 本轮实际需要预填的增量 token 数。
+    private func deltaTokens(_ line: String) -> Int? {
+        guard let range = line.range(of: "delta=") else { return nil }
+        let digits = line[range.upperBound...].prefix { $0.isNumber }
+        return Int(digits)
+    }
 
     /// 校验调用序列：`reuse=false` 只允许出现在首次调用，以及紧跟
     /// 「截断工具调用→保护性 invalidate」或「周期折叠/兜底收缩→主动失效」
@@ -94,8 +100,16 @@ final class KVReuseFlowTests: XCTestCase {
                 if cached <= 0 {
                     problems.append("reuse=true 但 cached=0，复用形同虚设：\(line)")
                 }
-                if let ms = prefillMS(line), ms > 5_000 {
-                    problems.append("reuse=true 但 prefill 耗时 \(ms)ms，近似全量重扫：\(line)")
+                // 折叠后从前缀快照重建时，增量本身可能含数千 token（工具
+                // 结果 + 自动续跑历史），prefill 线性变长是合法的。按增量
+                // 规模归一化阈值，才不会把「大增量」误判成「全量重扫」；
+                // 真正的假复用（日志说 reuse=true 却重算整个 7k 前缀）仍会
+                // 远超 6ms/token 的余量。
+                let budget = max(5_000, (deltaTokens(line) ?? 0) * 6)
+                if let ms = prefillMS(line), ms > budget {
+                    problems.append("reuse=true 但 prefill 耗时 \(ms)ms"
+                        + "（增量 \(deltaTokens(line) ?? 0) token，上限 \(budget)ms），"
+                        + "近似全量重扫：\(line)")
                 }
                 rebuiltByInvalidation = false
             } else if !rebuiltByInvalidation {

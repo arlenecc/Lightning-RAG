@@ -42,7 +42,10 @@ enum WebURLPolicy {
 public final class WebScanTool: AgentTool, ShutdownableTool {
     public let name = "web_scan"
     public let description =
-        "Fetch a URL and return its visible text content (HTML stripped, scripts removed)."
+        "Fetch a URL and return its visible text content (HTML stripped, scripts removed). "
+        + "For JS-driven list pages, also captures the page's own same-origin data API "
+        + "requests, replays them, and summarizes JSON records into a readable list; "
+        + "same-day records are merged across pages when a read-only paging API exists."
 
     private let config: AgentConfig
     private let session: URLSession
@@ -57,8 +60,10 @@ public final class WebScanTool: AgentTool, ShutdownableTool {
                     "Return raw HTML instead of extracted text (default false)."),
                 "render": ToolSupport.stringProperty(
                     "'auto' (default): when dynamic loading is detected (SPA/AJAX shell), "
-                    + "automatically re-render with the built-in WebKit view and return "
-                    + "the visible text; 'force': always render; 'never': skip rendering."),
+                    + "automatically re-render with the built-in WebKit view, return "
+                    + "the visible text, and summarize the page's own data API responses "
+                    + "as a structured list; 'force': always render; 'never': skip rendering "
+                    + "(data API hints from the HTML/JS are still used)."),
             ],
             required: ["url"])
     }
@@ -182,11 +187,12 @@ public final class WebScanTool: AgentTool, ShutdownableTool {
             // 列表页/SPA 动态加载检测：正文短或主体只是加载占位时附降级建议，
             // 避免模型把加载占位误当有效内容。
             var hint = ToolSupport.dynamicLoadingHint(html: bodyText, extracted: content)
+            // 同源 JS 源码同时供提示与接口直取复用，避免重复下载。
+            var externalScriptTexts: [String] = []
 
             // 数据源线索增强：动态页的真实接口常写在同源 JS 里（HTML 内联只有少量线索），
             // 抓取评分最高的几个脚本，把其中的 /api/... 端点合并进提示。
             if !hint.isEmpty {
-                var externalScriptTexts: [String] = []
                 var inspectedScriptURLs: [String] = []
                 for scriptURL in ToolSupport.selectScriptSourcesForInspection(
                     html: bodyText, baseURL: url, limit: 2) {
@@ -220,11 +226,14 @@ public final class WebScanTool: AgentTool, ShutdownableTool {
             default: shouldRender = !hint.isEmpty
             }
 
+            let staticText = content.trimmingCharacters(in: .whitespacesAndNewlines)
+            var sections: [String] = []
+            var capturedRequests: [WebRenderer.CapturedRequest] = []
+
             if shouldRender {
                 do {
-                    let staticText = content.trimmingCharacters(in: .whitespacesAndNewlines)
-                    // 自动降级：用内置 WebKit 渲染一次拿真实正文。
-                    // 静态正文明显偏少时等待正文增长（SPA 数据落地），而不是固定睡 1.5s。
+                    // 自动降级：用内置 WebKit 渲染一次拿真实正文，并捕获页面
+                    // 自己发出的数据请求（完整查询参数由页面 JS 运行时拼好）。
                     let outcome = try await WebRenderer.shared.render(
                         url: url,
                         waitMS: 500,
@@ -235,26 +244,75 @@ public final class WebScanTool: AgentTool, ShutdownableTool {
                         timeout: 45,
                         waitForTextGrowthFrom: hint.isEmpty ? nil : staticText.count,
                         maxContentWait: 8)
+                    capturedRequests = outcome.capturedRequests
                     let rendered = outcome.text
                         .trimmingCharacters(in: .whitespacesAndNewlines)
-                    if rendered.count > staticText.count {
-                        var sections: [String] = [
-                            "[渲染后正文（检测到动态加载，已自动用内置 WebKit 渲染提取），"
-                                + "\(rendered.count) 字符]\n" + String(rendered.prefix(20_000)),
-                        ]
-                        if staticText.count > 30 {
-                            sections.append("[静态提取正文]\n" + String(content.prefix(5_000)))
-                        }
-                        // 提示仍保留：若渲染后仍缺信息，模型可继续调接口或 web_render 交互。
-                        return .ok(sections.joined(separator: "\n\n") + hint)
+                    if !rendered.isEmpty {
+                        // 不能只按总长度决定取舍：CSS 隐藏的导航会让渲染正文比静态
+                        // 短，但动态数据其实已经落地。一律附上，交模型判断。
+                        let title = rendered.count > staticText.count
+                            ? "[渲染后正文（检测到动态加载，已自动用内置 WebKit 渲染提取）"
+                            : "[渲染后正文（WebKit，短于静态正文，供对照）"
+                        sections.append(title + "，\(rendered.count) 字符]\n"
+                            + String(rendered.prefix(12_000)))
                     }
                 } catch is CancellationError {
                     throw AgentError.cancelled
                 } catch AgentError.cancelled {
                     throw AgentError.cancelled
                 } catch {
-                    // 渲染失败不拖垮主流程：回退静态结果 + 提示。
+                    // 渲染失败不拖垮主流程：仍可按线索直取数据接口。
                 }
+            }
+
+            // 数据接口直取：优先页面实发 URL，其次源码里的端点线索。只做同源 GET，
+            // 且只采纳「含非空记录数组」的响应，避免错误体/登录页被当成数据。
+            if !hint.isEmpty || shouldRender {
+                var endpointHints: [String] = []
+                for source in [bodyText] + externalScriptTexts {
+                    for endpoint in ToolSupport.extractAPIEndpointHints(html: source, limit: 8) {
+                        if !endpointHints.contains(endpoint) { endpointHints.append(endpoint) }
+                    }
+                }
+                let candidates = WebDataCapture.candidateURLs(
+                    captured: capturedRequests,
+                    endpointHints: Array(endpointHints.prefix(12)),
+                    baseURL: url, limit: 8)
+                var dataSections: [String] = []
+                for endpoint in candidates {
+                    let label = Self.endpointLabel(endpoint)
+                    var sourceData: Data?
+                    var text: String?
+                    // WKWebView 已拿到响应体时直接复用，省一次请求。
+                    if let hit = capturedRequests.first(where: {
+                        URL(string: $0.url, relativeTo: url)?.absoluteURL == endpoint
+                    }), !hit.body.isEmpty {
+                        let data = Data(hit.body.utf8)
+                        sourceData = data
+                        text = WebDataCapture.summarize(
+                            data: data, contentType: "application/json", label: label)
+                    } else if let fetched = await fetchEndpoint(endpoint, referer: url) {
+                        sourceData = fetched.data
+                        text = WebDataCapture.summarize(
+                            data: fetched.data, contentType: fetched.contentType,
+                            label: label)
+                    }
+                    guard let text, let sourceData else { continue }
+                    // 第一页日期一致且总数更大时，用响应自带的搜索条件在只读接口
+                    // 上继续翻页，把当天记录取全；任何异常都静默回退到第一页。
+                    let merged = await fetchSameDayPages(
+                        firstData: sourceData, label: label,
+                        candidates: candidates, firstEndpoint: endpoint, referer: url)
+                    dataSections.append(merged ?? text)
+                    break
+                }
+                sections = dataSections + sections
+            }
+
+            if !sections.isEmpty {
+                // 数据段最长 16k，静态正文只留短摘要，整体仍受 20k 输出上限约束。
+                let tail = "\n\n[静态提取正文]\n" + String(content.prefix(2_000)) + hint
+                return .ok(String((sections.joined(separator: "\n\n") + tail).prefix(20_000)))
             }
             return .ok(String(content.prefix(20_000)) + hint)
         } catch let error as URLError {
@@ -268,6 +326,113 @@ public final class WebScanTool: AgentTool, ShutdownableTool {
         } catch {
             return ToolSupport.failure(error)
         }
+    }
+
+    /// 直取同源数据接口：带 XHR / Referer 头，沿用同一 URLSession（保留 cookie）。
+    /// 只用于 GET，不对未知端点发 POST，避免误触发写操作。
+    private func fetchEndpoint(_ endpoint: URL,
+                               referer: URL) async -> (data: Data, contentType: String)? {
+        var request = URLRequest(url: endpoint)
+        request.timeoutInterval = 15
+        request.setValue("XMLHttpRequest", forHTTPHeaderField: "X-Requested-With")
+        request.setValue(referer.absoluteString, forHTTPHeaderField: "Referer")
+        request.setValue("application/json, text/plain, */*", forHTTPHeaderField: "Accept")
+        guard let result = try? await redirectGuard.fetch(
+            session: session, request: request,
+            limit: min(ToolSupport.maxFetchBytes, 2 * 1024 * 1024)),
+              (result.response?.statusCode ?? 500) < 400 else { return nil }
+        return (result.data,
+                result.response?.value(forHTTPHeaderField: "Content-Type") ?? "")
+    }
+
+    private static func endpointLabel(_ url: URL) -> String {
+        let query = url.query.map { "?" + String($0.prefix(120)) } ?? ""
+        return url.path + query
+    }
+
+    /// 按「响应自带的搜索条件 + 只读搜索端点」翻页，把同一天的记录合并成一份列表。
+    /// 只改页码字段，最多 5 页 / 200 条；遇到其它日期或请求失败即停止。
+    private func fetchSameDayPages(firstData: Data, label: String,
+                                   candidates: [URL], firstEndpoint: URL,
+                                   referer: URL) async -> String? {
+        guard let root = try? JSONSerialization.jsonObject(with: firstData),
+              let plan = WebDataCapture.pageSpec(
+                  root: root, candidates: candidates, exclude: firstEndpoint),
+              let dateKey = plan.dateKey, let dateValue = plan.dateValue else { return nil }
+        let firstRecords = WebDataCapture.records(in: root)
+        guard let total = WebDataCapture.totalCount(in: root),
+              total > firstRecords.count,
+              firstRecords.allSatisfy({ Self.datePrefix($0, key: dateKey) == dateValue })
+        else { return nil }
+
+        var all = firstRecords
+        var seen = Set(firstRecords.map { Self.fingerprint($0) })
+        var sawOtherDate = false
+        for step in 1...5 {
+            var form = plan.form
+            form[plan.pageKey] = String(plan.startPage + step)
+            guard let data = await postForm(plan.endpoint, form: form, referer: referer),
+                  let pageRoot = try? JSONSerialization.jsonObject(with: data) else { break }
+            let rows = WebDataCapture.records(in: pageRoot)
+            guard !rows.isEmpty else { break }
+            if rows.contains(where: { Self.datePrefix($0, key: dateKey) != dateValue }) {
+                sawOtherDate = true
+            }
+            let fresh = rows.filter { Self.datePrefix($0, key: dateKey) == dateValue }
+                .filter { seen.insert(Self.fingerprint($0)).inserted }
+            all.append(contentsOf: fresh)
+            if sawOtherDate || all.count >= 200 || all.count >= total { break }
+        }
+        guard all.count > firstRecords.count else { return nil }
+        return WebDataCapture.summary(
+            records: all, total: total,
+            label: label + "（已自动合并当天分页）",
+            pageInfo: plan.form, allDatesCollected: sawOtherDate, maxChars: 16_000)
+    }
+
+    /// 表单 POST：仅用于被识别为「只读搜索」的同源端点。
+    private func postForm(_ endpoint: URL, form: [String: String],
+                          referer: URL) async -> Data? {
+        var request = URLRequest(url: endpoint)
+        request.httpMethod = "POST"
+        request.timeoutInterval = 15
+        request.setValue("application/x-www-form-urlencoded; charset=UTF-8",
+                         forHTTPHeaderField: "Content-Type")
+        request.setValue("XMLHttpRequest", forHTTPHeaderField: "X-Requested-With")
+        request.setValue(referer.absoluteString, forHTTPHeaderField: "Referer")
+        request.httpBody = Self.formBody(form)
+        guard let result = try? await redirectGuard.fetch(
+            session: session, request: request,
+            limit: min(ToolSupport.maxFetchBytes, 2 * 1024 * 1024)),
+              (result.response?.statusCode ?? 500) < 400 else { return nil }
+        return result.data
+    }
+
+    private static func formBody(_ form: [String: String]) -> Data {
+        let allowed = CharacterSet.alphanumerics
+            .union(CharacterSet(charactersIn: "-._*"))
+        let body = form.keys.sorted().map { key in
+            let encodedKey = key.addingPercentEncoding(withAllowedCharacters: allowed) ?? key
+            let encodedValue = (form[key] ?? "")
+                .addingPercentEncoding(withAllowedCharacters: allowed) ?? ""
+            return "\(encodedKey)=\(encodedValue)"
+        }.joined(separator: "&")
+        return Data(body.utf8)
+    }
+
+    private static func datePrefix(_ record: [String: Any], key: String) -> String? {
+        let source = (record["Document"] as? [String: Any])
+            ?? (record["document"] as? [String: Any]) ?? record
+        guard let value = source[key] as? String else { return nil }
+        return String(value.prefix(10))
+    }
+
+    private static func fingerprint(_ record: [String: Any]) -> String {
+        guard let data = try? JSONSerialization.data(withJSONObject: record,
+                                                     options: [.sortedKeys]) else {
+            return String(String(describing: record).prefix(300))
+        }
+        return String(decoding: data.prefix(400), as: UTF8.self)
     }
 
     /// 读取响应头里的 charset；缺失/非法时回退 UTF-8。

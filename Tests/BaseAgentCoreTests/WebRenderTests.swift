@@ -144,6 +144,39 @@ final class WebRenderTests: XCTestCase {
         XCTAssertTrue(result.output.contains("alert-page-ok"))
     }
 
+    /// 动态列表页的接口参数由 JS 运行时拼好，只有捕获页面实发请求才能直取数据。
+    /// applytoeducation 的 `GetSearch?SearchText=job,*|^|...` 正是这种形态。
+    func testRenderCapturesPageXHRWithRuntimeParameters() async throws {
+        let url = try startServer(body: """
+        <html><body><div id="done"></div>
+        <script>
+          var xhr = new XMLHttpRequest();
+          xhr.open('GET', '/api/jobs?day=today&page=1');
+          xhr.onload = function () {
+            document.getElementById('done').textContent = 'loaded';
+          };
+          xhr.send();
+        </script>
+        </body></html>
+        """)
+        let outcome = try await WebRenderer.shared.render(
+            url: url,
+            waitMS: 500,
+            waitSelector: nil,
+            script: nil,
+            wantHTML: false,
+            wantScreenshot: false,
+            timeout: 30,
+            waitForTextGrowthFrom: nil,
+            maxContentWait: 3)
+        let request = outcome.capturedRequests.first {
+            $0.url.contains("/api/jobs?day=today&page=1")
+        }
+        XCTAssertNotNil(request, "捕获列表：\(outcome.capturedRequests.map(\.url))")
+        // 页内 XHR 可能被 WKWebView 网络层拦下（status=0、空响应体），这正是
+        // 工具层要用捕获到的完整 URL 重放的原因：URL 在 open() 时就能拿到。
+    }
+
     func testInvalidURLFailsFast() async throws {
         let tool = WebRenderTool(config: testConfig, callbacks: nil)
         let result = try await tool.run(["url": .string("file:///etc/passwd")])

@@ -47,4 +47,27 @@ final class WebScanLiveTests: XCTestCase {
         XCTAssertFalse(endpointLine?.lowercased().contains("jquery") ?? true,
                        "静态资源不应进入候选接口")
     }
+
+    /// 端到端：真实列表页应自动渲染 + 直取页内数据接口，输出结构化职位列表，
+    /// 而不是只有「Loading jobs please wait...」的静态外壳。
+    func testApplyToEducationWebScanReturnsStructuredJobs() async throws {
+        try XCTSkipUnless(
+            ProcessInfo.processInfo.environment["ENABLE_WEB_NETWORK_TESTS"] == "1",
+            "需要外网访问，设置 ENABLE_WEB_NETWORK_TESTS=1 启用")
+
+        var config = AgentConfig()
+        config.workspace = NSTemporaryDirectory()
+            + "webscan-live-\(UUID().uuidString)"
+        let tool = WebScanTool(config: config, callbacks: nil)
+        defer { tool.shutdown() }
+        let result = try await tool.run(["url": .string(pageURL.absoluteString)])
+        XCTAssertTrue(result.success, "web_scan 失败：\(result.error)")
+        XCTAssertTrue(result.output.contains("返回结构化数据"),
+                      "应直取页面数据接口：\n\(result.output.prefix(800))")
+        XCTAssertTrue(result.output.contains("position_Subject"))
+        XCTAssertTrue(result.output.contains("posted_On"))
+        XCTAssertTrue(result.output.contains("分页参数（响应自带）"))
+        XCTAssertFalse(result.output.contains("Loading jobs please wait...")
+                        && !result.output.contains("结构化数据"))
+    }
 }

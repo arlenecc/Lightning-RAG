@@ -567,10 +567,11 @@ public enum ToolSupport {
             : "本页提取正文 \(visible.count) 字符但主要是导航/页脚/静态文案"
         var hint = "\n\n[web_scan 提示] \(summary)，且检测到动态加载"
             + "特征（\(signals.joined(separator: "、"))）——页面主体内容很可能由 JS 动态加载，"
-            + "静态 HTML 只能拿到加载占位。建议：1) web_scan 会尝试内置 WebKit 渲染一次；"
-            + "若仍缺信息，优先检查下面的数据源线索，用 shell_run/code_run 直接调用数据接口，"
-            + "通常能拿到结构化数据；2) 若需要交互（点击/填表/滚动加载），用 web_render "
-            + "的 script 参数执行 JS；3) 或 webexec_js 经外部浏览器桥渲染（需配置 browser_endpoint）。"
+            + "静态 HTML 只能拿到加载占位。web_scan 已自动渲染并直取页面数据接口，结果见上方"
+            + "数据段；若仍缺信息或需要翻页，用 shell_run/code_run 按数据段给出的分页参数"
+            + "显式调用（不要对未知 POST 接口盲发写请求）；若需要点击/填表/滚动加载等交互，"
+            + "用 web_render 的 script 参数执行 JS，或 webexec_js 外部浏览器桥"
+            + "（需配置 browser_endpoint）。"
         if !lines.isEmpty {
             hint += "\n已定位的数据源线索：\n" + lines.joined(separator: "\n")
         }

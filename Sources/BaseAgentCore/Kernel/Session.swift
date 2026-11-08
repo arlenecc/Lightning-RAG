@@ -163,9 +163,11 @@ public final class Session: @unchecked Sendable {
                            toolCalls: [ToolCall] = [],
                            toolResults: [ToolResultRecord] = [],
                            summary: String = "",
-                           rawContent: String = "") {
+                           rawContent: String = "",
+                           excludeFromContext: Bool = false) {
         rec.assistantText = assistantText
         rec.rawContent = rawContent
+        rec.excludeFromContext = excludeFromContext
         rec.toolCalls = toolCalls
         rec.toolResults = toolResults
         rec.summary = summary
@@ -522,6 +524,8 @@ public final class Session: @unchecked Sendable {
     }
 
     private func turnMessages(_ turn: TurnRecord) -> [ChatMessage] {
+        // 本地直答轮没有对应的 KV token，不能注入 LLM 上下文。
+        if turn.excludeFromContext { return [] }
         // 进行中的轮（还没产出任何东西）不进消息列表。
         if turn.prompt.isEmpty && turn.assistantText.isEmpty && turn.toolCalls.isEmpty {
             return []

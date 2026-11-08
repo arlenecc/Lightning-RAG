@@ -150,6 +150,10 @@ public final class TurnRecord: @unchecked Sendable {
     /// 可选图像附件（JPEG/PNG 字节），仅首条用户消息携带，用于多模态模型。
     /// 文本/无多模态能力的后端忽略此字段。
     public var images: [Data]?
+    /// 本地直答轮（寒暄/能力问询）不进 LLM 上下文：这些 token 从未进过
+    /// KV cache，若发给模型会让下一轮前缀凭空多出 user+assistant → 全量重建。
+    /// 该轮仍保留在会话历史里，供 UI、L2/L3 记忆使用。
+    public var excludeFromContext = false
 
     public init(index: Int = 0, prompt: String = "", assistantText: String = "",
                 rawContent: String = "", toolCalls: [ToolCall] = [],

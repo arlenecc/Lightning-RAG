@@ -955,7 +955,8 @@ final class AppViewModel: ObservableObject {
                                      tools: agent.dispatcher.schemas())
             guard generation == nil || configGeneration == generation else { return }
             appendLog("[model] 主模型预热结束")
-            if !isRunning { statusText = "预热结束" }
+            // 预热期间已排队的用户请求此时开始生成，状态切回「思考中…」。
+            statusText = isRunning ? "思考中…" : "预热结束"
             try? await Task.sleep(nanoseconds: 1_200_000_000)
             if !isRunning, statusText == "预热结束" { statusText = "就绪" }
         } catch {
@@ -1074,8 +1075,11 @@ final class AppViewModel: ObservableObject {
 
     func send(_ input: String, images: [Data] = []) {
         let text = input.trimmingCharacters(in: .whitespacesAndNewlines)
+        // 模型加载/预热期间不再丢弃用户输入：寒暄/能力问询在内核本地直答
+        // （零 GPU，启动即有响应）；正式任务排队，MLXLLMService.chatStream
+        // 等预热结束后直接复用刚建好的 system+tools 前缀。
         guard !text.isEmpty || !images.isEmpty,
-              !isRunning, !isModelLoading, !isWarmingUp,
+              !isRunning,
               !isSyncing, !isDeduplicating, !isBuildingANN, let agent else { return }
         if blockForMissingModels("发送消息") { return }
         cancelIdleUnload()
@@ -1092,7 +1096,14 @@ final class AppViewModel: ObservableObject {
         toolEvents.removeAll()
         pendingToolIndices.removeAll()
         isRunning = true
-        statusText = "思考中…"
+        // 预热尚未结束时正式任务会排队等前缀就绪（约 20s，只有启动这一次）。
+        // 明确显示排队状态，避免「思考中…」却长时间无首个 token 像卡死。
+        if isWarmingUp {
+            statusText = "模型预热中，问题已排队…"
+            appendLog("[model] 预热期间收到请求，前缀就绪后立即开始处理")
+        } else {
+            statusText = "思考中…"
+        }
         totalTokens = 0
         tokenSpeed = 0
         cancelFlag.set(false)

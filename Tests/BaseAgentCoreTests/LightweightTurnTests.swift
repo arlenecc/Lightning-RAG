@@ -104,7 +104,9 @@ final class LightweightTurnTests: XCTestCase {
                               config: AgentConfig(),
                               systemPrompt: { self.fullSystem },
                               maxTurns: 1)
-        let result = await loop.run("hi", toolsEnabled: false)
+        // 寒暄/能力问询已改为本地直答；这里用普通轻量输入覆盖「仍然走
+        // LLM 的轻量轮」：极简 system + 拒绝 system prompt 复述。
+        let result = await loop.run("讲个冷笑话", toolsEnabled: false)
 
         XCTAssertEqual(result.reason, .done)
         XCTAssertEqual(result.text, "你好！有什么我可以帮你的吗？")
@@ -182,14 +184,18 @@ final class LightweightTurnTests: XCTestCase {
         }
     }
 
-    func testGreetingStillUsesLLM() async {
+    /// 寒暄本地直答：不创建 LLM stream，也就不会换掉预热好的 system/tools
+    /// 前缀（tools-changed 全量重建）或在启动预热期间让用户干等 20s。
+    func testGreetingAnswersLocallyWithoutLLM() async {
         let captured = Captured()
         let loop = KernelLoop(runtime: makeRuntime(captured, reply: "你好呀"),
                               config: AgentConfig(),
                               systemPrompt: { self.fullSystem },
                               maxTurns: 1)
         let result = await loop.run("hi", toolsEnabled: false)
-        XCTAssertEqual(result.text, "你好呀")
-        XCTAssertFalse(captured.messages.isEmpty, "寒暄仍走模型")
+        XCTAssertEqual(result.reason, .done)
+        XCTAssertEqual(result.text, KernelLoop.greetingAnswer(for: "hi"))
+        XCTAssertTrue(captured.messages.isEmpty, "寒暄不得调用 LLM")
+        XCTAssertTrue(captured.tools.isEmpty, "寒暄不得提供工具 schema")
     }
 }
