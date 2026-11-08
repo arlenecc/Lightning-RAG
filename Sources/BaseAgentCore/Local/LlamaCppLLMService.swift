@@ -42,11 +42,10 @@ public final class LlamaCppLLMService: LLMService, PreloadableLLMService,
     private var warmupTokens: [llama_token] = []
     /// `llama_memory_seq_rm` 是否可用。llama.h 明确：partial sequence 裁剪
     /// 在 hybrid/recurrent memory 上会返回 false（只有删除整个序列才保证
-    /// 成功）。Qwen3.5 等混合 SSM 模型因此每轮生成后的 `trim` 都退化成
-    /// 整段重建（实测 7~8k token prefill 需 7~8s），反思门重试时会被
-    /// 放大到几十秒。首次失败后记住，后续直接全量重建，避免每轮白试。
-    /// 彻底解法是消息级增量 append（不重渲染 assistant、只追加新
-    /// user/tool 增量），让这类模型也能走 `mode=append`。
+    /// 成功）。Qwen3.5 等混合 SSM 模型因此每轮生成后的 `trim` 都会走到
+    /// 这里；旧实现直接整段重建（实测 7~8k token prefill 需 7~8s）。
+    /// 现在失败后改走消息级增量 append（不重渲染 assistant、只追加新
+    /// user/tool 增量），首次失败后记住能力，后续不再白试 seq_rm。
     private var seqRmSupported = true
 
     init(modelPath: String,
@@ -333,26 +332,45 @@ public final class LlamaCppLLMService: LLMService, PreloadableLLMService,
             AgentLog.info("[gguf-kv] mode=\(mode) common=\(common) "
                 + "cached=\(cachedTokens.count) prompt=\(tokens.count) "
                 + "tools_match=\(toolsMatch)")
+            // 生成前缓存中实际存在的完整 token 序列；增量路径基于它续写。
+            let prefixTokens = cachedTokens
+            var deltaTokens: [llama_token]? = nil
             if mode == "trim" {
+                var trimmed = false
                 if seqRmSupported, let memory = loaded.memory {
                     let removed = llama_memory_seq_rm(memory, 0, llama_pos(common), -1)
+                    trimmed = removed
                     if !removed {
                         // 混合 SSM 等结构不支持按位置裁剪 KV；记住能力，
-                        // 后续直接整段重建。
+                        // 后续不再白试，改走消息级增量。
                         AgentLog.warning("[gguf-kv] seq_rm(\(common)) 失败，"
-                            + "此后跳过裁剪尝试，整段重建")
+                            + "改用消息级增量 append")
                         seqRmSupported = false
-                        common = 0
                     }
-                } else {
-                    common = 0
+                }
+                if !trimmed {
+                    let stale = prefixTokens.count - common
+                    if let delta = makeDeltaTokens(
+                        messages: messages, loaded: loaded, tools: tools, stale: stale) {
+                        deltaTokens = delta
+                    } else {
+                        common = 0
+                        AgentLog.warning("[gguf-kv] 增量不可用，回退整段重建")
+                    }
                 }
             }
-            if common == 0 {
+            if let delta = deltaTokens {
+                // 不清内存：上一轮 assistant 的原始输出仍在缓存里，
+                // 直接把新消息增量接在后面，等于形态① append。
+                common = prefixTokens.count
+                AgentLog.info("[gguf-kv] delta-append cached=\(common) "
+                    + "delta=\(delta.count)（免整段重建）")
+            } else if common == 0 {
                 llama_memory_clear(loaded.memory, true)
             }
 
-            let suffix = Array(tokens[common...])
+            let suffix = deltaTokens ?? Array(tokens[common...])
+            let effectiveTokens = deltaTokens.map { prefixTokens + $0 } ?? tokens
             let prefillStart = Date()
             do {
                 try LlamaCppContext.decode(tokens: suffix,
@@ -372,7 +390,8 @@ public final class LlamaCppLLMService: LLMService, PreloadableLLMService,
             let prefillMilliseconds = Int(Date().timeIntervalSince(prefillStart) * 1_000)
             let cachedPromptTokens = common
 
-            let generationBudget = max(1, min(maxTokens, contextWindow - tokens.count - 8))
+            let generationBudget = max(1, min(maxTokens,
+                contextWindow - effectiveTokens.count - 8))
             let startInThink = prompt
                 .trimmingCharacters(in: .whitespacesAndNewlines)
                 .hasSuffix("<think>")
@@ -387,7 +406,7 @@ public final class LlamaCppLLMService: LLMService, PreloadableLLMService,
             do {
                 (rawContent, generated) = try generateLoop(
                     context: loaded.context, model: model,
-                    temperature: temperature, startPast: llama_pos(tokens.count),
+                    temperature: temperature, startPast: llama_pos(effectiveTokens.count),
                     budget: generationBudget, startInThink: startInThink,
                     allowedToolNames: allowedToolNames, continuation: continuation)
             } catch {
@@ -406,18 +425,18 @@ public final class LlamaCppLLMService: LLMService, PreloadableLLMService,
                 raw: rawContent, allowedNames: allowedToolNames)
             let elapsed = max(0.001, Date().timeIntervalSince(generationStart))
             let usage: [String: Int] = [
-                "prompt_tokens": tokens.count,
+                "prompt_tokens": effectiveTokens.count,
                 "completion_tokens": generated.count,
-                "total_tokens": tokens.count + generated.count,
+                "total_tokens": effectiveTokens.count + generated.count,
                 "tokens_per_second": Int(Double(generated.count) / elapsed),
                 "cached_prompt_tokens": cachedPromptTokens,
             ]
-            AgentLog.info("[gguf] prompt=\(tokens.count) cached=\(cachedPromptTokens) "
+            AgentLog.info("[gguf] prompt=\(effectiveTokens.count) cached=\(cachedPromptTokens) "
                 + "generated=\(generated.count) prefill_ms=\(prefillMilliseconds) "
                 + "tps=\(usage["tokens_per_second"] ?? 0)")
 
             if !isolated {
-                cachedTokens = tokens + generated
+                cachedTokens = effectiveTokens + generated
                 cachedToolsKey = toolsKey
             }
             continuation.yield(LLMStreamEvent(
@@ -425,6 +444,68 @@ public final class LlamaCppLLMService: LLMService, PreloadableLLMService,
                 toolCalls: toolCalls,
                 usage: usage,
                 rawContent: rawContent))
+        }
+    }
+
+    /// 混合 SSM / recurrent memory 无法按位置裁剪 KV（`llama_memory_seq_rm`
+    /// 对 partial sequence 返回 false），旧路径只能整段重建 7~8k token。
+    /// 这里改用消息级增量：缓存里已经完整保留上一轮 assistant 的原始输出
+    /// （含 EOS），只需把本轮新追加的 user/tool 消息按同一 chat template
+    /// 渲染成增量 token 接在后面，就能继续 `mode=append`，生成质量不变。
+    ///
+    /// 增量用「锚点差分」求：渲染 head（真实 system + 占位 user + 占位
+    /// assistant）得 a，再渲染 head + 新消息得 b；a 去掉尾部空白后，b 剩下
+    /// 的部分正是「消息尾 + 新消息 + generation prompt」。任何一步不匹配
+    /// 都返回 nil，调用方回退到 seq_rm / 全量重建，不会破坏正确性。
+    private func makeDeltaTokens(messages: [ChatMessage], loaded: Loaded,
+                                 tools: [JSONValue], stale: Int) -> [llama_token]? {
+        func reject(_ why: String, quiet: Bool = false) -> [llama_token]? {
+            if !quiet { AgentLog.info("[gguf-kv] delta-reject \(why)") }
+            return nil
+        }
+        // stale 是缓存里需要丢弃的尾部长度，应只是上一轮生成的几十~几百
+        // token；大跨度改写说明历史被折叠/回滚，增量不可信。
+        guard stale > 0, stale <= 1_024 else { return reject("stale=\(stale)") }
+        guard messages.first?.role == .system else { return reject("no-system") }
+        // 首轮还没有 assistant，本来就该走 rebuild，不必刷日志。
+        guard let lastAssistant = messages.lastIndex(where: { $0.role == .assistant })
+        else { return reject("no-assistant", quiet: true) }
+        let delta = Array(messages[(lastAssistant + 1)...])
+        guard !delta.isEmpty else { return reject("no-new-messages") }
+        guard delta.allSatisfy({ $0.role == .user || $0.role == .tool })
+        else { return reject("roles=" + delta.map(\.role.rawValue).joined(separator: ",")) }
+        let model = loaded.model
+        let sentinel = "__DELTA_\(UUID().uuidString)__"
+        let head: [ChatMessage] = [
+            messages[0],
+            ChatMessage(role: .user, content: sentinel + "_u1"),
+            ChatMessage(role: .assistant, content: "A"),
+            // Qwen3.5 模板只给「最后一条 assistant」加 <think>…</think> 块。
+            // 让占位 assistant 在 a / b 里都不是最后一条，两次渲染的 head
+            // 才会逐字节相同；末尾这条占位 user 属于锚点，不会进增量。
+            ChatMessage(role: .user, content: sentinel + "_u2"),
+        ]
+        do {
+            let a = try LlamaCppPromptRenderer.render(
+                template: model.chatTemplate, model: model, messages: head,
+                tools: tools, enableThinking: enableThinking,
+                addGenerationPrompt: false)
+            let b = try LlamaCppPromptRenderer.render(
+                template: model.chatTemplate, model: model, messages: head + delta,
+                tools: tools, enableThinking: enableThinking,
+                addGenerationPrompt: true)
+            // a 末尾的换行是模板给 assistant 消息加的，但模型生成到
+            // EOS(<|im_end|>) 就停，缓存里没有它；把它留给增量才能严格拼接。
+            let anchor = a.replacingOccurrences(
+                of: "\\s+$", with: "", options: .regularExpression)
+            guard !anchor.isEmpty, b.hasPrefix(anchor)
+            else { return reject("template-prefix-mismatch") }
+            let tail = String(b.dropFirst(anchor.count))
+            guard !tail.isEmpty else { return reject("empty-tail") }
+            let ids = try model.tokenize(tail, addSpecial: false)
+            return ids.isEmpty ? reject("empty-tokens") : ids
+        } catch {
+            return reject("render-error=\(error.localizedDescription)")
         }
     }
 

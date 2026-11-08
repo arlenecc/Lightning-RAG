@@ -187,18 +187,33 @@ final class AppViewModel: ObservableObject {
     @Published var logs: [LogLine] = []
     @Published var toolEvents: [ToolEvent] = []
     @Published var plan: Plan?
-    @Published var isRunning = false
+    @Published var isRunning = false {
+        didSet { if !isRunning { flushQueuedSends() } }
+    }
     @Published var statusText = "就绪"
     @Published var totalTokens = 0
     @Published var tokenSpeed: Double = 0
     @Published var ragStatusText = "RAG 未就绪"
-    @Published var isSyncing = false
+    @Published var isSyncing = false {
+        didSet { if !isSyncing { flushQueuedSends() } }
+    }
     /// 已请求停止、正在等当前解析/embedding 批次收尾。
     @Published var isStoppingSync = false
     /// 正在手动清理向量库内的重复切片。
-    @Published var isDeduplicating = false
+    @Published var isDeduplicating = false {
+        didSet { if !isDeduplicating { flushQueuedSends() } }
+    }
     /// 正在构建/续建向量库的 ANN 索引（构建期间检索会按超时跳过）。
-    @Published var isBuildingANN = false
+    @Published var isBuildingANN = false {
+        didSet { if !isBuildingANN { flushQueuedSends() } }
+    }
+    /// 维护态期间用户发来的消息：旧实现直接 return 静默丢弃，改为排队，
+    /// 等维护结束（或上一轮生成结束）后依次自动发送。
+    private struct QueuedSend {
+        let text: String
+        let images: [Data]
+    }
+    private var queuedSends: [QueuedSend] = []
     /// ANN 索引摘要（设置窗口显示，来自 RAG status 快照）。
     @Published var annStatusText = "ANN 索引未构建"
     /// 二值 ANN 索引摘要（stage 1 自研 bann；未构建时显示回退提示）。
@@ -244,6 +259,9 @@ final class AppViewModel: ObservableObject {
     private var reasoningBuffer = ""
     private var summaryFilter = SummaryStreamFilter()
     private var flushScheduled = false
+    /// 本轮是否已把第一个 chunk 刷到 UI。首字节延迟是用户最敏感的指标，
+    /// 不该为了 50ms 批处理再等一轮。
+    private var didFirstFlush = false
     private var ragStatusRefreshing = false
     private var configGeneration = 0
     /// `applyConfig { sync }` 路径：记住应用配置前已加载的模型，同步结束后再恢复。
@@ -545,6 +563,7 @@ final class AppViewModel: ObservableObject {
         reasoningBuffer = ""
         streamingID = nil
         flushScheduled = false
+        didFirstFlush = false
         summaryFilter.reset()
     }
 
@@ -1073,14 +1092,30 @@ final class AppViewModel: ObservableObject {
 
     // MARK: 发送
 
+    /// 维护态解除 / 上一轮结束后，把排队消息依次发出。每次只发一条，
+    /// isRunning 的 didSet 会在本轮结束时触发下一次 flush。
+    private func flushQueuedSends() {
+        guard !queuedSends.isEmpty, !isRunning,
+              !isSyncing, !isDeduplicating, !isBuildingANN else { return }
+        let next = queuedSends.removeFirst()
+        appendLog("[ui] 维护任务已结束，自动发送排队消息")
+        send(next.text, images: next.images)
+    }
+
     func send(_ input: String, images: [Data] = []) {
         let text = input.trimmingCharacters(in: .whitespacesAndNewlines)
         // 模型加载/预热期间不再丢弃用户输入：寒暄/能力问询在内核本地直答
         // （零 GPU，启动即有响应）；正式任务排队，MLXLLMService.chatStream
         // 等预热结束后直接复用刚建好的 system+tools 前缀。
-        guard !text.isEmpty || !images.isEmpty,
-              !isRunning,
-              !isSyncing, !isDeduplicating, !isBuildingANN, let agent else { return }
+        guard !text.isEmpty || !images.isEmpty, !isRunning, let agent else { return }
+        // 知识同步 / 向量去重 / ANN 构建期间不再静默丢弃输入。
+        if isSyncing || isDeduplicating || isBuildingANN {
+            if queuedSends.count >= 20 { queuedSends.removeFirst() }
+            queuedSends.append(QueuedSend(text: text, images: images))
+            statusText = "维护任务进行中，消息已排队（\(queuedSends.count)）…"
+            appendLog("[ui] 知识同步/向量去重/索引构建进行中，消息已排队，结束后自动发送")
+            return
+        }
         if blockForMissingModels("发送消息") { return }
         cancelIdleUnload()
         runGeneration += 1
@@ -1110,9 +1145,9 @@ final class AppViewModel: ObservableObject {
 
         runTask = Task { [weak self, weak agent] in
             guard let self, let agent else { return }
-            // 闲时摘要可能正借用同一个辅助模型（临时会话还会加载/卸载权重）；
-            // 模型服务依赖调用串行，必须等摘要会话彻底退出再开始本轮生成。
-            await self.stopSummaryIdleSession()
+            // 闲时摘要可能正借用同一个辅助模型；给它 1.5s 让出 GPU，
+            // 超时也不再阻塞用户这一轮（卸载继续在后台完成）。
+            await self.stopSummaryIdleSession(timeout: 1.5)
             // 等待期间用户可能已点「终止」，或配置切换已作废旧一轮。
             let answer: String
             if Task.isCancelled || self.runGeneration != generation {
@@ -1379,10 +1414,21 @@ final class AppViewModel: ObservableObject {
     }
 
     /// 等待摘要会话彻底结束（含临时模型卸载）；可重复调用。
-    private func stopSummaryIdleSession() async {
+    ///
+    /// `timeout` 只给前台发送请求用：闲时摘要的 `cancelCurrent()` +
+    /// `unloadAndWait()` 可能耗时数十秒，不能让用户每轮都等它。超时后
+    /// 直接放行，卸载仍在后台完成；配置切换/卸载模型/退出等必须真正等完
+    /// 的调用点继续用默认的无限等待。
+    private func stopSummaryIdleSession(timeout: TimeInterval? = nil) async {
         requestSummaryStop()
-        if let task = summaryStopTask {
-            _ = await task.value
+        guard summaryStopTask != nil else { return }
+        guard let timeout else {
+            if let task = summaryStopTask { _ = await task.value }
+            return
+        }
+        let deadline = Date().addingTimeInterval(timeout)
+        while summaryStopTask != nil, Date() < deadline {
+            try? await Task.sleep(nanoseconds: 50_000_000)
         }
     }
 
@@ -1426,6 +1472,12 @@ final class AppViewModel: ObservableObject {
     /// 每 50ms 合并一次流式增量，避免逐 token 修改整个数组触发重绘。
     private func scheduleFlush() {
         guard !flushScheduled else { return }
+        // 首个 chunk 立即上屏；批处理只对后续 token 有意义。
+        if !didFirstFlush {
+            didFirstFlush = true
+            flushBuffers()
+            return
+        }
         flushScheduled = true
         let generation = runGeneration
         Task { @MainActor [weak self] in

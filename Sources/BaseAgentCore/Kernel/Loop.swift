@@ -65,6 +65,10 @@ public struct FailureSnapshot: Sendable {
     public var stepFails: Int
     public var repeatStreak: Int
     public var lastCallSigs: [String]
+    /// 跨段保留：意图空转与上下文超长重试的已用额度。旧实现每段都重新
+    /// 发放完整配额，等于把上限放大到段数倍。
+    public var intentStall: Int
+    public var shrinkGuard: Int
 
     public init(failedTotal: Int = 0, lastFail: ToolFailure? = nil,
                 failSigs: [String] = [], failStreak: Int = 0,
@@ -72,7 +76,8 @@ public struct FailureSnapshot: Sendable {
                 blockNudge: Int = 0, emptyRetry: Int = 0,
                 reaskGuard: Int = 0, planNudged: Int = 0,
                 didWork: Bool = false, stepFails: Int = 0,
-                repeatStreak: Int = 0, lastCallSigs: [String] = []) {
+                repeatStreak: Int = 0, lastCallSigs: [String] = [],
+                intentStall: Int = 0, shrinkGuard: Int = 0) {
         self.failedTotal = failedTotal
         self.lastFail = lastFail
         self.failSigs = failSigs
@@ -87,6 +92,8 @@ public struct FailureSnapshot: Sendable {
         self.stepFails = stepFails
         self.repeatStreak = repeatStreak
         self.lastCallSigs = lastCallSigs
+        self.intentStall = intentStall
+        self.shrinkGuard = shrinkGuard
     }
 }
 
@@ -119,8 +126,15 @@ private let planFinishHint = """
 """
 
 private let finishNudgeMax = 2
-private let finishNudgeFailMax = 8
-private let finishNudgePlanMax = 6
+/// 反思门上限。实测一次多步任务可被放大到 29 次 LLM 调用 / 108s，
+/// 每次提醒都会让模型再多生成一轮并把提示累积进上下文；收紧到能
+/// 纠偏即可，失败场景也别无限重试。
+private let finishNudgeFailMax = 4
+private let finishNudgePlanMax = 3
+/// 「只声明要做什么、却一次工具都不发」最多容忍几轮。小模型会把
+/// `update_plan` 协议复述成文字，内核再提示「先建计划」就会形成正反馈，
+/// 计划与第一步永远不推进；两次之后必须收敛，不能无限提示。
+private let maxIntentStall = 2
 private let maxFailSigs = 8
 private let minAttemptsBeforeBlock = 3
 private let blockNudgeMax = 2
@@ -137,9 +151,12 @@ private let askUserPattern =
     + "(哪个|哪些)(文件|目录|路径|项目|模块|分支|环境)|"
     + "想?要我(先)?(做|处理|修改|改)|希望我(做|先做)|你希望|你想要)"
 
+/// 只在一段内核循环的**首轮**注入一次。旧实现每个 THINK 轮都 `pending +=`
+/// 一遍（约 200 字），而 pending 会随 userText 写进 `rec.prompt` 永久留在
+/// 历史里，于是每重试一轮上下文就多一段重复训诫，prefill 单调变长。
 private let planGateHint = """
 
-[System] 开始执行前，先用 update_plan(op="create", goal=..., steps=[...]) 把目标和路径规划成 2~7 个可验证的步骤，并写入执行计划（Session.working['plan']）；**计划建好之前不要先发实际工具调用**——先把目标与步骤登记为执行计划，再**紧接着在同一轮或下一轮开始执行第一步**（计划建好不等于任务开始，不要停下来问用户是否开始/是否继续）；然后从第一步开始，每完成一步就用 update_plan(op="patch", step_id=..., status="done", note="结论") 更新进度。
+[System] 非平凡任务先 update_plan(op="create", goal=..., steps=[...]) 登记 2~7 步；计划与首个工具调用可同轮发出。登记后立即执行，每步完成用 update_plan(op="patch", status="done") 收尾，不要只登记计划就停下。
 """
 
 // MARK: - KernelLoop
@@ -191,6 +208,10 @@ public final class KernelLoop {
     private var didWork = false
     private var planNudged = 0
     private var planFinishNudge = 0
+    /// 连续「只描述计划 / 只声明要开工」却零工具调用的轮数。
+    private var intentStall = 0
+    /// 规划提示是否已在本段注入过（一段只注入一次）。
+    private var planGateHintInjected = false
     private var repeatStreak = 0
     private var lastCallSigs: [String] = []
     private var toolCallCounter = 0
@@ -389,6 +410,8 @@ public final class KernelLoop {
         didWork = false
         planNudged = 0
         planFinishNudge = 0
+        intentStall = 0
+        planGateHintInjected = false
         repeatStreak = 0
         lastCallSigs = []
         ragSearchCount = 0
@@ -408,6 +431,8 @@ public final class KernelLoop {
             stepFails = seed.stepFails
             repeatStreak = seed.repeatStreak
             lastCallSigs = Array(seed.lastCallSigs.suffix(8))
+            intentStall = seed.intentStall
+            shrinkGuard = seed.shrinkGuard
         }
         pendingSeed = nil
         turnsUsed = 0
@@ -473,11 +498,15 @@ public final class KernelLoop {
             // ---- THINK ----
             state = .think
             // 规划门：还没干过实际活、且还没有计划时，持续提醒先规划再动手。
-            // 轻量轮（寒暄/能力问询）没有工具 schema，注入「先调 update_plan」
-            // 只会让模型反复声明要建计划却无从执行。
+            // 规划提示一段只注入一次：旧实现每个 THINK 轮都 `pending +=`
+            // 一遍，而 pending 会写进 rec.prompt 永久留在历史里，越重试
+            // 上下文越长（实测 3614→5689 字符）。意图空转期间也不注入，
+            // 避免与「直接调用工具」的指令互相打架。
             if toolsEnabled && session.getPlan() == nil && !didWork
+                && intentStall == 0 && !planGateHintInjected
                 && !isSimpleInput(userInput) {
                 pending += planGateHint
+                planGateHintInjected = true
             }
             var userText = session.anchorPrompt(extra: pending)
             // 动态上下文只加在 user 消息尾部：system 与历史前缀保持不变，
@@ -486,6 +515,14 @@ public final class KernelLoop {
             if !dynamic.isEmpty {
                 userText += "\n\n" + dynamic
             }
+            // KV 对齐铁律：写进 rec.prompt 的就是本轮实际发给模型的完整
+            // user 文本，**事后不得裁剪、替换或压缩历史里的任何一轮**。
+            // MLX 的 token 级前缀匹配 / 消息级 delta、GGUF 的 delta-append
+            // 都依赖「Session 历史 == 缓存里的 token 序列」；一旦把训诫或
+            // 被拒正文从历史里抹掉，下一轮渲染会在很早的位置分叉，而
+            // Qwen3.5 的 MambaCache 不可裁剪，只能整段重建（7~20s/轮）。
+            // 所以减少上下文膨胀只能靠「少注入新增量」：一次性提示、精简
+            // 文案、以及第 1/2 项减少被拒轮数，绝不能改写已落盘的历史。
             let rec = session.startTurn(prompt: userText, images: attachImages)
             attachImages = nil
             turnsUsed += 1
@@ -591,6 +628,47 @@ public final class KernelLoop {
                 // 反思门：模型想收尾，但计划里还有未完成步骤 —— 不能就这么放它走。
                 let openSteps = session.planOpenSteps()
 
+                // 「我要先创建计划 / 现在开始执行第一步」这类纯意图声明：
+                // 既没有工具调用也没有任何实质结果，绝不能当最终答复收下。
+                // 旧路径会由 noToolEvent 判 done → reason=done、plan 仍为空
+                // 又不触发自动续跑，用户反复点「继续」只得到同样的自我复述
+                // （2026-11-08 cnn.com 事故）。这里给一条真正走得通的路：
+                // 跳过计划门、直接点名真实工具、只要求输出工具调用。
+                // resume（自动续跑）段同样保留意图检测：旧实现用 !resume
+                // 把所有门控一并关掉，续跑段第一句元陈述就被当最终答复。
+                if toolsEnabled, !didWork,
+                   Self.looksLikeIntentOnly(resp.content) {
+                    intentStall += 1
+                    session.finishTurn(rec, assistantText: resp.content,
+                                       summary: l2Summary(resp.content),
+                                       rawContent: resp.rawContent)
+                    if intentStall <= maxIntentStall {
+                        let names = toolSchemas.compactMap {
+                            $0["function"]?["name"]?.stringValue
+                        }
+                        let toolList = names.isEmpty
+                            ? "web_scan / shell_run / file_read / code_run"
+                            : names.prefix(8).joined(separator: " / ")
+                        pending = """
+                        [System] 上一条回复只是描述了你打算做什么，没有发出任何工具调用，任务没有任何进展。
+                        历史里此前「我要创建计划」「现在开始执行第一步」之类的文字都是无效回复，不要复述它们。
+                        现在**跳过 update_plan**，不要再创建计划、不要复述任务、不要输出「我需要」「让我」「现在开始」这类文字。
+                        直接发出一个真实工具调用去获取所需信息，然后基于工具返回结果作答。
+                        可用工具：\(toolList)。
+                        本轮只输出工具调用本身，不要输出其它解释文字。
+                        """
+                        log("[kernel] 意图空转 \(intentStall)/\(maxIntentStall)："
+                            + "跳过计划门，强制直接调用工具")
+                        continue
+                    }
+                    finalText = "（模型连续 \(maxIntentStall + 1) 轮只描述了计划、"
+                        + "没有发出任何工具调用，任务未能执行。请换用工具调用能力更强的模型，"
+                        + "或把请求写成明确的单步指令后重试。）"
+                    exitReason = .done
+                    log("[kernel] 意图空转已达上限，返回明确失败说明而不是元陈述")
+                    break
+                }
+
                 // 任务尚未起步，且模型是在向用户追问必要信息 → 收下提问。
                 if session.getPlan() == nil && !didWork && looksLikeAskingUser(resp.content) {
                     finalText = resp.content
@@ -603,9 +681,12 @@ public final class KernelLoop {
                 }
 
                 // 多步任务却连执行计划都没写、也没真正动手就想收尾。
+                // 例外：模型已经给出结果性答复时直接放行——逼它为了补一张
+                // 计划表重答 3 次，用户只会多等 3 倍时间拿到同样的内容。
                 if session.getPlan() == nil
                     && (isMultistep(userInput))
                     && !didWork
+                    && !Self.looksLikeResult(resp.content)
                     && planFinishNudge < finishNudgePlanMax
                     && !resume {
                     planFinishNudge += 1
@@ -723,27 +804,11 @@ public final class KernelLoop {
 
             // ---- 规划前置门：先于执行 ----
             let hasActual = toolCalls.contains { $0.name != "update_plan" }
-            let hasPlanOp = toolCalls.contains { $0.name == "update_plan" }
-            if toolsEnabled && session.getPlan() == nil
-                && !didWork
-                && hasActual && !hasPlanOp
-                && !resume {
-                let simple = turnsUsed <= 1
-                    && userInput.count <= 60
-                    && !isMultistep(userInput)
-                if !simple {
-                    // 提交本轮（只收 assistant 正文，未执行的工具调用不进
-                    // 历史也不伪造结果）：回滚会造成 KV 前缀错位 → 全量重建。
-                    session.finishTurn(rec, assistantText: resp.content,
-                                       summary: l2Summary(resp.content),
-                                       rawContent: resp.rawContent)
-                    pending = """
-                    [System] 你准备执行实际工具，但还没有执行计划（Session 中 plan 为空）。请先用 update_plan(op='create', goal='一句话目标', steps=[...]) 把目标与 2~7 个可验证步骤规划好；创建后工具结果会指示『立即开始第一步』，不要停下来问用户是否开始。计划每轮回注，是后续多步任务跟踪的依据，必须先于执行写入。
-                    """
-                    log("[kernel] 规划前置门：拦截首次执行，要求先 update_plan(create)")
-                    continue
-                }
-            }
+            // 规划前置门已移除：旧实现在模型已经完整生成可用的工具调用时，
+            // 仅因为 `plan` 为空就把它整体丢弃（不执行、不进历史），再花
+            // 一整轮要求「先 update_plan」，实测 4 次 LLM 调用里只有 1 次
+            // 工具真正执行。计划只是进度追踪，缺了不影响任务本身；让工具
+            // 立即执行，`didWork=true` 后各反思门自然不再触发。
 
             // ---- 大纲后检索次数硬上限（默认 3）----
             // 每次 `rag_outline` 开启新一轮「检索预算」并清零；超出上限的 `rag_search`
@@ -897,7 +962,21 @@ public final class KernelLoop {
         }
 
         if exitReason == .maxTurns && finalText.isEmpty {
-            finalText = "（已达到本轮最大轮次上限 \(maxTurns)，任务可能未完成。请先总结已完成的进展，再询问用户是否继续。）"
+            // 旧实现只回一句「任务可能未完成」：实测工具已执行 4 次、用户
+            // 等了 6 轮，却拿不到任何结果。把已取得的工具结果一并汇总，
+            // 让这次等待至少交付点东西。
+            let highlights = session.turns
+                .flatMap { $0.toolResults }
+                .suffix(3)
+                .filter { !$0.content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+                .map { "• \($0.name)：" + String($0.content.prefix(180)) }
+                .joined(separator: "\n")
+            finalText = "（已达到本轮最大轮次上限 \(maxTurns)，本轮自动停止。）"
+            if highlights.isEmpty {
+                finalText += "\n本轮尚未取得任何工具结果。"
+            } else {
+                finalText += "\n\n已取得的进展：\n" + highlights
+            }
         }
         // 提醒次数用尽后模型仍要收尾：尊重决定，但必须把「其实没做完」告诉用户。
         // 例外：最后一轮是无工具的纯文字回答——文字步骤（说明 / 总结 / 边界）本就
@@ -1344,6 +1423,46 @@ public final class KernelLoop {
         return !isMultistep(text)
     }
 
+    /// 回复是否只是「声明要做什么」的元陈述，而不是任务结果。
+    ///
+    /// 典型事故（2026-11-08「获取 cnn.com 今日新闻并总结」）：模型把
+    /// system 里的 `update_plan` 协议复述成「我需要先创建任务计划……现在
+    /// 开始执行第一步」，一次工具都不发；内核却把这段当成正常正文收下，
+    /// `plan` 仍为空又不触发自动续跑，用户反复点「继续」只得到同样的
+    /// 自我复述。只在「无工具调用 + 未做过实际工作」时调用本判定，
+    /// 避免误伤正常的文字总结。
+    static func looksLikeIntentOnly(_ content: String) -> Bool {
+        let text = stripSummaryTags(content)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty, text.count <= 800 else { return false }
+        let markers = [
+            "我需要先", "我先", "让我", "接下来我", "现在我开始", "现在开始执行",
+            "创建任务计划", "创建计划", "将任务分解", "制定并执行", "开始执行第一步",
+            "紧接着发出", "步骤：", "目标：", "我需要：", "请立即：",
+            "执行计划", "可验证的步骤", "创建 2~7", "开始执行计划",
+        ]
+        return markers.filter { text.contains($0) }.count >= 2
+    }
+
+    /// 回复是否已经是一份可交付的结果（而非意图声明 / 追问 / 空话）。
+    /// 仅用于「多步任务、plan 为空、尚未动手」时避免 planFinish 门把
+    /// 模型第 1 轮就答对的正文作废、逼它重答 3 次（实测 4 倍墙钟）。
+    /// 保守判定：必须通过元陈述排除、末尾无问号，且带明确结论标记或
+    /// 结构化编号列表。
+    static func looksLikeResult(_ content: String) -> Bool {
+        let text = stripSummaryTags(content)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard text.count >= 12, !looksLikeIntentOnly(text) else { return false }
+        let tail = String(text.suffix(120))
+        guard !tail.contains("？"), !tail.contains("?") else { return false }
+        let markers = ["已完成", "完成了", "结果是", "答案是", "结论", "共计",
+                       "共有", "总共", "分别为", "分别是", "总计", "得到",
+                       "查到", "因此", "综上"]
+        if markers.contains(where: { text.contains($0) }) { return true }
+        return KernelRegex.search("(^|\\n)\\s*[1-9][\\.、\\)]", text)
+            && text.contains("。")
+    }
+
     private func isMultistep(_ text: String) -> Bool {
         KernelRegex.search(multistepHintPattern, text,
                            options: [.caseInsensitive, .anchorsMatchLines])
@@ -1409,7 +1528,9 @@ public final class KernelLoop {
     // MARK: 辅助
 
     private func resetRetryGuards() {
-        emptyRetry = 0
+        // 不清 emptyRetry：旧实现每次 ACT 成功就把它归零，一次请求里
+        // 「空回复 3 次 → 工具成功 → 又 3 次」可以反复续命。改成整段
+        // 共享 3 次空回复预算，由 run()/seedFailures 统一重置或恢复。
         reaskGuard = 0
     }
 
@@ -1451,7 +1572,9 @@ public final class KernelLoop {
             didWork: didWork,
             stepFails: stepFails,
             repeatStreak: repeatStreak,
-            lastCallSigs: Array(lastCallSigs.suffix(8))
+            lastCallSigs: Array(lastCallSigs.suffix(8)),
+            intentStall: intentStall,
+            shrinkGuard: shrinkGuard
         )
     }
 
@@ -1479,6 +1602,8 @@ public final class KernelLoop {
         didWork = false
         planNudged = 0
         planFinishNudge = 0
+        intentStall = 0
+        planGateHintInjected = false
         repeatStreak = 0
         lastCallSigs.removeAll()
         pendingSeed = nil

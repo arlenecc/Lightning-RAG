@@ -368,10 +368,34 @@ public final class WebScanTool: AgentTool, ShutdownableTool {
         var all = firstRecords
         var seen = Set(firstRecords.map { Self.fingerprint($0) })
         var sawOtherDate = false
+
+        // 分页只读、互不依赖：5 页并发取回，总耗时约等于单页而不是 5×15s。
+        // 仍按页码顺序合并，保留「空页 / 遇到其它日期 / 条数达上限即停」语义。
+        let session = self.session
+        let redirectGuard = self.redirectGuard
+        let endpoint = plan.endpoint
+        let pageKey = plan.pageKey
+        let startPage = plan.startPage
+        let baseForm = plan.form
+        let pages: [Int: Data] = await withTaskGroup(of: (Int, Data?).self) { group in
+            for step in 1...5 {
+                var form = baseForm
+                form[pageKey] = String(startPage + step)
+                group.addTask {
+                    let data = await Self.postForm(
+                        endpoint, form: form, referer: referer,
+                        session: session, redirectGuard: redirectGuard)
+                    return (step, data)
+                }
+            }
+            var out: [Int: Data] = [:]
+            for await (step, data) in group {
+                if let data { out[step] = data }
+            }
+            return out
+        }
         for step in 1...5 {
-            var form = plan.form
-            form[plan.pageKey] = String(plan.startPage + step)
-            guard let data = await postForm(plan.endpoint, form: form, referer: referer),
+            guard let data = pages[step],
                   let pageRoot = try? JSONSerialization.jsonObject(with: data) else { break }
             let rows = WebDataCapture.records(in: pageRoot)
             guard !rows.isEmpty else { break }
@@ -391,8 +415,11 @@ public final class WebScanTool: AgentTool, ShutdownableTool {
     }
 
     /// 表单 POST：仅用于被识别为「只读搜索」的同源端点。
-    private func postForm(_ endpoint: URL, form: [String: String],
-                          referer: URL) async -> Data? {
+    /// 静态化是为了让多页并发请求只捕获 Sendable 的 session / guard，
+    /// 不必把非 Sendable 的 tool 实例带进 `@Sendable` 闭包。
+    private static func postForm(_ endpoint: URL, form: [String: String],
+                                 referer: URL, session: URLSession,
+                                 redirectGuard: WebRedirectGuard) async -> Data? {
         var request = URLRequest(url: endpoint)
         request.httpMethod = "POST"
         request.timeoutInterval = 15

@@ -202,6 +202,10 @@ public final class Agent: @unchecked Sendable {
     /// 多级记忆目录（L0–L4）。与 `.agent/` 下既有 WorkMemory/GraphMemory 并存。
     public let memoryDirectory: MemoryDirectory
     public let rawSessionStore: RawSessionStore
+    /// 历史归档串行链：避免 zip/大文件读取卡住用户请求，同时保证同一天
+    /// 不会被两个后台任务重复归档。
+    private let archiveLock = NSLock()
+    private var archiveTask: Task<Void, Never>?
     /// 与 FileReadTool 共享的 SOP 去重记录器（reset() 时清空）。
     public let sopReadTracker: SOPReadTracker
     public lazy var dispatcher: AgentToolDispatcher = AgentToolDispatcher(agent: self)
@@ -248,7 +252,10 @@ public final class Agent: @unchecked Sendable {
     /// 后台事实抽取的文件游标：每 4 小时一次，增量读当天 raw_session 记录。
     /// 状态全部持久化在 cursor 文件里，不占用会话内存、与折叠边界无关。
     private let factExtractionWorker: FactExtractionWorker
-    private let autoContinueMax = 4
+    /// 自动续跑段数。每段都重跑完整 prefill 并带着累积的提示，实测 4 段
+    /// 可把一次请求放大到 29 次 LLM 调用 / 108s；收缩到 2 段，配合
+    /// KernelLoop 已收紧的反思门上限，避免「越提醒越慢」。
+    private let autoContinueMax = 2
     public var autoContinue = true
 
     /// 兼容 Python Agent.max_iterations：始终以 config 为唯一真源。
@@ -431,6 +438,20 @@ public final class Agent: @unchecked Sendable {
         // 清空对话后 Session 已重置，但本地 LLM 仍持有旧会话的 KV cache；
         // 不失效会让下一轮继续复用已经“被清空”的历史。
         invalidateKVCache()
+    }
+
+    /// 把过期归档排到后台串行链。每轮只排一次，前一个没跑完就跟着它，
+    /// 避免多轮请求同时压缩同一天的历史文件。
+    private func scheduleArchive() {
+        let store = rawSessionStore
+        archiveLock.lock()
+        let previous = archiveTask
+        let task = Task.detached(priority: .utility) {
+            _ = await previous?.value
+            _ = store.archivePastSessions()
+        }
+        archiveTask = task
+        archiveLock.unlock()
     }
 
     /// 丢弃计划（Session 内 + 落盘文件），不触碰对话历史。
@@ -693,10 +714,15 @@ public final class Agent: @unchecked Sendable {
                 text = "（模型多次重试后仍未返回可见正文，已停止。"
                     + "请换个说法再试，或检查模型的输出设置。）"
             case .maxTurns, .interrupt:
-                text = "（已达到本轮最大轮次上限，任务可能未完成。"
-                    + "请先总结已完成的进展，再询问用户是否继续。）"
+                text = "（已达到本轮最大轮次上限，本轮自动停止，尚未取得可见结果。）"
             }
             log("[agent] 空回复（reason=\(result.reason.rawValue)）：已向用户返回可见提示")
+        }
+        // 自动续跑额度用尽后，旧实现只把状态写进 session.working（用户
+        // 看不见），前台依旧像「卡住了没结果」。把停车原因追加到可见答复。
+        if result.reason == .maxTurns && segments > 0 {
+            text += "\n\n---\n（已连续 \(segments + 1) 段达到轮次上限，系统已自动停止；"
+                + "以上为本轮已取得的结果，剩余步骤需要你再发一句继续。）"
         }
         // 技能固化只针对「建过多步骤计划且已收尾」或「显式触发长期蒸馏」的任务。
         // 寒暄、简单查询、未完成的任务即使重复出现，也不会再提示保存技能。
@@ -724,9 +750,11 @@ public final class Agent: @unchecked Sendable {
             turns: takeFinishedTurnSnapshot(),
             finalText: text)
 
-        // 改进7 前半：过期记录预处理/打包（纯文件，单次最多 1 天；内部在删原文前
-        // 把 session 写入持久化队列，因此后续任何异常都不会让提炼任务丢失）。
-        _ = rawSessionStore.archivePastSessions()
+        // 改进7 前半：过期记录预处理/打包（纯文件，单次最多 1 天）。
+        // 归档只处理「今天之前」的文件，与上面的当天追加写不冲突，因此
+        // 放到后台串行链：它会读最多 2000 万字符并 zip 压缩，旧实现同步
+        // 卡在 run 返回前，直接拉长「本轮结束 → 用户可再发送」的间隔。
+        scheduleArchive()
 
         // 寒暄/能力问询跳过事实抽取与蒸馏，但**记忆维护仍要跑**：它消费的是
         // 持久化队列，否则这些轮归档的 session 会一直挂在队列里等不到提炼。

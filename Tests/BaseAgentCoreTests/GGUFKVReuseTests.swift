@@ -116,8 +116,7 @@ final class GGUFKVReuseTests: XCTestCase {
         }
         // llama.h 明确：partial sequence 裁剪在 hybrid/recurrent memory 上
         // 会返回 false（「Removing a whole sequence never fails」）。混合 SSM
-        // 模型（如 Qwen3.5 GGUF）因此合法降级为整段重建，不能当成账目 bug；
-        // 标准 attention 模型才要求所有非首轮都走 append/trim。
+        // 模型（如 Qwen3.5 GGUF）改走消息级增量 append，不再整段重建。
         let seqRmFailures = collector.lines.filter {
             $0.contains("[gguf-kv] seq_rm") && $0.contains("失败")
         }
@@ -129,6 +128,12 @@ final class GGUFKVReuseTests: XCTestCase {
         } else {
             XCTAssertFalse(collector.lines.contains { $0.contains("llama_decode 返回") },
                 "裁剪降级后不得出现 decode 失败：\(collector.lines)")
+            let deltas = collector.lines.filter {
+                $0.contains("[gguf-kv] delta-append")
+            }
+            XCTAssertFalse(deltas.isEmpty,
+                "裁剪失败后必须走消息级增量，避免每轮整段重建 7~8s："
+                + "\(collector.lines.filter { $0.contains("[gguf-") })")
         }
     }
 
