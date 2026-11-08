@@ -11,7 +11,25 @@ import WebKit
 /// - 实现 WKUIDelegate 的 alert/confirm/prompt：页面弹窗直接返回默认值，
 ///   防止 alert 阻塞整个渲染流程。
 final class WebRenderer: @unchecked Sendable {
-    static let shared = WebRenderer()
+    /// 渲染池：`web_scan` / `web_render` 共享。单实例串行会让 parallelSafe
+    /// 的 8 路并发退化成队头阻塞（动态页渲染 45s 起，8 连发最坏 8×45s）；
+    /// 固定 2 个槽位按轮询分派，槽内 WKWebView 仍各自串行复用。
+    /// ContentRuleList 由静态 RuleCache 共享，不会重复编译。
+    private static let pool: [WebRenderer] = [WebRenderer(), WebRenderer()]
+    private static let poolLock = NSLock()
+    private static var poolCursor = 0
+    static var shared: WebRenderer { nextFromPool() }
+    private static func nextFromPool() -> WebRenderer {
+        poolLock.lock(); defer { poolLock.unlock() }
+        let renderer = pool[poolCursor % pool.count]
+        poolCursor += 1
+        return renderer
+    }
+    /// 会话结束时整池清理。
+    static func resetAll() {
+        poolLock.lock(); defer { poolLock.unlock() }
+        pool.forEach { $0.reset() }
+    }
     /// 测试专用：允许渲染 localhost（SSRF 防护由工具层负责，这里只管执行）。
     static var localhostAllowedForTesting = false
 

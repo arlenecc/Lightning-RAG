@@ -92,7 +92,7 @@ final class RegressionTests: XCTestCase {
         config.maxIterations = 3
         let agent = Agent(llm: ScriptedAskLLM(), config: config, callbacks: AnswerCallbacks())
         let answer = await agent.run("need value")
-        XCTAssertEqual(answer, "finished")
+        XCTAssertTrue(answer.hasPrefix("finished"), "实际答复：\(answer)")
         agent.close()
     }
 

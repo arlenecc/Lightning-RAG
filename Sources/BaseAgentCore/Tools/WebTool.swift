@@ -45,7 +45,9 @@ public final class WebScanTool: AgentTool, ShutdownableTool {
         "Fetch a URL and return its visible text content (HTML stripped, scripts removed). "
         + "For JS-driven list pages, also captures the page's own same-origin data API "
         + "requests, replays them, and summarizes JSON records into a readable list; "
-        + "same-day records are merged across pages when a read-only paging API exists."
+        + "same-day records are merged across pages when a read-only paging API exists. "
+        + "PREFER THIS TOOL over writing scraping scripts (code_run/shell_run): it handles "
+        + "JS rendering, browser headers and data-API discovery automatically."
 
     private let config: AgentConfig
     private let session: URLSession
@@ -103,8 +105,11 @@ public final class WebScanTool: AgentTool, ShutdownableTool {
             }
 
             let raw = ToolSupport.optionalBool(args, "raw") ?? false
+            var mainRequest = URLRequest(url: url)
+            mainRequest.setValue(ToolSupport.browserUserAgent,
+                                 forHTTPHeaderField: "User-Agent")
             let result = try await redirectGuard.fetch(session: session,
-                                                       request: URLRequest(url: url),
+                                                       request: mainRequest,
                                                        limit: ToolSupport.maxFetchBytes)
             guard let http = result.response else {
                 return .fail("Request failed: invalid HTTP response")
@@ -152,7 +157,14 @@ public final class WebScanTool: AgentTool, ShutdownableTool {
             }
 
             if raw {
-                return .ok(String(bodyText.prefix(20_000)))
+                // raw 也要跳过超长 head：cnn.com 首页 raw 直出会是几千字符的
+                // 字体预加载清单，模型拿到的是完全无效的内容。
+                var rawText = bodyText
+                if bodyText.count > 20_000,
+                   let bodyRange = bodyText.range(of: "<body", options: .caseInsensitive) {
+                    rawText = String(bodyText[bodyRange.lowerBound...])
+                }
+                return .ok(String(rawText.prefix(20_000)) + truncationNote)
             }
 
             var content = ToolSupport.htmlToText(bodyText,
@@ -166,6 +178,8 @@ public final class WebScanTool: AgentTool, ShutdownableTool {
                           frameURL.host == url.host else { continue }
                     var frameRequest = URLRequest(url: frameURL)
                     frameRequest.timeoutInterval = requestTimeout
+                    frameRequest.setValue(ToolSupport.browserUserAgent,
+                                          forHTTPHeaderField: "User-Agent")
                     if let frameResult = try? await redirectGuard.fetch(
                         session: session,
                         request: frameRequest,
@@ -198,6 +212,8 @@ public final class WebScanTool: AgentTool, ShutdownableTool {
                     html: bodyText, baseURL: url, limit: 2) {
                     var scriptRequest = URLRequest(url: scriptURL)
                     scriptRequest.timeoutInterval = 5
+                    scriptRequest.setValue(ToolSupport.browserUserAgent,
+                                           forHTTPHeaderField: "User-Agent")
                     let scriptLimit = min(ToolSupport.maxFetchBytes, 512 * 1024)
                     guard let scriptResult = try? await redirectGuard.fetch(
                         session: session, request: scriptRequest, limit: scriptLimit) else {
@@ -334,6 +350,7 @@ public final class WebScanTool: AgentTool, ShutdownableTool {
                                referer: URL) async -> (data: Data, contentType: String)? {
         var request = URLRequest(url: endpoint)
         request.timeoutInterval = 15
+        request.setValue(ToolSupport.browserUserAgent, forHTTPHeaderField: "User-Agent")
         request.setValue("XMLHttpRequest", forHTTPHeaderField: "X-Requested-With")
         request.setValue(referer.absoluteString, forHTTPHeaderField: "Referer")
         request.setValue("application/json, text/plain, */*", forHTTPHeaderField: "Accept")
@@ -423,6 +440,7 @@ public final class WebScanTool: AgentTool, ShutdownableTool {
         var request = URLRequest(url: endpoint)
         request.httpMethod = "POST"
         request.timeoutInterval = 15
+        request.setValue(ToolSupport.browserUserAgent, forHTTPHeaderField: "User-Agent")
         request.setValue("application/x-www-form-urlencoded; charset=UTF-8",
                          forHTTPHeaderField: "Content-Type")
         request.setValue("XMLHttpRequest", forHTTPHeaderField: "X-Requested-With")
@@ -908,6 +926,6 @@ public final class WebRenderTool: AgentTool, ShutdownableTool {
     }
 
     public func shutdown() {
-        WebRenderer.shared.reset()
+        WebRenderer.resetAll()
     }
 }

@@ -111,6 +111,17 @@ public final class AgentToolDispatcher {
         let workerCount = min(maxParallel, jobs.count)
         var offset = 0
         while offset < jobs.count {
+            // 慢工具（MCP 300s / 渲染 45s）运行期间用户点了取消：
+            // 剩余调用不再排队执行，直接补 fail 结果，避免整批继续空转。
+            if agent.callbacks.isCancelled() {
+                for (index, call) in jobs[offset...] {
+                    agent.callbacks.onToolStart(call.name, call.arguments)
+                    let result = ToolResult.fail("用户取消了对话，工具未执行")
+                    agent.callbacks.onToolEnd(call.name, result)
+                    results[index] = result
+                }
+                return
+            }
             let slice = Array(jobs[offset..<min(offset + workerCount, jobs.count)])
             for (_, call) in slice {
                 agent.callbacks.onToolStart(call.name, call.arguments)
@@ -120,6 +131,10 @@ public final class AgentToolDispatcher {
                 for (index, call) in slice {
                     let tool = agent.tools.get(call.name)
                     group.addTask {
+                        if agent.callbacks.isCancelled() {
+                            return (index, call.name,
+                                    ToolResult.fail("用户取消了对话，工具未执行"))
+                        }
                         if let tool {
                             return (index, call.name,
                                     await AgentToolDispatcher.run(tool, call.arguments))
@@ -342,6 +357,13 @@ public final class Agent: @unchecked Sendable {
                 }
                 return self.llm.chatStream(messages: messages, tools: schemas,
                                            temperature: temperature)
+            },
+            streamWithOptions: { [weak self] messages, schemas, temperature, options in
+                guard let self else {
+                    return AsyncThrowingStream { $0.finish(throwing: AgentError.internalError("agent 已释放")) }
+                }
+                return self.llm.chatStream(messages: messages, tools: schemas,
+                                           temperature: temperature, options: options)
             },
             execute: { [weak self] calls in
                 guard let self else { return calls.map { _ in .fail("agent 已释放") } }
@@ -577,6 +599,8 @@ public final class Agent: @unchecked Sendable {
         await cancelBackgroundWork()
         turnIndex += 1
         cachedDynamicContext = nil
+        // 新用户请求：动态上下文重新注入一次（内容由本行之后的缓存重建）。
+        kernel.beginUserRequest()
         clearFinishedTurnSnapshot()
         freezeRequestSystemPrompt()  // 段内冻结 system 前缀；落盘也写这一份
         lastUserText = userInput
@@ -658,13 +682,25 @@ public final class Agent: @unchecked Sendable {
 
             if result.reason == .maxTurns {
                 log("[agent] 达到轮次上限，自动续跑 \(segments)/\(autoContinueMax)")
-                session.working["__truncated__"] = .string(
-                    "[系统提示] 上一段在达到轮次上限（\(maxIterations)）后被自动续跑。"
-                    + "请先用一句话总结当前进展，然后**立即继续执行**计划中的剩余步骤；"
-                    + "若全部步骤已完成，用 update_plan 收尾并给出最终答复。\(failText)")
+                // 最后一段续跑必须强制收尾：2B 模型拿到结果后容易一直调工具
+                // 不总结，把 3 段额度全部耗光，用户等 8 分钟仍拿不到答复。
+                if segments == autoContinueMax {
+                    session.working["__truncated__"] = .string(
+                        "[系统提示] 这是**最后一次**自动续跑。**不要再调用任何工具**："
+                        + "基于已获得的工具结果直接输出最终答复"
+                        + "（<summary>…</summary> 加正文）。确实无法完成的步骤，"
+                        + "在答复里说明原因即可。")
+                } else {
+                    session.working["__truncated__"] = .string(
+                        "[系统提示] 上一段在达到轮次上限（\(maxIterations)）后被自动续跑。"
+                        + "请先用一句话总结当前进展，然后**立即继续执行**计划中的剩余步骤；"
+                        + "若全部步骤已完成，用 update_plan 收尾并给出最终答复。\(failText)")
+                }
                 result = await kernel.run(
                     "[System] 任务在上一段达到轮次上限被截断，已自动续跑。"
-                    + "请继续执行计划中的剩余步骤；不要询问用户是否继续。",
+                    + (segments == autoContinueMax
+                       ? "这是最后一次续跑：不要再调用工具，立即基于已有结果给出最终答复。"
+                       : "请继续执行计划中的剩余步骤；不要询问用户是否继续。"),
                     resume: true, emitFinished: false,
                     toolsEnabled: !lightweightTurn)
             } else {

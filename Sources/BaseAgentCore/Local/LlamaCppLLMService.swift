@@ -390,6 +390,14 @@ public final class LlamaCppLLMService: LLMService, PreloadableLLMService,
             let prefillMilliseconds = Int(Date().timeIntervalSince(prefillStart) * 1_000)
             let cachedPromptTokens = common
 
+            // prompt 挤满上下文时生成预算趋近 0：继续生成只会产出空/半截
+            // 正文，被内核判 retry 后反复空转（2026-11-08 cnn.com 事故）。
+            // 抛 context 错误交给内核 resetForFreshContext 收缩历史后重试。
+            guard contextWindow - effectiveTokens.count >= 200 else {
+                throw AgentError.llm("GGUF 生成预算不足：prompt 已占 "
+                    + "\(effectiveTokens.count)/\(contextWindow)（context window），"
+                    + "需要收缩历史后重试")
+            }
             let generationBudget = max(1, min(maxTokens,
                 contextWindow - effectiveTokens.count - 8))
             let startInThink = prompt

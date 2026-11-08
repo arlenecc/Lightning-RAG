@@ -12,6 +12,10 @@ public struct KernelRuntime {
 
     /// 发起一次流式 LLM 调用：(messages, tools, temperature)。
     public var stream: StreamFunction
+    /// 请求级覆盖版 stream（如空正文重试时关闭 thinking 让模型直接作答）。
+    /// nil 时回退 `stream`（兼容测试 mock 与未迁移的构造方）。
+    public var streamWithOptions: (([ChatMessage], [JSONValue], Double, LLMRequestOptions)
+        -> AsyncThrowingStream<LLMStreamEvent, Error>)?
     /// 分发一批工具调用，返回与调用顺序一致的结果。
     public var execute: ExecuteFunction
     /// 工具 schema（对应 Python dispatcher.schemas()）。
@@ -24,12 +28,15 @@ public struct KernelRuntime {
     public var log: (String) -> Void
 
     public init(stream: @escaping StreamFunction,
+                streamWithOptions: (([ChatMessage], [JSONValue], Double, LLMRequestOptions)
+                    -> AsyncThrowingStream<LLMStreamEvent, Error>)? = nil,
                 execute: @escaping ExecuteFunction,
                 schemas: @escaping () throws -> [JSONValue] = { [] },
                 shouldCancel: @escaping () -> Bool = { false },
                 invalidateKV: (() -> Void)? = nil,
                 log: @escaping (String) -> Void = { _ in }) {
         self.stream = stream
+        self.streamWithOptions = streamWithOptions
         self.execute = execute
         self.schemas = schemas
         self.shouldCancel = shouldCancel
@@ -117,12 +124,13 @@ private let multistepVerbPattern =
     "(重构|重写|批量|全部|所有|每个|一系列|整套|完整|"
     + "部署|迁移|搭建|改造|升级|替换|整合|拆分|合并|"
     + "整理|归档|备份|还原|恢复|排查|定位并|分析并|"
+    + "获取|查询|搜索|读取|抓取|下载|"
     + "制定|实现|开发|配置|初始化|生成报告|写一份|做一份)"
 
 private let planFinishHint = """
-[System] 你只是在回复文本里写出了计划、并声称「开始执行第一个任务」，但既没有调用 update_plan 把计划写入执行计划（Session.working['plan'] 为空），也没有发出任何实际工具调用——这等于什么都没做。
-请立即：1) 用 update_plan(op='create', goal=..., steps=[...]) 把计划写入执行计划；2) 紧接着发出第一步的实际工具调用并持续推进，直到计划完成。
-禁止只在文本里描述计划——计划必须写进执行计划，每一步都必须真正调用工具。
+[System] 你既没有调用 update_plan 把计划写入执行计划（Session.working['plan'] 为空），也没有发出任何实际工具调用——任务等于什么都没做，哪怕你在文本里给出了结论也只是猜测。
+请立即：1) 需要外部信息时直接发出第一步的实际工具调用（如 web_scan 获取页面、rag_search 查询知识库）并持续推进；2) 或用 update_plan(op='create', goal=..., steps=[...]) 先登记计划，紧接着发出第一步调用。
+禁止只在文本里描述计划或给出来自猜测的结论——每一步都必须真正调用工具，拿到真实结果后再总结。
 """
 
 private let finishNudgeMax = 2
@@ -212,6 +220,9 @@ public final class KernelLoop {
     private var intentStall = 0
     /// 规划提示是否已在本段注入过（一段只注入一次）。
     private var planGateHintInjected = false
+    /// 动态上下文是否已在本段注入过。`dynamicContext()` 按「一次用户请求」
+    /// 冻结内容，同一段内逐轮注入只是把同一份 ~7.5k 字符重复写进历史。
+    private var dynamicContextInjected = false
     private var repeatStreak = 0
     private var lastCallSigs: [String] = []
     private var toolCallCounter = 0
@@ -412,6 +423,7 @@ public final class KernelLoop {
         planFinishNudge = 0
         intentStall = 0
         planGateHintInjected = false
+        dynamicContextInjected = false
         repeatStreak = 0
         lastCallSigs = []
         ragSearchCount = 0
@@ -439,6 +451,9 @@ public final class KernelLoop {
         distillRequested = false
 
         var pending = userInput
+        /// 出现过「只有思考没有正文」的空回复后，本轮剩余调用关闭 thinking，
+        /// 让模型直接给出 <summary> + 正文（2026-11-08 cnn.com 事故）。
+        var forceNoThinking = false
         var finalText = ""
         var exitReason: ExitReason = .maxTurns
         /// 触发 `.done` 退出的最后一轮是否为「无工具纯文字回答」。文字步骤
@@ -511,9 +526,15 @@ public final class KernelLoop {
             var userText = session.anchorPrompt(extra: pending)
             // 动态上下文只加在 user 消息尾部：system 与历史前缀保持不变，
             // 本地 KV cache 才能跨轮复用。
+            // 动态上下文（工作记忆/检查点/命中技能/KB 说明）按「一次用户请求」
+            // 冻结，同一段内逐轮注入只是把同一份 ~7.5k 字符重复写进历史，
+            // 快速吃满 raw 窗口并触发提前折叠。只在首个 THINK 轮注入：后续轮
+            // 模型在历史里能看到首轮那份；已注入的轮原样保留（KV 对齐铁律），
+            // 由 beginUserRequest()/resetRuntimeState() 在新请求时重置。
             let dynamic = dynamicContext()
-            if !dynamic.isEmpty {
+            if !dynamic.isEmpty && !dynamicContextInjected {
                 userText += "\n\n" + dynamic
+                dynamicContextInjected = true
             }
             // KV 对齐铁律：写进 rec.prompt 的就是本轮实际发给模型的完整
             // user 文本，**事后不得裁剪、替换或压缩历史里的任何一轮**。
@@ -566,7 +587,10 @@ public final class KernelLoop {
                     localCapabilityAnswer = answer
                     respOptional = LLMResponse(content: answer)
                 } else {
-                    respOptional = try await ask(messages, toolsEnabled: toolsEnabled)
+                    respOptional = try await ask(
+                        messages, toolsEnabled: toolsEnabled,
+                        options: LLMRequestOptions(
+                            enableThinking: forceNoThinking ? false : nil))
                 }
             } catch {
                 let msg = describe(error)
@@ -625,7 +649,73 @@ public final class KernelLoop {
                     exitReason = .done
                     break
                 }
+                // 空回复/截断必须先于一切进度门处理：连正文都没有的轮次
+                // 根本谈不上「没写计划」「步骤未完成」，旧顺序让空正文先被
+                // planFinish 门白耗 3 次重答，才轮到真正的对症重试。
+                let event = noToolEvent(resp)
+                if event == "retry" {
+                    // 提交本轮（可能为空回复）：回滚会让下一轮消息前缀与
+                    // KV cache 错位（unexpected-assistant 全量重建）。空回复
+                    // 提交后 turnMessages 只含 user 消息，与 cache 追加对齐。
+                    session.finishTurn(rec, assistantText: resp.content,
+                                       summary: l2Summary(resp.content),
+                                       rawContent: resp.rawContent)
+                    if resp.content
+                        .trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                        // 只有思考没有正文：关闭 thinking 重试，否则同样的
+                        // 长思考会原样再来一遍（3 次全空后只能空手退出）。
+                        forceNoThinking = true
+                    }
+                    pending = resp.truncated
+                        ? "[ERROR] 上一轮的工具调用被截断：参数还没输出完生成就结束了，工具没有执行。请重新生成，并把较大的写入内容拆成多次较小的工具调用，不要把长文件塞进一次调用。"
+                        : """
+                        [ERROR] 上一轮回复为空或流被截断（很可能只有思考、没有正文）。请直接输出 <summary>…</summary> 和简短正文作答，不要长篇思考、不要重复分析过程；如需操作必须显式调用工具。系统已在本轮关闭思考模式。
+                        """
+                    continue
+                }
+                if event == "reask" {
+                    reaskGuard += 1
+                    if reaskGuard <= 1 {
+                        // 同反思门：提交本轮，保持 KV 前缀与历史一致。
+                        session.finishTurn(rec, assistantText: resp.content,
+                                           summary: l2Summary(resp.content),
+                                           rawContent: resp.rawContent)
+                        pending = """
+                        [System] 检测到你上轮主要内容是大段代码却未调用工具。若这些代码需要执行/写入/分析，请显式调用 code_run / file_write / file_patch；若只是展示给用户的示例，请在回复中补充自然语言说明。
+                        """
+                        continue
+                    }
+                    // 第二次不再纠缠：把这轮的正文当作最终答复收下。
+                    finalText = resp.content
+                    session.finishTurn(rec, assistantText: resp.content,
+                                       summary: l2Summary(resp.content),
+                                       rawContent: resp.rawContent)
+                    exitReason = .done
+                    break
+                }
+                // 重试耗尽仍无可见正文：不再把空串交给上层兜底，而是把失败
+                // 原因、已有工具结果与计划状态一次讲清楚（知道怎么失败，
+                // 而不是让计划静默卡死或"假装完成"）。
+                let visibleNow = stripSummaryTags(resp.content)
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                if visibleNow.isEmpty {
+                    markPlanBlocked(reason: "生成连续为空/被截断，未能推进")
+                    finalText = "（模型连续 \(maxEmptyRetry) 轮未输出可见正文——"
+                        + "通常只有思考且被截断、或思考后未给出正文。本轮已停止，"
+                        + "系统已自动关闭思考模式重试仍未解决。"
+                        + summarizeToolResults()
+                        + "\n建议：换用工具调用能力更强的模型，或把任务拆成单步指令后重试。）"
+                    session.finishTurn(rec, assistantText: resp.content,
+                                       summary: l2Summary(resp.content),
+                                       rawContent: resp.rawContent)
+                    exitReason = .done
+                    log("[kernel] 空正文重试耗尽：已标记计划受阻并交付失败说明")
+                    break
+                }
+
                 // 反思门：模型想收尾，但计划里还有未完成步骤 —— 不能就这么放它走。
+                // （含「复述一句用户请求就 EOS」的过短回复：isMultistep 现已
+                // 识别「获取/查询/搜索」类任务，统一走本门的 3 次推进预算。）
                 let openSteps = session.planOpenSteps()
 
                 // 「我要先创建计划 / 现在开始执行第一步」这类纯意图声明：
@@ -680,13 +770,15 @@ public final class KernelLoop {
                     break
                 }
 
-                // 多步任务却连执行计划都没写、也没真正动手就想收尾。
-                // 例外：模型已经给出结果性答复时直接放行——逼它为了补一张
-                // 计划表重答 3 次，用户只会多等 3 倍时间拿到同样的内容。
+                // 多步任务却连一次工具都没执行就想收尾：不放行。这里不再用
+                // looksLikeResult 豁免——v1.2.27 放行后用户实测出现「模型一句
+                // 『已完成：xxx』根本没调工具就被当最终答复」，2 步任务的计划
+                // 面板是空的、任务也没执行。没有 didWork 的「结果」只能是
+                // 幻觉或对任务的复述；有 didWork 的纯文字收尾走
+                // turnedTextAnswer 分支，不受此门影响。
                 if session.getPlan() == nil
                     && (isMultistep(userInput))
                     && !didWork
-                    && !Self.looksLikeResult(resp.content)
                     && planFinishNudge < finishNudgePlanMax
                     && !resume {
                     planFinishNudge += 1
@@ -755,40 +847,6 @@ public final class KernelLoop {
                     log("[kernel] 反思门：还有 \(openSteps.count) 步未完成，提醒继续")
                     continue
                 }
-
-                let event = noToolEvent(resp)
-                if event == "retry" {
-                    // 提交本轮（可能为空回复）：回滚会让下一轮消息前缀与
-                    // KV cache 错位（unexpected-assistant 全量重建）。空回复
-                    // 提交后 turnMessages 只含 user 消息，与 cache 追加对齐。
-                    session.finishTurn(rec, assistantText: resp.content,
-                                       summary: l2Summary(resp.content),
-                                       rawContent: resp.rawContent)
-                    pending = resp.truncated
-                        ? "[ERROR] 上一轮的工具调用被截断：参数还没输出完生成就结束了，工具没有执行。请重新生成，并把较大的写入内容拆成多次较小的工具调用，不要把长文件塞进一次调用。"
-                        : "[ERROR] 上一轮回复为空或流被截断，请重新生成；如需操作必须显式调用工具。"
-                    continue
-                }
-                if event == "reask" {
-                    reaskGuard += 1
-                    if reaskGuard <= 1 {
-                        // 同反思门：提交本轮，保持 KV 前缀与历史一致。
-                        session.finishTurn(rec, assistantText: resp.content,
-                                           summary: l2Summary(resp.content),
-                                           rawContent: resp.rawContent)
-                        pending = """
-                        [System] 检测到你上轮主要内容是大段代码却未调用工具。若这些代码需要执行/写入/分析，请显式调用 code_run / file_write / file_patch；若只是展示给用户的示例，请在回复中补充自然语言说明。
-                        """
-                        continue
-                    }
-                    // 第二次不再纠缠：把这轮的正文当作最终答复收下。
-                    finalText = resp.content
-                    session.finishTurn(rec, assistantText: resp.content,
-                                       summary: l2Summary(resp.content),
-                                       rawContent: resp.rawContent)
-                    exitReason = .done
-                    break
-                }
                 finalText = resp.content
                 session.finishTurn(rec, assistantText: resp.content,
                                    summary: l2Summary(resp.content),
@@ -804,11 +862,32 @@ public final class KernelLoop {
 
             // ---- 规划前置门：先于执行 ----
             let hasActual = toolCalls.contains { $0.name != "update_plan" }
-            // 规划前置门已移除：旧实现在模型已经完整生成可用的工具调用时，
-            // 仅因为 `plan` 为空就把它整体丢弃（不执行、不进历史），再花
-            // 一整轮要求「先 update_plan」，实测 4 次 LLM 调用里只有 1 次
-            // 工具真正执行。计划只是进度追踪，缺了不影响任务本身；让工具
-            // 立即执行，`didWork=true` 后各反思门自然不再触发。
+            let hasPlanOp = toolCalls.contains { $0.name == "update_plan" }
+            // 计划面板保障：模型没有自觉创建计划而实际工具调用已开始时，内核
+            // 代建一条最小计划并同步面板/落盘。旧规划门在这里把已生成的工具
+            // 调用整体丢弃（浪费一轮、且模型不自觉时计划永远建不起来，用户
+            // 只看到空面板和「直接结束」）；代建**不拦截执行**，只保证计划
+            // 面板有内容、进度可见、反思门与收尾判定有据可依。
+            // 不按 isMultistep 过滤：真机实测「从 cnn.com 获取今天的新闻并
+            // 进行总结」不命中任何关键词，导致计划面板始终为空；能发出实际
+            // 工具调用本身就说明这是需要外部信息的任务。模型随后仍可
+            // update_plan(op="create"/"patch") 覆盖或细化这份计划。
+            if toolsEnabled, session.getPlan() == nil, hasActual, !hasPlanOp {
+                let plan = Plan(goal: String(userInput.prefix(80)), steps: [
+                    PlanStep(id: "1", title: "收集所需信息（调用工具获取真实数据）",
+                             status: "doing"),
+                    PlanStep(id: "2", title: "基于工具结果整理并给出最终答复",
+                             status: "pending"),
+                ])
+                session.setPlan(plan)
+                do {
+                    try PlanStore.save(plan, config: config)
+                } catch {
+                    AgentLog.warning("[kernel] 计划落盘失败: \(error.localizedDescription)")
+                }
+                callbacks.onPlanUpdated(plan)
+                log("[kernel] 多步任务模型未建计划，内核代建最小计划（不拦截工具执行）")
+            }
 
             // ---- 大纲后检索次数硬上限（默认 3）----
             // 每次 `rag_outline` 开启新一轮「检索预算」并清零；超出上限的 `rag_search`
@@ -890,19 +969,25 @@ public final class KernelLoop {
                 if repeatStreak >= repeatCallLimit {
                     log("[kernel] 重复调用达到上限，结束本轮")
                     // 不能把最后一轮正文丢掉：模型可能已经给出了阶段性说明。
+                    // 同时把计划里未完成步骤标 blocked：失败要可见、可恢复，
+                    // 不能让面板永远停在 doing（2026-11-08 cnn.com 事故）。
+                    markPlanBlocked(reason: "连续 \(repeatStreak + 1) 次完全相同的工具调用"
+                        + "（\(toolCalls.first?.name ?? "?")）未能推进")
                     finalText = resp.content.trimmingCharacters(
                         in: .whitespacesAndNewlines).isEmpty
                         ? "（检测到连续 \(repeatStreak + 1) 次完全相同的工具调用，"
-                            + "内核已停止本轮以避免空转。请调整指令后重试。）"
+                            + "内核已停止本轮以避免空转。已把计划受阻原因记入计划面板。"
+                            + summarizeToolResults()
+                            + "\n建议：换用工具调用能力更强的模型，或把任务拆成单步指令后重试。）"
                         : resp.content
                     exitReason = .done
                     break
                 }
                 repeatWarning = """
-                [System] 你已经连续 \(repeatStreak + 1) 次调用**完全相同**的工具与参数（\(toolCalls.first?.name ?? "?")）——这不会让任务前进哪怕一步。立刻换一个动作：
-                1) 若这一步其实做不了/不需要工具，就用 update_plan(patch) 把它标为 done（写明结论）或 skipped，然后进入下一步；
-                2) 若任务本身已经可以回答（例如只是问候/闲聊/缺少信息），直接用文字回复用户结束本轮；
-                3) 若确实需要用户补充信息，用 ask_user 工具提问。
+                [System] 你已经连续 \(repeatStreak + 1) 次调用**完全相同**的工具与参数（\(toolCalls.first?.name ?? "?")）——这不会让任务前进哪怕一步。上一轮的工具结果已经返回，所需资料大概率已经拿到。立刻换一个动作：
+                1) **最优先**：直接基于已获得的工具结果用文字作答（写 <summary>…</summary> 加正文），不要再调用工具；
+                2) 若该工具确实拿不到数据，换其它工具 / URL / 参数（如 rag_search、ask_user），或用 update_plan 把该步标 blocked 并写明原因后继续；
+                3) 若还没有计划，先 update_plan(create) 登记再推进。
                 不要再次发出与上一轮相同的调用。
                 """
             }
@@ -964,19 +1049,13 @@ public final class KernelLoop {
         if exitReason == .maxTurns && finalText.isEmpty {
             // 旧实现只回一句「任务可能未完成」：实测工具已执行 4 次、用户
             // 等了 6 轮，却拿不到任何结果。把已取得的工具结果一并汇总，
-            // 让这次等待至少交付点东西。
-            let highlights = session.turns
-                .flatMap { $0.toolResults }
-                .suffix(3)
-                .filter { !$0.content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
-                .map { "• \($0.name)：" + String($0.content.prefix(180)) }
-                .joined(separator: "\n")
+            // 让这次等待至少交付点东西；同时把 doing 步骤标 blocked，
+            // 计划面板要能看出「停在哪」。
+            markPlanBlocked(reason: "轮次上限（\(maxTurns)）耗尽，等待用户继续",
+                            includePending: false)
+            let highlights = summarizeToolResults()
             finalText = "（已达到本轮最大轮次上限 \(maxTurns)，本轮自动停止。）"
-            if highlights.isEmpty {
-                finalText += "\n本轮尚未取得任何工具结果。"
-            } else {
-                finalText += "\n\n已取得的进展：\n" + highlights
-            }
+            finalText += highlights.isEmpty ? "\n本轮尚未取得任何工具结果。" : highlights
         }
         // 提醒次数用尽后模型仍要收尾：尊重决定，但必须把「其实没做完」告诉用户。
         // 例外：最后一轮是无工具的纯文字回答——文字步骤（说明 / 总结 / 边界）本就
@@ -1096,7 +1175,8 @@ public final class KernelLoop {
     }
 
     private func ask(_ messages: [ChatMessage],
-                     toolsEnabled: Bool = true) async throws -> LLMResponse? {
+                     toolsEnabled: Bool = true,
+                     options: LLMRequestOptions = .default) async throws -> LLMResponse? {
         var contentBuf: [String] = []
         var reasoningBuf: [String] = []
         var calls: [ToolCall] = []
@@ -1124,8 +1204,16 @@ public final class KernelLoop {
             truncated = false
             var gotAny = false
             do {
-                let stream = cancellableStream(
-                    runtime.stream(messages, toolSchemas, config.temperature))
+                // 只在有实际覆盖（关闭 thinking / isolated）时走 options 通道：
+                // 默认调用保持原 3 参路径，后端重载选择与 KV 复用行为不变。
+                let baseStream: AsyncThrowingStream<LLMStreamEvent, Error>
+                if options != .default, let streamWithOptions = runtime.streamWithOptions {
+                    baseStream = streamWithOptions(messages, toolSchemas,
+                                                   config.temperature, options)
+                } else {
+                    baseStream = runtime.stream(messages, toolSchemas, config.temperature)
+                }
+                let stream = cancellableStream(baseStream)
                 for try await event in stream {
                     gotAny = true
                     if self.cancelled() {
@@ -1477,6 +1565,51 @@ public final class KernelLoop {
         return KernelRegex.search(askUserPattern, tail, options: [.caseInsensitive])
     }
 
+    /// 最近几条工具结果的紧凑汇总，用于失败/耗尽时让用户看到已取得的进展。
+    /// HTML 开头的结果先转可见文本，避免汇总里全是 `<!DOCTYPE>`/字体清单。
+    private func summarizeToolResults(limit: Int = 3) -> String {
+        func preview(_ content: String) -> String {
+            let trimmed = content.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard trimmed.hasPrefix("<") else { return String(trimmed.prefix(180)) }
+            let text = ToolSupport.htmlToText(trimmed, maxChars: 4_000)
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            return String((text.isEmpty ? trimmed : text).prefix(180))
+        }
+        let highlights = session.turns
+            .flatMap { $0.toolResults }
+            .suffix(limit)
+            .filter { !$0.content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+            .map { "\n• \($0.name)：" + preview($0.content) }
+            .joined()
+        return highlights.isEmpty ? "" : "\n\n已取得的进展：" + highlights
+    }
+
+    /// 生成连续失败/轮次耗尽时把未完成步骤标 blocked 并落盘：让失败可见、
+    /// 可恢复，而不是让计划静默卡死，或被「纯文字收尾自动标 done」假装完成。
+    /// `includePending=false` 用于「轮次耗尽待续」：只收 doing（当前步停在哪），
+    /// pending（尚未开始）留给下一次用户「继续」。
+    private func markPlanBlocked(reason: String, includePending: Bool = true) {
+        guard var plan = session.getPlan(),
+              plan.steps.contains(where: {
+                  $0.status == "doing" || (includePending && $0.status == "pending")
+              })
+        else { return }
+        for index in plan.steps.indices {
+            let status = plan.steps[index].status
+            guard status == "doing" || (includePending && status == "pending") else { continue }
+            plan.steps[index].status = "blocked"
+            if plan.steps[index].note.isEmpty { plan.steps[index].note = reason }
+        }
+        session.setPlan(plan)
+        do {
+            try PlanStore.save(plan, config: config)
+        } catch {
+            AgentLog.warning("[kernel] 计划落盘失败: \(error.localizedDescription)")
+        }
+        callbacks.onPlanUpdated(plan)
+        log("[kernel] 计划未完成步骤已标记 blocked（\(reason)）")
+    }
+
     private func noToolEvent(_ resp: LLMResponse) -> String {
         let content = resp.content.trimmingCharacters(in: .whitespacesAndNewlines)
         // 工具调用被截断：可见正文可能只是半截前言，不能当最终答复收下。
@@ -1578,6 +1711,14 @@ public final class KernelLoop {
         )
     }
 
+    /// 开始一个新的用户请求：重置与「单次请求」绑定的注入标志。
+    ///
+    /// 动态上下文按一次请求冻结，同一段 autoContinue 的所有 THINK 轮都
+    /// 不该重复注入；只有 Agent 开启新用户输入时才允许重新注入。
+    public func beginUserRequest() {
+        dynamicContextInjected = false
+    }
+
     /// 把上一段的失败上下文带进下一段 run()（自动续跑用）。
     public func seedFailures(_ snapshot: FailureSnapshot?) {
         pendingSeed = snapshot
@@ -1604,6 +1745,7 @@ public final class KernelLoop {
         planFinishNudge = 0
         intentStall = 0
         planGateHintInjected = false
+        dynamicContextInjected = false
         repeatStreak = 0
         lastCallSigs.removeAll()
         pendingSeed = nil

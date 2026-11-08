@@ -44,6 +44,11 @@ public enum ToolSupport {
     public static let maxFetchBytes = 8 * 1024 * 1024
     /// 交给 HTML 解析器的最大字符数。
     public static let maxParseChars = 2 * 1024 * 1024
+    /// 浏览器 UA：不少 CDN（Fastly 等）对空/非浏览器 UA 直接 403/404，
+    /// URLSession 默认不带 UA，必须在所有 web 请求上显式设置。
+    public static let browserUserAgent =
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        + "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15"
 
     // MARK: JSON Schema 构造
 
@@ -454,9 +459,16 @@ public enum ToolSupport {
 
     /// SwiftSoup 提取网页可见正文：移除 script/style/noscript，按块级元素换行。
     public static func htmlToText(_ html: String, maxChars: Int = maxParseChars) -> String {
-        let limited = String(html.prefix(maxChars))
-        guard let document = try? SwiftSoup.parse(limited) else {
-            return normalizeLines(stripTags(limited))
+        // 超长页面（如 cnn.com 首页 5.9MB）的开头是巨大的 <head>/预加载清单，
+        // 直接按字符截断会把正文体整体截出解析窗口、提取结果为空，进而被
+        // 误判为「动态加载」再花 20s+ 渲染兜底。跳过 head 从 <body> 起取窗口。
+        var window = String(html.prefix(maxChars))
+        if html.count > maxChars,
+           let bodyRange = html.range(of: "<body", options: .caseInsensitive) {
+            window = String(html[bodyRange.lowerBound...].prefix(maxChars))
+        }
+        guard let document = try? SwiftSoup.parse(window) else {
+            return normalizeLines(stripTags(window))
         }
         _ = try? document.select("script, style, noscript").remove()
 
@@ -471,7 +483,7 @@ public enum ToolSupport {
 
         let text = normalizeLines(lines.joined(separator: "\n"))
         if !text.isEmpty { return text }
-        return normalizeLines((try? document.text()) ?? stripTags(limited))
+        return normalizeLines((try? document.text()) ?? stripTags(window))
     }
 
     /// 列表页 / SPA 动态加载检测：提取正文过短，或正文虽长但主体只是加载占位时，

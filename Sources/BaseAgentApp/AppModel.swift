@@ -809,7 +809,6 @@ final class AppViewModel: ObservableObject {
                         ? "默认主模型" : newConfig.localLLMModel
                     self.appendLog("[model] 主模型已加载：\(label)")
                     self.statusText = "模型加载成功"
-                    try? await Task.sleep(nanoseconds: 500_000_000)
                     guard self.configGeneration == generation else { return }
                     if let warmable = service as? WarmupLLMService {
                         await self.warmupMainModel(warmable, generation: generation)
@@ -847,7 +846,6 @@ final class AppViewModel: ObservableObject {
                         ? "默认辅助模型" : newConfig.auxLocalLLMModel
                     self.appendLog("[model] 辅助模型已加载：\(label)")
                     self.statusText = "模型加载成功"
-                    try? await Task.sleep(nanoseconds: 500_000_000)
                     if !self.isRunning { self.statusText = "就绪" }
                 } catch {
                     self.auxModelLoaded = false
@@ -924,8 +922,6 @@ final class AppViewModel: ObservableObject {
         guard configGeneration == generation else { return }
         if loadedAny {
             statusText = "模型加载成功"
-            // 让「加载成功」在状态栏可见，再进入预热。
-            try? await Task.sleep(nanoseconds: 500_000_000)
         }
         guard configGeneration == generation else { return }
         // 辅助模型失败不应阻止主模型预热。
@@ -974,10 +970,9 @@ final class AppViewModel: ObservableObject {
                                      tools: agent.dispatcher.schemas())
             guard generation == nil || configGeneration == generation else { return }
             appendLog("[model] 主模型预热结束")
-            // 预热期间已排队的用户请求此时开始生成，状态切回「思考中…」。
-            statusText = isRunning ? "思考中…" : "预热结束"
-            try? await Task.sleep(nanoseconds: 1_200_000_000)
-            if !isRunning, statusText == "预热结束" { statusText = "就绪" }
+            // 预热期间已排队的用户请求此时开始生成，状态切回「思考中…」；
+            // 否则直接就绪。旧实现固定睡 1.2s 只为让中间状态可见。
+            statusText = isRunning ? "思考中…" : "就绪"
         } catch {
             guard generation == nil || configGeneration == generation else { return }
             appendLog("[model] 主模型预热失败：\(error.localizedDescription)")

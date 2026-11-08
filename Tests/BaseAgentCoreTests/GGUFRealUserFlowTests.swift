@@ -99,9 +99,11 @@ final class GGUFRealUserFlowTests: XCTestCase {
         let modes = collector.lines.filter { $0.contains("[gguf-kv] mode=") }
         XCTAssertGreaterThanOrEqual(modes.count, 4,
             "4 个正式轮应各有一次 LLM 调用：\(modes)")
-        // 启动预热必须真的生效：首轮从 7172 token 前缀后增量追加。
+        // 启动预热必须真的生效：首轮从预热前缀（约 7.2k token，随提示注入
+        // 略有浮动）后增量追加，而不是全量重建。
         let appendFromWarmup = modes.filter {
-            $0.contains("mode=append") && $0.contains("common=7172")
+            $0.contains("mode=append") && $0.contains("tools_match=true")
+                && $0.contains("cached=0") == false
         }
         XCTAssertFalse(appendFromWarmup.isEmpty,
             "预热前缀必须被正式请求命中：\(modes)")

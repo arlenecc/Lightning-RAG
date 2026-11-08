@@ -2344,6 +2344,24 @@ public final class RAGEngine {
     public func search(query: String, topK: Int = 3,
                        source: String? = nil,
                        timeout: Double? = nil) async throws -> [SearchHit] {
+        let limit = resolvedTimeout(timeout)
+        // 端到端总预算：单段各有超时（embedding 20s、查询 5s、rerank 5s），
+        // 但串起来最坏 ~150s，rag_query_timeout 根本约束不到。给整段一个
+        // 墙钟上限；各段超时仍生效，总预算只防「多段依次慢慢超时」叠成长卡顿。
+        let totalBudget = max(30, limit * 3)
+        do {
+            return try await Self.withTimeout(Double(totalBudget)) {
+                try await self.searchBody(query: query, topK: topK,
+                                          source: source, timeout: timeout)
+            }
+        } catch is RerankTimeout {
+            throw AgentError.timeout("rag_search 端到端超时（\(Int(totalBudget))s），"
+                + "已放弃本次检索；可稍后重试或缩小 topK")
+        }
+    }
+
+    private func searchBody(query: String, topK: Int, source: String?,
+                            timeout: Double?) async throws -> [SearchHit] {
         guard let embedding else { throw AgentError.storage("embedding 模型不可用") }
         let limit = resolvedTimeout(timeout)
         // topK 来自模型参数：硬性封顶，避免一次检索把 reranker 批量推到很高。

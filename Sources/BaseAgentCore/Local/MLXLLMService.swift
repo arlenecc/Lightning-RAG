@@ -395,7 +395,15 @@ public final class MLXLLMService: LLMService, PreloadableLLMService,
                         throw AgentError.llm("本地输入准备失败")
                     }
 
-                    let tokenBudget = max(256, contextWindow - totalPromptTokens - 64)
+                    // 生成预算不足时抛 context 错误交给内核收缩历史，
+                    // 而不是用 max(256,…) 硬撑：KV 越界 + 空正文反复重试。
+                    let remainingContext = contextWindow - totalPromptTokens - 64
+                    guard remainingContext >= 256 else {
+                        throw AgentError.llm("MLX 生成预算不足：prompt 已占 "
+                            + "\(totalPromptTokens)/\(contextWindow)（context window），"
+                            + "需要收缩历史后重试")
+                    }
+                    let tokenBudget = remainingContext
                     let parameters = Self.parameters(
                         maxTokens: min(maxTokens, tokenBudget),
                         temperature: temperature, topP: topP, topK: topK,

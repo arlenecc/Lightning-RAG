@@ -41,6 +41,11 @@ enum WebDataCapture {
         let assets = [".css", ".js", ".png", ".jpg", ".jpeg", ".gif", ".svg",
                       ".ico", ".woff", ".woff2", ".ttf", ".map"]
         if assets.contains(where: { path.hasSuffix($0) }) { return false }
+        // 素材/构建产物目录下的 .json 不是内容数据（如 /imgs/.../price_tracker_x.json
+        // 的动画素材清单）：直取只会把无关记录顶到结果头部，挤掉真正的新闻数据。
+        let assetDirs = ["/imgs/", "/images/", "/assets/", "/static/",
+                         "/media/", "/fonts/", "/img/", "/js/"]
+        if assetDirs.contains(where: { path.contains($0) }) { return false }
         let markers = ["/api/", "/ajax/", ".ashx", ".asmx", "graphql",
                        "search", "query", "json", "list", "getdata"]
         return markers.contains { (path + "?" + (url.query ?? "")).lowercased().contains($0) }

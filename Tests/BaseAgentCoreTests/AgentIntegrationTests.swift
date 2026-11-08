@@ -75,7 +75,8 @@ final class AgentIntegrationTests: XCTestCase {
 
         let agent = Agent(llm: ScriptedLLM(), config: config, callbacks: NoopCallbacks())
         let answer = await agent.run("write file")
-        XCTAssertEqual(answer, "Done.")
+        // 收尾自动把代建计划标完成时会追加计划说明，正文前缀不变。
+        XCTAssertTrue(answer.hasPrefix("Done."), "实际答复：\(answer)")
         let written = try String(contentsOf: workspace.appendingPathComponent("out.txt"),
                                  encoding: .utf8)
         XCTAssertEqual(written, "hello from tool")
