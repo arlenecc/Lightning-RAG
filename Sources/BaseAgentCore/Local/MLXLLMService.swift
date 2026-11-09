@@ -1089,6 +1089,7 @@ public final class MLXLLMService: LLMService, PreloadableLLMService,
         }
 
         var calls: [ToolCall] = []
+        var jsonHandled = Set<String>()
         for payload in payloads {
             guard let object = JSONValue.parse(payload)?.objectValue else { continue }
             let function = object["function"]?.objectValue
@@ -1107,8 +1108,18 @@ public final class MLXLLMService: LLMService, PreloadableLLMService,
             }
             let id = object["id"]?.stringValue
                 ?? "call_\(UUID().uuidString.prefix(8))"
+            jsonHandled.insert(payload)
             calls.append(ToolCall(id: id, name: name, arguments: arguments,
                                   rawArguments: JSONValue.object(arguments).jsonString()))
+        }
+        // GLM47 / GLM4 方言：`name<arg_key>k</arg_key><arg_value>v</arg_value>`。
+        // Spark-X2.6 的 chat template 就是这套；库的结构化 parser 要求至少
+        // 一个 <arg_key>，零参数工具会解析失败，文本兜底里一并兼容。
+        // GGUF / ONNX 侧通过 `LocalToolCallParser` 复用同一实现。
+        for payload in payloads where !jsonHandled.contains(payload) {
+            guard let call = LocalToolCallParser.glm4Payload(
+                payload, allowedNames: allowedNames) else { continue }
+            calls.append(call)
         }
         return calls
     }
@@ -1492,6 +1503,11 @@ private actor LLMLoadState {
         if let failure { throw failure }
 
         do {
+            // Spark-X2.6（config.json 的 model_type = spark2_5）是自定义架构，
+            // mlx-swift-lm 内置表里没有；必须在 loadContainer 之前注册 creator，
+            // 否则 ModelTypeRegistry 会抛 unsupportedModelType。注册幂等，
+            // 对其它 model_type 无副作用。
+            await SparkModel.register()
             let container = try await LLMModelFactory.shared.loadContainer(
                 from: directory,
                 using: LocalTokenizerLoader()

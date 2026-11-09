@@ -52,8 +52,8 @@ VARIANT=lite  scripts/package-app.sh release && VARIANT=lite  scripts/package-dm
 
 | VARIANT | 内置模型 | DMG |
 |---|---|---|
-| `clean`（默认） | 无；potion 语义切片 / jina embedding / jina reranker 均在首次启动时从 hf-mirror 自动下载 | `dist/Lightning-RAG-1.3.1-clean.dmg` |
-| `lite` | potion-multilingual-128M int4（语义切片）+ jina-embeddings-v5-text-nano-mlx-int4 + jina-reranker-v2-base-multilingual-onnx | `dist/Lightning-RAG-1.3.1-lite.dmg` |
+| `clean`（默认） | 无；potion 语义切片 / jina embedding / jina reranker 均在首次启动时从 hf-mirror 自动下载 | `dist/Lightning-RAG-1.3.2-clean.dmg` |
+| `lite` | potion-multilingual-128M int4（语义切片）+ jina-embeddings-v5-text-nano-mlx-int4 + jina-reranker-v2-base-multilingual-onnx | `dist/Lightning-RAG-1.3.2-lite.dmg` |
 
 两个版本共用 `dist/Lightning-RAG.app`（应用本体与显示名不变，只有内置模型不同），
 因此需按「打包 App → 打包 DMG」的顺序逐个构建。两个版本都不含主模型、辅助模型
@@ -122,6 +122,8 @@ HTML 与 Office 解析另有专项覆盖：HTML 保存页的本地 iframe / fram
 配置保存在 `~/.base-agent/config.json`，可在配置窗口修改；工作区默认 `~/base-agent-workspace`。
 
 **自定义 system prompt**：首次启动会在 `<workspace>/assets/system_prompt.txt` 写出内置的 `BASE_SYSTEM_PROMPT`；之后每次启动读取该文件并替换内置提示词，可直接用文本编辑器调整模型行为规则，**重启（或重新应用配置）后生效**（会话期间保持不变，以免 system 前缀抖动使 KV cache 反复重建）。文件内容空白或不可读时本次回退内置提示词，且不会覆盖文件。它替换的是协议主体，L0 META-SOP 与 L1 全局索引仍按多级记忆机制追加在其后；轻量轮（纯寒暄/能力问询）使用内核的极简提示，不受该文件影响。内置提示词中的 `<summary>` 标签、`rag_outline` 起手式、工具状态词等是内核回注与测试的硬依赖，建议在原文基础上调整，不要整段删除。
+
+**v1.3.2**：新增 Spark-X2.6 自定义架构的 MLX 与 GGUF 双后端支持。**MLX**：`model_type=spark2_5` 不在 mlx-swift-lm 内置表，应用内手写计算图（headwise sigmoid 输出门、逐层双 RoPE、sliding(512)/full 混合注意力、GEGLU、tied 量化 embedding）并在加载容器前注册 `LLMTypeRegistry`；**GGUF**：llama.cpp 原生识别 `general.architecture=spark2_5`，单文件由 `GGUFFileResolver` 直接解析。两个后端的 `tokenizer.chat_template` 都含 HF 专有 `tojson(separators=(...))`，统一由 `ChatTemplateCompatibility` 去掉该参数；工具调用按 `glm47` → `.glm4` 解析，并把 GLM47 `<arg_key>/<arg_value>`（含零参数）文本兜底抽成 `LocalToolCallParser.glm4Payload` 供三端共用。新增「不回归护栏」：非 Spark 模板逐字不变、既有 JSON / Qwen XML / JSON 围栏解析结果不变、对照 GGUF 元数据模板不变。真机验证覆盖 MLX 4bit 与 GGUF i1-Q4_K_M 的加载生成、thinking、工具调用参数、跨轮 KV、FA+q8_0、warmup 全流程；Qwen3.5 2B/4B GGUF 回归全过。
 
 **v1.3.1**：修复 cnn.com 新闻任务真机复现的「什么都不做、连报 3 次失败直接结束」与「已抓到数据却被一句元标记覆盖」两类回归。**内核**：模型只输出 `<summary>…</summary>` 元标签时不再按空正文重试（旧提示只要求「输出简短正文」，反而诱导继续复述元陈述），改判意图空转并给出可照抄的 `web_scan` 调用参数；3 轮仍不发工具调用时由内核代发一次 `web_scan` 兜底抓取（结果只进下一轮 user 提示，不伪造 `tool_calls`，KV 前缀仍严格对齐），绝不空手结束。**成果核验**：只在至少一次工具真正成功返回时开启；`<review>fix</review>` 等纯元标记、核验轮空输出一律收下上一轮候选；核验轮不再请求级关闭 thinking。**工具**：`web_scan`/`web_render` 接受裸域名（如 `cnn.com`）并自动补 `https://`，其它 scheme 仍被 SSRF 策略拒绝。**性能**：请求级 thinking 覆盖改用可复用的持久 MLX 副本（`kvReuse=true`），避免连续重试每轮全量 prefill（真机约 80s/轮）。系统提示显式禁止「本地 agent 无法访问外部网站」的推诿。新增 8 项 cnn.com 事故回归测试；相关 61 项测试与 release 构建通过。
 
@@ -248,6 +250,8 @@ manifest 条目同时记录 `chunkCount` 与 `complete`：增量跳过前会校�
   - MLX-LM / MLX-VLM：原生内存内推理；
   - GGUF：`LlamaCppLLMService` / `LlamaCppVLMService` 在进程内直接加载权重（Metal GPU offload、Jinja chat template、工具调用、mtmd 多模态），不启动 `llama-server`；Embedding 使用 pooled embedding，Reranker 要求 RANK pooling；
   - ONNX LLM：`ONNXLLMService` 用 onnxruntime-swift 直接运行 decoder 图（`input_ids` / `attention_mask` / `position_ids` + `past_key_values`），支持流式生成与工具调用；ONNX VLM 因缺少通用图适配暂未接入，会明确报错而不是回退 Python。
+  - **Spark-X2.6（自定义架构 `model_type=spark2_5`）**：mlx-swift-lm 内置表没有该架构，应用内 `Sources/BaseAgentCore/Local/SparkModel.swift` 手写配置解码与计算图（headwise sigmoid 输出门、逐层双 RoPE、sliding(512)/full 混合注意力、GEGLU MLP、tied 量化 embedding），并在 `LLMLoadState.container` 加载前注册 `LLMTypeRegistry.shared`。配置窗口把主模型类型选 **MLX-LM**、路径直接填模型目录（如 `/Volumes/SSD/Spark-X2.6-4B-MLX-4bit`）即可。chat template 的 `tojson(separators=(...))` 是 HF Jinja 语法、`swift-jinja` 不支持，`ChatTemplateCompatibility` 会在加载 tokenizer 时自动去掉该关键字参数（仅影响 JSON 空白）；工具调用由 `tokenizer_config.json` 的 `tool_parser_type=glm47` 映射到 `.glm4` 解析，应用侧文本兜底额外兼容零参数的 `<tool_call>name</tool_call>`（上游 `GLM4ToolCallParser` 要求至少一个 `<arg_key>`）。4bit 权重真机验证：加载约 8–11s、thinking 模式工具调用参数正确、跨轮 `token-reuse` 生效。
+  - **Spark-X2.6 GGUF**：`/Volumes/SSD/gguf/Spark-X2.6-4B.i1-Q4_K_M.gguf` 这类单文件由 `GGUFFileResolver` 直接解析，llama.cpp b11815 原生识别 `general.architecture=spark2_5`（sliding/full 混合注意力），配置窗口把主模型类型选 **GGUF**、路径填该 `.gguf` 即可。GGUF 元数据内的 `tokenizer.chat_template` 同样含 `tojson(separators=...)`，`LlamaCppModel` 加载时复用 `ChatTemplateCompatibility.strippingSeparators`；工具调用走 GGUF / ONNX / MLX 共用的 `LocalToolCallParser.glm4Payload`（GLM47 `<arg_key>/<arg_value>`，含零参数形式）。真机验证：加载生成、thinking 流式切分、工具调用参数、跨轮 `seq_rm` trim、FA + q8_0 KV、warmup 全流程均通过。
 - Embedding / Reranker：**onnxruntime-swift**（`OnnxRuntimeBindings`）+ `onnxruntime-swift-package-manager`，或 **mlx-swift-lm** 的 `MLXEmbedders` / `MLXRerankers`，或 GGUF（llama.cpp pooled embedding / RANK pooling）。类型支持 ONNX / FastEmbed / MLX / GGUF。
   - jina-embeddings-v5-text-nano（默认）：MLX int4 与可选 ONNX int8 都不在通用工厂中。`JinaV5MLXModel` 直接读取 `model.safetensors`（兼容 `weights.safetensors`）推理 EuroBERT-210M（双向 attention + last-token pooling）；ONNX 图内完成 last-token + L2。两类后端按 `rag_matryoshka_dim`（默认 128，六档 32 / 64 / 128 / 256 / 512 / 768）截断、**重新 L2 归一化**，元素类型由用户配置（默认 int8，可选 fp32 / fp16 / bin）；文档切片前缀 `Document: `，检索查询前缀 `Query: `（provider 内部只加一次）；provider 内部完成截断，Matryoshka 不再包装；关闭 Matryoshka 时输出原生 768 维。
     二值签名始终取截断前的原生 768 维，与主向量共用同一次前向。

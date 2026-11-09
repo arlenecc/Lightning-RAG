@@ -372,12 +372,59 @@ private func sendableValue(_ value: JSONValue) -> any Sendable {
     }
 }
 
+/// HF chat template 与 `swift-jinja` 的语法兼容层。
+///
+/// Spark-X2.6 的模板为了紧凑 JSON 写了
+/// `tojson(separators=(',', ':'))` / `tojson(separators=(', ', ': '))`。
+/// `swift-jinja` 的 `tojson` 只接受 `indent` 等参数，遇到 `separators`
+/// 会抛 `Unexpected keyword argument 'separators' for filter.` ——
+/// 只要 prompt 带 tools 就会命中，模型连第一次推理都跑不起来。
+/// 补丁只去掉这个关键字参数，JSON 内容等价（仅空白不同）。
+public enum ChatTemplateCompatibility {
+    public static func strippingSeparators(_ template: String) -> String {
+        template.replacingOccurrences(
+            of: #"tojson\s*\(\s*separators\s*=\s*\([^)]*\)\s*\)"#,
+            with: "tojson",
+            options: .regularExpression)
+    }
+
+    /// 仅当模板确实含不兼容语法时返回覆盖用的字面量模板；其它模型
+    /// 继续走 `tokenizer_config.json` 的原生模板，行为零变化。
+    public static func overrideTemplate(in directory: URL) -> String? {
+        let fm = FileManager.default
+        var templates: [String] = []
+        if let data = fm.contents(
+            atPath: directory.appendingPathComponent("chat_template.jinja").path),
+           let text = String(data: data, encoding: .utf8) {
+            templates.append(text)
+        }
+        if let data = fm.contents(
+            atPath: directory.appendingPathComponent("tokenizer_config.json").path),
+           let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+            if let text = json["chat_template"] as? String {
+                templates.append(text)
+            } else if let list = json["chat_template"] as? [String] {
+                templates.append(contentsOf: list)
+            }
+        }
+        for template in templates {
+            let patched = strippingSeparators(template)
+            if patched != template { return patched }
+        }
+        return nil
+    }
+}
+
 /// 把 `swift-transformers` 的 tokenizer 桥接给 `MLXLMCommon`。
 public final class MLXTokenizerBridge: MLXLMCommon.Tokenizer, @unchecked Sendable {
     private let base: any Tokenizers.Tokenizer
+    /// 非 nil 时用字面量模板覆盖 tokenizer_config 里的模板（兼容补丁）。
+    private let chatTemplateOverride: String?
 
-    public init(_ base: any Tokenizers.Tokenizer) {
+    public init(_ base: any Tokenizers.Tokenizer,
+                chatTemplateOverride: String? = nil) {
         self.base = base
+        self.chatTemplateOverride = chatTemplateOverride
     }
 
     public func encode(text: String, addSpecialTokens: Bool) -> [Int] {
@@ -405,11 +452,9 @@ public final class MLXTokenizerBridge: MLXLMCommon.Tokenizer, @unchecked Sendabl
         tools: [[String: any Sendable]]?,
         additionalContext: [String: any Sendable]?
     ) throws -> [Int] {
-        try base.applyChatTemplate(
-            messages: messages,
-            tools: tools,
-            additionalContext: additionalContext
-        )
+        try render(messages: messages, tools: tools,
+                   additionalContext: additionalContext,
+                   addGenerationPrompt: true)
     }
 
     /// 显式控制是否追加 generation prompt。
@@ -422,9 +467,22 @@ public final class MLXTokenizerBridge: MLXLMCommon.Tokenizer, @unchecked Sendabl
         additionalContext: [String: any Sendable]?,
         addGenerationPrompt: Bool
     ) throws -> [Int] {
+        try render(messages: messages, tools: tools,
+                   additionalContext: additionalContext,
+                   addGenerationPrompt: addGenerationPrompt)
+    }
+
+    private func render(
+        messages: [[String: any Sendable]],
+        tools: [[String: any Sendable]]?,
+        additionalContext: [String: any Sendable]?,
+        addGenerationPrompt: Bool
+    ) throws -> [Int] {
         try base.applyChatTemplate(
             messages: messages,
-            chatTemplate: nil,
+            chatTemplate: chatTemplateOverride.map {
+                Tokenizers.ChatTemplateArgument.literal($0)
+            },
             addGenerationPrompt: addGenerationPrompt,
             truncation: false,
             maxLength: nil,
@@ -440,7 +498,9 @@ public struct LocalTokenizerLoader: MLXLMCommon.TokenizerLoader {
 
     public func load(from directory: URL) async throws -> any MLXLMCommon.Tokenizer {
         let tokenizer = try await LocalTokenizer.load(directory: directory)
-        return MLXTokenizerBridge(tokenizer.base)
+        return MLXTokenizerBridge(
+            tokenizer.base,
+            chatTemplateOverride: ChatTemplateCompatibility.overrideTemplate(in: directory))
     }
 }
 

@@ -83,7 +83,12 @@ final class LlamaCppModel: @unchecked Sendable {
         self.path = path
         self.contextTrain = Int(llama_model_n_ctx_train(loaded))
         self.embeddingSize = Int(llama_model_n_embd(loaded))
-        self.chatTemplate = Self.loadChatTemplate(loaded)
+        // HF 模板常用 `tojson(separators=(...))`，swift-jinja 的 tojson 不接受
+        // 该关键字参数，带 tools 渲染会直接抛错（Spark-X2.6 GGUF 实测）。
+        // 与 MLX 侧共用同一补丁，只去掉参数，JSON 内容等价。
+        self.chatTemplate = Self.loadChatTemplate(loaded).map {
+            ChatTemplateCompatibility.strippingSeparators($0)
+        }
     }
 
     deinit {
