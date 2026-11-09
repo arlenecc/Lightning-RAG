@@ -217,6 +217,14 @@ public final class KernelLoop {
     private var stepFails = 0
     private var blockNudge = 0
     private var didWork = false
+    /// 本段是否至少有一次「真正成功」的工具结果。preset 预置失败、调度异常
+    /// 都不算；成果核验反思只能建立在真实数据之上，不能因为「发过工具调用」
+    /// 就把幻觉结论核验通过。
+    private var hasToolSuccess = false
+    /// 意图空转耗尽后由内核代发过一次 web_scan（一段只兜底一次）。
+    private var didFallbackFetch = false
+    /// 兜底抓取拿到的真实内容：模型若仍不给正文，失败说明里也要交付它。
+    private var fallbackToolText = ""
     private var planNudged = 0
     private var planFinishNudge = 0
     /// 连续「只描述计划 / 只声明要开工」却零工具调用的轮数。
@@ -429,6 +437,9 @@ public final class KernelLoop {
         stepFails = 0
         blockNudge = 0
         didWork = false
+        hasToolSuccess = false
+        didFallbackFetch = false
+        fallbackToolText = ""
         planNudged = 0
         planFinishNudge = 0
         intentStall = 0
@@ -669,6 +680,18 @@ public final class KernelLoop {
                 // 根本谈不上「没写计划」「步骤未完成」，旧顺序让空正文先被
                 // planFinish 门白耗 3 次重答，才轮到真正的对症重试。
                 let event = noToolEvent(resp)
+                // 核验轮自己没吐出可见内容时，绝不启动「空正文 3 次重试」链：
+                // 候选答复已经在手，重试只会把「没结果」放大成整轮失败。
+                if event == "retry" && reviewRounds > 0 {
+                    session.finishTurn(rec, assistantText: resp.content,
+                                       summary: l2Summary(resp.content),
+                                       rawContent: resp.rawContent)
+                    finalText = reviewCandidate
+                    finalTurnNoTool = true
+                    exitReason = .done
+                    log("[kernel] 成果核验轮无可见输出，收下上一轮候选")
+                    break
+                }
                 if event == "retry" {
                     // 提交本轮（可能为空回复）：回滚会让下一轮消息前缀与
                     // KV cache 错位（unexpected-assistant 全量重建）。空回复
@@ -714,7 +737,7 @@ public final class KernelLoop {
                 // 而不是让计划静默卡死或"假装完成"）。
                 let visibleNow = stripSummaryTags(resp.content)
                     .trimmingCharacters(in: .whitespacesAndNewlines)
-                if visibleNow.isEmpty {
+                if visibleNow.isEmpty && event != "intent" {
                     markPlanBlocked(reason: "生成连续为空/被截断，未能推进")
                     finalText = "（模型连续 \(maxEmptyRetry) 轮未输出可见正文——"
                         + "通常只有思考且被截断、或思考后未给出正文。本轮已停止，"
@@ -742,8 +765,9 @@ public final class KernelLoop {
                 // 跳过计划门、直接点名真实工具、只要求输出工具调用。
                 // resume（自动续跑）段同样保留意图检测：旧实现用 !resume
                 // 把所有门控一并关掉，续跑段第一句元陈述就被当最终答复。
-                if toolsEnabled, !didWork,
-                   Self.looksLikeIntentOnly(resp.content) {
+                if toolsEnabled,
+                   event == "intent"
+                    || (!didWork && Self.looksLikeIntentOnly(resp.content)) {
                     intentStall += 1
                     // 空转场景也要保证计划面板有内容：多步任务模型零工具调用、
                     // 只描述计划，面板会一直空着，用户只看到「直接失败」。这里
@@ -775,11 +799,18 @@ public final class KernelLoop {
                         let toolList = names.isEmpty
                             ? "web_scan / shell_run / file_read / code_run"
                             : names.prefix(8).joined(separator: " / ")
+                        // 用户明确给了网址时，给出可直接照抄的调用参数：小模型
+                        // 看到精确示例比抽象指令更容易真的发出 tool_call。
+                        let urlExample = Self.firstWebURL(in: userInput).map { url in
+                            "\n可直接照抄这一条（不要改写 URL）："
+                                + "web_scan({\"url\": \"\(url)\"})。"
+                        } ?? ""
                         pending = """
                         [System] 上一条回复只是描述了你打算做什么，没有发出任何工具调用，任务没有任何进展。
                         历史里此前「我要创建计划」「现在开始执行第一步」之类的文字都是无效回复，不要复述它们。
+                        注意：<summary>…</summary> 只是内部摘要，既不是给用户的答复，也不能代替工具调用。
                         现在**跳过 update_plan**，不要再创建计划、不要复述任务、不要输出「我需要」「让我」「现在开始」这类文字。
-                        直接发出一个真实工具调用去获取所需信息，然后基于工具返回结果作答。
+                        直接发出一个真实工具调用去获取所需信息，然后基于工具返回结果作答。\(urlExample)
                         可用工具：\(toolList)。
                         本轮只输出工具调用本身，不要输出其它解释文字。
                         """
@@ -787,9 +818,46 @@ public final class KernelLoop {
                             + "跳过计划门，强制直接调用工具")
                         continue
                     }
+                    // 三次强制之后模型仍不发工具调用，而用户明确给了网址：
+                    // 内核代发一次 web_scan，把真实数据交给模型总结。工具结果
+                    // 只进下一轮 user 提示，不伪造 tool_calls 写进 Session，
+                    // 因此「Session 历史 == KV 缓存 token 序列」不被破坏。
+                    if !didFallbackFetch, event == "intent",
+                       let url = Self.firstWebURL(in: userInput) {
+                        didFallbackFetch = true
+                        let call = ToolCall(id: "", name: "web_scan",
+                                            arguments: ["url": .string(url)])
+                        var fetched: [ToolResult] = []
+                        do {
+                            fetched = try await runtime.execute([call])
+                        } catch {
+                            log("[kernel] 兜底抓取失败：\(describe(error))")
+                        }
+                        if let first = fetched.first, first.success,
+                           !first.output.isEmpty {
+                            fallbackToolText = first.output
+                            didWork = true
+                            let head = String(first.output.prefix(8_000))
+                            pending = """
+                            [System] 内核已代你执行 web_scan 取得真实数据（见下方）。
+                            **不要再调用任何工具，也不要只输出 <summary> 元标签**：
+                            直接基于下面的真实内容，用中文写一份分点的最新新闻总结作为最终答复。
+                            只写真实出现的内容，不要编造标题或数字。
+
+                            \(head)
+                            """
+                            log("[kernel] 意图空转耗尽：内核代发 web_scan 兜底抓取"
+                                + "（\(first.output.count) 字符）")
+                            continue
+                        }
+                    }
                     finalText = "（模型连续 \(maxIntentStall + 1) 轮只描述了计划、"
                         + "没有发出任何工具调用，任务未能执行。请换用工具调用能力更强的模型，"
                         + "或把请求写成明确的单步指令后重试。）"
+                    if !fallbackToolText.isEmpty {
+                        finalText += "\n\n内核已代抓取的页面内容（供参考）：\n"
+                            + String(fallbackToolText.prefix(2_000))
+                    }
                     exitReason = .done
                     log("[kernel] 意图空转已达上限，返回明确失败说明而不是元陈述")
                     break
@@ -886,14 +954,15 @@ public final class KernelLoop {
                 // 成果核验反思：以从业 10 年的资深专家身份审视最终结果，质量
                 // 不达标最多打回 2 次完善。只在「多步任务 + 有实质工作」时开启
                 // ——轻量轮、单步工具操作、简单问答不核验，避免每次收尾白多一轮。
-                if toolsEnabled && didWork && isMultistep(userInput) {
+                if toolsEnabled && didWork && hasToolSuccess
+                    && isMultistep(userInput) {
                     if reviewRounds == 0 {
                         // 第一轮核验：把当前答复记为候选，注入专家核验提示。
-                        // 关闭思考：2B 模型被「专家审视」诱发长思考后常只输出
-                        // thinking 没有正文（真机 3 轮全空），直接出结论更稳。
+                        // 保持默认请求通道：请求级关闭 thinking 会新建
+                        // isolated 副本、丢掉 KV 前缀（真机每轮全量 prefill
+                        // 约 80s）。核验轮无输出/只吐元标记都有收候选保护。
                         reviewCandidate = resp.content
                         reviewRounds = 1
-                        forceNoThinking = true
                         session.finishTurn(rec, assistantText: resp.content,
                                            summary: l2Summary(resp.content),
                                            rawContent: resp.rawContent)
@@ -901,9 +970,15 @@ public final class KernelLoop {
                         log("[kernel] 成果核验反思 1/\(reviewMax)：专家视角审视结果")
                         continue
                     }
-                    if Self.isReviewPass(resp.content) {
-                        // 专家判「通过」：收下上一轮候选，不再纠缠。
+                    if Self.isReviewPass(resp.content)
+                        || Self.isReviewMetaOnly(resp.content) {
+                        // pass 或只吐 `<review>fix</review>` 这类元标记：绝不
+                        // 能把元标记当最终答复（2026-11-09 cnn.com 实测把整份
+                        // 新闻总结覆盖成一句 fix），收下候选。
                         finalText = reviewCandidate
+                        if !Self.isReviewPass(resp.content) {
+                            log("[kernel] 成果核验：模型只输出元标记，收下候选")
+                        }
                     } else if Self.isNoImprovement(reviewCandidate, resp.content) {
                         // 反思没带来实质改进（只是把候选重复堆叠），收下干净的
                         // 单次候选，不再为「完善」而反复刷屏。
@@ -913,7 +988,6 @@ public final class KernelLoop {
                         // 专家给出完善后的答复，再核验一轮。
                         reviewCandidate = resp.content
                         reviewRounds += 1
-                        forceNoThinking = true
                         session.finishTurn(rec, assistantText: resp.content,
                                            summary: l2Summary(resp.content),
                                            rawContent: resp.rawContent)
@@ -1055,6 +1129,12 @@ public final class KernelLoop {
             // 算「做过事」——避免「只调了 update_plan 却被判定为一次工具都没调用」的
             // 误导，也让纯文字收尾时把已 patch 完成的计划正确视为已完成。
             if hasActual || batch.planPatched { didWork = true }
+            // 只有真正成功返回过内容的工具结果才让成果核验门开启：
+            // preset 预置失败 / dispatcher 异常都会让 hasActual 为真，
+            // 但那时「核验」审视的只是幻觉结论。
+            if rawResults.contains(where: { $0.success && !$0.output.isEmpty }) {
+                hasToolSuccess = true
+            }
 
             // ---- 重复调用检测（成功调用也要管）----
             let sigs = toolCalls.map(callSig)
@@ -1673,6 +1753,58 @@ public final class KernelLoop {
         """
     }
 
+    /// 从用户输入里抽出第一个可抓取的 URL（含裸域名），用于意图空转提示
+    /// 给出可照抄的调用参数，以及耗尽时内核代发 `web_scan` 兜底。
+    static func firstWebURL(in text: String) -> String? {
+        let patterns = [
+            "https?://[^\\s，。；、\"'）)]+",
+            "(?:[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?\\.)+[A-Za-z]{2,}"
+                + "(?::[0-9]{1,5})?(?:/[^\\s，。；、\"'）)]*)?",
+        ]
+        // 文件名/扩展名不是网址（「读一下 config.js」「参考 report.pdf」）。
+        let nonWebTLDs: Set<String> = [
+            "js", "ts", "py", "md", "json", "txt", "pdf", "swift", "cpp",
+            "java", "go", "rs", "csv", "xml", "html", "css", "sh", "yml",
+            "yaml", "log", "zip", "png", "jpg",
+        ]
+        for pattern in patterns {
+            guard let match = KernelRegex.matches(
+                pattern, text, options: [.caseInsensitive]).first,
+                  let range = Range(match.range, in: text) else { continue }
+            let candidate = String(text[range])
+            let hostPart = candidate
+                .replacingOccurrences(of: "https://", with: "")
+                .replacingOccurrences(of: "http://", with: "")
+                .split(separator: "/").first ?? ""
+            let tld = String(hostPart.split(separator: ".").last ?? "").lowercased()
+            if nonWebTLDs.contains(tld) { continue }
+            if let url = WebURLPolicy.normalizedURLString(candidate) {
+                return url
+            }
+        }
+        return nil
+    }
+
+    /// 核验轮是否只输出了元标记（`<review>fix</review>`、`pass`、空串），
+    /// 而不是一份可交付的答复。这类输出绝不能覆盖上一轮候选。
+    static func isReviewMetaOnly(_ content: String) -> Bool {
+        let text = stripSummaryTags(content)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty else { return true }
+        let withoutReview = KernelRegex.replace(
+            "<review>[\\s\\S]*?</review>", in: text, with: "",
+            options: [.caseInsensitive])
+        let residual = KernelRegex.replace(
+            tagStripPattern, in: withoutReview, with: " ",
+            options: [.caseInsensitive])
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if residual.isEmpty { return true }
+        let lower = residual.lowercased()
+            .trimmingCharacters(in: CharacterSet(charactersIn: "。，.!！:："))
+        return ["fix", "pass", "revise", "ok", "需要修改", "无需修改"]
+            .contains(lower)
+    }
+
     /// 核验轮模型是否判定「通过」（无需再改）。
     static func isReviewPass(_ content: String) -> Bool {
         let text = stripSummaryTags(content)
@@ -1779,6 +1911,13 @@ public final class KernelLoop {
         let visible = stripSummaryTags(content)
             .trimmingCharacters(in: .whitespacesAndNewlines)
         if visible.isEmpty {
+            // 只有 `<summary>…</summary>` / `<think>…</think>` 等元标签：模型
+            // 描述了「我要调用 web_scan」却既没发工具调用也没写正文。
+            // 这不是「空正文」，按空正文重试会注入「请输出简短正文」并关闭
+            // thinking，反而诱导小模型继续复述元陈述（2026-11-09 cnn.com
+            // 实测连报 3 次失败后空手结束）。交给意图空转门：强制发出真实
+            // 工具调用；URL 任务还会在耗尽时由内核代发 web_scan 兜底。
+            if !content.isEmpty { return "intent" }
             emptyRetry += 1
             return emptyRetry <= maxEmptyRetry ? "retry" : "done"
         }
@@ -1886,6 +2025,9 @@ public final class KernelLoop {
         stepFails = 0
         blockNudge = 0
         didWork = false
+        hasToolSuccess = false
+        didFallbackFetch = false
+        fallbackToolText = ""
         planNudged = 0
         planFinishNudge = 0
         intentStall = 0

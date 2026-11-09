@@ -27,10 +27,44 @@ enum WebURLPolicy {
         return "Blocked: \(host) resolves to a private/loopback address (SSRF protection)."
     }
 
-    /// 字符串入口：解析失败也明确拒绝。
+    /// 把用户/模型常写的裸域名规范化为可请求的 https URL。
+    ///
+    /// 事故背景（2026-11-09 cnn.com）：模型把 `url` 填成 `cnn.com`，工具因缺
+    /// scheme 直接 `.fail`，内核又按「同参数失败」拦截后续重试，用户看到
+    /// 连续 3 次失败、任务什么都没做就结束。补齐 scheme 是工具层该做的事，
+    /// 不能指望小模型每次都记得写 `https://`。
+    /// - 已有 http/https：原样返回（host 必须可解析）；
+    /// - 明确的其它 scheme（file/javascript/ftp…）：返回 nil，不放宽 SSRF；
+    /// - 裸域名（可带端口、路径、查询）：补 `https://`。
+    static func normalizedURLString(_ raw: String) -> String? {
+        let text = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty else { return nil }
+        if text.range(of: "^[a-z][a-z0-9+-]*:",
+                      options: [.regularExpression, .caseInsensitive]) != nil {
+            let scheme = String(text.split(separator: ":", maxSplits: 1).first ?? "")
+                .lowercased()
+            guard scheme == "http" || scheme == "https",
+                  URL(string: text)?.host?.isEmpty == false else { return nil }
+            return text
+        }
+        let domain = "^(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\\.)+[a-z]{2,}"
+            + "(?::[0-9]{1,5})?(?:[/?#][^\\s]*)?$"
+        guard text.range(of: domain,
+                         options: [.regularExpression, .caseInsensitive]) != nil else {
+            return nil
+        }
+        return "https://" + text
+    }
+
+    static func normalizedURL(_ raw: String) -> URL? {
+        guard let text = normalizedURLString(raw) else { return nil }
+        return URL(string: text)
+    }
+
+    /// 字符串入口：先规范化裸域名，再做协议/SSRF 校验。
     static func validate(_ raw: String,
                          allowLoopbackForTesting: Bool = false) -> String? {
-        guard let url = URL(string: raw) else { return "Invalid URL: \(raw)" }
+        guard let url = normalizedURL(raw) else { return "Invalid URL: \(raw)" }
         return rejectionReason(for: url,
                                allowLoopbackForTesting: allowLoopbackForTesting)
     }
@@ -57,7 +91,9 @@ public final class WebScanTool: AgentTool, ShutdownableTool {
     public var parameters: JSONValue {
         ToolSupport.objectSchema(
             properties: [
-                "url": ToolSupport.stringProperty("http/https URL to fetch."),
+                "url": ToolSupport.stringProperty(
+                    "URL to fetch. A bare domain such as cnn.com is accepted "
+                    + "and https:// is added automatically."),
                 "raw": ToolSupport.boolProperty(
                     "Return raw HTML instead of extracted text (default false)."),
                 "render": ToolSupport.stringProperty(
@@ -89,10 +125,8 @@ public final class WebScanTool: AgentTool, ShutdownableTool {
     public func run(_ args: [String: JSONValue]) async throws -> ToolResult {
         do {
             let urlText = try ToolSupport.requireString(args, "url")
-            // 协议白名单：防止 file:// 读取本地文件或探测内网。
-            let lowered = urlText.lowercased()
-            guard lowered.hasPrefix("http://") || lowered.hasPrefix("https://"),
-                  let url = URL(string: urlText) else {
+            // 协议白名单：防止 file:// 读取本地文件或探测内网；裸域名补 https。
+            guard let url = WebURLPolicy.normalizedURL(urlText) else {
                 return .fail("Only http/https URLs are supported: \(String(urlText.prefix(80)))")
             }
 
@@ -986,7 +1020,9 @@ public final class WebRenderTool: AgentTool, ShutdownableTool {
         if let error = Self.validateURL(rawURL) {
             return .fail(error)
         }
-        guard let url = URL(string: rawURL) else { return .fail("Invalid URL") }
+        guard let url = WebURLPolicy.normalizedURL(rawURL) else {
+            return .fail("Invalid URL")
+        }
 
         let waitMS = max(0, min(Int(Double(ToolSupport.string(args, "wait_ms")) ?? 1500), 30_000))
         let waitSelector = ToolSupport.string(args, "wait_selector")

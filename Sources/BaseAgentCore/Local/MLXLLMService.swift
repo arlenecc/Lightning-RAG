@@ -64,6 +64,12 @@ public final class MLXLLMService: LLMService, PreloadableLLMService,
     /// prefill 好的前缀；否则并发 prefill 会踩踏 GPU 并让首轮全量重建。
     private let warmupLock = NSLock()
     private var activeWarmup: Task<Void, Error>?
+    /// 请求级 thinking 覆盖用的持久副本（按 thinking 值缓存）。
+    /// 旧实现每次 options 调用都新建副本且 `kvReuse=false`：连续 3 次空正文
+    /// 重试就是 3 次全量 prefill（4B 模型真机实测约 80s/次）。副本与主服务
+    /// 各自持有独立 KV/轨迹，缓存它不会污染常驻会话。
+    private let thinkingCopyLock = NSLock()
+    private var thinkingCopies: [Bool: MLXLLMService] = [:]
 
     private func setActiveWarmup(_ task: Task<Void, Error>?) {
         warmupLock.lock(); activeWarmup = task; warmupLock.unlock()
@@ -107,7 +113,8 @@ public final class MLXLLMService: LLMService, PreloadableLLMService,
     /// 共享已加载权重的轻量副本：独立持有 KV/session，用于并行的一次性请求。
     ///
     /// 只有 `state` 共享；`rawCache`、会话轨迹等仍各自独立，因此不会互相污染。
-    private init(sharing other: MLXLLMService, enableThinking: Bool) {
+    private init(sharing other: MLXLLMService, enableThinking: Bool,
+                 kvReuse: Bool = false) {
         self.directory = other.directory
         self.modelName = other.modelName
         self.identifier = other.identifier
@@ -119,8 +126,9 @@ public final class MLXLLMService: LLMService, PreloadableLLMService,
         self.enableThinking = enableThinking
         self.contextWindow = other.contextWindow
         self.promptBatchSize = other.promptBatchSize
-        // 一次性请求不能复用其它分片的 KV，也不能把半截历史留给下一次调用。
-        self.kvReuse = false
+        // 一次性并行请求不能复用其它分片的 KV；持久的 thinking 副本则允许
+        // 在自己独立的轨迹上跨轮复用。
+        self.kvReuse = kvReuse
         self.kvInt8 = other.kvInt8
         self.state = other.state
     }
@@ -657,8 +665,27 @@ public final class MLXLLMService: LLMService, PreloadableLLMService,
         guard options.isolated || thinking != enableThinking else {
             return chatStream(messages: messages, tools: tools, temperature: temperature)
         }
-        let isolated = MLXLLMService(sharing: self, enableThinking: thinking)
-        return isolated.chatStream(messages: messages, tools: tools, temperature: temperature)
+        if options.isolated {
+            // 并行摘要分片：一次性副本，不保留半截历史污染其它请求。
+            let isolated = MLXLLMService(sharing: self, enableThinking: thinking)
+            return isolated.chatStream(messages: messages, tools: tools,
+                                       temperature: temperature)
+        }
+        // 仅覆盖 thinking（空正文重试等）：复用持久副本。它与主服务各自
+        // 持有独立 KV/轨迹，但副本内部允许跨轮前缀复用，避免每次重试都
+        // 重跑整段 prefill。
+        thinkingCopyLock.lock()
+        let copy: MLXLLMService
+        if let existing = thinkingCopies[thinking] {
+            copy = existing
+        } else {
+            copy = MLXLLMService(sharing: self, enableThinking: thinking,
+                                 kvReuse: true)
+            thinkingCopies[thinking] = copy
+        }
+        thinkingCopyLock.unlock()
+        return copy.chatStream(messages: messages, tools: tools,
+                               temperature: temperature)
     }
 
     // MARK: - 加载 / 卸载
@@ -872,6 +899,9 @@ public final class MLXLLMService: LLMService, PreloadableLLMService,
     /// 销毁并发，触发 Metal 断言或 SIGSEGV。
     public func unloadAndWait() async {
         invalidateKVCache()
+        thinkingCopyLock.lock()
+        thinkingCopies.removeAll()
+        thinkingCopyLock.unlock()
         warmupCacheSnapshot = nil
         warmupStateSnapshot = nil
         warmupTokens = []
@@ -898,6 +928,12 @@ public final class MLXLLMService: LLMService, PreloadableLLMService,
         sessionTranscript = []
         pendingGeneratedAssistant = false
         cachedToolsKey = nil
+        // 历史被折叠/回滚/换模型时，副本的轨迹同样失效；副本字典为空，
+        // 不会递归回主服务。
+        thinkingCopyLock.lock()
+        let copies = Array(thinkingCopies.values)
+        thinkingCopyLock.unlock()
+        for copy in copies { copy.invalidateKVCache() }
     }
 
     // MARK: - 批量摘要
