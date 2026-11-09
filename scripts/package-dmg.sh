@@ -8,7 +8,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-VERSION="${VERSION:-${1:-1.3.2}}"
+VERSION="${VERSION:-${1:-1.3.3}}"
 VARIANT="${VARIANT:-clean}"
 case "$VARIANT" in
   clean) LABEL="Clean" ;;

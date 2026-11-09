@@ -103,6 +103,43 @@ enum LocalToolCallParser {
                         rawArguments: JSONValue.object(arguments).jsonString())
     }
 
+    /// 仅用于 MLX 的 `.glm4` 被拒事件：从 `RejectedToolCall.rawTextPreview`
+    /// 恢复上游 `GLM4ToolCallParser` 因「零参数」误拒的调用。
+    ///
+    /// 调用方必须先确认 `rejected.format == .glm4`；`glm4Payload` 的守卫
+    /// 保证 JSON / Qwen XML / 普通正文一律不恢复。新增方法，不改动
+    /// `extract` 与 `glm4Payload` 的既有行为。
+    static func recoverGLM4(from raw: String,
+                            allowedNames: Set<String>) -> [ToolCall] {
+        guard !raw.isEmpty, !allowedNames.isEmpty else { return [] }
+        var payloads: [String] = []
+        if let regex = try? NSRegularExpression(
+            pattern: "<tool_call>\\s*([\\s\\S]*?)\\s*</tool_call>",
+            options: [.dotMatchesLineSeparators]) {
+            let range = NSRange(raw.startIndex..<raw.endIndex, in: raw)
+            for match in regex.matches(in: raw, options: [], range: range) {
+                guard match.numberOfRanges > 1,
+                      let payloadRange = Range(match.range(at: 1), in: raw) else { continue }
+                let text = String(raw[payloadRange])
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                if !text.isEmpty { payloads.append(text) }
+            }
+        }
+        // 预览可能只有开始标签（EOS 前被截断）：整段再试一次，
+        // 由 glm4Payload 的纯工具名守卫决定是否放行。
+        if payloads.isEmpty {
+            payloads.append(raw.trimmingCharacters(in: .whitespacesAndNewlines))
+        }
+        var calls: [ToolCall] = []
+        var seen = Set<String>()
+        for payload in payloads where seen.insert(payload).inserted {
+            if let call = glm4Payload(payload, allowedNames: allowedNames) {
+                calls.append(call)
+            }
+        }
+        return calls
+    }
+
     // MARK: - JSON
 
     private static func callsFromJSON(_ value: JSONValue,

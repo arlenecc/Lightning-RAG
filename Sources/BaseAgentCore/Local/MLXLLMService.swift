@@ -467,6 +467,9 @@ public final class MLXLLMService: LLMService, PreloadableLLMService,
                     var rawContent = probe.generationPrefix
                     var collectedCalls: [ToolCall] = []
                     var rejectedDetail: String?
+                    /// 仅 `.glm4` 格式：上游 parser 会把零参数调用误拒，
+                    /// 库在 rawTextPreview 里保留了原文，收尾时按 GLM47 恢复。
+                    var glm4RejectedPreviews: [String] = []
                     var usage: [String: Int] = [:]
 
                     for await generation in stream {
@@ -500,6 +503,10 @@ public final class MLXLLMService: LLMService, PreloadableLLMService,
                             // 先记录，流结束后再尝试文本解析兜底。
                             let name = rejected.toolName.map { "（工具：\($0)）" } ?? ""
                             rejectedDetail = name + (rejected.detail ?? rejected.reason.rawValue)
+                            // 严格限定 GLM4：其它格式的被拒事件行为完全不变。
+                            if rejected.format == .glm4 {
+                                glm4RejectedPreviews.append(rejected.rawTextPreview)
+                            }
 
                         case .info(let info):
                             let promptTokens = cachedPromptTokens + info.promptTokenCount
@@ -545,6 +552,22 @@ public final class MLXLLMService: LLMService, PreloadableLLMService,
                     if finalCalls.isEmpty {
                         finalCalls = Self.extractTextToolCalls(
                             rawContent, allowedNames: allowedToolNames)
+                    }
+                    // 仅 GLM4：上游 GLM4ToolCallParser 要求至少一个 <arg_key>，
+                    // Spark-X2.6 的零参数工具（<tool_call>name</tool_call>）会被
+                    // 误判为 malformedSyntax。库把完整 payload 保留在
+                    // RejectedToolCall.rawTextPreview，这里按 GLM47 方言恢复；
+                    // 恢复成功即 truncated=false，内核不再注入「工具调用被截断」
+                    // 的误导提示，也不会关思考、清空 KV 重复全量 prefill。
+                    if finalCalls.isEmpty, !glm4RejectedPreviews.isEmpty {
+                        for preview in glm4RejectedPreviews {
+                            finalCalls.append(contentsOf: LocalToolCallParser.recoverGLM4(
+                                from: preview, allowedNames: allowedToolNames))
+                        }
+                        if !finalCalls.isEmpty {
+                            AgentLog.info("[mlx] glm4 恢复零参数工具调用 "
+                                + "count=\(finalCalls.count)")
+                        }
                     }
                     // 框架拒绝了工具调用、文本兜底也提不出完整调用时，视为生成被
                     // 截断：不直接失败终止本轮，交给内核按「截断」重试。

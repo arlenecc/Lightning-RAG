@@ -310,4 +310,48 @@ final class SparkX26ModelTests: XCTestCase {
         XCTAssertEqual(calls.first?.arguments["timezone"]?.stringValue,
                        "Asia/Shanghai")
     }
+
+    /// 真机复现「你知识库里有什么」：零参数工具 `rag_status` 曾被上游
+    /// GLM4ToolCallParser 误判为 malformedSyntax，导致整轮「工具调用未完成」
+    /// 并连续三轮全量重建。恢复后必须是正常的、非截断的工具调用。
+    func testZeroArgumentToolCallIsRecovered() async throws {
+        let dir = try modelDirectory()
+        let service = MLXLLMService(
+            directory: dir, modelName: dir.lastPathComponent,
+            maxTokens: 256, topP: 1, minP: 0, topK: 0, repetitionPenalty: 1,
+            enableThinking: true, contextWindow: 4096)
+        defer { service.close() }
+        let tool: BaseAgentCore.JSONValue = .object([
+            "type": .string("function"),
+            "function": .object([
+                "name": .string("rag_status"),
+                "description": .string("检查知识库索引状态。"),
+                "parameters": .object([
+                    "type": .string("object"),
+                    "properties": .object([:]),
+                ]),
+            ]),
+        ])
+        var calls: [BaseAgentCore.ToolCall] = []
+        var truncated = true
+        for try await event in service.chatStream(
+            messages: [
+                ChatMessage(role: .system,
+                            content: "You are a helpful assistant. Always use the provided tool."),
+                ChatMessage(role: .user,
+                            content: "检查知识库状态，只输出 rag_status 工具调用。"),
+            ],
+            tools: [tool], temperature: 0) {
+            if case .done = event.kind {
+                calls = event.toolCalls
+                truncated = event.truncated
+            }
+        }
+        FileHandle.standardError.write(Data(
+            ("[spark-x26][zero-arg] calls=\(calls) truncated=\(truncated)\n").utf8))
+        XCTAssertFalse(truncated, "零参数调用恢复后不能再被判为截断")
+        XCTAssertFalse(calls.isEmpty, "零参数工具必须恢复成可执行调用")
+        XCTAssertEqual(calls.first?.name, "rag_status")
+        XCTAssertTrue(calls.first?.arguments.isEmpty ?? false)
+    }
 }

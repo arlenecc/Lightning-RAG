@@ -229,8 +229,11 @@ enum LlamaCppPromptRenderer {
                 "模型没有 tokenizer.chat_template，无法按对话格式生成（\(model.path)）")
         }
 
+        let needsMappingArguments = Self.templateNeedsMappingToolArguments(template)
         var context: [String: Jinja.Value] = [
-            "messages": .array(messages.map(messageValue)),
+            "messages": .array(messages.map {
+                messageValue($0, dictionaryToolArguments: needsMappingArguments)
+            }),
             "add_generation_prompt": .boolean(addGenerationPrompt),
             "enable_thinking": .boolean(enableThinking),
         ]
@@ -250,6 +253,16 @@ enum LlamaCppPromptRenderer {
             throw LlamaCppError.template(
                 "\(error.localizedDescription)（\(String(describing: error))）")
         }
+    }
+
+    /// 只有会遍历 `args.items()` 或显式要求 mapping 的模板（Spark-X2.6 /
+    /// GLM47）需要把历史 `tool_calls` 的参数传成字典：这类模板对字符串参数
+    /// 会直接 `raise_exception('... must be a dictionary')`。
+    /// ChatML / Qwen / Llama 等模板把 arguments 当字符串原样输出，必须保持
+    /// `.string`，否则会改变其它模型的渲染结果。
+    static func templateNeedsMappingToolArguments(_ template: String) -> Bool {
+        template.contains("<arg_key>")
+            && (template.contains("is not mapping") || template.contains(".items()"))
     }
 
     /// `add_generation_prompt` 追加的文本里，assistant 角色标记之后的部分。
@@ -278,7 +291,10 @@ enum LlamaCppPromptRenderer {
         return String(suffix[end...])
     }
 
-    private static func messageValue(_ message: ChatMessage) -> Jinja.Value {
+    private static func messageValue(
+        _ message: ChatMessage,
+        dictionaryToolArguments: Bool
+    ) -> Jinja.Value {
         var dictionary: [String: Jinja.Value] = [
             "role": .string(message.role.rawValue),
             "content": .string(message.content),
@@ -291,15 +307,27 @@ enum LlamaCppPromptRenderer {
         }
         if let toolCalls = message.toolCalls, !toolCalls.isEmpty {
             dictionary["tool_calls"] = .array(toolCalls.map { call in
-                let arguments = call.rawArguments.isEmpty
+                let raw = call.rawArguments.isEmpty
                     ? JSONValue.object(call.arguments).jsonString()
                     : call.rawArguments
+                let argumentsValue: Jinja.Value
+                if dictionaryToolArguments {
+                    // Spark/GLM47 模板要求 `tool_call.function.arguments`
+                    // 是 mapping；优先按 rawArguments 还原，解析失败回退
+                    // 已结构化的 arguments，保证一定是 .object。
+                    let fields = JSONValue.parse(raw)?.objectValue ?? call.arguments
+                    var object: [String: Jinja.Value] = [:]
+                    for (key, value) in fields { object[key] = jinjaValue(value) }
+                    argumentsValue = .object(object)
+                } else {
+                    argumentsValue = .string(raw)
+                }
                 return .object([
                     "id": .string(call.id),
                     "type": .string("function"),
                     "function": .object([
                         "name": .string(call.name),
-                        "arguments": .string(arguments),
+                        "arguments": argumentsValue,
                     ]),
                 ])
             })
