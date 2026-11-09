@@ -186,4 +186,78 @@ final class WebScanHintTests: XCTestCase {
         XCTAssertTrue(hint.contains("azure-search-ui-settings.min.js"))
     }
 
+    // MARK: - htmlToText 清洗增强
+
+    func testHtmlToTextDropsInlineHiddenSubtree() {
+        // 内联 display:none 的子树应被剔除，保留可见正文。
+        let html = """
+        <html><body><h1>标题</h1>
+        <div style="display:none">隐藏的垃圾广告文案 should be dropped</div>
+        <p>可见正文内容</p>
+        <div style="visibility:hidden">also hidden</div>
+        </body></html>
+        """
+        let content = ToolSupport.htmlToText(html)
+        XCTAssertTrue(content.contains("标题"))
+        XCTAssertTrue(content.contains("可见正文内容"))
+        XCTAssertFalse(content.contains("隐藏的垃圾广告文案"))
+        XCTAssertFalse(content.contains("also hidden"))
+    }
+
+    func testHtmlToTextDropsAriaHidden() {
+        let html = """
+        <html><body><p>保留</p>
+        <span aria-hidden="true">屏幕阅读器专用，视觉不可见</span>
+        </body></html>
+        """
+        let content = ToolSupport.htmlToText(html)
+        XCTAssertTrue(content.contains("保留"))
+        XCTAssertFalse(content.contains("屏幕阅读器专用"))
+    }
+
+    func testHtmlToTextAnnotatesFormControls() {
+        let html = """
+        <html><body><form>
+        <input id="kw" name="keyword" type="text" placeholder="输入关键词">
+        <input type="checkbox" checked> 订阅
+        <select id="cat" name="category"><option>技术</option><option>财经</option></select>
+        <input type="hidden" name="token" value="abc">
+        </form></body></html>
+        """
+        let content = ToolSupport.htmlToText(html)
+        XCTAssertTrue(content.contains("[input #kw name=keyword type=text \"输入关键词\"]"))
+        XCTAssertTrue(content.contains("[input type=checkbox checked]"))
+        XCTAssertTrue(content.contains("options=[技术, 财经]"))
+        // 纯隐藏域不应产生标注。
+        XCTAssertFalse(content.contains("type=hidden"))
+    }
+
+    func testHtmlToTextDropsNoiseTags() {
+        // svg / meta / link 等噪音应被剔除，正文保留。
+        let html = """
+        <html><head><meta name="desc" content="x"><link rel="icon" href="a.ico"></head>
+        <body><p>正文</p>
+        <svg viewBox="0 0 10 10"><path d="M0 0"/></svg>
+        <script>var a=1;</script>
+        </body></html>
+        """
+        let content = ToolSupport.htmlToText(html)
+        XCTAssertTrue(content.contains("正文"))
+        XCTAssertFalse(content.contains("viewBox"))
+        XCTAssertFalse(content.contains("var a=1"))
+        XCTAssertFalse(content.contains("name=\"desc\""))
+    }
+
+    func testHtmlToTextBlockNewlinesSeparateSections() {
+        // 块级元素之间应换行，标题与段落不应粘连成一行。
+        let html = "<html><body><h2>Heading</h2><p>First paragraph.</p>"
+            + "<p>Second paragraph.</p></body></html>"
+        let content = ToolSupport.htmlToText(html)
+        let lines = content.components(separatedBy: "\n").filter { !$0.isEmpty }
+        XCTAssertGreaterThanOrEqual(lines.count, 3)
+        XCTAssertTrue(lines.contains(where: { $0.contains("Heading") }))
+        XCTAssertTrue(lines.contains(where: { $0.contains("First paragraph.") }))
+        XCTAssertTrue(lines.contains(where: { $0.contains("Second paragraph.") }))
+    }
+
 }

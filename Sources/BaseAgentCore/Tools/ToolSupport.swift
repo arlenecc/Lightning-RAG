@@ -465,7 +465,11 @@ public enum ToolSupport {
 
     // MARK: HTML / Markdown 文本化
 
-    /// SwiftSoup 提取网页可见正文：移除 script/style/noscript，按块级元素换行。
+    /// SwiftSoup 提取网页可见正文：移除脚本/样式等噪音标签，按内联样式与
+    /// `aria-hidden` 启发式剔除隐藏子树，按块级元素换行，并把表单控件标注成
+    /// `[input #id name= type= "placeholder"]` 形式——参考 simphtml.py 的可见性
+    /// 与表单态保留思路，但只在静态解析能可靠判断的范围内做（真实布局可见性
+    /// 交给 WebKit 渲染路径负责）。
     public static func htmlToText(_ html: String, maxChars: Int = maxParseChars) -> String {
         // 超长页面（如 cnn.com 首页 5.9MB）的开头是巨大的 <head>/预加载清单，
         // 直接按字符截断会把正文体整体截出解析窗口、提取结果为空，进而被
@@ -478,7 +482,7 @@ public enum ToolSupport {
         guard let document = try? SwiftSoup.parse(window) else {
             return normalizeLines(stripTags(window))
         }
-        _ = try? document.select("script, style, noscript").remove()
+        pruneHTMLDocument(document)
 
         var lines: [String] = []
         var current = ""
@@ -492,6 +496,38 @@ public enum ToolSupport {
         let text = normalizeLines(lines.joined(separator: "\n"))
         if !text.isEmpty { return text }
         return normalizeLines((try? document.text()) ?? stripTags(window))
+    }
+
+    /// 解析前的 DOM 裁剪：移除噪音标签与隐藏子树，让正文提取少背垃圾。
+    /// - 噪音标签：script/style/noscript/meta/link/template/colgroup/col/param/
+    ///   source/head/title/svg（svg 内联路径/图形对文本提取无价值）；
+    /// - 隐藏：`aria-hidden="true"`，或内联 `style` 里 `display:none` /
+    ///   `visibility:hidden` / `opacity:0`（静态解析无法算布局，只认内联声明）。
+    private static func pruneHTMLDocument(_ doc: Document) {
+        let _ = try? doc.select(
+            "script, style, noscript, meta, link, template, colgroup, col, param, source, "
+            + "head, title, svg").remove()
+        if let hidden = try? doc.select("[aria-hidden='true']") {
+            for el in hidden { let _ = try? el.remove() }
+        }
+        // 内联隐藏：先收集候选再逐个移除（移除父节点会让子节点脱离，但
+        // SwiftSoup 的 Elements 是独立快照，重复 remove 是安全的 no-op）。
+        guard let all = try? doc.select("*") else { return }
+        for el in all {
+            guard let style = try? el.attr("style"), !style.isEmpty else { continue }
+            let s = style.lowercased().replacingOccurrences(of: " ", with: "")
+            if s.contains("display:none") || s.contains("visibility:hidden") {
+                let _ = try? el.remove()
+                continue
+            }
+            if let m = s.range(of: #"opacity:([0-9]*\.?[0-9]+)"#, options: .regularExpression),
+               let value = Double(s[m].replacingOccurrences(of: "opacity", with: "")
+                                        .replacingOccurrences(of: ":", with: "")
+                                        .replacingOccurrences(of: " ", with: "")),
+               value <= 0 {
+                let _ = try? el.remove()
+            }
+        }
     }
 
     /// 列表页 / SPA 动态加载检测：提取正文过短，或正文虽长但主体只是加载占位时，
@@ -748,9 +784,30 @@ public enum ToolSupport {
         }
         guard let element = node as? Element else { return }
         let tag = element.tagName().lowercased()
-        if ["script", "style", "noscript"].contains(tag) { return }
+        // 已在 pruneHTMLDocument 里清掉；这里再兜底一次，避免遗漏。
+        if ["script", "style", "noscript", "meta", "link", "template",
+            "colgroup", "col", "param", "source", "head", "title", "svg"].contains(tag) {
+            return
+        }
         if tag == "br" {
             current += "\n"
+            return
+        }
+        if tag == "hr" {
+            current += "\n----\n"
+            return
+        }
+        // 表单控件：标注成单行 `[input #id name= type= "placeholder"]`，
+        // 把运行态相关信息（勾选/选中值）保留给模型，而不是整段丢掉。
+        if tag == "input" || tag == "textarea" || tag == "select" {
+            if let annotation = formControlAnnotation(element) {
+                flushHTMLText(&current, lines: &lines)
+                lines.append(annotation)
+            }
+            if tag == "textarea",
+               let value = try? element.text(), !value.isEmpty {
+                lines.append(value)
+            }
             return
         }
         let isBlock = htmlBlockTags.contains(tag)
@@ -759,6 +816,43 @@ public enum ToolSupport {
             collectHTMLText(child, lines: &lines, current: &current)
         }
         if isBlock { flushHTMLText(&current, lines: &lines) }
+    }
+
+    /// 把表单控件压成一行标注；返回 nil 表示该控件无需输出（如隐藏域 type=hidden）。
+    private static func formControlAnnotation(_ el: Element) -> String? {
+        let tag = el.tagName().lowercased()
+        // 隐藏域（CSRF token 等）对用户不可见、对模型无意义，直接跳过。
+        let type = (tag == "input") ? ((try? el.attr("type"))?.lowercased() ?? "text") : nil
+        if tag == "input", type == "hidden" { return nil }
+        var parts: [String] = [tag]
+        if let id = try? el.id(), !id.isEmpty { parts.append("#\(id)") }
+        if let name = try? el.attr("name"), !name.isEmpty { parts.append("name=\(name)") }
+        if tag == "input", let type {
+            parts.append("type=\(type)")
+        }
+        if let ph = try? el.attr("placeholder"), !ph.isEmpty { parts.append("\"\(ph)\"") }
+        if let disabled = try? el.attr("disabled"), !disabled.isEmpty {
+            parts.append("disabled")
+        }
+        if tag == "select" {
+            if let sel = try? el.attr("data-selected"), !sel.isEmpty {
+                parts.append("=\"\(sel)\"")
+            } else if let opts = try? el.select("option") {
+                let labels = opts.compactMap { try? $0.text() }
+                    .filter { !$0.trimmingCharacters(in: .whitespaces).isEmpty }
+                    .prefix(12)
+                if !labels.isEmpty {
+                    parts.append("options=[\(labels.joined(separator: ", "))]")
+                }
+            }
+        }
+        if tag == "input",
+           let type, (type == "checkbox" || type == "radio"),
+           el.hasAttr("checked"),
+           (try? el.attr("checked"))?.lowercased() != "false" {
+            parts.append("checked")
+        }
+        return "[\(parts.joined(separator: " "))]"
     }
 
     private static func flushHTMLText(_ current: inout String, lines: inout [String]) {
@@ -771,10 +865,11 @@ public enum ToolSupport {
     }
 
     private static let htmlBlockTags: Set<String> = [
-        "p", "div", "section", "article", "header", "footer", "aside", "main",
+        "p", "div", "section", "article", "header", "footer", "aside", "main", "nav",
         "h1", "h2", "h3", "h4", "h5", "h6", "ul", "ol", "li", "dl", "dt", "dd",
         "table", "thead", "tbody", "tfoot", "tr", "td", "th", "pre", "blockquote",
         "figure", "figcaption", "form", "fieldset", "address",
+        "details", "summary", "hr",
     ]
 
     /// 极简标签剥离（SwiftSoup 解析失败时的兜底）。

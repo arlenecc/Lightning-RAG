@@ -107,6 +107,71 @@ final class WebRenderer: @unchecked Sendable {
     })();
     """
 
+    /// 渲染后正文清洗（参考 simphtml.py 的 optHTML text_only 思路）：用真实渲染
+    /// DOM 的 `getComputedStyle` + `getBoundingClientRect` 判定可见性，剔除
+    /// `display:none` / `visibility:hidden` / `opacity<=0` / 离屏的隐藏弹窗与
+    /// 折叠菜单；内联同源 iframe 与 shadow DOM 内容；把表单控件注解成
+    /// `[input #id name= type= "placeholder"]`；按块级元素换行。
+    /// 比裸 `innerText` 更能丢掉广告、隐藏 modal、未激活 tab 等垃圾信息。
+    private static let cleanTextScript = """
+    (function () {
+      function isHidden(el) {
+        try {
+          var s = window.getComputedStyle(el);
+          if (s.display === 'none' || s.visibility === 'hidden' || parseFloat(s.opacity) <= 0) return true;
+          var r = el.getBoundingClientRect();
+          if (r.width < 1 || r.height < 1) return true;
+          if (Math.abs(r.left) > 5000 || Math.abs(r.top) > 5000) return true;
+        } catch (e) {}
+        return false;
+      }
+      var BLOCK = ['DIV','P','H1','H2','H3','H4','H5','H6','LI','TR','SECTION','ARTICLE','HEADER','FOOTER','NAV','BLOCKQUOTE','PRE','HR','BR','DT','DD','FIGCAPTION','DETAILS','SUMMARY','UL','OL','TABLE','FIELDSET','ASIDE','MAIN'];
+      var out = [];
+      function walk(node) {
+        if (!node) return;
+        var t = node.nodeType;
+        if (t === 3) { var txt = node.textContent.replace(/\\s+/g, ' '); if (txt.trim()) out.push(txt); return; }
+        if (t !== 1) return;
+        var tag = node.tagName;
+        if (tag === 'SCRIPT' || tag === 'STYLE' || tag === 'NOSCRIPT' || tag === 'META' || tag === 'LINK' || tag === 'TEMPLATE' || tag === 'COLGROUP' || tag === 'COL' || tag === 'PARAM' || tag === 'SOURCE' || tag === 'HEAD' || tag === 'TITLE' || tag === 'SVG') return;
+        if (tag === 'BR') { out.push('\\n'); return; }
+        if (tag === 'HR') { out.push('\\n----\\n'); return; }
+        if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') {
+          var p = [tag];
+          if (node.id) p.push('#' + node.id);
+          var nm = node.getAttribute('name'); if (nm) p.push('name=' + nm);
+          if (tag === 'INPUT') p.push('type=' + (node.getAttribute('type') || 'text'));
+          var ph = node.getAttribute('placeholder'); if (ph) p.push('"' + ph + '"');
+          if (node.disabled) p.push('disabled');
+          if (tag === 'SELECT') {
+            var sel = node.getAttribute('data-selected');
+            if (!sel && node.value && node.selectedIndex >= 0) {
+              try { sel = node.options[node.selectedIndex].text; } catch (e) {}
+            }
+            if (sel) p.push('="' + sel + '"');
+          }
+          if (tag === 'INPUT' && (node.type === 'checkbox' || node.type === 'radio') && node.checked) p.push('checked');
+          out.push('\\n[' + p.join(' ') + ']\\n');
+          if (tag === 'TEXTAREA' && node.value) out.push(node.value);
+          return;
+        }
+        if (isHidden(node)) return;
+        if (BLOCK.indexOf(tag) >= 0) out.push('\\n');
+        if (tag === 'IFRAME') {
+          try {
+            var d = node.contentDocument || (node.contentWindow && node.contentWindow.document);
+            if (d && d.body) walk(d.body);
+          } catch (e) {}
+          return;
+        }
+        if (node.shadowRoot) { for (var i = 0; i < node.shadowRoot.childNodes.length; i++) walk(node.shadowRoot.childNodes[i]); return; }
+        for (var i = 0; i < node.childNodes.length; i++) walk(node.childNodes[i]);
+      }
+      walk(document.body);
+      return out.join('').replace(/[ \\t]+/g, ' ').replace(/\\n[ \\t]*/g, '\\n').replace(/\\n{3,}/g, '\\n\\n').trim();
+    })()
+    """
+
     /// 渲染任务串行化（复用同一个 WKWebView；NSLock 不能跨 await 持有）。
     private let serial = AsyncSemaphore(value: 1)
 
@@ -394,14 +459,22 @@ final class WebRenderer: @unchecked Sendable {
                                         maxWait: maxContentWait)
         }
 
-        // 3. 提取正文（innerText 为空时回退 textContent，覆盖部分隐藏布局）。
+        // 3. 提取正文：优先用可见性感知的清洗脚本（剔除隐藏弹窗/广告、内联
+        //    iframe、标注表单控件）；脚本失败再回退到裸 innerText。
         var outcome = Outcome()
-        outcome.text = (try? await withTimeout(15, "正文提取") {
-            try await self.evaluate(
-                "(document.body ? document.body.innerText : '') "
-                    + "|| (document.body ? document.body.textContent : '')",
-                webView: webView) as? String
-        }) ?? ""
+        let cleaned: String? = try? await withTimeout(15, "正文清洗") {
+            try await self.evaluate(Self.cleanTextScript, webView: webView) as? String
+        }
+        if let cleaned, !cleaned.isEmpty {
+            outcome.text = cleaned
+        } else {
+            outcome.text = (try? await withTimeout(15, "正文提取") {
+                try await self.evaluate(
+                    "(document.body ? document.body.innerText : '') "
+                        + "|| (document.body ? document.body.textContent : '')",
+                    webView: webView) as? String
+            }) ?? ""
+        }
 
         // 3b. 取回页面自己发出的数据请求（含运行时拼好的参数）。
         let capturedRaw: String? = try? await withTimeout(10, "XHR 捕获") {

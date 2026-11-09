@@ -13,7 +13,7 @@
 set -euo pipefail
 
 CONFIG="${1:-release}"
-VERSION="${VERSION:-1.3.3}"
+VERSION="${VERSION:-1.3.4}"
 VARIANT="${VARIANT:-clean}"
 case "$VARIANT" in
   clean|lite) ;;
