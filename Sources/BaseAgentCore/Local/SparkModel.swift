@@ -4,9 +4,9 @@ import MLXNN
 import MLXLMCommon
 import MLXLLM
 
-// 参考实现见仓库根目录 `spark/SparkModel.swift`；本文件是编入
-// BaseAgentCore 的正式版本，由 `MLXLLMService` 在加载容器前调用
-// `SparkModel.register()` 注册 `spark2_5` 架构（Spark-X2.6 4B MLX）。
+// Spark-X2.6（`model_type = spark2_5`）的自定义 MLX 实现，编入
+// BaseAgentCore；`MLXLLMService` 在加载容器前调用
+// `SparkModel.register()` 把该架构注册进 `LLMTypeRegistry`。
 
 // MARK: - Configuration
 
