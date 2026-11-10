@@ -1068,7 +1068,7 @@ public final class WebRenderTool: AgentTool, ShutdownableTool {
         } catch AgentError.cancelled {
             throw AgentError.cancelled
         } catch {
-            return .fail("web_render failed: \(ToolSupport.errorText(error))")
+            return .fail("web_scan(op=\"render\") failed: \(ToolSupport.errorText(error))")
         }
     }
 

@@ -140,7 +140,9 @@ public final class MemoryGraphTool: AgentTool {
                 "description": .string("snapshot 返回的实体条数，默认 10，范围 1-50"),
             ]),
         ]),
-        "required": .array([.string("op")]),
+        // 组合工具 long_memory 独占 `op`，本工具的动作键已改名为 `graph_op`；
+        // required 必须与之一致，否则 schema 会要求一个永远被删掉的键。
+        "required": .array([.string("graph_op")]),
     ])
 
     private let graph: GraphMemoryStore

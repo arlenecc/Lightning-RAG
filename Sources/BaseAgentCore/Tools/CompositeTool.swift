@@ -14,6 +14,18 @@ public final class CompositeTool: AgentTool {
     /// `op` 缺失时使用的默认动作；nil 表示必填。
     public let defaultOp: String?
 
+    /// 组合工具独占的参数键：分发前会被删除，子工具不得声明同名参数。
+    private static let reservedKeys: Set<String> = ["op"]
+
+    /// 诊断：声明了保留键（或把它列入 required）的子工具名。非空即表示该
+    /// 子工具的动作参数会被组合层吞掉（早期 `skill_search` 的 `op=list`）。
+    /// 正常应始终为空，测试据此回归。
+    public private(set) var reservedKeyCollisions: [String] = []
+
+    /// 诊断：不同子工具间同名参数但 schema 类型/枚举不一致的键。非空即表示
+    /// 合并时「先到先得」会静默丢掉后者的定义。正常应始终为空。
+    public private(set) var parameterTypeCollisions: [String] = []
+
     private let subcommands: [String: AgentTool]
     private let orderedOps: [String]
 
@@ -35,15 +47,38 @@ public final class CompositeTool: AgentTool {
         self.orderedOps = order
 
         // 合并各子命令的参数 schema；`op` 枚举覆盖所有子命令值。
+        // 同时校验参数冲突：保留键冲突会让子工具永远收不到动作参数，
+        // 同名参数类型/枚举冲突会让「先到先得」静默丢弃一方定义。
         var properties: [String: JSONValue] = [:]
-        for tool in subcommands.map({ $0.tool }) {
-            guard let props = tool.parameters.objectValue?["properties"]?.objectValue else {
-                continue
+        var signatures: [String: String] = [:]
+        var reserved: [String] = []
+        var typeCollisions: [String] = []
+        for op in order {
+            guard let tool = map[op],
+                  let schema = tool.parameters.objectValue,
+                  let props = schema["properties"]?.objectValue else { continue }
+            let required = Set(schema["required"]?.arrayValue?
+                .compactMap(\.stringValue) ?? [])
+            if props["op"] != nil || required.contains("op"), !reserved.contains(tool.name) {
+                reserved.append(tool.name)
             }
-            for (key, value) in props where properties[key] == nil {
-                properties[key] = value
+            for (key, value) in props where !Self.reservedKeys.contains(key) {
+                let object = value.objectValue ?? [:]
+                let type = object["type"]?.stringValue ?? ""
+                let enums = object["enum"]?.arrayValue?.compactMap(\.stringValue) ?? []
+                let signature = type + "|" + enums.joined(separator: ",")
+                if let existing = signatures[key] {
+                    if existing != signature && !typeCollisions.contains(key) {
+                        typeCollisions.append(key)
+                    }
+                } else {
+                    signatures[key] = signature
+                }
+                if properties[key] == nil { properties[key] = value }
             }
         }
+        self.reservedKeyCollisions = reserved
+        self.parameterTypeCollisions = typeCollisions
         properties["op"] = ToolSupport.stringProperty(
             "选择要执行的动作：\(order.joined(separator: " / "))",
             enumValues: order)
@@ -53,7 +88,7 @@ public final class CompositeTool: AgentTool {
 
     public func shouldConfirm(_ args: [String: JSONValue]) -> Bool {
         guard let tool = resolvedTool(args) else { return false }
-        return tool.shouldConfirm(args)
+        return tool.shouldConfirm(forwardedArgs(args))
     }
 
     public func run(_ args: [String: JSONValue]) async throws -> ToolResult {
@@ -62,9 +97,14 @@ public final class CompositeTool: AgentTool {
             return .fail(
                 "unknown op: \"\(op)\"（可用: \(orderedOps.joined(separator: "/"))）")
         }
+        return try await tool.run(forwardedArgs(args))
+    }
+
+    /// 分发给子工具的参数：移除组合层独占的 `op`，其余参数原样透传。
+    private func forwardedArgs(_ args: [String: JSONValue]) -> [String: JSONValue] {
         var rest = args
-        rest.removeValue(forKey: "op")
-        return try await tool.run(rest)
+        for key in Self.reservedKeys { rest.removeValue(forKey: key) }
+        return rest
     }
 
     private func resolvedOp(_ args: [String: JSONValue]) -> String {

@@ -238,7 +238,7 @@ public final class FileModifyTool: AgentTool {
     public let name = "file_modify"
     public let description =
         "Replace the first occurrence of `old` with `new` in a workspace file. "
-        + "`old` must match exactly (whitespace/indentation); use file_read first. "
+        + "`old` must match exactly (whitespace/indentation); use file_tools(op=\"read\") first. "
         + "Set replace_all=true to replace every occurrence."
     public let destructive = false
 

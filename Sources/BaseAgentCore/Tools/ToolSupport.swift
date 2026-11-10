@@ -531,7 +531,7 @@ public enum ToolSupport {
     }
 
     /// 列表页 / SPA 动态加载检测：提取正文过短，或正文虽长但主体只是加载占位时，
-    /// 返回降级提示（分析数据接口直接调用 / 内置 WebKit 渲染 / webexec_js 交互）。
+    /// 返回降级提示（分析数据接口直接调用 / 内置 WebKit 渲染 / 交互脚本）。
     /// 避免模型把「加载占位」误当有效内容或直接断定站点无信息。
     ///
     /// 触发条件（两者任一）：
@@ -626,8 +626,7 @@ public enum ToolSupport {
             + "静态 HTML 只能拿到加载占位。web_scan 已自动渲染并直取页面数据接口，结果见上方"
             + "数据段；若仍缺信息或需要翻页，用 shell_run/code_run 按数据段给出的分页参数"
             + "显式调用（不要对未知 POST 接口盲发写请求）；若需要点击/填表/滚动加载等交互，"
-            + "用 web_render 的 script 参数执行 JS，或 webexec_js 外部浏览器桥"
-            + "（需配置 browser_endpoint）。"
+            + "用 web_scan(op=\"render\", script=...) 执行 JS。"
         if !lines.isEmpty {
             hint += "\n已定位的数据源线索：\n" + lines.joined(separator: "\n")
         }

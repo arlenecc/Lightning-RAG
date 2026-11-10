@@ -35,17 +35,17 @@ private func rounded(_ value: Double) -> Double {
 // MARK: - skill_search
 
 /// 关键词技能检索工具：等价于 Python `SkillSearchTool`。
+///
+/// 注意：本工具**不得**声明 `op` 参数。它是 `skill_tools` 组合工具的子命令，
+/// 组合工具独占 `op` 键并在分发前将其删除；早期版本自带的 `op`(search/list)
+/// 因此永远收不到，`list` 动作实际失效。现在 `list` 由 `SkillListTool` 承担，
+/// 这里只做关键词检索。
 public final class SkillSearchTool: AgentTool {
     public let name = "skill_search"
-    public let description = "关键词搜索 .agent/skills 下已保存的技能；op=list 列出全部技能，op=search 按 query 打分（名称 > 关键词/tags > 描述）。"
+    public let description = "关键词搜索 .agent/skills 下已保存的技能；按 query 打分（名称 > 关键词/tags > 描述）。"
     public let parameters: JSONValue = .object([
         "type": .string("object"),
         "properties": .object([
-            "op": .object([
-                "type": .string("string"),
-                "enum": .array([.string("search"), .string("list")]),
-                "description": .string("操作类型，默认 search"),
-            ]),
             "query": .object([
                 "type": .string("string"),
                 "description": .string("搜索关键词"),
@@ -55,6 +55,57 @@ public final class SkillSearchTool: AgentTool {
                 "description": .string("返回条数，默认 5，范围 1-20"),
             ]),
         ]),
+        "required": .array([.string("query")]),
+    ])
+
+    private let index: SkillIndex
+
+    public init(config: AgentConfig,
+                callbacks: AgentCallbacks? = nil,
+                registry: ToolRegistry? = nil,
+                index: SkillIndex? = nil) {
+        self.index = index ?? SkillIndex(workspace: config.workspace)
+    }
+
+    public func run(_ args: [String: JSONValue]) async throws -> ToolResult {
+        // 兼容旧调用方：若仍传 op=list / skill_op=list，转发给共享实现。
+        let legacy = args.trimmedString("skill_op").isEmpty
+            ? args.trimmedString("op") : args.trimmedString("skill_op")
+        if legacy == "list" { return listAllSkills(index) }
+
+        let query = args.trimmedString("query")
+        guard !query.isEmpty else { return .fail("缺少参数: query") }
+        let topK = args.boundedInt("top_k", default: 5, range: 1...20)
+        let results = index.search(query: query, topK: topK)
+        if results.isEmpty {
+            return .ok("找不到匹配的技能。")
+        }
+        let payload: JSONValue = .array(results.map { entryJSON($0) })
+        return .ok(payload.jsonString(pretty: true))
+    }
+
+    private func entryJSON(_ entry: SkillIndexEntry) -> JSONValue {
+        .object([
+            "name": .string(entry.name),
+            "description": .string(entry.description),
+            "keywords": .array(entry.keywords.map { .string($0) }),
+            "tags": .array(entry.tags.map { .string($0) }),
+            "path": .string(entry.path),
+            "entry": .string(entry.entry),
+        ])
+    }
+}
+
+// MARK: - skill_list
+
+/// 列出全部已保存技能。作为 `skill_tools(op="list")` 的子命令独立存在，
+/// 避免任何子工具再声明与组合工具 `op` 同名的参数。
+public final class SkillListTool: AgentTool {
+    public let name = "skill_list"
+    public let description = "列出全部已保存技能（名称、路径、描述）。"
+    public let parameters: JSONValue = .object([
+        "type": .string("object"),
+        "properties": .object([:]),
         "required": .array([]),
     ])
 
@@ -68,51 +119,29 @@ public final class SkillSearchTool: AgentTool {
     }
 
     public func run(_ args: [String: JSONValue]) async throws -> ToolResult {
-        let op = args.trimmedString("op").isEmpty ? "search" : args.trimmedString("op")
-        switch op {
-        case "list":
-            index.scan(force: true)
-            let entries = index.listAll()
-            if entries.isEmpty {
-                return .ok("暂无已保存的技能。")
-            }
-            let compact: [JSONValue] = entries.prefix(50).map { entry in
-                .object([
-                    "name": .string(entry.name),
-                    "path": .string(entry.path),
-                    "description": .string(String(entry.description.prefix(100))),
-                ])
-            }
-            var output = JSONValue.array(compact).jsonString(pretty: true)
-            if entries.count > 50 {
-                output += "\n… (共 \(entries.count) 个技能，仅显示前 50 个；用 op='search' + query 精确查找)"
-            }
-            return .ok(output)
-        case "search":
-            let query = args.trimmedString("query")
-            guard !query.isEmpty else { return .fail("缺少参数: query") }
-            let topK = args.boundedInt("top_k", default: 5, range: 1...20)
-            let results = index.search(query: query, topK: topK)
-            if results.isEmpty {
-                return .ok("找不到匹配的技能。")
-            }
-            let payload: JSONValue = .array(results.map { entryJSON($0) })
-            return .ok(payload.jsonString(pretty: true))
-        default:
-            return .fail("未知 op: \(op)（可用: search/list）")
-        }
+        listAllSkills(index)
     }
+}
 
-    private func entryJSON(_ entry: SkillIndexEntry) -> JSONValue {
+/// `list` 动作的共享实现（原 `SkillSearchTool(op="list")` 分支）。
+private func listAllSkills(_ index: SkillIndex) -> ToolResult {
+    index.scan(force: true)
+    let entries = index.listAll()
+    if entries.isEmpty {
+        return .ok("暂无已保存的技能。")
+    }
+    let compact: [JSONValue] = entries.prefix(50).map { entry in
         .object([
             "name": .string(entry.name),
-            "description": .string(entry.description),
-            "keywords": .array(entry.keywords.map { .string($0) }),
-            "tags": .array(entry.tags.map { .string($0) }),
             "path": .string(entry.path),
-            "entry": .string(entry.entry),
+            "description": .string(String(entry.description.prefix(100))),
         ])
     }
+    var output = JSONValue.array(compact).jsonString(pretty: true)
+    if entries.count > 50 {
+        output += "\n… (共 \(entries.count) 个技能，仅显示前 50 个；用 skill_tools(op=\"search\") + query 精确查找)"
+    }
+    return .ok(output)
 }
 
 // MARK: - skill_semantic_search
@@ -324,7 +353,7 @@ public final class SkillSaveTool: AgentTool {
                 .appendingPathComponent(skill.directory)
                 .appendingPathComponent("SKILL.md")
                 .path
-            var note = "下次可用 skill_semantic_search 或 skill_search 召回（索引会自动增量同步）"
+            var note = "下次可用 skill_tools(op=\"semantic_search\") 或 skill_tools(op=\"search\") 召回（索引会自动增量同步）"
             if FileManager.default.fileExists(atPath: mirrored) {
                 note += "；已镜像到 \(mirrored) 以便关键词检索命中"
             }

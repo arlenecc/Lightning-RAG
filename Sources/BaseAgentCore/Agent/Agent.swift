@@ -22,7 +22,7 @@ public final class AgentToolDispatcher {
         case "rag_tools":
             return op == "search" || op == "outline"
         case "skill_tools":
-            return op == "search" || op == "semantic_search"
+            return op == "search" || op == "semantic_search" || op == "list"
         case "long_memory":
             return op == "search"
         default:

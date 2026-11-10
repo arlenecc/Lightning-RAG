@@ -79,7 +79,7 @@ public enum AgentToolFactory {
                 ("search", MemorySearchTool(config: config, callbacks: callbacks, registry: registry)),
             ]))
 
-        // 技能 → skill_tools（op: search/load/semantic_search/save）。
+        // 技能 → skill_tools（op: search/load/semantic_search/save/list）。
         tools.append(CompositeTool(
             name: "skill_tools",
             description:
@@ -89,10 +89,13 @@ public enum AgentToolFactory {
                 + "use the user's original wording for query.\n"
                 + "- op=\"load\": load a skill's full instructions by directory (path, entry).\n"
                 + "- op=\"save\": save a reusable workflow as a skill "
-                + "(name, description, steps, when_to_use, pitfalls, tags).",
+                + "(name, description, steps, when_to_use, pitfalls, tags).\n"
+                + "- op=\"list\": list all saved skills (no arguments).",
             subcommands: [
                 ("search", SkillSearchTool(config: config, callbacks: callbacks, registry: registry,
                                            index: skillIndex)),
+                ("list", SkillListTool(config: config, callbacks: callbacks, registry: registry,
+                                       index: skillIndex)),
                 ("semantic_search", SkillSemanticSearchTool(
                     config: config, callbacks: callbacks, registry: registry,
                     retriever: skillRetriever)),
