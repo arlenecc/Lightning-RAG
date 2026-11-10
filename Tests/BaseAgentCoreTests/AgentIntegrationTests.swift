@@ -17,13 +17,15 @@ private final class ScriptedLLM: LLMService, @unchecked Sendable {
         return AsyncThrowingStream { continuation in
             if index == 0 {
                 let arguments = JSONValue.object([
+                    "op": .string("write"),
                     "path": .string("out.txt"),
                     "content": .string("hello from tool"),
                 ]).jsonString()
                 continuation.yield(LLMStreamEvent(
                     kind: .done,
-                    toolCalls: [ToolCall(id: "call_1", name: "file_write",
-                                         arguments: ["path": .string("out.txt"),
+                    toolCalls: [ToolCall(id: "call_1", name: "file_tools",
+                                         arguments: ["op": .string("write"),
+                                                      "path": .string("out.txt"),
                                                       "content": .string("hello from tool")],
                                          rawArguments: arguments)]))
             } else {
@@ -88,9 +90,9 @@ final class AgentIntegrationTests: XCTestCase {
         config.workspace = NSTemporaryDirectory() + "/base-agent-schema-\(UUID().uuidString)"
         let agent = Agent(llm: ScriptedLLM(), config: config, callbacks: NoopCallbacks())
         let names = Set(agent.tools.allTools.map(\.name))
-        for expected in ["file_read", "file_write", "file_modify", "code_run", "shell_run",
-                         "rag_search", "rag_outline", "rag_ingest", "memory_search",
-                         "skill_search", "update_plan", "update_working_checkpoint"] {
+        for expected in ["file_tools", "web_scan", "rag_tools", "long_memory", "skill_tools",
+                         "code_run", "shell_run", "ask_user", "work_memory",
+                         "update_working_checkpoint", "start_long_term_update", "update_plan"] {
             XCTAssertTrue(names.contains(expected), "缺少工具 \(expected)")
         }
         XCTAssertTrue(agent.dispatcher.schemas().count >= names.count)

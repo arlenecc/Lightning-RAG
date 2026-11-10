@@ -129,7 +129,7 @@ private let multistepVerbPattern =
 
 private let planFinishHint = """
 [System] 你既没有调用 update_plan 把计划写入执行计划（Session.working['plan'] 为空），也没有发出任何实际工具调用——任务等于什么都没做，哪怕你在文本里给出了结论也只是猜测。
-请立即：1) 需要外部信息时直接发出第一步的实际工具调用（如 web_scan 获取页面、rag_search 查询知识库）并持续推进；2) 或用 update_plan(op='create', goal=..., steps=[...]) 先登记计划，紧接着发出第一步调用。
+请立即：1) 需要外部信息时直接发出第一步的实际工具调用（如 web_scan 获取页面、rag_tools(op=\"search\") 查询知识库）并持续推进；2) 或用 update_plan(op='create', goal=..., steps=[...]) 先登记计划，紧接着发出第一步调用。
 禁止只在文本里描述计划或给出来自猜测的结论——每一步都必须真正调用工具，拿到真实结果后再总结。
 """
 
@@ -151,7 +151,7 @@ private let repeatCallLimit = 3
 /// 成果核验反思的最多打回次数：以资深专家身份审视最终结果，质量不达标
 /// 最多打回完善 2 次，之后无论是否完美都收下，避免无限自我批评死循环。
 private let reviewMax = 2
-/// 单次大纲（rag_outline）之后允许的 rag_search 次数硬上限。
+/// 单次大纲（rag_tools(op="outline")）之后允许的 rag_tools(op="search") 次数硬上限。
 /// 超过后内核直接把多余检索预置为失败，逼模型基于已有结果 + 大纲摘要作答，
 /// 杜绝「同一问题反复换关键词 scatter 检索」的无效搜索。
 private let maxRagSearchesPerOutline = 3
@@ -244,7 +244,7 @@ public final class KernelLoop {
     /// 拦截，强令基于已有结果作答或换参数，而不是等 4 次重复才终止。
     private var successSigs: Set<String> = []
     private var toolCallCounter = 0
-    /// 当前「大纲后检索预算」已用次数；每次 rag_outline 清零，每次 run() 也清零。
+    /// 当前「大纲后检索预算」已用次数；每次 rag_tools(op="outline") 清零，每次 run() 也清零。
     private var ragSearchCount = 0
     private var resume = false
     private var pendingSeed: FailureSnapshot?
@@ -385,13 +385,15 @@ public final class KernelLoop {
                 + "检索本地知识库，也能拆解并完成多步任务。"
                 + "当前工具清单还在加载，稍后再问一次即可。"
         }
+        // 注意：合并后工具名不再带 file_/rag_/memory_/skill_ 前缀，按合并后的
+        // 组合工具名精确归类（MCP 等其余工具自然落入「其它」分支）。
         let groups: [(String, (String) -> Bool)] = [
-            ("文件与执行", { $0.hasPrefix("file_") || $0 == "code_run" || $0 == "shell_run" }),
-            ("知识库检索", { $0.hasPrefix("rag_") }),
-            ("记忆与计划", { $0.hasPrefix("memory_") || $0 == "work_memory"
+            ("文件与执行", { $0 == "file_tools" || $0 == "code_run" || $0 == "shell_run" }),
+            ("知识库检索", { $0 == "rag_tools" }),
+            ("记忆与计划", { $0 == "long_memory" || $0 == "work_memory"
                 || $0 == "update_plan" || $0 == "update_working_checkpoint"
                 || $0 == "start_long_term_update" || $0 == "ask_user" }),
-            ("网页与技能", { $0.hasPrefix("web") || $0.hasPrefix("skill_") }),
+            ("网页与技能", { $0 == "web_scan" || $0 == "skill_tools" }),
         ]
         var remaining = names
         var lines = [
@@ -720,7 +722,7 @@ public final class KernelLoop {
                                            summary: l2Summary(resp.content),
                                            rawContent: resp.rawContent)
                         pending = """
-                        [System] 检测到你上轮主要内容是大段代码却未调用工具。若这些代码需要执行/写入/分析，请显式调用 code_run / file_write / file_patch；若只是展示给用户的示例，请在回复中补充自然语言说明。
+                        [System] 检测到你上轮主要内容是大段代码却未调用工具。若这些代码需要执行/写入/分析，请显式调用 code_run / file_tools(op=\"write\") / file_tools(op=\"patch\")；若只是展示给用户的示例，请在回复中补充自然语言说明。
                         """
                         continue
                     }
@@ -775,7 +777,7 @@ public final class KernelLoop {
                     if session.getPlan() == nil, isMultistep(userInput) {
                         let plan = Plan(goal: String(userInput.prefix(80)), steps: [
                             PlanStep(id: "1",
-                                     title: "立即调用工具获取真实数据（如 web_scan / rag_search）",
+                                     title: "立即调用工具获取真实数据（如 web_scan / rag_tools(op=\"search\")）",
                                      status: "doing"),
                             PlanStep(id: "2", title: "基于工具结果整理并给出最终答复",
                                      status: "pending"),
@@ -797,7 +799,7 @@ public final class KernelLoop {
                             $0["function"]?["name"]?.stringValue
                         }
                         let toolList = names.isEmpty
-                            ? "web_scan / shell_run / file_read / code_run"
+                            ? "web_scan / shell_run / file_tools(op=\"read\") / code_run"
                             : names.prefix(8).joined(separator: " / ")
                         // 用户明确给了网址时，给出可直接照抄的调用参数：小模型
                         // 看到精确示例比抽象指令更容易真的发出 tool_call。
@@ -1027,7 +1029,7 @@ public final class KernelLoop {
                (hasActual || isMultistep(userInput)), !hasPlanOp {
                 let plan = Plan(goal: String(userInput.prefix(80)), steps: [
                     PlanStep(id: "1",
-                             title: "立即调用工具获取真实数据（如 web_scan / rag_search）",
+                             title: "立即调用工具获取真实数据（如 web_scan / rag_tools(op=\"search\")）",
                              status: "doing"),
                     PlanStep(id: "2", title: "基于工具结果整理并给出最终答复",
                              status: "pending"),
@@ -1043,48 +1045,51 @@ public final class KernelLoop {
             }
 
             // ---- 大纲后检索次数硬上限（默认 3）----
-            // 每次 `rag_outline` 开启新一轮「检索预算」并清零；超出上限的 `rag_search`
+            // 每次 `rag_tools(op="outline")` 开启新一轮「检索预算」并清零；超出上限的 `rag_tools(op="search")`
             // 直接预置失败，逼模型基于已有结果与大纲摘要综合作答，杜绝无效重复检索。
             var executeCalls: [ToolCall] = []
             var preset: [Int: ToolResult] = [:]
             var liveCount = ragSearchCount
             for (i, tc) in toolCalls.enumerated() {
                 let sig = callSig(tc)
+                let tcOp = tc.arguments["op"]?.stringValue ?? ""
+                let isRagOutline = tc.name == "rag_tools" && tcOp == "outline"
                 // 已经以完全相同参数失败过的调用，再执行必然还是失败。旧版只在
-                // 事后给软提示，模型仍把同一个 file_read / shell_run cat 原样
+                // 事后给软提示，模型仍把同一个 file_tools(read) / shell_run cat 原样
                 // 重发三次（知识库问答里读臆造的 .md 路径），整轮被耗空。
                 if failSigs.contains(sig) {
                     preset[i] = .fail(
                         "该调用此前已用完全相同的参数失败过，已跳过（原样重试不会改变结果）。"
                         + "请换参数/换工具，或直接依据已获得的信息作答；"
-                        + "已索引文档的内容用 rag_* 获取，不要重复读不存在的路径。"
-                        + "外部网站与本地文件任务请改用 web_scan / file_* / shell_run 等对应工具。")
+                        + "已索引文档的内容用 rag_tools 获取，不要重复读不存在的路径。"
+                        + "外部网站与本地文件任务请改用 web_scan / file_tools / shell_run 等对应工具。")
                     continue
                 }
                 // 成功过的调用原样重发：结果已在上一轮返回、不会再变。模型常
                 // 「拿到 web_scan 结果却反复重发相同 URL 刷屏」，旧逻辑只给软
                 // 提示，模型无视后连刷 4~5 次才被终止。这里直接拦截，逼它基于
                 // 已有结果作答，或换参数/换工具获取其它内容。
-                // 排除控制类工具：rag_outline 重复调用会重置检索预算、update_plan
+                // 排除控制类工具：rag_tools(outline) 重复调用会重置检索预算、update_plan
                 // 会更新计划状态，重复执行是必要的，不能被「成功过」拦掉。
                 if successSigs.contains(sig),
-                   tc.name != "rag_outline", tc.name != "update_plan" {
+                   !isRagOutline, tc.name != "update_plan" {
                     preset[i] = .fail(
                         "该调用此前已成功返回过结果（内容见上一轮历史）。完全相同参数"
                         + "再调一次不会带来任何新信息——请直接基于已获得的结果作答、"
                         + "给出最终总结；若确需其它内容，请换参数 / 换工具（如翻页、"
-                        + "换 URL、用 rag_search / ask_user 等），不要原样重发。")
+                        + "换 URL、用 rag_tools(op=\"search\") / ask_user 等），不要原样重发。")
                     continue
                 }
-                switch tc.name {
-                case "rag_outline":
+                switch (tc.name, tcOp) {
+                case ("rag_tools", "outline"):
                     liveCount = 0
                     executeCalls.append(tc)
-                case "rag_search":
+                case ("rag_tools", "search"):
                     if liveCount >= maxRagSearchesPerOutline {
                         preset[i] = .fail(
                             "已达单次大纲后的检索上限（\(maxRagSearchesPerOutline) 次）。"
-                            + "请基于已检索内容与大纲摘要直接综合作答，不要再调用 rag_search。")
+                            + "请基于已检索内容与大纲摘要直接综合作答，不要再调用 "
+                            + "rag_tools(op=\"search\")。")
                         continue
                     }
                     liveCount += 1
@@ -1167,7 +1172,7 @@ public final class KernelLoop {
                 repeatWarning = """
                 [System] 你已经连续 \(repeatStreak + 1) 次调用**完全相同**的工具与参数（\(toolCalls.first?.name ?? "?")）——这不会让任务前进哪怕一步。上一轮的工具结果已经返回，所需资料大概率已经拿到。立刻换一个动作：
                 1) **最优先**：直接基于已获得的工具结果用文字作答（写 <summary>…</summary> 加正文），不要再调用工具；
-                2) 若该工具确实拿不到数据，换其它工具 / URL / 参数（如 rag_search、ask_user），或用 update_plan 把该步标 blocked 并写明原因后继续；
+                2) 若该工具确实拿不到数据，换其它工具 / URL / 参数（如 rag_tools(op=\"search\")、ask_user），或用 update_plan 把该步标 blocked 并写明原因后继续；
                 3) 若还没有计划，先 update_plan(create) 登记再推进。
                 不要再次发出与上一轮相同的调用。
                 """
@@ -1518,10 +1523,10 @@ public final class KernelLoop {
     // MARK: ACT：RAG 工具结果进历史前的收紧
 
     /// RAG 工具结果进历史 / KV 前缀前的纯函数收紧：保留最相关头部、丢弃尾部，
-    /// 避免 bulky 大返回把历史撑大、拖慢后续每轮生成。非 `rag_` 前缀、或
-    /// `limit <= 0`、或内容未超限时原样返回（调用方据此决定是否收紧）。
+    /// 避免 bulky 大返回把历史撑大、拖慢后续每轮生成。仅 `rag_tools`（合并后的
+    /// 知识库工具）结果收紧；`limit <= 0`、或内容未超限时原样返回。
     static func trimRagHistory(_ name: String, _ content: String, limit: Int) -> String {
-        guard limit > 0, name.hasPrefix("rag_"), content.count > limit else {
+        guard limit > 0, name == "rag_tools", content.count > limit else {
             return content
         }
         return String(content.prefix(limit))

@@ -121,7 +121,7 @@ public final class UpdateWorkingCheckpointTool: AgentTool {
 /// `start_long_term_update`：**L2/L3 文件的唯一正式写入入口**（改进6）。
 ///
 /// 本身不直接写文件，而是「门控 + 返回提纯 prompt 与材料」，由模型随后用
-/// `file_patch` 少量追加。门控：当前轮数 < `minTurns`(5) 直接拒绝，短任务不许碰长期记忆。
+/// `file_tools(op="patch")` 少量追加。门控：当前轮数 < `minTurns`(5) 直接拒绝，短任务不许碰长期记忆。
 ///
 /// 内核（`Loop.swift` 按工具名）仍会置 `distillRequested`，触发后台图谱蒸馏；
 /// 但 L2 `memory/global_mem.txt` / L3 `memory/*_sop.md` 的写入必须经过这里。
@@ -132,7 +132,7 @@ public final class StartLongTermUpdateTool: AgentTool {
         + "or reaching an important checkpoint; rejected before turn 5. Returns the purification "
         + "prompt and current L1 index. Then follow L0 decision tree: verified environment facts "
         + "-> append to memory/global_mem.txt; hard-won task pitfalls -> append/create "
-        + "memory/xxx_sop.md. Use file_patch (small additions only), then sync the L1 index. "
+        + "memory/xxx_sop.md. Use file_tools(op=\"patch\") (small additions only), then sync the L1 index. "
         + "Skip if nothing durable was learned."
 
     /// 短任务门控：当前轮数小于此值直接拒绝。
@@ -191,15 +191,15 @@ public final class StartLongTermUpdateTool: AgentTool {
             "l1_current": .string(l1),
             "prompt": .string(MEMORY_PURIFY_PROMPT),
             "next": .array([
-                .string("先 file_read 读 memory/global_mem.txt 与相关 xxx_sop.md 现状（先读后patch）"),
-                .string("按 L0 决策树归类：环境特异性事实 → file_patch 追加到 memory/global_mem.txt"),
-                .string("特定任务技术/坑 → file_patch 追加或新建 memory/xxx_sop.md"),
-                .string("每次 L2/L3 变更后，用 file_patch 同步 L1 索引行（只放关键词/名称，≤30 行）"),
+                .string("先 file_tools(op=\"read\") 读 memory/global_mem.txt 与相关 xxx_sop.md 现状（先读后patch）"),
+                .string("按 L0 决策树归类：环境特异性事实 → file_tools(op=\"patch\") 追加到 memory/global_mem.txt"),
+                .string("特定任务技术/坑 → file_tools(op=\"patch\") 追加或新建 memory/xxx_sop.md"),
+                .string("每次 L2/L3 变更后，用 file_tools(op=\"patch\") 同步 L1 索引行（只放关键词/名称，≤30 行）"),
             ]),
             "rules": .array([
                 .string("只写经工具验证成功的信息；禁止写入推测、临时状态、通用常识、易重建细节"),
                 .string("合并重复、压缩冗述，不堆叠流水账；不得把模型推测记作用户要求"),
-                .string("memory/ 下只能 file_patch 少量追加，禁止 file_write 覆盖与 code_run 批量改写"),
+                .string("memory/ 下只能 file_tools(op=\"patch\") 少量追加，禁止 file_tools(op=\"write\") 覆盖与 code_run 批量改写"),
                 .string("无提纯价值则跳过，不要为了调用而调用"),
             ]),
         ])

@@ -122,14 +122,14 @@ final class LightweightTurnTests: XCTestCase {
 
     func testCapabilityQueryUsesRealToolListWithoutLLM() async {
         let captured = Captured()
-        let schemas = ["file_read", "rag_search", "web_scan"].map(toolSchema)
+        let schemas = ["file_tools", "rag_tools", "web_scan"].map(toolSchema)
         let loop = KernelLoop(runtime: makeRuntime(captured, reply: echo, schemas: schemas),
                               config: AgentConfig(),
                               systemPrompt: { self.fullSystem },
                               maxTurns: 1)
         let result = await loop.run("你能干什么", toolsEnabled: false)
-        XCTAssertTrue(result.text.contains("file_read"))
-        XCTAssertTrue(result.text.contains("rag_search"))
+        XCTAssertTrue(result.text.contains("file_tools"))
+        XCTAssertTrue(result.text.contains("rag_tools"))
         XCTAssertFalse(result.text.contains("[SYSTEM]"))
         XCTAssertTrue(captured.messages.isEmpty, "能力问询不得调用 LLM")
     }
@@ -146,11 +146,10 @@ final class LightweightTurnTests: XCTestCase {
     }
 
     func testCapabilityAnswerListsRealTools() {
-        let names = ["file_read", "file_write", "code_run", "rag_search",
-                     "memory_search", "update_plan", "web_scan", "skill_load",
-                     "ask_user", "mcp_custom"]
+        let names = ["file_tools", "code_run", "rag_tools", "long_memory", "update_plan",
+                     "web_scan", "skill_tools", "ask_user", "mcp_custom"]
         let answer = KernelLoop.capabilityAnswer(from: names.map(toolSchema))
-        XCTAssertTrue(answer.contains("共 10 个"), answer)
+        XCTAssertTrue(answer.contains("共 9 个"), answer)
         for name in names { XCTAssertTrue(answer.contains(name), "缺少工具 \(name)") }
         XCTAssertTrue(answer.contains("文件与执行"))
         XCTAssertTrue(answer.contains("知识库检索"))
@@ -165,7 +164,7 @@ final class LightweightTurnTests: XCTestCase {
     /// 用户实测：「你能干什么 / 你有什么工具 / 有什么可用工具」三种问法
     /// 都得到同一段空泛套话。修复后三种都给出真实工具清单，且完全不调模型。
     func testAllCapabilityQueryPhrasesAnswerLocally() async {
-        let schemas = ["file_read", "rag_search", "web_scan"].map(toolSchema)
+        let schemas = ["file_tools", "rag_tools", "web_scan"].map(toolSchema)
         for phrase in ["你能干什么", "你有什么工具", "有什么可用工具"] {
             let captured = Captured()
             let loop = KernelLoop(runtime: makeRuntime(captured, reply: echo,
@@ -175,8 +174,8 @@ final class LightweightTurnTests: XCTestCase {
                                   maxTurns: 1)
             let result = await loop.run(phrase, toolsEnabled: false)
             XCTAssertEqual(result.reason, .done, phrase)
-            XCTAssertTrue(result.text.contains("file_read"), phrase)
-            XCTAssertTrue(result.text.contains("rag_search"), phrase)
+            XCTAssertTrue(result.text.contains("file_tools"), phrase)
+            XCTAssertTrue(result.text.contains("rag_tools"), phrase)
             XCTAssertFalse(result.text.contains("提供信息"), phrase)
             XCTAssertFalse(result.text.contains("[SYSTEM]"), phrase)
             XCTAssertTrue(captured.messages.isEmpty,

@@ -118,7 +118,7 @@ public final class FileReadTool: AgentTool {
                     result += first
                         ? "\n\n[SOP 已全文载入] 立即调用 update_working_checkpoint(key_info=...) "
                             + "把本 SOP 的关键前置条件与典型坑提炼进去；key_info 每轮自动回注，"
-                            + "正常情况下本次会话无需再次 file_read 本文件。"
+                            + "正常情况下本次会话无需再次 file_tools(op=\"read\") 本文件。"
                         : "\n\n[SOP 重复载入] 本文件本次会话已读过，要点应已在 key_info 中；"
                             + "若 key_info 仍含要点请直接据此行动；若已被覆盖/清空导致要点丢失，"
                             + "应立即重新读取全文并再次提炼，不要凭印象继续。"
@@ -214,7 +214,7 @@ public final class FileWriteTool: AgentTool {
             guard content.count <= ToolSupport.maxWriteChars else {
                 return .fail(
                     "content too large (\(content.count) chars > \(ToolSupport.maxWriteChars) cap). "
-                    + "Split the write into several smaller file_write calls, or use "
+                    + "Split the write into several smaller file_tools(op=\"write\") calls, or use "
                     + "shell_run with a heredoc / streaming write for large files.")
             }
 
@@ -293,8 +293,8 @@ public final class FileModifyTool: AgentTool {
             let size = ToolSupport.fileSize(full)
             guard size <= ToolSupport.maxModifyBytes else {
                 return .fail(
-                    "File too large for file_modify (\(size) bytes > "
-                    + "\(ToolSupport.maxModifyBytes)); use file_write to rewrite it "
+                    "File too large for file_tools(op=\"modify\") (\(size) bytes > "
+                    + "\(ToolSupport.maxModifyBytes)); use file_tools(op=\"write\") to rewrite it "
                     + "or shell_run (sed/python) instead")
             }
 
@@ -312,7 +312,7 @@ public final class FileModifyTool: AgentTool {
                     + "常见原因：① 缩进/空白与文件实际内容不一致；"
                     + "② 文件为 CRLF 行尾\(hasCR ? "（本文件确为 CRLF）" : "")；"
                     + "③ 内容已被之前的操作改过。"
-                    + "请用 file_read(path, line_numbers=true) 重新确认精确文本后再试。")
+                    + "请用 file_tools(op=\"read\", line_numbers=true) 重新确认精确文本后再试。")
             }
 
             let updated: String

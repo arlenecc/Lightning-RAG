@@ -79,7 +79,7 @@ final class MemoryLayeringTests: XCTestCase {
         let rec = TurnRecord(index: 7, prompt: "anchor-prompt-with-working-memory")
         rec.assistantText = "assistant middle reply"
         rec.summary = "确认了端口 8080"
-        rec.toolResults = [ToolResultRecord(id: "1", name: "file_read", content: "file body")]
+        rec.toolResults = [ToolResultRecord(id: "1", name: "file_tools", content: "file body")]
 
         let id = store.appendSession(systemText: "SYSTEM TEXT",
                                      userText: "帮我查端口",

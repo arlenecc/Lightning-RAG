@@ -291,7 +291,7 @@ public enum ToolSupport {
         return protected.contains((fullPath as NSString).lastPathComponent)
     }
 
-    /// `file_write` 写入前守卫。协议只允许 `file_patch` 少量追加，故：
+    /// `file_tools(op="write")` 写入前守卫。协议只允许 `file_tools(op="patch")` 少量追加，故：
     /// - L0/L1 一律不允许覆盖/重建（无论文件当前是否存在）；
     /// - `memory/` 内已存在的其它文件不允许覆盖；
     /// - 新建 L3 SOP 等文件允许，但由 `shouldConfirm` 强制人工复核。
@@ -299,13 +299,13 @@ public enum ToolSupport {
         guard isManagedMemoryPath(fullPath, workspace: workspace) else { return }
         if isSystemPromptMemoryFile(fullPath, workspace: workspace) {
             throw ToolError.message(
-                "拒绝用 file_write 写 `memory/` 的 L0/L1 文件：它们直接注入 system prompt。"
-                + "若确需修改，请用 file_patch 做词级修改（会请求用户确认）。")
+                "拒绝用 file_tools(op=\"write\") 写 `memory/` 的 L0/L1 文件：它们直接注入 system prompt。"
+                + "若确需修改，请用 file_tools(op=\"patch\") 做词级修改（会请求用户确认）。")
         }
         if FileManager.default.fileExists(atPath: fullPath) {
             throw ToolError.message(
-                "拒绝用 file_write 覆盖 `memory/` 内已有文件；按 META-SOP 只能 "
-                + "用 file_patch 少量追加（会请求用户确认）。")
+                "拒绝用 file_tools(op=\"write\") 覆盖 `memory/` 内已有文件；按 META-SOP 只能 "
+                + "用 file_tools(op=\"patch\") 少量追加（会请求用户确认）。")
         }
     }
 

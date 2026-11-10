@@ -157,7 +157,7 @@ final class ToolEnhancementTests: XCTestCase {
             "path": .string("n.txt"), "old": .string("no-such-text"), "new": .string("x"),
         ])
         XCTAssertFalse(result.success)
-        XCTAssertTrue(result.error.contains("file_read"), "应给出排查指引：\(result.error)")
+        XCTAssertTrue(result.error.contains("file_tools"), "应给出排查指引：\(result.error)")
     }
 
     // MARK: shell_run shell/env

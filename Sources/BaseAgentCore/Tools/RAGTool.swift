@@ -25,11 +25,11 @@ let ragUsageNote = """
 
 ---
 【知识库读取规则（仅适用于读取已索引文档）】以上即本次检索返回的全部可用内容，
-请直接据此作答（需要更多细节就再用 `rag_search` 换措辞/换章节，或 `rag_outline`
-看大纲）。「来源 / 章节 / 文档名 / 文档 ID」是向量库索引标识、不是磁盘文件路径；
-源文件（PDF、扫描件等）已切片入库，磁盘上不存在由它们拼出的 `.md`，去读必然失败、
-无需尝试。本规则不限制其它工具：访问外部网站用 `web_scan`/`web_render`，读写本地文件、
-执行命令用 `file_*`/`shell_run`/`code_run`，均照常可用。
+请直接据此作答（需要更多细节就再用 `rag_tools(op="search")` 换措辞/换章节，或
+`rag_tools(op="outline")` 看大纲）。「来源 / 章节 / 文档名 / 文档 ID」是向量库索引标识、
+不是磁盘文件路径；源文件（PDF、扫描件等）已切片入库，磁盘上不存在由它们拼出的 `.md`，
+去读必然失败、无需尝试。本规则不限制其它工具：访问外部网站用 `web_scan`，读写本地文件、
+执行命令用 `file_tools`/`shell_run`/`code_run`，均照常可用。
 """
 
 func ragToolOK(_ text: String) -> ToolResult {
@@ -41,7 +41,7 @@ func ragToolOK(_ text: String) -> ToolResult {
 /// 知识库检索工具：等价于 Python `RagSearchTool`。
 public final class RagSearchTool: AgentTool {
     public let name = "rag_search"
-    public let description = "从本地知识库（RAG）检索与 query 相关的内容，可限定来源文件。query 请使用用户原始措辞，不要翻译或音译。返回带来源的 Markdown 片段，片段即正文、请直接据此作答；来源/章节只是索引标识、不是磁盘文件路径，无需再找原文件。此说明只针对知识库文档，不影响 web_scan / file_* / shell_run 等其它工具。"
+    public let description = "从本地知识库（RAG）检索与 query 相关的内容，可限定来源文件。query 请使用用户原始措辞，不要翻译或音译。返回带来源的 Markdown 片段，片段即正文、请直接据此作答；来源/章节只是索引标识、不是磁盘文件路径，无需再找原文件。此说明只针对知识库文档，不影响 web_scan / file_tools / shell_run 等其它工具。"
     public let parameters: JSONValue = .object([
         "type": .string("object"),
         "properties": .object([
@@ -93,7 +93,7 @@ public final class RagSearchTool: AgentTool {
 /// 文档大纲工具：等价于 Python `RagOutlineTool`。
 public final class RagOutlineTool: AgentTool {
     public let name = "rag_outline"
-    public let description = "查看已索引文档的章节结构（目录）与内容摘要，用于先整体了解一本书再定位细节；不传 book_name 时列出全部已索引文档。章节标题/摘要是向量库索引内容、不是磁盘文件路径，无需再找原文件。此说明只针对知识库文档，不影响 web_scan / file_* / shell_run 等其它工具。"
+    public let description = "查看已索引文档的章节结构（目录）与内容摘要，用于先整体了解一本书再定位细节；不传 book_name 时列出全部已索引文档。章节标题/摘要是向量库索引内容、不是磁盘文件路径，无需再找原文件。此说明只针对知识库文档，不影响 web_scan / file_tools / shell_run 等其它工具。"
     public let parameters: JSONValue = .object([
         "type": .string("object"),
         "properties": .object([
@@ -135,7 +135,7 @@ public final class RagOutlineTool: AgentTool {
         case .notFound:
             return .fail("未找到文档: \(name)")
         case .ambiguous(let candidates):
-            var lines = ["匹配到多个文档（\(candidates.count) 个），请给 rag_outline 传更完整的文档名:"]
+            var lines = ["匹配到多个文档（\(candidates.count) 个），请给 rag_tools(op=\"outline\") 传更完整的文档名:"]
             for candidate in candidates.prefix(20) {
                 lines.append("  - \(candidate.docName)（ID: \(candidate.docID)）")
             }

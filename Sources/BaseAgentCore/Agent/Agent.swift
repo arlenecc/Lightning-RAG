@@ -10,11 +10,25 @@ public final class AgentToolDispatcher {
     private var schemaCache: [JSONValue]?
     private let lock = NSLock()
 
-    private let parallelSafe: Set<String> = [
-        "web_scan", "rag_search", "rag_outline",
-        "skill_search", "skill_semantic_search", "memory_search",
-    ]
     private let maxParallel = 8
+
+    /// 只读、无副作用、可并发的调用。组合工具需按 `op` 判定：`rag_tools(op=ingest)`
+    /// 会写索引、`long_memory(op=graph)` 会写图谱，绝不能并行。
+    private func isParallelSafe(_ call: ToolCall) -> Bool {
+        let op = call.arguments["op"]?.stringValue ?? ""
+        switch call.name {
+        case "web_scan":
+            return true
+        case "rag_tools":
+            return op == "search" || op == "outline"
+        case "skill_tools":
+            return op == "search" || op == "semantic_search"
+        case "long_memory":
+            return op == "search"
+        default:
+            return false
+        }
+    }
 
     public init(agent: Agent) { self.agent = agent }
 
@@ -85,7 +99,7 @@ public final class AgentToolDispatcher {
                 continue
             }
 
-            if parallelSafe.contains(call.name) {
+            if isParallelSafe(call) {
                 parallelJobs.append((index, call))
                 continue
             }
@@ -943,12 +957,12 @@ public final class Agent: @unchecked Sendable {
             sections.append("# Working checkpoint\n\(checkpoint.prefix(4_000))")
         }
 
-        // 命中技能：截断并提示用 skill_load 读全文。
+        // 命中技能：截断并提示用 skill_tools(op="load") 读全文。
         if !lastUserText.isEmpty, let matched = skills.match(lastUserText) {
             var prompt = matched.body
             if prompt.count > SystemPromptLimits.maxSkillPromptChars {
                 prompt = String(prompt.prefix(SystemPromptLimits.maxSkillPromptChars))
-                    + "\n…（已截断，用 skill_load 读取完整技能内容）"
+                    + "\n…（已截断，用 skill_tools(op=\"load\") 读取完整技能内容）"
             }
             sections.append("# Active skill: \(matched.name)\n\(prompt)")
         }
@@ -968,7 +982,7 @@ public final class Agent: @unchecked Sendable {
                     + "\(names). " + KNOWLEDGE_BASE_HINT
                     + " Follow the knowledge-base strategy in the system prompt.")
             } else {
-                sections.append("# Knowledge base\nConfigured but empty. Use `rag_ingest` to index.")
+                sections.append("# Knowledge base\nConfigured but empty. Use `rag_tools(op=\"ingest\")` to index.")
             }
         } else if FileManager.default.fileExists(atPath: ragEngine.indexDBPath) {
             // 启动后状态快照还没生成（由 UI 在后台刷新）：先给一个无统计的轻提示，

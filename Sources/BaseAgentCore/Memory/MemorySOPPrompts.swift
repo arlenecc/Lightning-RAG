@@ -18,7 +18,7 @@ import Foundation
 public let MEMORY_MANAGEMENT_SOP = """
 ## 0. 核心公理（最高优先级）
 1. **行动验证 (Action-Verified Only)**：写入 L1/L2/L3 必须源自**成功的工具调用结果**
-   （`shell_run`/`file_read`/运行通过的代码）；禁写固有知识、推理猜测、未执行的计划、
+   （`shell_run`/`file_tools(op="read")`/运行通过的代码）；禁写固有知识、推理猜测、未执行的计划、
    未验证假设。No Execution, No Memory.
 2. **神圣不可删改 (Sanctity of Verified Data)**：已验证的配置/避坑/关键路径，重构时
    严禁丢弃；可压缩文字、迁移层级（L2→L3），但不得丢准确性与可追溯性。
@@ -42,7 +42,7 @@ L1 global_mem_insight.txt   极简索引，≤30 行（指针）
 **L2 事实库**：按 `## [SECTION]` 组织全局环境性事实（路径/凭证/配置/常量），可随环境膨胀。
 禁存易变状态、猜测、大模型可推理的通用常识。变化时同步 L1 导航行（只导航）。
 
-**L3 记录库**：只记**跨会话**仍重要、难以几步 `file_read`/`web_scan`/脚本重建的要点：
+**L3 记录库**：只记**跨会话**仍重要、难以几步 `file_tools(op="read")`/`web_scan`/脚本重建的要点：
 任务特有隐藏前置条件、典型坑（遗忘会导致高成本重试）。不记普通步骤、易重建路径、
 项目特定事实。SOP（`*_sop.md`）＝极简「关键前置＋典型坑」清单，禁长篇教程；
 脚本（`*.py`）只封装高复用复杂流程。
@@ -69,10 +69,10 @@ L1 global_mem_insight.txt   极简索引，≤30 行（指针）
 
 ## 运行时读写约定
 - L0 META-SOP 与 L1 索引常驻 system prompt，无需自行读取。
-- L2/L3 细节用 `file_read("memory/global_mem.txt")` / `file_read("memory/xxx_sop.md")`；
+- L2/L3 细节用 `file_tools(op="read", path="memory/global_mem.txt")` / `file_tools(op="read", path="memory/xxx_sop.md")`；
   读到 SOP 后立即 `update_working_checkpoint(key_info=...)` 提炼要点，每轮回注、只读一次
   （要点丢失才重读）。
-- 改 `memory/` 只允许 `file_patch` 少量追加，禁 `file_write` 覆盖与 `code_run` 批量改写，
+- 改 `memory/` 只允许 `file_tools(op="patch")` 少量追加，禁 `file_tools(op="write")` 覆盖与 `code_run` 批量改写，
   改不动宁可不改。
 - L2/L3 唯一正式写入入口 `start_long_term_update`（任务完成/重要检查点，轮数 ≥5）。
 """
@@ -89,12 +89,12 @@ L3: memory_cleanup_sop(记忆整理)
 [RULES]
 1. 搜索先行: 禁长时间递归, 网络搜索优先bing, 优先看cwd, 禁猜路径
 2. 交叉验证: 禁信摘要, 数值进详情页核实
-3. 编码安全: 禁PS cat/type用file_read; 改前必读, patch的old唯一命中
+3. 编码安全: 禁PS cat/type用file_tools(op="read"); 改前必读, patch的old唯一命中
 4. 分步执行, 控制粒度, 限制失败半径
 5. 失败: ≥3种不同方法失败才blocked并继续其余步骤, 不问是否继续
 6. 进程: 禁无条件杀python(杀自己), 精确PID, 禁os.kill判活
 7. SOP: 决策前查记忆, 有SOP/utils必用; 未查证不断言, 读SOP禁凭印象
-8. 写记忆按L0决策树归类, memory下只file_patch少量追加
+8. 写记忆按L0决策树归类, memory下只file_tools(op="patch")少量追加
 9. 密钥文件仅引用, 不读取/移动
 10. 写记忆唯一入口: start_long_term_update(轮数≥5), 禁overwrite/code_run
 """

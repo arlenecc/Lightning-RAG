@@ -22,66 +22,125 @@ public enum AgentToolFactory {
         // 改进5：file_read 使用调用方（Agent）持有的 tracker，reset() 才能清空。
         let sharedSOPTracker = sopTracker
 
-        var tools: [AgentTool] = [
-            FileReadTool(config: config, callbacks: callbacks, registry: registry,
-                         sopTracker: sharedSOPTracker),
-            FileWriteTool(config: config, callbacks: callbacks, registry: registry),
-            FileModifyTool(config: config, callbacks: callbacks, registry: registry),
-            FileListTool(config: config, callbacks: callbacks, registry: registry),
-            FileSearchTool(config: config, callbacks: callbacks, registry: registry),
+        var tools: [AgentTool] = []
+
+        // 文件操作 → file_tools（op: read/write/modify/patch/list/search）。
+        let fileModify = FileModifyTool(config: config, callbacks: callbacks, registry: registry)
+        tools.append(CompositeTool(
+            name: "file_tools",
+            description:
+                "Workspace file operations. Choose the action via `op`:\n"
+                + "- op=\"read\": read a text file (path, offset, limit, line_numbers); returns "
+                + "lines, optionally numbered for precise patching.\n"
+                + "- op=\"write\": overwrite or create a file (path, content).\n"
+                + "- op=\"modify\" (alias \"patch\"): replace the first occurrence of `old` with "
+                + "`new` (path, old, new, replace_all).\n"
+                + "- op=\"list\": list directory entries (path, glob, recursive, max_depth, max_entries).\n"
+                + "- op=\"search\": regex-search file contents, returns \"path:line: text\" "
+                + "(pattern, path, glob, case_sensitive, context, max_results).",
+            subcommands: [
+                ("read", FileReadTool(config: config, callbacks: callbacks, registry: registry,
+                                      sopTracker: sharedSOPTracker)),
+                ("write", FileWriteTool(config: config, callbacks: callbacks, registry: registry)),
+                ("modify", fileModify),
+                ("patch", fileModify),
+                ("list", FileListTool(config: config, callbacks: callbacks, registry: registry)),
+                ("search", FileSearchTool(config: config, callbacks: callbacks, registry: registry)),
+            ]))
+
+        // 网络 → web_scan（op: scan/render）；webexec_js 已删除。
+        tools.append(CompositeTool(
+            name: "web_scan",
+            description:
+                "Fetch or render a web page. Choose via `op`:\n"
+                + "- op=\"scan\" (default): fetch a URL and return visible text (HTML stripped); "
+                + "auto-renders JS-driven pages with the built-in WebKit (url, raw, render).\n"
+                + "- op=\"render\": explicit WebKit render — wait for a CSS selector, run JS, "
+                + "return text / rendered HTML / script result / screenshot "
+                + "(url, wait_ms, wait_selector, script, raw_html, screenshot).",
+            subcommands: [
+                ("scan", WebScanTool(config: config, callbacks: callbacks, registry: registry)),
+                ("render", WebRenderTool(config: config, callbacks: callbacks, registry: registry)),
+            ],
+            defaultOp: "scan"))
+
+        // 长期记忆 → long_memory（op: graph/search）。
+        tools.append(CompositeTool(
+            name: "long_memory",
+            description:
+                "Long-term memory (knowledge graph + semantic recall). Choose via `op`:\n"
+                + "- op=\"graph\": manipulate the entity/relation/observation graph "
+                + "(graph_op: create_entity / add_observations / create_relation / list_entities / "
+                + "get_entity / delete_entity / snapshot / clear).\n"
+                + "- op=\"search\": semantic recall of stored facts (query, top_k). "
+                + "Use the user's original wording for query.",
+            subcommands: [
+                ("graph", MemoryGraphTool(config: config, callbacks: callbacks, registry: registry)),
+                ("search", MemorySearchTool(config: config, callbacks: callbacks, registry: registry)),
+            ]))
+
+        // 技能 → skill_tools（op: search/load/semantic_search/save）。
+        tools.append(CompositeTool(
+            name: "skill_tools",
+            description:
+                "Reusable skills. Choose via `op`:\n"
+                + "- op=\"search\": keyword search of saved skills (query, top_k).\n"
+                + "- op=\"semantic_search\": semantic/BM25 hybrid search of SKILL.md (query, top_k); "
+                + "use the user's original wording for query.\n"
+                + "- op=\"load\": load a skill's full instructions by directory (path, entry).\n"
+                + "- op=\"save\": save a reusable workflow as a skill "
+                + "(name, description, steps, when_to_use, pitfalls, tags).",
+            subcommands: [
+                ("search", SkillSearchTool(config: config, callbacks: callbacks, registry: registry,
+                                           index: skillIndex)),
+                ("semantic_search", SkillSemanticSearchTool(
+                    config: config, callbacks: callbacks, registry: registry,
+                    retriever: skillRetriever)),
+                ("load", SkillLoadTool(config: config, callbacks: callbacks, registry: registry,
+                                       retriever: skillRetriever, index: skillIndex)),
+                ("save", SkillSaveTool(config: config, callbacks: callbacks, registry: registry,
+                                       manager: skillManager, retriever: skillRetriever,
+                                       index: skillIndex)),
+            ]))
+
+        // 知识库 → rag_tools（op: search/outline/status/ingest）。
+        tools.append(CompositeTool(
+            name: "rag_tools",
+            description:
+                "Local knowledge-base (RAG). Choose via `op`:\n"
+                + "- op=\"search\": retrieve relevant chunks (query, source, top_k); "
+                + "use the user's original wording for query.\n"
+                + "- op=\"outline\": view a document's chapter outline/summaries, or list all "
+                + "documents (book_name).\n"
+                + "- op=\"status\": knowledge-base indexing status.\n"
+                + "- op=\"ingest\": build/update the index (force).",
+            subcommands: [
+                ("search", RagSearchTool(config: config, callbacks: callbacks, registry: registry,
+                                         engine: ragEngine)),
+                ("outline", RagOutlineTool(config: config, callbacks: callbacks, registry: registry,
+                                           engine: ragEngine)),
+                ("status", RagStatusTool(config: config, callbacks: callbacks, registry: registry,
+                                         engine: ragEngine)),
+                ("ingest", RagIngestTool(config: config, callbacks: callbacks, registry: registry,
+                                         engine: ragEngine)),
+            ]))
+
+        // 未合并的独立工具。
+        let standaloneTools: [AgentTool] = [
             CodeRunTool(config: config, callbacks: callbacks, registry: registry),
             ShellRunTool(config: config, callbacks: callbacks, registry: registry),
-            WebScanTool(config: config, callbacks: callbacks, registry: registry),
             AskUserTool(config: config, callbacks: callbacks, registry: registry),
 
             WorkMemoryTool(config: config, callbacks: callbacks, registry: registry,
                            workMemory: sharedWorkMemory),
-            MemoryGraphTool(config: config, callbacks: callbacks, registry: registry),
-            MemorySearchTool(config: config, callbacks: callbacks, registry: registry),
-
-            SkillSearchTool(config: config, callbacks: callbacks, registry: registry,
-                            index: skillIndex),
-            SkillLoadTool(config: config, callbacks: callbacks, registry: registry,
-                          retriever: skillRetriever, index: skillIndex),
-            SkillSemanticSearchTool(config: config, callbacks: callbacks, registry: registry,
-                                    retriever: skillRetriever),
-            SkillSaveTool(config: config, callbacks: callbacks, registry: registry,
-                          manager: skillManager, retriever: skillRetriever, index: skillIndex),
 
             UpdateWorkingCheckpointTool(config: config, callbacks: callbacks, registry: registry),
             StartLongTermUpdateTool(config: config, callbacks: callbacks, registry: registry),
             UpdatePlanTool(config: config, callbacks: callbacks, registry: registry),
-
-            RagSearchTool(config: config, callbacks: callbacks, registry: registry,
-                          engine: ragEngine),
-            RagOutlineTool(config: config, callbacks: callbacks, registry: registry,
-                           engine: ragEngine),
-            RagStatusTool(config: config, callbacks: callbacks, registry: registry,
-                          engine: ragEngine),
-            RagIngestTool(config: config, callbacks: callbacks, registry: registry,
-                          engine: ragEngine),
         ]
-        if !config.browserEndpoint.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            tools.append(WebExecJsTool(config: config, callbacks: callbacks, registry: registry))
-        }
-        // 内置 WebKit 渲染：无需外部浏览器桥，动态页面兜底能力。
-        tools.append(WebRenderTool(config: config, callbacks: callbacks, registry: registry))
-        registry.registerAll(tools)
+        tools.append(contentsOf: standaloneTools)
 
-        // 原子工具名对齐 GenericAgent。
-        if registry.get("file_modify") != nil {
-            registry.register(AliasTool(
-                targetName: "file_modify", alias: "file_patch",
-                description: "Replace a unique block of text (old) with new. old must match exactly "
-                    + "(whitespace/indentation). Use file_read first to get current content.",
-                registry: registry))
-        }
-        if registry.get("webexec_js") != nil {
-            registry.register(AliasTool(
-                targetName: "webexec_js", alias: "web_execute_js",
-                description: "Execute JavaScript in the attached browser for full page control.",
-                registry: registry))
-        }
+        registry.registerAll(tools)
         return registry
     }
 

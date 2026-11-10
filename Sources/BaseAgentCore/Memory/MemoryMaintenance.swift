@@ -97,7 +97,7 @@ public final class MemoryMaintenance: @unchecked Sendable {
     /// **绝不自动改写记忆文件**：META-SOP 红线「L1 只能 patch 词级别修改，禁
     /// overwrite」，且覆盖会改 mtime → system 前缀变 → KV 全量失效。辅助引擎只
     /// 产出「整理建议 + 建议的 L1 全文」到 `memory_tidy_proposal.md`，由模型在
-    /// `start_long_term_update` 门控后用 `file_patch` 逐词修改；无人复核不落盘。
+    /// `start_long_term_update` 门控后用 `file_tools(op="patch")` 逐词修改；无人复核不落盘。
     public func tidyMemory() async -> Bool {
         let l1 = dir.read(dir.l1File, limit: 8_000) ?? ""
         let l2 = dir.read(dir.l2File, limit: 20_000) ?? ""
@@ -125,7 +125,7 @@ public final class MemoryMaintenance: @unchecked Sendable {
         删翻译/内容描述/实现细节/冗余；保留原 [RULES] 标号体系）。
         === PROPOSAL ===
         L2 瘦身与 L3 审计的**建议清单**（纯文本，逐条写清改哪个文件、建议的
-        file_patch(old,new) 是什么；本部分不会自动执行，仅供后续按门控少量 patch）。
+        file_tools(op="patch", old, new) 是什么；本部分不会自动执行，仅供后续按门控少量 patch）。
         """
         let raw = await collect([
             ChatMessage(role: .system, content: "你是记忆整理器。" + MEMORY_TIDY_SOP),
@@ -145,7 +145,7 @@ public final class MemoryMaintenance: @unchecked Sendable {
         # 记忆整理建议（辅助引擎产出，未自动执行）
 
         > 按 META-SOP：L1 只能 patch 词级别修改，禁 overwrite。
-        > 请经 start_long_term_update 门控后，用 file_patch 逐条核对再修改。
+        > 请经 start_long_term_update 门控后，用 file_tools(op="patch") 逐条核对再修改。
         > 生成时间：\(MemoryDirectory.timestamp())
 
         ## 建议的 L1 全文（仅供对照，不要整文件覆盖）

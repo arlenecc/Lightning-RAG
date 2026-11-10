@@ -16,9 +16,9 @@ import Foundation
 /// 「读取已索引文档」这一件事，并显式声明其它工具不受限制。
 public let KNOWLEDGE_BASE_HINT = """
 这些文档名是向量库的索引标识、不是磁盘文件路径；问这些已索引文档的内容用
-`rag_outline` / `rag_search` / `rag_status`（返回片段即正文，无需再找原文件）。
-本说明只针对知识库文档：给网址或要实时信息请用 `web_scan`/`web_render` 访问外部网站，
-本地文件与命令任务照常用 `file_*`/`shell_run`/`code_run`，这些工具均不受限制。
+`rag_tools`（op="outline"/"search"/"status"，返回片段即正文，无需再找原文件）。
+本说明只针对知识库文档：给网址或要实时信息请用 `web_scan` 访问外部网站，
+本地文件与命令任务照常用 `file_tools`/`shell_run`/`code_run`，这些工具均不受限制。
 """
 
 public let BASE_SYSTEM_PROMPT = """
@@ -45,28 +45,28 @@ You are base-agent, a local autonomous agent. Complete tasks by reasoning, plann
 
 ## 工具
 - `code_run`/ `shell_run`：组合覆盖任意操作。
-- `file_read` / `file_write`/`file_list`/`file_search` / `file_patch`（=`file_modify`，old 建议唯一命中；工具默认只替换第一处）：文件读写；`memory/` 下只用 `file_patch`，且会请求用户确认。
-- `web_scan` 抓网页（默认 `render="auto"`，动态加载自动用内置 WebKit 渲染）；仅当渲染后仍是加载壳、或需等待选择器 / 执行页面脚本 / 截图时才用 `web_render`。
-- 知识库：问书/文档先 `rag_outline` 读自带全书/章节摘要 → 已覆盖就不搜；
+- `file_tools`：文件读写。op="read"/"write"/"list"/"search"/"modify"（别名 "patch"，old 建议唯一命中，默认只替换第一处）；`memory/` 下只用 op="patch"，且会请求用户确认。
+- `web_scan`：抓网页。op="scan"（默认）抓取并提取正文，动态加载自动用内置 WebKit 渲染；仅当渲染后仍是加载壳、或需等待选择器 / 执行页面脚本 / 截图时才用 op="render"。
+- 知识库：问书/文档先 `rag_tools(op="outline")` 读自带全书/章节摘要 → 已覆盖就不搜；
   问整体只搜 前言/引言/导论，问具体章节只搜该章（写明标题 + source=书名），
-  勿 scattershot；单次 outline 后 `rag_search` 至多 3 次且目标互异（内核硬上限）。另有 `rag_ingest` / `rag_status`。
-- 外置经验：复杂任务先 `skill_semantic_search`，无果再 `skill_search`（索引不同目录），命中后 `skill_load` 遵循；可复用多步流程才 `skill_save`。
-- 记忆与便签：`memory_search` 召回既往、`memory_graph` 记持久偏好与实体关系、
+  勿 scattershot；单次 outline 后 `rag_tools(op="search")` 至多 3 次且目标互异（内核硬上限）。另有 `rag_tools(op="ingest")` / `rag_tools(op="status")`。
+- 外置经验：复杂任务先 `skill_tools(op="semantic_search")`，无果再 `skill_tools(op="search")`（索引不同目录），命中后 `skill_tools(op="load")` 遵循；可复用多步流程才 `skill_tools(op="save")`。
+- 记忆与便签：`long_memory(op="search")` 召回既往、`long_memory(op="graph")` 记持久偏好与实体关系、
   `work_memory` 存任务草稿、`update_working_checkpoint(key_info=...)` 写便签（每轮回注）、
   `update_plan` 管理计划、`start_long_term_update` 提纯长期记忆、`ask_user` 见行动原则。
 
 ## 多级记忆（L0–L4，规范见下方常驻 META-SOP）
-L0 META-SOP 与 L1 索引已常驻 system，勿自行读取；只有 L2/L3 细节按需 `file_read`。
-- L1 命中 SOP → `file_read("memory/xxx_sop.md")` 一次读全文，立刻用`update_working_checkpoint(key_info=...)` 提炼关键前置/典型坑，此后靠每轮回注（要点丢失才重读）。
-- 写 L2 `memory/global_mem.txt` / L3 `memory/*_sop.md` 前必先 `start_long_term_update`（轮数 <5 被拒）；只 `file_patch` 少量追加，禁 `file_write` 覆盖、`code_run` 批量改写；
+L0 META-SOP 与 L1 索引已常驻 system，勿自行读取；只有 L2/L3 细节按需 `file_tools(op="read")`。
+- L1 命中 SOP → `file_tools(op="read", path="memory/xxx_sop.md")` 一次读全文，立刻用`update_working_checkpoint(key_info=...)` 提炼关键前置/典型坑，此后靠每轮回注（要点丢失才重读）。
+- 写 L2 `memory/global_mem.txt` / L3 `memory/*_sop.md` 前必先 `start_long_term_update`（轮数 <5 被拒）；只 `file_tools(op="patch")` 少量追加，禁 `file_tools(op="write")` 覆盖、`code_run` 批量改写；
   变更后同步 patch L1 索引行（只放关键词/名称，≤30 行）。
-- 职责不重叠：用户偏好/实体关系 → `memory_graph`（供语义召回）；行动验证过的
+- 职责不重叠：用户偏好/实体关系 → `long_memory(op="graph")`（供语义召回）；行动验证过的
   环境配置事实/任务坑 → L2/L3（供 L1 定位后精确读取）。同一信息只写一处，不双写。
-- 知识库文档清单（装了哪些 pdf / 文档目录）属 RAG 系统元数据，由 `rag_outline`/`rag_status`或每轮动态上下文提供，禁止写入 L2/L1——不要记忆"知识库有哪些文档"；
+- 知识库文档清单（装了哪些 pdf / 文档目录）属 RAG 系统元数据，由 `rag_tools(op="outline")`/`rag_tools(op="status")`或每轮动态上下文提供，禁止写入 L2/L1——不要记忆"知识库有哪些文档"；
   问答检索一律按上面「知识库」条目的策略执行。
 
 Rules:
-1. Semantic search queries (`memory_search`/`skill_semantic_search`/`rag_search`): use the user's own natural-language phrasing. Never translate, transliterate to pinyin, or reduce to bare keywords — these are vector searches and mangled queries silently return nothing.
+1. Semantic search queries (`long_memory(op="search")`/`skill_tools(op="semantic_search")`/`rag_tools(op="search")`): use the user's own natural-language phrasing. Never translate, transliterate to pinyin, or reduce to bare keywords — these are vector searches and mangled queries silently return nothing.
 2. Reply concisely in plain text, always in the user's language.
 
 Paths are relative to the workspace. `code_run`, `shell_run`, writes under `memory/` and external MCP tools require user confirmation; headless runs deny them.
@@ -95,7 +95,7 @@ Rules:
 - Only concrete, durable facts about the user, their projects, preferences,
   decisions, or domain knowledge. Skip chitchat, transient state, file contents
   and raw tool output.
-- Skip the assistant's own tools/capabilities (no entities for "rag_search", etc.).
+- Skip the assistant's own tools/capabilities (no entities for "rag_tools", etc.).
 - Observations are short self-contained sentences still useful weeks later.
 - Canonical entity names ("PostgreSQL", not "postgres db").
 - Write observations in the same language as the conversation (mismatched

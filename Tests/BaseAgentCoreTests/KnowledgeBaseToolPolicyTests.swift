@@ -28,10 +28,14 @@ final class KnowledgeBaseToolPolicyTests: XCTestCase {
     }
 
     func testSystemPromptKeepsKnowledgeBaseRuleNarrow() {
-        XCTAssertTrue(BASE_SYSTEM_PROMPT.contains("不是磁盘"))
-        XCTAssertTrue(BASE_SYSTEM_PROMPT.contains("以上仅约束「读取已索引文档」"))
-        XCTAssertTrue(BASE_SYSTEM_PROMPT.contains("给网址/要实时信息用 `web_scan`"))
+        // 窄规则现已落在 KNOWLEDGE_BASE_HINT（动态上下文注入）；BASE 保留「不替代联网」声明。
+        XCTAssertTrue(KNOWLEDGE_BASE_HINT.contains("不是磁盘"))
+        XCTAssertTrue(KNOWLEDGE_BASE_HINT.contains("本说明只针对知识库文档"))
+        XCTAssertTrue(KNOWLEDGE_BASE_HINT.contains("给网址或要实时信息请用 `web_scan`"))
+        XCTAssertTrue(BASE_SYSTEM_PROMPT.contains("不要用知识库检索代替联网"))
         XCTAssertFalse(BASE_SYSTEM_PROMPT.contains("知识库问答只用 rag_"),
+                       "全局禁令会让模型连联网工具都不敢调用")
+        XCTAssertFalse(KNOWLEDGE_BASE_HINT.contains("知识库问答只用"),
                        "全局禁令会让模型连联网工具都不敢调用")
     }
 
@@ -50,15 +54,17 @@ final class KnowledgeBaseToolPolicyTests: XCTestCase {
                 XCTAssertFalse(text.contains(ban), "\(label) 不得含全局禁令：\(ban)")
             }
             XCTAssertTrue(text.contains("web_scan"), "\(label) 必须正向提到联网工具")
-            XCTAssertTrue(text.contains("不受限制") || text.contains("不限制其它工具")
-                || text.contains("均不受限制") || text.contains("照常用"),
-                          "\(label) 必须显式声明其它工具不受限制")
+            let affirmsOtherTools = text.contains("不受限制") || text.contains("不限制其它工具")
+                || text.contains("均不受限制") || text.contains("照常用")
+                || text.contains("不要用知识库检索代替联网")
+            XCTAssertTrue(affirmsOtherTools,
+                          "\(label) 必须显式声明其它工具不受限制（或「不替代联网」）")
         }
     }
 
     func testSystemPromptAffirmsNetworkAccess() {
         XCTAssertTrue(BASE_SYSTEM_PROMPT.contains("联网抓取"))
-        XCTAssertTrue(BASE_SYSTEM_PROMPT.contains("不要声称"))
+        XCTAssertTrue(BASE_SYSTEM_PROMPT.contains("无法访问网络"))
         XCTAssertTrue(BASE_SYSTEM_PROMPT.contains("不要用知识库检索代替联网"))
     }
 
@@ -76,8 +82,9 @@ final class KnowledgeBaseToolPolicyTests: XCTestCase {
                     // id 每轮不同，但 name + arguments 完全相同 —— callSig 只看后者，
                     // 正是事故中「原样重试」的形态。
                     c.yield(.init(kind: .done, toolCalls: [
-                        ToolCall(id: "f\(n)", name: "file_read",
-                                 arguments: ["path": .string("memory/猫图鉴.pdf/6 猫图鉴.md")])
+                        ToolCall(id: "f\(n)", name: "file_tools",
+                                 arguments: ["op": .string("read"),
+                                             "path": .string("memory/猫图鉴.pdf/6 猫图鉴.md")])
                     ]))
                     c.finish()
                 }

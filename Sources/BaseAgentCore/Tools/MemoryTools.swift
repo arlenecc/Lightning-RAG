@@ -96,11 +96,11 @@ public final class WorkMemoryTool: AgentTool {
 /// 知识图谱工具：等价于 Python `MemoryGraphTool`。
 public final class MemoryGraphTool: AgentTool {
     public let name = "memory_graph"
-    public let description = "跨任务长期记忆（实体-关系-观察知识图谱）。op=create_entity/add_observations/create_relation/list_entities/get_entity/delete_entity/snapshot/clear。"
+    public let description = "跨任务长期记忆（实体-关系-观察知识图谱）。graph_op=create_entity/add_observations/create_relation/list_entities/get_entity/delete_entity/snapshot/clear。"
     public let parameters: JSONValue = .object([
         "type": .string("object"),
         "properties": .object([
-            "op": .object([
+            "graph_op": .object([
                 "type": .string("string"),
                 "enum": .array([
                     .string("create_entity"), .string("add_observations"),
@@ -155,12 +155,12 @@ public final class MemoryGraphTool: AgentTool {
     }
 
     public func shouldConfirm(_ args: [String: JSONValue]) -> Bool {
-        let op = args.trimmedString("op")
+        let op = args.trimmedString("graph_op")
         return op == "clear" || op == "delete_entity"
     }
 
     public func run(_ args: [String: JSONValue]) async throws -> ToolResult {
-        let op = args.trimmedString("op")
+        let op = args.trimmedString("graph_op")
         switch op {
         case "create_entity":
             let name = args.trimmedString("name")
@@ -219,7 +219,7 @@ public final class MemoryGraphTool: AgentTool {
             graph.clear()
             return .ok("cleared")
         default:
-            return .fail("未知 op: \(op)")
+            return .fail("未知 graph_op: \(op)")
         }
     }
 

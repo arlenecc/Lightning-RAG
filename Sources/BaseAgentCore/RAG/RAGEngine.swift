@@ -2355,7 +2355,7 @@ public final class RAGEngine {
                                           source: source, timeout: timeout)
             }
         } catch is RerankTimeout {
-            throw AgentError.timeout("rag_search 端到端超时（\(Int(totalBudget))s），"
+            throw AgentError.timeout("rag_tools(op=\"search\") 端到端超时（\(Int(totalBudget))s），"
                 + "已放弃本次检索；可稍后重试或缩小 topK")
         }
     }

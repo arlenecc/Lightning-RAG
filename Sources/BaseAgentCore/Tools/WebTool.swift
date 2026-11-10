@@ -166,7 +166,7 @@ public final class WebScanTool: AgentTool, ShutdownableTool {
                 let hint: String
                 switch http.statusCode {
                 case 403, 412:
-                    hint = "（疑似反爬或权限拦截：建议改用 web_render 用内置 WebKit "
+                    hint = "（疑似反爬或权限拦截：建议改用 web_scan(op=\"render\") 用内置 WebKit "
                         + "渲染重试；或改抓取该站的 RSS/feed / 移动版 URL）"
                 case 429, 503:
                     hint = "（限流/暂不可用：已按 Retry-After 重试仍失败，"
