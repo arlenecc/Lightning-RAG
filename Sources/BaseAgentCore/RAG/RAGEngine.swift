@@ -532,6 +532,13 @@ public final class RAGEngine {
     public let config: AgentConfig
     public let ragDir: String
     public let markdownDir: String
+    /// 图谱抽取限额（来自配置，构建/增量都使用同一套参数）。
+    private var kgExtractionLimits: KGExtractionLimits {
+        KGExtractionLimits(
+            maxEntitiesPerChunk: config.ragKGMaxEntitiesPerChunk,
+            maxRelationsPerChunk: config.ragKGMaxRelationsPerChunk,
+            maxDescriptionCharacters: config.ragKGMaxDescriptionChars)
+    }
     /// 按知识库隔离的向量库路径（ragDir/index.sqlite）。
     public var indexDBPath: String {
         (ragDir as NSString).appendingPathComponent("index.sqlite")
@@ -972,7 +979,8 @@ public final class RAGEngine {
         guard let embedding else {
             throw AgentError.storage("embedding 模型不可用，无法使用知识图谱")
         }
-        let s = try KnowledgeGraphStore(dbPath: indexDBPath, embedding: embedding)
+        let s = try KnowledgeGraphStore(dbPath: indexDBPath, embedding: embedding,
+                                        enableSQLiteVec: config.ragSQLiteVecEnabled)
         kgStore = s
         return s
     }
@@ -981,7 +989,8 @@ public final class RAGEngine {
     private func ensureKnowledgeGraph() throws -> (KnowledgeGraphStore, KnowledgeGraph) {
         let s = try ensureKnowledgeGraphStore()
         if kgGraph == nil {
-            let g = KnowledgeGraph(snapshotPath: knowledgeGraphSnapshotPath)
+            let g = KnowledgeGraph(snapshotPath: knowledgeGraphSnapshotPath,
+                                   revisionProvider: { [weak s] in try? s?.revision() })
             try? g.loadOrRestore(from: s)
             kgGraph = g
         }
@@ -1000,7 +1009,17 @@ public final class RAGEngine {
         let e = (try? db.scalar("SELECT COUNT(*) FROM \(KnowledgeGraphStore.entitiesTable)").intValue) ?? 0
         let r = (try? db.scalar("SELECT COUNT(*) FROM \(KnowledgeGraphStore.relationshipsTable)").intValue) ?? 0
         let entities = Int(e), relationships = Int(r)
-        return (built: entities > 0 || relationships > 0, entities: entities, relationships: relationships)
+        let state = (try? db.scalar("SELECT value FROM meta WHERE key = ?",
+                                    [.text(KnowledgeGraphStore.buildStateKey)]))?.stringValue
+        let built: Bool
+        if let state {
+            // 新库以构建状态为准：只有全量抽取并建图完成（complete）才算建成。
+            built = state == KnowledgeGraphStore.BuildState.complete.rawValue
+        } else {
+            // 旧库没有状态标记：沿用「有实体或关系」的判定。
+            built = entities > 0 || relationships > 0
+        }
+        return (built: built, entities: entities, relationships: relationships)
     }
 
     /// 构建知识图谱：后台用辅助模型在已完成切片上抽取实体/关系，聚合入库，
@@ -1012,6 +1031,8 @@ public final class RAGEngine {
         log: ((String) -> Void)? = nil
     ) async -> KnowledgeGraphBuilder.BuildStats {
         var stats = KnowledgeGraphBuilder.BuildStats()
+        var priorState: KnowledgeGraphStore.BuildState?
+        var priorRevision = 0
         do {
             let llm = auxLLM ?? self.auxLLM
             guard let llm else {
@@ -1020,14 +1041,320 @@ public final class RAGEngine {
             }
             self.auxLLM = llm
             let store = try ensureKnowledgeGraphStore()
-            let graph = KnowledgeGraph(snapshotPath: knowledgeGraphSnapshotPath)
-            kgGraph = graph
-            let builder = KnowledgeGraphBuilder(store: store, graph: graph, llm: llm)
+            priorState = try store.buildState()
+            priorRevision = store.revision()
+            // 先在旁路图上构建，成功后才替换内存图；失败时旧图谱仍可用。
+            let graph = KnowledgeGraph(snapshotPath: knowledgeGraphSnapshotPath,
+                                       revisionProvider: { [weak store] in
+                                           try? store?.revision()
+                                       })
+            let builder = KnowledgeGraphBuilder(store: store, graph: graph, llm: llm,
+                                                limits: kgExtractionLimits)
             stats = try await builder.build(progress: progress, log: log)
+            kgLock.lock()
+            kgGraph = graph
+            kgLock.unlock()
         } catch {
+            if let store = try? ensureKnowledgeGraphStore() {
+                // 数据库已被原子替换过（revision 变化）则只能等重建；
+                // 否则恢复构建前状态，旧图谱继续可用。
+                if store.revision() != priorRevision {
+                    try? store.markBuildState(.stale)
+                } else {
+                    try? store.markBuildState(priorState ?? .stale)
+                }
+                // 抽取缓存按内容哈希保留：重试时可直接复用已完成的切片。
+            }
             log?("[kg] 知识图谱构建失败: \(error.localizedDescription)")
         }
         return stats
+    }
+
+    /// 知识库内容变化后图谱失效：标记 stale 并丢弃内存图，检索自动回退 naive，
+    /// 直到用户重新构建知识图谱。
+    private func invalidateKnowledgeGraph(reason: String) {
+        guard let store = try? ensureKnowledgeGraphStore() else { return }
+        do {
+            try store.markBuildState(.stale)
+            kgLock.lock()
+            kgGraph = nil
+            kgLock.unlock()
+            AgentLog.info("[kg] 图谱已失效（\(reason)），重新构建后才能使用图谱检索")
+        } catch {
+            AgentLog.warning("[kg] 图谱失效标记写入失败：\(error.localizedDescription)")
+        }
+    }
+
+    /// 新切片入库后，仅对未进入图谱的切片做增量抽取，并合并进现有图谱与快照。
+    private func updateKnowledgeGraphIncrementally() async {
+        guard let llm = auxLLM else { return }
+        guard let store = try? ensureKnowledgeGraphStore(),
+              store.buildState() == .complete else { return }
+        // 已有切片被改写/删除时，增量无法撤回旧证据，只能整体重建。
+        guard let refs = try? store.listChunkRefs() else { return }
+        let current = Dictionary(uniqueKeysWithValues: refs.map {
+            ($0.id, KnowledgeGraphBuilder.contentHash($0.text))
+        })
+        let processed = store.processedChunkHashes()
+        if processed.contains(where: { current[$0.key] != $0.value }) {
+            invalidateKnowledgeGraph(reason: "已有切片被修改或删除")
+            return
+        }
+        guard let (_, graph) = try? ensureKnowledgeGraph() else { return }
+        let builder = KnowledgeGraphBuilder(store: store, graph: graph, llm: llm,
+                                            limits: kgExtractionLimits)
+        do {
+            let result = try await builder.buildIncremental()
+            // 只对变更项做内存图 upsert，避免整图重建；快照交给 1 秒防抖保存。
+            for entity in result.changedEntities {
+                graph.replaceEntity(entity)
+            }
+            for id in result.removedRelationshipIDs {
+                graph.removeRelationship(id: id)
+            }
+            for relationship in result.changedRelationships {
+                graph.replaceRelationship(relationship)
+            }
+            if result.stats.chunksProcessed > 0 {
+                AgentLog.info("[kg] 增量更新：\(result.stats.chunksProcessed) 个切片，"
+                    + "变更实体 \(result.stats.entities)、关系 \(result.stats.relationships)")
+            }
+        } catch {
+            try? store.markBuildState(.stale)
+            AgentLog.warning("[kg] 增量更新失败，图谱标记为 stale：\(error.localizedDescription)")
+        }
+    }
+
+    /// 手动触发图谱实体消歧：用向量语义相似度对同指实体做进一步合并。
+    ///
+    /// 「构建知识图谱」阶段仅做字符全匹配（快速、不依赖向量），本方法用于事后
+    /// 「进一步」收敛重复实体（如「川普」与「特朗普」）。需要 embedding 可用
+    /// （懒加载 store 会校验，缺失时抛错）。合并后重建内存图并落快照。
+    @discardableResult
+    public func resolveKnowledgeGraphDuplicates(threshold: Double = 0.90) async throws
+        -> (mergedGroups: Int, removedEntities: Int, entities: Int, relationships: Int) {
+        let store = try ensureKnowledgeGraphStore()
+        let (_, graph) = try ensureKnowledgeGraph()
+        let result = try await store.resolveEntityDuplicates(threshold: threshold)
+        graph.rebuild(entities: result.entities, relationships: result.relationships)
+        return (result.mergedGroups, result.removedEntities,
+                result.entities.count, result.relationships.count)
+    }
+
+    // MARK: - 知识图谱 MCP 门面
+
+    /// 图谱检索策略（GraphRAG 风格）。
+    public enum GraphSearchMode: String, Sendable {
+        /// 从命中实体拉邻边与关联实体，适合问具体细节。
+        case local
+        /// 从命中关系反查两边实体及度数，适合跨文档的宏观主题/总结。
+        case global
+        /// 实体和关系两路都做，子图轮询交织合并，适合既要细节又要全貌。
+        case hybrid
+        /// 实体 + 关系 + 原文 chunk 全部都做，适合在图谱语境之上还想要原始文本片段兜底。
+        case mix
+    }
+
+    /// 图谱检索结果。
+    public struct GraphSearchResult: Sendable {
+        public let mode: String
+        public let entities: [KGEntity]
+        public let relationships: [KGRelationship]
+        public let chunks: [String]
+        public init(mode: String, entities: [KGEntity],
+                    relationships: [KGRelationship], chunks: [String]) {
+            self.mode = mode
+            self.entities = entities
+            self.relationships = relationships
+            self.chunks = chunks
+        }
+    }
+
+    public func graphEntity(named name: String) -> KGEntity? {
+        (try? ensureKnowledgeGraph().1.entity(named: name)) ?? nil
+    }
+
+    public func graphNeighbors(name: String) -> [String] {
+        (try? ensureKnowledgeGraph().1.neighbors(of: name)) ?? []
+    }
+
+    public func graphDegree(name: String) -> Int {
+        (try? ensureKnowledgeGraph().1.degree(of: name)) ?? 0
+    }
+
+    public func graphIncidentRelationships(name: String) -> [KGRelationship] {
+        (try? ensureKnowledgeGraph().1.incidentRelationships(of: name)) ?? []
+    }
+
+    public func graphSubgraph(root: String, depth: Int,
+                              edgeTypes: [String]?) -> KGSubgraph {
+        (try? ensureKnowledgeGraph().1.subgraph(root: root, depth: depth, edgeTypes: edgeTypes))
+            ?? KGSubgraph(entities: [], relationships: [])
+    }
+
+    public func graphPath(from a: String, to b: String,
+                          algorithm: KGPathAlgorithm) -> KGPath {
+        (try? ensureKnowledgeGraph().1.shortestPath(from: a, to: b, algorithm: algorithm))
+            ?? KGPath(nodes: [], relationships: [])
+    }
+
+    /// 新增实体节点（写入存储层 + 内存图，并落快照）。
+    public func graphAddEntity(name: String, type: String = "") async throws -> KGEntity {
+        let store = try ensureKnowledgeGraphStore()
+        let (_, graph) = try ensureKnowledgeGraph()
+        let now = Date().timeIntervalSince1970
+        // 同名实体（含 UNKNOWN 占位）就地升级，避免同一实体出现两行。
+        if var existing = try store.entityByName(name) {
+            if !type.isEmpty { existing.type = type }
+            existing.updatedAt = now
+            try store.upsertEntity(existing)
+            graph.upsertEntity(existing)
+            graph.flush()
+            return existing
+        }
+        let entity = KGEntity(id: UUID().uuidString, name: name, type: type,
+                              description: "", properties: [:], sourceIDs: [],
+                              createdAt: now, updatedAt: now)
+        try store.upsertEntity(entity)
+        graph.upsertEntity(entity)
+        graph.flush()
+        return entity
+    }
+
+    /// 新增关系边（同一对实体合并 keywords/来源；端点不存在时落库 `UNKNOWN` 占位）。
+    public func graphAddRelationship(source: String, target: String,
+                                     relation: String) async throws -> KGRelationship {
+        let store = try ensureKnowledgeGraphStore()
+        let (_, graph) = try ensureKnowledgeGraph()
+        let now = Date().timeIntervalSince1970
+        if var existing = try store.relationship(byPair: source, dst: target) {
+            var keywords = Set(existing.relationType.split(separator: ",")
+                .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                .filter { !$0.isEmpty })
+            let trimmed = relation.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !trimmed.isEmpty { keywords.insert(trimmed) }
+            existing.relationType = keywords.sorted().joined(separator: ",")
+            existing.updatedAt = now
+            try store.upsertRelationship(existing)
+            graph.upsertRelationship(existing)
+            graph.flush()
+            return existing
+        }
+        let rel = KGRelationship(id: UUID().uuidString, srcEntity: source, dstEntity: target,
+                                 relationType: relation, description: "", weight: 1.0,
+                                 properties: [:], sourceIDs: [], createdAt: now, updatedAt: now)
+        try store.upsertRelationship(rel)
+        for endpoint in [source, target] {
+            if (try store.entityByName(endpoint)) == nil {
+                let placeholder = KGEntity(id: "unknown-\(endpoint.lowercased())",
+                                           name: endpoint, type: "UNKNOWN",
+                                           description: "", properties: [:], sourceIDs: [],
+                                           createdAt: now, updatedAt: now)
+                try store.upsertEntity(placeholder)
+            }
+        }
+        graph.upsertRelationship(rel)
+        graph.flush()
+        return rel
+    }
+
+    /// 删除实体节点及其关联边（存储层 + 内存图同步）。
+    public func graphDeleteEntity(name: String) async throws {
+        let store = try ensureKnowledgeGraphStore()
+        let (_, graph) = try ensureKnowledgeGraph()
+        try store.deleteEntity(name: name)
+        graph.deleteEntity(name)
+        graph.flush()
+    }
+
+    /// 图谱检索（GraphRAG 风格）：local/global/hybrid/mix 四种策略。
+    /// 命中实体/关系先用字符包含匹配（不依赖 embedding，始终可用）；
+    /// mix 模式额外叠加原文 chunk 兜底。
+    public func graphSearch(query: String, mode: GraphSearchMode,
+                            topK: Int = 20) async throws -> GraphSearchResult {
+        let (_, graph) = try ensureKnowledgeGraph()
+        let tokens = query.lowercased()
+            .components(separatedBy: CharacterSet.alphanumerics.inverted)
+            .filter { $0.count >= 2 }
+        let allE = graph.allEntities()
+        let allR = graph.allRelationships()
+        let matchedE = allE.filter { e in
+            let hay = (e.name + " " + e.type + " " + e.description).lowercased()
+            return tokens.contains { hay.contains($0) }
+        }
+        let matchedR = allR.filter { r in
+            let hay = (r.relationType + " " + r.srcEntity + " " + r.dstEntity + " " + r.description)
+                .lowercased()
+            return tokens.contains { hay.contains($0) }
+        }
+
+        var entities: [KGEntity] = []
+        var relationships: [KGRelationship] = []
+
+        func collectEntity(_ e: KGEntity) {
+            if !entities.contains(where: { $0.name.lowercased() == e.name.lowercased() }) {
+                entities.append(e)
+            }
+        }
+        func collectRelationship(_ r: KGRelationship) {
+            if !relationships.contains(where: { $0.id == r.id }) {
+                relationships.append(r)
+            }
+        }
+
+        switch mode {
+        case .local:
+            // 命中实体的 1 跳邻居子图（适合具体细节）。
+            for e in matchedE {
+                collectEntity(e)
+                for nb in graph.neighbors(of: e.name) {
+                    if let ne = graph.entity(named: nb) { collectEntity(ne) }
+                }
+                for rel in graph.incidentRelationships(of: e.name) { collectRelationship(rel) }
+            }
+        case .global:
+            // 命中关系反查两端实体 + 度数（适合跨文档宏观主题/总结）。
+            for r in matchedR {
+                collectRelationship(r)
+                for end in [r.srcEntity, r.dstEntity] {
+                    if let e = graph.entity(named: end) { collectEntity(e) }
+                }
+            }
+            entities.sort { graph.degree(of: $0.name) > graph.degree(of: $1.name) }
+            relationships.sort { graph.relationRank($0) > graph.relationRank($1) }
+        case .hybrid:
+            // 实体 + 关系两路都做，子图轮询交织合并。
+            for e in matchedE {
+                collectEntity(e)
+                for nb in graph.neighbors(of: e.name) {
+                    if let ne = graph.entity(named: nb) { collectEntity(ne) }
+                }
+                for rel in graph.incidentRelationships(of: e.name) { collectRelationship(rel) }
+            }
+            for r in matchedR {
+                collectRelationship(r)
+                for end in [r.srcEntity, r.dstEntity] {
+                    if let e = graph.entity(named: end) { collectEntity(e) }
+                }
+            }
+        case .mix:
+            // hybrid + 原文 chunk 兜底。
+            let hybrid = try await graphSearch(query: query, mode: .hybrid, topK: topK)
+            entities = hybrid.entities
+            relationships = hybrid.relationships
+        }
+
+        if entities.count > topK { entities = Array(entities.prefix(topK)) }
+        if relationships.count > topK { relationships = Array(relationships.prefix(topK)) }
+
+        var chunks: [String] = []
+        if mode == .mix {
+            if let hits = try? await search(query: query, topK: min(topK, 10), source: nil) {
+                chunks = hits.map { $0.text }
+            }
+        }
+        return GraphSearchResult(mode: mode.rawValue, entities: entities,
+                                 relationships: relationships, chunks: chunks)
     }
 
     /// 启动时把本地 Embedding / Reranker 权重加载好并保持常驻。
@@ -1430,6 +1757,12 @@ public final class RAGEngine {
         // 下一次加载不必回放整轮同步的全部记录。放在所有 merge（含收尾去重）
         // 之后，保证 manifest.json 对诊断/外部读取仍是最新完整快照。
         manifestStore.compact()
+        // 新切片/去重完成后：去重改变了 chunk 标识，只能重建；纯新增则增量更新图谱。
+        if stats.deduplicated > 0 {
+            invalidateKnowledgeGraph(reason: "切片去重改变了 chunk 标识")
+        } else if stats.processed > 0 {
+            await updateKnowledgeGraphIncrementally()
+        }
         return stats
     }
 
@@ -2603,6 +2936,11 @@ public final class RAGEngine {
         guard config.ragRetrievalStrategy.usesKnowledgeGraph else { return nil }
         guard let embedding else { return nil }
         let (kgStore, kgGraph) = try ensureKnowledgeGraph()
+        // 构建中/知识库已变化（stale）的图谱不可用于检索，避免拿旧图谱回答。
+        if let state = kgStore.buildState(), state != .complete {
+            AgentLog.info("[kg] 图谱状态为 \(state.rawValue)，检索回退 naive")
+            return nil
+        }
         guard !kgGraph.isEmpty else {
             AgentLog.info("[kg] 知识图谱未构建，检索回退 naive")
             return nil
@@ -2611,19 +2949,26 @@ public final class RAGEngine {
             AgentLog.info("[kg] 辅助模型不可用，检索回退 naive")
             return nil
         }
-        guard let store else { return nil }
-        let builder = KnowledgeGraphBuilder(store: kgStore, graph: kgGraph, llm: auxLLM)
+        // 新进程/未同步时切片库可能尚未打开，图谱检索需要按来源反查原文。
+        guard let store = try? ensureStore() else { return nil }
+        let builder = KnowledgeGraphBuilder(store: kgStore, graph: kgGraph, llm: auxLLM,
+                                            limits: kgExtractionLimits)
         let retriever = KnowledgeGraphRetriever(kgStore: kgStore, graph: kgGraph,
                                                 builder: builder, embedding: embedding,
                                                 config: config, chunkStore: store)
-        let candidates = try await retriever.retrieve(query: query)
+        let candidates = try await retriever.retrieve(query: query, source: source)
         guard !candidates.isEmpty else { return nil }
-        return await formatKnowledgeGraph(query: query, candidates: candidates)
+        // 总预算 = system prompt + query + 图谱 + 原文。
+        let reserved = TokenEstimator.estimate(query)
+            + TokenEstimator.estimate(BASE_SYSTEM_PROMPT)
+        return await formatKnowledgeGraph(query: query, candidates: candidates,
+                                          reservedTokens: reserved)
     }
 
     /// 三路候选统一走同一个 reranker 精排，按实体/关系/原文分组并做 token 预算截断。
     private func formatKnowledgeGraph(query: String,
-                                      candidates: KGRetrievalCandidates) async -> String {
+                                      candidates: KGRetrievalCandidates,
+                                      reservedTokens: Int) async -> String {
         var passages = candidates.allPassages
         // 1) 统一 reranker 精排（失败/超时则保留图谱自身排序）。
         if config.ragRerankEnabled, let reranker, !passages.isEmpty {
@@ -2635,29 +2980,28 @@ public final class RAGEngine {
                 for i in passages.indices { passages[i].score = scores[i] }
             }
         }
-        // 2) 分组排序：实体按相似度，关系按 rank+weight，原文按相似度。
-        var entities = passages.filter { $0.kind == .entity }
-        var relations = passages.filter { $0.kind == .relation }
-        var chunks = passages.filter { $0.kind == .chunk }
-        entities.sort {
-            if $0.score != $1.score { return $0.score > $1.score }
-            return $0.degree > $1.degree
-        }
-        relations.sort {
-            if $0.degree != $1.degree { return $0.degree > $1.degree }
-            if $0.weight != $1.weight { return $0.weight > $1.weight }
-            return $0.score > $1.score
-        }
-        chunks.sort { $0.score > $1.score }
+        // 2) 分组排序：实体/关系按余弦 + 度数/权重合成，原文按相似度稳定排序。
+        let entities = KGCandidateRanking.entities(passages.filter { $0.kind == .entity })
+        let relations = KGCandidateRanking.relations(passages.filter { $0.kind == .relation })
+        let chunks = passages.filter { $0.kind == .chunk }
+            .enumerated()
+            .sorted { lhs, rhs in
+                if lhs.element.score != rhs.element.score {
+                    return lhs.element.score > rhs.element.score
+                }
+                return lhs.offset < rhs.offset
+            }
+            .map(\.element)
 
-        // 3) 预算截断：实体 6000、关系 8000，总预算 30000（原文吃剩余）。
+        // 3) 预算截断：实体 6000、关系 8000；总预算 30000 含 system + query。
         let entitySection = assembleSection("实体", passages: entities,
                                             budgetTokens: config.ragKGEntityTokenBudget)
         let relationSection = assembleSection("关系", passages: relations,
                                               budgetTokens: config.ragKGRelationTokenBudget)
         let entityTokens = TokenEstimator.estimate(entitySection)
         let relationTokens = TokenEstimator.estimate(relationSection)
-        let chunkBudget = max(1_000, config.ragKGTotalTokenBudget - entityTokens - relationTokens)
+        let chunkBudget = max(0, config.ragKGTotalTokenBudget
+            - entityTokens - relationTokens - reservedTokens)
         let chunkSection = assembleSection("原文片段", passages: chunks,
                                            budgetTokens: chunkBudget)
 
@@ -2688,6 +3032,7 @@ public final class RAGEngine {
             lines.append("")
             used += tokens + 1
         }
+        guard lines.count > 1 else { return "" }
         return lines.joined(separator: "\n")
     }
 
@@ -2900,6 +3245,7 @@ public final class RAGEngine {
                 return chunks
             }
             invalidateStatusCache()
+            invalidateKnowledgeGraph(reason: "文档已删除")
             return .deleted(chunksRemoved: chunksRemoved, docName: record.docName)
         }
     }

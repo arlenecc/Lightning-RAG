@@ -43,9 +43,11 @@ public final class RAGMCPToolset: @unchecked Sendable {
 
     /// 已注册的工具名（未知工具在协议层报 -32602）。
     static let knownToolNames: Set<String> = [
-        "parse_and_ingest_document", "delete_document", "forget_context",
+        "ingest_document", "delete_document", "forget_context",
         "list_document", "extract_metadata", "hybrid_search_with_rerank",
         "get_document",
+        "ingest_knowledge", "add_entity", "add_relationship", "get_entity",
+        "delete_entity", "get_path", "get_neighbors", "get_subgraph", "search_graph",
     ]
 
     /// 构造一个 SDK Server 并注册全部工具处理器。
@@ -90,7 +92,7 @@ public final class RAGMCPToolset: @unchecked Sendable {
 
     private func callTool(name: String, args: [String: JSONValue]) async -> RAGMCPToolOutcome {
         switch name {
-        case "parse_and_ingest_document":
+        case "ingest_document":
             return await ingestDocument(args)
         case "delete_document", "forget_context":
             return deleteDocument(args)
@@ -102,75 +104,34 @@ public final class RAGMCPToolset: @unchecked Sendable {
             return await hybridSearch(args)
         case "get_document":
             return getDocument(args)
+        case "ingest_knowledge":
+            return await ingestKnowledge(args)
+        case "add_entity":
+            return await addEntity(args)
+        case "add_relationship":
+            return await addRelationship(args)
+        case "get_entity":
+            return getEntity(args)
+        case "delete_entity":
+            return await deleteEntity(args)
+        case "get_path":
+            return getPath(args)
+        case "get_neighbors":
+            return getNeighbors(args)
+        case "get_subgraph":
+            return getSubgraph(args)
+        case "search_graph":
+            return await searchGraph(args)
         default:
             return .failure("未知工具：\(name)")
         }
     }
 
-    /// `parse_and_ingest_document`：把传入文档落到知识库目录，然后走既有
+    /// `ingest_document`：把传入文档落到知识库目录，然后走既有
     /// `ingest()` 增量流程（解析 → 提取 → 清洗 → 切片 → 向量化 → 入库）。
     private func ingestDocument(_ args: [String: JSONValue]) async -> RAGMCPToolOutcome {
-        let kb = engine.knowledgeBase
-        let fm = FileManager.default
-        do {
-            try fm.createDirectory(atPath: kb, withIntermediateDirectories: true)
-        } catch {
-            return .failure("知识库目录不可写（\(kb)）：\(error.localizedDescription)")
-        }
-
-        let sourcePath: String
-        if let path = args["path"]?.stringValue, !path.isEmpty {
-            let standardized = (path as NSString).standardizingPath
-            guard fm.fileExists(atPath: standardized) else {
-                return .failure("文件不存在：\(standardized)")
-            }
-            let ext = (standardized as NSString).pathExtension.lowercased()
-            guard RAGEngine.supportedExtensions.contains(ext) else {
-                return .failure("不支持的文件类型 .\(ext)；支持："
-                    + RAGEngine.supportedExtensions.sorted().joined(separator: ", "))
-            }
-            if (standardized as NSString).deletingPathPrefixIfMatches(kb) {
-                // 已在知识库目录内：直接增量入库。
-                sourcePath = standardized
-            } else {
-                let target = uniqueDestination(for: standardized, in: kb)
-                do {
-                    try fm.copyItem(atPath: standardized, toPath: target)
-                } catch {
-                    return .failure("复制文件到知识库失败：\(error.localizedDescription)")
-                }
-                sourcePath = target
-            }
-        } else if let filename = args["filename"]?.stringValue, !filename.isEmpty {
-            let safeName = (filename as NSString).lastPathComponent
-            guard !safeName.isEmpty, safeName != "." , safeName != ".." else {
-                return .failure("filename 非法：\(filename)")
-            }
-            let ext = (safeName as NSString).pathExtension.lowercased()
-            guard RAGEngine.supportedExtensions.contains(ext) else {
-                return .failure("不支持的文件类型 .\(ext)；支持："
-                    + RAGEngine.supportedExtensions.sorted().joined(separator: ", "))
-            }
-            let target = (kb as NSString).appendingPathComponent(safeName)
-            let content: Data
-            if let base64 = args["content_base64"]?.stringValue,
-               let decoded = Data(base64Encoded: base64) {
-                content = decoded
-            } else if let text = args["content"]?.stringValue {
-                content = Data(text.utf8)
-            } else {
-                return .failure("缺少文档内容：请提供 content_base64 或 content")
-            }
-            do {
-                try content.write(to: URL(fileURLWithPath: target), options: .atomic)
-            } catch {
-                return .failure("写入知识库失败：\(error.localizedDescription)")
-            }
-            sourcePath = target
-        } else {
-            return .failure("缺少文档：请提供 path（本机路径）或 filename + content_base64/content")
-        }
-
+        let (sourcePath, error) = landDocument(args)
+        guard let sourcePath else { return .failure(error ?? "文档落地失败") }
         let stats = await engine.ingest(force: false)
         let docName = ((sourcePath as NSString).lastPathComponent)
         return .success("""
@@ -273,6 +234,13 @@ public final class RAGMCPToolset: @unchecked Sendable {
         let topK = max(1, min(20, args["top_k"]?.intValue ?? 5))
         let source = args["source"]?.stringValue
         do {
+            // 图谱策略已启用时走统一检索链路（local/global/hybrid/mix + reranker），
+            // 与 App 内 rag_search 保持同一套召回逻辑。
+            if engine.config.ragRetrievalStrategy.usesKnowledgeGraph {
+                let output = try await engine.searchFormatted(
+                    query: query, topK: topK, source: source)
+                return .success(output)
+            }
             let hits = try await engine.search(query: query, topK: topK, source: source)
             if hits.isEmpty {
                 return .success("知识库中未检索到与「\(query)」相关的内容。")
@@ -309,6 +277,286 @@ public final class RAGMCPToolset: @unchecked Sendable {
         return .success(markdown)
     }
 
+    // MARK: 知识图谱工具
+
+    /// 把文档落地到知识库目录，返回路径；失败返回 (nil, 错误原因)。
+    /// `ingest_document` 与 `ingest_knowledge` 共用。
+    private func landDocument(_ args: [String: JSONValue]) -> (path: String?, error: String?) {
+        let kb = engine.knowledgeBase
+        let fm = FileManager.default
+        do {
+            try fm.createDirectory(atPath: kb, withIntermediateDirectories: true)
+        } catch {
+            return (nil, "知识库目录不可写（\(kb)）：\(error.localizedDescription)")
+        }
+        let sourcePath: String
+        if let path = args["path"]?.stringValue, !path.isEmpty {
+            let standardized = (path as NSString).standardizingPath
+            guard fm.fileExists(atPath: standardized) else {
+                return (nil, "文件不存在：\(standardized)")
+            }
+            let ext = (standardized as NSString).pathExtension.lowercased()
+            guard RAGEngine.supportedExtensions.contains(ext) else {
+                return (nil, "不支持的文件类型 .\(ext)；支持："
+                    + RAGEngine.supportedExtensions.sorted().joined(separator: ", "))
+            }
+            if (standardized as NSString).deletingPathPrefixIfMatches(kb) {
+                sourcePath = standardized
+            } else {
+                let target = uniqueDestination(for: standardized, in: kb)
+                do {
+                    try fm.copyItem(atPath: standardized, toPath: target)
+                } catch {
+                    return (nil, "复制文件到知识库失败：\(error.localizedDescription)")
+                }
+                sourcePath = target
+            }
+        } else if let filename = args["filename"]?.stringValue, !filename.isEmpty {
+            let safeName = (filename as NSString).lastPathComponent
+            guard !safeName.isEmpty, safeName != "." , safeName != ".." else {
+                return (nil, "filename 非法：\(filename)")
+            }
+            let ext = (safeName as NSString).pathExtension.lowercased()
+            guard RAGEngine.supportedExtensions.contains(ext) else {
+                return (nil, "不支持的文件类型 .\(ext)；支持："
+                    + RAGEngine.supportedExtensions.sorted().joined(separator: ", "))
+            }
+            let target = (kb as NSString).appendingPathComponent(safeName)
+            let content: Data
+            if let base64 = args["content_base64"]?.stringValue,
+               let decoded = Data(base64Encoded: base64) {
+                content = decoded
+            } else if let text = args["content"]?.stringValue {
+                content = Data(text.utf8)
+            } else {
+                return (nil, "缺少文档内容：请提供 content_base64 或 content")
+            }
+            do {
+                try content.write(to: URL(fileURLWithPath: target), options: .atomic)
+            } catch {
+                return (nil, "写入知识库失败：\(error.localizedDescription)")
+            }
+            sourcePath = target
+        } else {
+            return (nil, "缺少文档：请提供 path（本机路径）或 filename + content_base64/content")
+        }
+        return (sourcePath, nil)
+    }
+
+    private func resolveBool(_ value: JSONValue?) -> Bool? {
+        if let b = value?.boolValue { return b }
+        if let s = value?.stringValue { return s == "true" || s == "1" }
+        return nil
+    }
+
+    /// `ingest_knowledge`：把指定文档提取并入库，随后构建（或更新）知识图谱。
+    private func ingestKnowledge(_ args: [String: JSONValue]) async -> RAGMCPToolOutcome {
+        let (sourcePath, error) = landDocument(args)
+        guard let sourcePath else { return .failure(error ?? "文档落地失败") }
+        let buildGraph = resolveBool(args["build_graph"]) ?? true
+        let stats = await engine.ingest(force: false)
+        var report = "文档入库完成：\((sourcePath as NSString).lastPathComponent)\n\(stats.summary)"
+        if buildGraph {
+            let kg = await engine.buildKnowledgeGraph(log: { [weak self] m in self?.log("[kg] \(m)") })
+            report += "\n\n知识图谱构建：实体 \(kg.entities) 个、关系 \(kg.relationships) 条"
+        }
+        return .success(report)
+    }
+
+    private func addEntity(_ args: [String: JSONValue]) async -> RAGMCPToolOutcome {
+        guard let name = args["name"]?.stringValue, !name.isEmpty else {
+            return .failure("缺少参数 name（实体名）")
+        }
+        let type = args["type"]?.stringValue ?? ""
+        do {
+            let entity = try await engine.graphAddEntity(name: name, type: type)
+            return .success("已添加实体：\(entity.name)（类型：\(entity.type.isEmpty ? "UNKNOWN" : entity.type)）")
+        } catch {
+            return .failure("添加实体失败：\(error.localizedDescription)")
+        }
+    }
+
+    private func addRelationship(_ args: [String: JSONValue]) async -> RAGMCPToolOutcome {
+        guard let source = args["source"]?.stringValue, !source.isEmpty else {
+            return .failure("缺少参数 source（源实体名）")
+        }
+        guard let target = args["target"]?.stringValue, !target.isEmpty else {
+            return .failure("缺少参数 target（目标实体名）")
+        }
+        let relation = args["relation"]?.stringValue ?? ""
+        do {
+            let rel = try await engine.graphAddRelationship(source: source, target: target,
+                                                           relation: relation)
+            return .success("已添加关系：\(rel.srcEntity) -[\(rel.relationType)]-> \(rel.dstEntity)")
+        } catch {
+            return .failure("添加关系失败：\(error.localizedDescription)")
+        }
+    }
+
+    private func getEntity(_ args: [String: JSONValue]) -> RAGMCPToolOutcome {
+        guard let name = args["name"]?.stringValue, !name.isEmpty else {
+            return .failure("缺少参数 name（实体名）")
+        }
+        guard let entity = engine.graphEntity(named: name) else {
+            return .failure("未找到实体：\(name)")
+        }
+        let neighbors = engine.graphNeighbors(name: entity.name)
+        let degree = engine.graphDegree(name: entity.name)
+        var md: [String] = ["# 实体：\(entity.name)", ""]
+        md.append("- 类型：\(entity.type.isEmpty ? "UNKNOWN" : entity.type)")
+        md.append("- 描述：\(entity.description.isEmpty ? "（无）" : entity.description)")
+        md.append("- 度数：\(degree)")
+        if !entity.sourceIDs.isEmpty {
+            md.append("- 来源切片：\(entity.sourceIDs.joined(separator: "、"))")
+        }
+        md.append("")
+        md.append("## 邻居（\(neighbors.count)）")
+        if neighbors.isEmpty {
+            md.append("（无）")
+        } else {
+            for nb in neighbors {
+                md.append("- \(nb)（度数 \(engine.graphDegree(name: nb))）")
+            }
+        }
+        md.append("")
+        md.append("## 关联关系")
+        let rels = engine.graphIncidentRelationships(name: entity.name)
+        if rels.isEmpty {
+            md.append("（无）")
+        } else {
+            for rel in rels {
+                let other = rel.srcEntity.lowercased() == entity.name.lowercased()
+                    ? rel.dstEntity : rel.srcEntity
+                md.append("- \(rel.relationType)：→ \(other)"
+                    + (rel.description.isEmpty ? "" : "（\(rel.description)）"))
+            }
+        }
+        return .success(md.joined(separator: "\n"))
+    }
+
+    private func deleteEntity(_ args: [String: JSONValue]) async -> RAGMCPToolOutcome {
+        guard let name = args["entity"]?.stringValue ?? args["name"]?.stringValue,
+              !name.isEmpty else {
+            return .failure("缺少参数 entity（实体名）")
+        }
+        do {
+            try await engine.graphDeleteEntity(name: name)
+            return .success("已删除实体及其关联边：\(name)")
+        } catch {
+            return .failure("删除实体失败：\(error.localizedDescription)")
+        }
+    }
+
+    private func getPath(_ args: [String: JSONValue]) -> RAGMCPToolOutcome {
+        guard let a = args["entityA"]?.stringValue ?? args["source"]?.stringValue,
+              !a.isEmpty else {
+            return .failure("缺少参数 entityA（起点实体名）")
+        }
+        guard let b = args["entityB"]?.stringValue ?? args["target"]?.stringValue,
+              !b.isEmpty else {
+            return .failure("缺少参数 entityB（终点实体名）")
+        }
+        let algoRaw = args["algorithm"]?.stringValue?.lowercased() ?? "bfs"
+        let algo: KGPathAlgorithm = KGPathAlgorithm(rawValue: algoRaw) ?? .bfs
+        let path = engine.graphPath(from: a, to: b, algorithm: algo)
+        if path.nodes.isEmpty {
+            return .success("未找到 \(a) 到 \(b) 的路径（实体不存在或图不连通）")
+        }
+        var md: [String] = ["路径（\(algoRaw)，\(path.nodes.count) 节点）：", ""]
+        md.append(path.nodes.joined(separator: " → "))
+        md.append("")
+        md.append("途经关系（\(path.relationships.count) 条）：")
+        if path.relationships.isEmpty {
+            md.append("（无，端点直接相邻）")
+        } else {
+            for r in path.relationships {
+                md.append("- \(r.srcEntity) -[\(r.relationType)]-> \(r.dstEntity)"
+                    + (r.description.isEmpty ? "" : "：\(r.description)"))
+            }
+        }
+        return .success(md.joined(separator: "\n"))
+    }
+
+    private func getNeighbors(_ args: [String: JSONValue]) -> RAGMCPToolOutcome {
+        guard let name = args["entity"]?.stringValue ?? args["name"]?.stringValue,
+              !name.isEmpty else {
+            return .failure("缺少参数 entity（实体名）")
+        }
+        let neighbors = engine.graphNeighbors(name: name)
+        let degree = engine.graphDegree(name: name)
+        if neighbors.isEmpty {
+            return .success("实体 \(name) 没有邻居（或不存在）")
+        }
+        var md: [String] = ["实体 \(name) 的 \(degree) 个邻居：", ""]
+        for nb in neighbors {
+            md.append("- \(nb)（度数 \(engine.graphDegree(name: nb))）")
+        }
+        return .success(md.joined(separator: "\n"))
+    }
+
+    private func getSubgraph(_ args: [String: JSONValue]) -> RAGMCPToolOutcome {
+        guard let root = args["root_id"]?.stringValue ?? args["root"]?.stringValue,
+              !root.isEmpty else {
+            return .failure("缺少参数 root_id（根实体名）")
+        }
+        let depth = max(1, min(10, args["depth"]?.intValue ?? 2))
+        let edgeTypes = (args["edge_types"]?.stringValue)?
+            .split(separator: ",")
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty }
+        let sub = engine.graphSubgraph(root: root, depth: depth, edgeTypes: edgeTypes)
+        if sub.entities.isEmpty {
+            return .success("未找到根实体或子图为空：\(root)")
+        }
+        var md: [String] = ["子图（根 \(root)，深度 \(depth)）：",
+                            "实体 \(sub.entities.count) 个、关系 \(sub.relationships.count) 条", ""]
+        md.append("### 实体")
+        for e in sub.entities {
+            md.append("- \(e.name)（\(e.type.isEmpty ? "UNKNOWN" : e.type)）："
+                + (e.description.isEmpty ? "（无描述）" : e.description))
+        }
+        md.append("")
+        md.append("### 关系")
+        for r in sub.relationships {
+            md.append("- \(r.srcEntity) -[\(r.relationType)]-> \(r.dstEntity)")
+        }
+        return .success(md.joined(separator: "\n"))
+    }
+
+    private func searchGraph(_ args: [String: JSONValue]) async -> RAGMCPToolOutcome {
+        guard let query = args["query"]?.stringValue, !query.isEmpty else {
+            return .failure("缺少参数 query（检索语句）")
+        }
+        let modeRaw = args["mode"]?.stringValue?.lowercased() ?? "local"
+        let mode: RAGEngine.GraphSearchMode = RAGEngine.GraphSearchMode(rawValue: modeRaw) ?? .local
+        let topK = max(1, min(50, args["top_k"]?.intValue ?? 20))
+        do {
+            let result = try await engine.graphSearch(query: query, mode: mode, topK: topK)
+            var md: [String] = ["知识图谱检索（模式 \(mode.rawValue)，查询「\(query)」）：",
+                                "命中实体 \(result.entities.count) 个、关系 \(result.relationships.count) 条", ""]
+            md.append("### 实体")
+            for e in result.entities.prefix(topK) {
+                let desc = e.description.isEmpty ? "（无描述）" : String(e.description.prefix(120))
+                md.append("- \(e.name)（\(e.type.isEmpty ? "UNKNOWN" : e.type)）：\(desc)")
+            }
+            md.append("")
+            md.append("### 关系")
+            for r in result.relationships.prefix(topK) {
+                md.append("- \(r.srcEntity) -[\(r.relationType)]-> \(r.dstEntity)")
+            }
+            if mode == .mix && !result.chunks.isEmpty {
+                md.append("")
+                md.append("### 原文片段兜底")
+                for (i, c) in result.chunks.prefix(5).enumerated() {
+                    md.append("#### [\(i + 1)] \(String(c.prefix(200)))")
+                }
+            }
+            return .success(md.joined(separator: "\n"))
+        } catch {
+            return .failure("图谱检索失败：\(error.localizedDescription)")
+        }
+    }
+
     // MARK: 工具 schema
 
     var tools: [MCP.Tool] {
@@ -326,7 +574,7 @@ public final class RAGMCPToolset: @unchecked Sendable {
         }
         return [
             schema(
-                "parse_and_ingest_document",
+                "ingest_document",
                 "解析文档并入库到 RAG 知识库：解析 → 提取 → 清洗 → 切片 → 向量化 → 入库。"
                 + "三选一：本机路径 path；或 filename + content_base64（二进制文件，如 PDF/EPUB）；"
                 + "或 filename + content（纯文本）。返回入库统计。",
@@ -389,6 +637,102 @@ public final class RAGMCPToolset: @unchecked Sendable {
                                           "description": .string("最多返回字符数，默认 100000")]),
                 ],
                 required: ["doc_name"]),
+            schema(
+                "ingest_knowledge",
+                "提取指定文档并（默认）构建知识图谱：把文档落到知识库、入库切片，"
+                + "随后用辅助模型抽取实体/关系建图。build_graph=false 时只入库不建图。",
+                [
+                    "path": .object(["type": .string("string"),
+                                     "description": .string("本机文档绝对路径（可选）")]),
+                    "filename": .object(["type": .string("string"),
+                                         "description": .string("文档文件名")]),
+                    "content_base64": .object(["type": .string("string"),
+                                               "description": .string("文档内容 base64 编码")]),
+                    "content": .object(["type": .string("string"),
+                                        "description": .string("纯文本内容")]),
+                    "build_graph": .object(["type": .string("boolean"),
+                                            "description": .string("是否构建知识图谱，默认 true")]),
+                ]),
+            schema(
+                "add_entity",
+                "向知识图谱新增一个实体节点（写入存储层 + 内存图）。",
+                [
+                    "name": .object(["type": .string("string"),
+                                     "description": .string("实体名（必填）")]),
+                    "type": .object(["type": .string("string"),
+                                     "description": .string("实体类型，如 person/organization/concept")]),
+                ],
+                required: ["name"]),
+            schema(
+                "add_relationship",
+                "向知识图谱新增一条关系边（端点不存在时自动建占位实体）。",
+                [
+                    "source": .object(["type": .string("string"),
+                                       "description": .string("源实体名（必填）")]),
+                    "target": .object(["type": .string("string"),
+                                       "description": .string("目标实体名（必填）")]),
+                    "relation": .object(["type": .string("string"),
+                                         "description": .string("关系类型/谓词，如 担任/位于/属于")]),
+                ],
+                required: ["source", "target"]),
+            schema(
+                "get_entity",
+                "返回单个实体的详细信息：类型、描述、度数、邻居列表与全部关联关系。",
+                ["name": .object(["type": .string("string"),
+                                  "description": .string("实体名（必填）")])],
+                required: ["name"]),
+            schema(
+                "delete_entity",
+                "删除指定实体节点及其所有关联边（存储层 + 内存图同步）。",
+                ["entity": .object(["type": .string("string"),
+                                    "description": .string("实体名（必填）")])],
+                required: ["entity"]),
+            schema(
+                "get_path",
+                "两实体间寻路，返回所有中间节点与途经关系。algorithm 可指定 "
+                + "dfs（任意路径）/ bfs（最短跳数）/ dijkstra（按关系权重优先）。",
+                [
+                    "entityA": .object(["type": .string("string"),
+                                        "description": .string("起点实体名（必填）")]),
+                    "entityB": .object(["type": .string("string"),
+                                        "description": .string("终点实体名（必填）")]),
+                    "algorithm": .object(["type": .string("string"),
+                                          "description": .string("寻路算法：dfs/bfs/dijkstra，默认 bfs")]),
+                ],
+                required: ["entityA", "entityB"]),
+            schema(
+                "get_neighbors",
+                "返回指定实体的一跳邻居列表（含各自度数）。",
+                ["entity": .object(["type": .string("string"),
+                                    "description": .string("实体名（必填）")])],
+                required: ["entity"]),
+            schema(
+                "get_subgraph",
+                "以根实体为起点 BFS 展开到指定深度，返回子图的实体与关系。"
+                + "edge_types 可限定保留的关系类型（逗号分隔）。",
+                [
+                    "root_id": .object(["type": .string("string"),
+                                        "description": .string("根实体名（必填）")]),
+                    "depth": .object(["type": .string("integer"),
+                                      "description": .string("展开深度（跳数），默认 2，上限 10")]),
+                    "edge_types": .object(["type": .string("string"),
+                                          "description": .string("可选：逗号分隔的关系类型白名单")]),
+                ],
+                required: ["root_id"]),
+            schema(
+                "search_graph",
+                "知识图谱检索（GraphRAG 风格）。mode 可选：local（命中实体拉邻边，"
+                + "问具体细节）/ global（命中关系反查两端实体及度数，跨文档宏观主题）/ "
+                + "hybrid（实体+关系两路合并）/ mix（hybrid + 原文 chunk 兜底）。",
+                [
+                    "query": .object(["type": .string("string"),
+                                      "description": .string("检索语句（必填）")]),
+                    "mode": .object(["type": .string("string"),
+                                     "description": .string("检索策略：local/global/hybrid/mix，默认 local")]),
+                    "top_k": .object(["type": .string("integer"),
+                                     "description": .string("返回条数上限，默认 20，上限 50")]),
+                ],
+                required: ["query"]),
         ]
     }
 }

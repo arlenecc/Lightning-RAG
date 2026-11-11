@@ -75,7 +75,7 @@ HTML 与 Office 解析另有专项覆盖：HTML 保存页的本地 iframe / fram
 协议实现基于官方 [MCP Swift SDK](https://github.com/modelcontextprotocol/swift-sdk)
 （vendor 在 `Vendor/mcp-swift-sdk/`，2025-11-25 规范：Streamable HTTP 传输、
 协议版本协商、会话管理、SSE 流、Origin 防回绑校验均由官方实现承担）。
-本机知识库通过 7 个 MCP 工具对外暴露：`parse_and_ingest_document`、`delete_document`
+本机知识库通过 7 个 MCP 工具对外暴露：`ingest_document`、`delete_document`
 （别名 `forget_context`）、`list_document`、`extract_metadata`、
 `hybrid_search_with_rerank`、`get_document`——入库/检索/删除与 App 内功能
 共享同一个知识库引擎，不影响原流程。

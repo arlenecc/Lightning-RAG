@@ -80,6 +80,25 @@ public struct KGRelationship: Codable, Sendable, Equatable, Identifiable {
         Self.canonicalKey(src: srcEntity, dst: dstEntity, type: relationType)
     }
 
+    /// 无向实体对键（不含谓词）。
+    ///
+    /// 同一对实体在不同切片里可能用不同措辞描述同一条关系，关系身份应按
+    /// 实体对归一，keywords 作为同一条边的属性合并，而不是产生平行边。
+    public var pairKey: String { Self.pairKey(srcEntity, dstEntity) }
+
+    public static func pairKey(_ src: String, _ dst: String) -> String {
+        let a = src.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let b = dst.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let (lo, hi) = a <= b ? (a, b) : (b, a)
+        return "\(lo)|\(hi)"
+    }
+
+    /// 反向向量的 target_id 后缀：关系无向，正序与反序各存一条向量。
+    public static let reverseVectorSuffix = "#rev"
+
+    /// 反序向量 id（关键词相同，源/目标互换）。
+    public var reverseVectorID: String { id + Self.reverseVectorSuffix }
+
     public static func canonicalKey(src: String, dst: String, type: String) -> String {
         let a = src.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         let b = dst.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
@@ -141,6 +160,28 @@ public struct KGExtractionResult: Sendable, Equatable {
     public var isEmpty: Bool { entities.isEmpty && relations.isEmpty }
 }
 
+// MARK: - 抽取限额
+
+/// 单个切片的抽取上限（由 config.json 的 `rag_kg_max_*` 参数控制）。
+public struct KGExtractionLimits: Sendable, Equatable {
+    /// 每个切片最多保留的实体数。
+    public var maxEntitiesPerChunk: Int
+    /// 每个切片最多保留的关系数。
+    public var maxRelationsPerChunk: Int
+    /// 实体/关系描述的最大字符数。
+    public var maxDescriptionCharacters: Int
+
+    public init(maxEntitiesPerChunk: Int = 20,
+                maxRelationsPerChunk: Int = 50,
+                maxDescriptionCharacters: Int = 100) {
+        self.maxEntitiesPerChunk = max(1, maxEntitiesPerChunk)
+        self.maxRelationsPerChunk = max(1, maxRelationsPerChunk)
+        self.maxDescriptionCharacters = max(1, maxDescriptionCharacters)
+    }
+
+    public static let `default` = KGExtractionLimits()
+}
+
 // MARK: - 关键词抽取
 
 /// 查询的关键词分解：高层主题（用于关系检索）与低层实体（用于实体检索）。
@@ -178,10 +219,16 @@ public struct KGPassage: Sendable, Equatable {
     public var weight: Double
     /// 该候选关联的原始切片 id（归因反查）。
     public var sourceChunkIDs: [String]
+    /// 关系候选的结构化三元组字段；实体/chunk 为空。
+    public var srcEntity: String?
+    public var dstEntity: String?
+    public var relationType: String?
 
     public init(text: String, kind: KGPassageKind, label: String,
                 score: Double, degree: Int = 0, weight: Double = 0,
-                sourceChunkIDs: [String] = []) {
+                sourceChunkIDs: [String] = [],
+                srcEntity: String? = nil, dstEntity: String? = nil,
+                relationType: String? = nil) {
         self.text = text
         self.kind = kind
         self.label = label
@@ -189,6 +236,82 @@ public struct KGPassage: Sendable, Equatable {
         self.degree = degree
         self.weight = weight
         self.sourceChunkIDs = sourceChunkIDs
+        self.srcEntity = srcEntity
+        self.dstEntity = dstEntity
+        self.relationType = relationType
+    }
+
+    /// 无向归一的三元组键；优先用结构化字段，避免实体名含 `--` 时解析错位。
+    func tripleKey() -> String {
+        let src: String
+        let dst: String
+        let type: String
+        if let s = srcEntity, let d = dstEntity {
+            src = s.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            dst = d.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            type = (relationType ?? "")
+                .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        } else {
+            let parts = label.components(separatedBy: "--")
+            guard parts.count >= 3 else { return label.lowercased() }
+            src = parts[0].trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            dst = parts[2].trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            type = parts[1].trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        }
+        let (lo, hi) = src <= dst ? (src, dst) : (dst, src)
+        return "\(lo)|\(hi)|\(type)"
+    }
+}
+
+/// 知识图谱候选的最终排序：向量余弦 + 图谱度数（中心性代理）+ 关系权重。
+///
+/// 度数/权重先按候选集合内的最大值归一化，再加权求和，避免大图度数悬殊时
+/// 直接把余弦淹没。
+public enum KGCandidateRanking {
+    static let entityCosineWeight = 0.8
+    static let entityDegreeWeight = 0.2
+    static let relationCosineWeight = 0.7
+    static let relationRankWeight = 0.2
+    static let relationEvidenceWeight = 0.1
+
+    public static func entities(_ passages: [KGPassage]) -> [KGPassage] {
+        let maxDegree = max(1, passages.map(\.degree).max() ?? 1)
+        return passages.sorted { lhs, rhs in
+            let ls = score(lhs, cosineWeight: entityCosineWeight,
+                           centralityWeight: entityDegreeWeight,
+                           centrality: Double(lhs.degree) / Double(maxDegree))
+            let rs = score(rhs, cosineWeight: entityCosineWeight,
+                           centralityWeight: entityDegreeWeight,
+                           centrality: Double(rhs.degree) / Double(maxDegree))
+            if ls != rs { return ls > rs }
+            if lhs.score != rhs.score { return lhs.score > rhs.score }
+            return lhs.label < rhs.label
+        }
+    }
+
+    public static func relations(_ passages: [KGPassage]) -> [KGPassage] {
+        let maxRank = max(1, passages.map(\.degree).max() ?? 1)
+        let maxWeight = max(1, passages.map(\.weight).max() ?? 1)
+        return passages.sorted { lhs, rhs in
+            let ls = relationScore(lhs, maxRank: maxRank, maxWeight: maxWeight)
+            let rs = relationScore(rhs, maxRank: maxRank, maxWeight: maxWeight)
+            if ls != rs { return ls > rs }
+            if lhs.degree != rhs.degree { return lhs.degree > rhs.degree }
+            if lhs.weight != rhs.weight { return lhs.weight > rhs.weight }
+            return lhs.label < rhs.label
+        }
+    }
+
+    private static func score(_ p: KGPassage, cosineWeight: Double,
+                              centralityWeight: Double, centrality: Double) -> Double {
+        cosineWeight * p.score + centralityWeight * centrality
+    }
+
+    private static func relationScore(_ p: KGPassage, maxRank: Int,
+                                      maxWeight: Double) -> Double {
+        relationCosineWeight * p.score
+            + relationRankWeight * (Double(p.degree) / Double(maxRank))
+            + relationEvidenceWeight * (p.weight / maxWeight)
     }
 }
 

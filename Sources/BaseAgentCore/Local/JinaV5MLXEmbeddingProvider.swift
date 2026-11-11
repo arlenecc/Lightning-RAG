@@ -6,6 +6,7 @@ import Foundation
 /// Matryoshka 配置输出对应维度的单位向量：内部已完成截断与重新 L2 归一化，
 /// 外层 `MatryoshkaEmbedding` 不会再包装它。落盘元素类型由用户配置决定。
 final class JinaV5MLXEmbeddingProvider: EmbeddingProvider,
+                                       EmbeddingQueryBatching,
                                        EmbeddingTokenCounting,
                                        EmbeddingBinarySigning,
                                        @unchecked Sendable {
@@ -55,6 +56,15 @@ final class JinaV5MLXEmbeddingProvider: EmbeddingProvider,
 
     func embedQuery(_ text: String) async throws -> [Float] {
         try await embedQueryWithSignature(text).vector
+    }
+
+    /// 批量 query 嵌入：多条检索文本共用一次 encode，前缀与单条 `embedQuery` 一致。
+    func embedQueries(_ texts: [String]) async throws -> [[Float]] {
+        guard !texts.isEmpty else { return [] }
+        let prefixed = texts.map {
+            prefixStrategy.apply($0, task: .retrievalQuery)
+        }
+        return try await embedWithSignatures(prefixed).vectors
     }
 
     func embedQueryWithSignature(_ text: String) async throws

@@ -211,6 +211,10 @@ final class AppViewModel: ObservableObject {
     @Published var isBuildingKG = false {
         didSet { if !isBuildingKG { flushQueuedSends() } }
     }
+    /// 正在对知识图谱做实体消歧（向量语义相似度合并同指实体）。
+    @Published var isResolvingEntities = false {
+        didSet { if !isResolvingEntities { flushQueuedSends() } }
+    }
     /// 知识图谱是否已构建（决定 4 种图谱检索策略是否可选）。
     @Published var knowledgeGraphBuilt = false
     @Published var knowledgeGraphEntityCount = 0
@@ -2037,6 +2041,73 @@ final class AppViewModel: ObservableObject {
         kgBuildTask?.cancel()
     }
 
+    /// 点击「实体消歧」：用向量语义相似度对图谱内同指实体做进一步合并。
+    /// 抽取/构建阶段只用字符全匹配，此方法用于事后收敛重复实体。
+    func requestEntityResolution() {
+        guard let agent else {
+            showInfoAlert(title: "实体消歧", message: "RAG 尚未就绪，请先在知识同步配置中应用配置。")
+            return
+        }
+        if isSyncing || isBuildingKG || isDeduplicating || isBuildingANN {
+            showInfoAlert(title: "暂不能实体消歧",
+                          message: "知识同步/图谱构建/去重/索引任务正在进行，请稍后再试。")
+            return
+        }
+        if isResolvingEntities {
+            showInfoAlert(title: "实体消歧进行中", message: "正在对图谱做向量语义合并，请稍候。")
+            return
+        }
+        guard agent.ragEngine.knowledgeGraphStatus().built else {
+            showInfoAlert(title: "暂不能实体消歧",
+                          message: "请先构建知识图谱（抽取/构建阶段仅做字符全匹配）。")
+            return
+        }
+        cancelIdleUnload()
+        isResolvingEntities = true
+        statusText = "正在对知识图谱做实体消歧…"
+        let target = ObjectIdentifier(agent)
+        Task.detached(priority: .utility) { [weak self] in
+            await self?.stopSummaryIdleSession()
+            let stillValid: Bool = await MainActor.run { [weak self] in
+                guard let self, self.isResolvingEntities,
+                      let current = self.agent,
+                      ObjectIdentifier(current) == target else { return false }
+                return true
+            }
+            guard stillValid else {
+                await MainActor.run { [weak self] in
+                    guard let self else { return }
+                    self.isResolvingEntities = false
+                    self.scheduleIdleUnload()
+                }
+                return
+            }
+            do {
+                let stats = try await agent.ragEngine
+                    .resolveKnowledgeGraphDuplicates(threshold: 0.90)
+                await MainActor.run { [weak self] in
+                    guard let self else { return }
+                    self.isResolvingEntities = false
+                    self.refreshKnowledgeGraphStatus()
+                    self.appendLog("[kg] 实体消歧完成：合并 \(stats.mergedGroups) 组、"
+                        + "删除 \(stats.removedEntities) 个实体（现存 \(stats.entities) 实体"
+                        + " / \(stats.relationships) 关系）")
+                    self.statusText = "实体消歧完成"
+                    self.scheduleIdleUnload()
+                }
+            } catch {
+                await MainActor.run { [weak self] in
+                    guard let self else { return }
+                    self.isResolvingEntities = false
+                    self.appendLog("[kg] 实体消歧失败: \(error.localizedDescription)")
+                    self.showInfoAlert(title: "实体消歧失败", message: error.localizedDescription)
+                    self.statusText = "就绪"
+                    self.scheduleIdleUnload()
+                }
+            }
+        }
+    }
+
     private func confirmANNIndexRebuild(_ status: ANNIndexStatus,
                                         target: RAGEngine.ANNIndexTarget) -> Bool {
         let label = target == .binary ? "二值 ANN 索引" : "ANN 索引"
@@ -2345,6 +2416,8 @@ final class AppViewModel: ObservableObject {
                 }
                 if self.agent === agent {
                     self.refreshRAGStatus()
+                    // 同步可能让旧图谱失效（stale），刷新后 UI 自动回落到 naive。
+                    self.refreshKnowledgeGraphStatus()
                 } else {
                     self.statusText = "就绪"
                 }

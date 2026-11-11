@@ -114,6 +114,14 @@ public protocol EmbeddingProvider: AnyObject, Sendable {
     var maxConcurrentRuns: Int { get }
 }
 
+/// 批量查询嵌入（可选能力）：一次把多条检索文本送进模型，避免逐条调用。
+///
+/// 未实现该协议的 provider 由调用方回退到逐条 `embedQuery`；实现方必须对每条
+/// 文本使用与 `embedQuery` 完全一致的 query 任务类型与前缀。
+public protocol EmbeddingQueryBatching: AnyObject, Sendable {
+    func embedQueries(_ texts: [String]) async throws -> [[Float]]
+}
+
 /// 一次同时返回主向量与二值签名。签名必须来自原生输出（截断/量化之前）。
 public struct BinaryEmbeddingOutput: Sendable {
     public var vectors: [[Float]]

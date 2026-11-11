@@ -205,18 +205,21 @@ final class RAGMCPServerTests: XCTestCase {
         XCTAssertNotNil(info.capabilities.tools, "应声明 tools 能力")
         XCTAssertTrue(MCP.Version.supported.contains(info.protocolVersion))
 
-        // tools/list：7 个工具（6 能力 + forget_context 别名）。
+        // tools/list：全部工具（7 个原始 + 9 个知识图谱工具）。
         let (tools, _) = try await client.listTools()
-        XCTAssertEqual(tools.map(\.name),
-                       ["parse_and_ingest_document", "delete_document",
-                        "forget_context", "list_document",
-                        "extract_metadata", "hybrid_search_with_rerank",
-                        "get_document"])
+        let expectedNames = Set([
+            "ingest_document", "delete_document", "forget_context",
+            "list_document", "extract_metadata", "hybrid_search_with_rerank",
+            "get_document",
+            "ingest_knowledge", "add_entity", "add_relationship", "get_entity",
+            "delete_entity", "get_path", "get_neighbors", "get_subgraph", "search_graph",
+        ])
+        XCTAssertEqual(Set(tools.map(\.name)), expectedNames)
 
-        // parse_and_ingest_document：纯文本入库。
+        // ingest_document：纯文本入库。
         let docBody = String(repeating: "apple orchard biology notes. ", count: 30)
         let (ingestContent, ingestError) = try await client.callTool(
-            name: "parse_and_ingest_document",
+            name: "ingest_document",
             arguments: ["filename": .string("notes.md"), "content": .string(docBody)])
         XCTAssertNotEqual(ingestError, true)
         let ingestText = Self.text(of: ingestContent)
@@ -431,11 +434,11 @@ final class RAGMCPServerTests: XCTestCase {
         try await client.connect(transport: clientTransport)
 
         let (tools, _) = try await client.listTools()
-        XCTAssertEqual(tools.count, 7)
+        XCTAssertEqual(tools.count, 16)
 
         let docBody = String(repeating: "volcano geology report. ", count: 30)
         let (ingest, ingestError) = try await client.callTool(
-            name: "parse_and_ingest_document",
+            name: "ingest_document",
             arguments: ["filename": .string("geo.md"), "content": .string(docBody)])
         XCTAssertNotEqual(ingestError, true)
         XCTAssertTrue(Self.text(of: ingest).contains("geo.md"))
@@ -490,7 +493,7 @@ final class RAGMCPServerTests: XCTestCase {
         try String(repeating: "volcano geology report. ", count: 30)
             .write(to: outside, atomically: true, encoding: .utf8)
         let (isError, text) = try await callTool(
-            "parse_and_ingest_document", ["path": .string(outside.path)],
+            "ingest_document", ["path": .string(outside.path)],
             port: port, session: session)
         XCTAssertFalse(isError, "path 入库失败：\(text)")
         XCTAssertTrue(text.contains("outside.md"), "应返回文档名：\(text)")

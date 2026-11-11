@@ -72,8 +72,10 @@ public enum AgentToolFactory {
                 + "- op=\"graph\": manipulate the entity/relation/observation graph "
                 + "(graph_op: create_entity / add_observations / create_relation / list_entities / "
                 + "get_entity / delete_entity / snapshot / clear).\n"
-                + "- op=\"search\": semantic recall of stored facts (query, top_k). "
-                + "Use the user's original wording for query.",
+                + "- op=\"search\": returns <=1000 chars of JSON. Priority: the 5 most "
+                + "recent matched observations (hits), then their entities and directly "
+                + "connected relations; one-hop neighbor expansion only if budget remains, "
+                + "otherwise expansion is dropped. Use the user's original wording for query.",
             subcommands: [
                 ("graph", MemoryGraphTool(config: config, callbacks: callbacks, registry: registry)),
                 ("search", MemorySearchTool(config: config, callbacks: callbacks, registry: registry)),

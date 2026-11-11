@@ -12,6 +12,11 @@ import Foundation
 /// - `mix`：实体 + 关系 + 原文切片全做。
 public final class KnowledgeGraphRetriever {
 
+    /// 查询语句直接召回的原文切片数（mix）。
+    private static let directChunkTopK = 20
+    /// 反查原文时最多读取的 chunk id 数，避免超大图谱一次拉爆。
+    private static let maxReverseLookupIDs = 1_000
+
     private let kgStore: KnowledgeGraphStore
     private let graph: KnowledgeGraph
     private let builder: KnowledgeGraphBuilder
@@ -32,29 +37,39 @@ public final class KnowledgeGraphRetriever {
 
     // MARK: - 主入口
 
-    public func retrieve(query: String) async throws -> KGRetrievalCandidates {
-        guard !query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+    public func retrieve(query: String, source: String? = nil) async throws -> KGRetrievalCandidates {
+        let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
             return KGRetrievalCandidates()
         }
         let strategy = config.ragRetrievalStrategy
         let floor = config.ragKGSimilarityFloor
         let entityTopK = config.ragKGEntityTopK
         let relationTopK = config.ragKGRelationTopK
+        let perHitChunkLimit = max(1, config.ragKGMaxChunksPerHit)
+        let sourceNeedle = source?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let hasSourceFilter = !sourceNeedle.isEmpty
 
         // 1) 关键词抽取（失败回退：直接用原 query）。
         let keywords: KGKeywords
         if strategy.usesKnowledgeGraph {
-            keywords = (try? await builder.extractKeywords(query: query))
-                ?? KGKeywords(highLevel: [query], lowLevel: [query])
+            keywords = (try? await builder.extractKeywords(query: trimmed))
+                ?? KGKeywords(highLevel: [trimmed], lowLevel: [trimmed])
         } else {
-            keywords = KGKeywords(highLevel: [query], lowLevel: [query])
+            keywords = KGKeywords(highLevel: [trimmed], lowLevel: [trimmed])
         }
 
-        // 2) 三路向量：ll→实体、hl→关系、原 query→原文（可并发计算）。
-        async let entityVec = averageQueryVector(keywords.lowLevel, fallback: query)
-        async let relationVec = averageQueryVector(keywords.highLevel, fallback: query)
-        async let chunkVec = embedding.embedQuery(query)
-        let (entityVector, relationVector, chunkVector) = try await (entityVec, relationVec, chunkVec)
+        // 2) 三路向量（ll→实体、hl→关系、原 query→原文）一次批量计算。
+        let lowTexts = normalizedKeywords(keywords.lowLevel, fallback: trimmed)
+        let highTexts = normalizedKeywords(keywords.highLevel, fallback: trimmed)
+        let vectors = try await embedQueries(lowTexts + highTexts + [trimmed])
+        guard vectors.count == lowTexts.count + highTexts.count + 1 else {
+            throw AgentError.storage("批量查询向量数量不一致")
+        }
+        let entityVector = averageVector(Array(vectors[0..<lowTexts.count]))
+        let relationVector = averageVector(
+            Array(vectors[lowTexts.count..<(lowTexts.count + highTexts.count)]))
+        let chunkVector = vectors[vectors.count - 1]
 
         // 3) 三路召回。
         async let entityHits = kgStore.searchEntities(vector: entityVector, topK: entityTopK,
@@ -66,7 +81,6 @@ public final class KnowledgeGraphRetriever {
         // 4) 按策略组装实体/关系候选 + 图谱扩展。
         var entityPassages: [KGPassage] = []
         var relationPassages: [KGPassage] = []
-        var extraChunkIDs: [String] = []
 
         switch strategy {
         case .naive:
@@ -76,7 +90,8 @@ public final class KnowledgeGraphRetriever {
             for hit in entities {
                 entityPassages.append(entityPassage(hit.entity, score: hit.score))
                 for neighbor in graph.neighbors(of: hit.entity.name) {
-                    if let e = graph.entity(named: neighbor), !contains(entityPassages, name: e.name) {
+                    if let e = graph.entity(named: neighbor),
+                       !contains(entityPassages, name: e.name) {
                         entityPassages.append(entityPassage(e, score: hit.score * 0.9))
                     }
                 }
@@ -86,7 +101,6 @@ public final class KnowledgeGraphRetriever {
                     relationPassages.append(relationPassage(rel, score: hit.score))
                 }
             }
-            extraChunkIDs = entities.flatMap { $0.entity.sourceIDs }
         case .global:
             // 命中关系 + 两端实体及度数。
             for hit in relations {
@@ -98,33 +112,51 @@ public final class KnowledgeGraphRetriever {
                     entityPassages.append(entityPassage(t, score: hit.score))
                 }
             }
-            extraChunkIDs = relations.flatMap { $0.relationship.sourceIDs }
-        case .hybrid:
+        case .hybrid, .mix:
             let local = localExpansion(entities)
             let global = globalExpansion(relations)
             (entityPassages, relationPassages) = interleave(local, global)
-            extraChunkIDs = entities.flatMap { $0.entity.sourceIDs }
-                + relations.flatMap { $0.relationship.sourceIDs }
-        case .mix:
-            let local = localExpansion(entities)
-            let global = globalExpansion(relations)
-            (entityPassages, relationPassages) = interleave(local, global)
-            extraChunkIDs = entities.flatMap { $0.entity.sourceIDs }
-                + relations.flatMap { $0.relationship.sourceIDs }
         }
 
-        // 5) 去重。
-        entityPassages = dedupEntities(entityPassages)
-        relationPassages = dedupRelations(relationPassages)
+        // 5) 去重 + 统一排序（余弦 + 度数/权重）。
+        entityPassages = KGCandidateRanking.entities(dedupEntities(entityPassages))
+        relationPassages = KGCandidateRanking.relations(dedupRelations(relationPassages))
 
-        // 6) 实体/关系反查原文（每条最多 5 片）。
-        let reverseChunks = try reverseLookupChunks(extraChunkIDs, limit: config.ragKGMaxChunksPerHit)
+        // 6) 反查原文所需的 chunk 引用（一次查表，供来源过滤与限量复用）。
+        let candidateSourceIDs = Set(entityPassages.flatMap(\.sourceChunkIDs)
+            + relationPassages.flatMap(\.sourceChunkIDs))
+        var refs = try kgStore.chunkRefs(
+            ids: Array(candidateSourceIDs.sorted().prefix(Self.maxReverseLookupIDs)))
+        if hasSourceFilter {
+            refs = refs.filter { $0.source.localizedCaseInsensitiveContains(sourceNeedle) }
+            let allowed = Set(refs.map(\.id))
+            // 来源过滤：实体/关系至少要有一条归因切片落在目标来源。
+            entityPassages = entityPassages.filter {
+                !$0.sourceChunkIDs.allSatisfy { !allowed.contains($0) }
+            }
+            relationPassages = relationPassages.filter {
+                !$0.sourceChunkIDs.allSatisfy { !allowed.contains($0) }
+            }
+            refs = refs.filter { ref in
+                entityPassages.contains { $0.sourceChunkIDs.contains(ref.id) }
+                    || relationPassages.contains { $0.sourceChunkIDs.contains(ref.id) }
+            }
+        }
+        let refMap = Dictionary(uniqueKeysWithValues: refs.map { ($0.id, $0) })
 
-        // 7) 原文直接召回（mix；优先级最高）。
+        // 7) 实体/关系 → chunk：每条最多带回 perHitChunkLimit 片。
+        let entityChunkStreams = chunkStreams(entityPassages, refMap: refMap,
+                                              limit: perHitChunkLimit)
+        let relationChunkStreams = chunkStreams(relationPassages, refMap: refMap,
+                                                limit: perHitChunkLimit)
+
+        // 8) 原文直接召回（mix；相似度低于下限直接丢弃）。
         var directChunks: [KGPassage] = []
         if strategy == .mix {
-            let hits = try chunkStore.search(vector: chunkVector, topK: 20)
-            directChunks = hits.map { hit in
+            let hits = try chunkStore.search(
+                vector: chunkVector, topK: Self.directChunkTopK,
+                sourceContains: hasSourceFilter ? sourceNeedle : nil)
+            directChunks = hits.filter { $0.score >= floor }.map { hit in
                 let chunkID = "\(VectorStore.hashSource(hit.source))_\(hit.chunkIndex)"
                 return KGPassage(text: hit.text, kind: .chunk,
                                  label: (hit.source as NSString).lastPathComponent,
@@ -132,11 +164,17 @@ public final class KnowledgeGraphRetriever {
             }
         }
 
-        // 8) chunk 去重（按 chunk id），直接召回在前。
-        var chunkPassages = directChunks
-        for chunk in reverseChunks where !contains(chunkPassages, chunkID: chunk.sourceChunkIDs.first ?? "") {
-            chunkPassages.append(chunk)
+        // 9) chunk 合并：直接召回在前，实体/关系反查按轮询交错去重（chunk id）。
+        var chunkPassages: [KGPassage] = []
+        var seenChunkIDs = Set<String>()
+        func append(_ passage: KGPassage) {
+            guard let id = passage.sourceChunkIDs.first,
+                  seenChunkIDs.insert(id).inserted else { return }
+            chunkPassages.append(passage)
         }
+        directChunks.forEach(append)
+        roundRobin(entityChunkStreams.flatMap { $0 },
+                   relationChunkStreams.flatMap { $0 }).forEach(append)
 
         return KGRetrievalCandidates(entities: entityPassages,
                                      relations: relationPassages,
@@ -213,7 +251,9 @@ public final class KnowledgeGraphRetriever {
         return KGPassage(text: text, kind: .relation,
                          label: "\(rel.srcEntity) --\(rel.relationType)--> \(rel.dstEntity)",
                          score: score, degree: graph.relationRank(rel),
-                         weight: rel.weight, sourceChunkIDs: rel.sourceIDs)
+                         weight: rel.weight, sourceChunkIDs: rel.sourceIDs,
+                         srcEntity: rel.srcEntity, dstEntity: rel.dstEntity,
+                         relationType: rel.relationType)
     }
 
     // MARK: - 去重
@@ -225,52 +265,48 @@ public final class KnowledgeGraphRetriever {
             let key = p.label.lowercased()
             if seen.insert(key).inserted { out.append(p) }
         }
-        return out.sorted {
-            if $0.score != $1.score { return $0.score > $1.score }
-            return $0.degree > $1.degree
-        }
+        return out
     }
 
-    /// 关系按三元组去重（无向边归一化），再按 rank（度数）+ weight 降序。
+    /// 关系按三元组去重（无向边归一化）。
     private func dedupRelations(_ passages: [KGPassage]) -> [KGPassage] {
         var seen = Set<String>()
         var out: [KGPassage] = []
         for p in passages {
-            // label 形如 "src --type--> dst"；拆回三元组做无向归一。
-            let key = canonicalTripleKey(p.label)
-            if seen.insert(key).inserted { out.append(p) }
+            if seen.insert(p.tripleKey()).inserted { out.append(p) }
         }
-        return out.sorted {
-            if $0.degree != $1.degree { return $0.degree > $1.degree }
-            if $0.weight != $1.weight { return $0.weight > $1.weight }
-            return $0.score > $1.score
+        return out
+    }
+
+    // MARK: - 原文反查
+
+    /// 每个实体/关系各自最多 `limit` 片，按候选顺序保留。
+    private func chunkStreams(_ passages: [KGPassage],
+                              refMap: [String: KnowledgeGraphStore.ChunkRef],
+                              limit: Int) -> [[KGPassage]] {
+        passages.map { passage in
+            var seen = Set<String>()
+            var out: [KGPassage] = []
+            for id in passage.sourceChunkIDs where seen.insert(id).inserted {
+                guard out.count < limit, let ref = refMap[id] else { continue }
+                out.append(KGPassage(text: ref.text, kind: .chunk,
+                                     label: (ref.source as NSString).lastPathComponent,
+                                     score: 0, sourceChunkIDs: [ref.id]))
+            }
+            return out
         }
     }
 
-    private func canonicalTripleKey(_ label: String) -> String {
-        let parts = label.components(separatedBy: "--")
-        guard parts.count >= 3 else { return label.lowercased() }
-        let src = parts[0].trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        let dst = parts[2].trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        let type = parts[1].trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        let (lo, hi) = src <= dst ? (src, dst) : (dst, src)
-        return "\(lo)|\(hi)|\(type)"
-    }
-
-    // MARK: - 反查
-
-    /// 实体/关系反查原文，每条最多带回 `limit` 片。
-    private func reverseLookupChunks(_ chunkIDs: [String],
-                                     limit: Int) throws -> [KGPassage] {
-        guard !chunkIDs.isEmpty else { return [] }
-        let deduped = Array(Set(chunkIDs))
-        // 每个来源实体/关系最多带回 limit 片：这里整体去重后再限量。
-        let refs = try kgStore.chunkRefs(ids: Array(deduped.prefix(1_000)))
-        return refs.prefix(limit * 2).map { ref in
-            KGPassage(text: ref.text, kind: .chunk,
-                      label: (ref.source as NSString).lastPathComponent,
-                      score: 0, sourceChunkIDs: [ref.id])
+    /// 两组候选按位轮询交错（a[0], b[0], a[1], b[1], …）。
+    private func roundRobin(_ a: [KGPassage], _ b: [KGPassage]) -> [KGPassage] {
+        var out: [KGPassage] = []
+        out.reserveCapacity(a.count + b.count)
+        let maxCount = max(a.count, b.count)
+        for i in 0..<maxCount {
+            if i < a.count { out.append(a[i]) }
+            if i < b.count { out.append(b[i]) }
         }
+        return out
     }
 
     // MARK: - 工具
@@ -279,19 +315,30 @@ public final class KnowledgeGraphRetriever {
         passages.contains { $0.label.lowercased() == name.lowercased() }
     }
 
-    private func contains(_ passages: [KGPassage], chunkID: String) -> Bool {
-        passages.contains { $0.sourceChunkIDs.first == chunkID }
+    private func normalizedKeywords(_ keywords: [String], fallback: String) -> [String] {
+        let filtered = keywords.filter {
+            !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        }
+        return filtered.isEmpty ? [fallback] : filtered
     }
 
-    /// 多个关键词查询向量取均值并重新归一化。
-    private func averageQueryVector(_ texts: [String],
-                                    fallback: String) async throws -> [Float] {
-        var texts = texts.filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
-        if texts.isEmpty { texts = [fallback] }
+    /// 多路查询文本一次批量嵌入；provider 不支持批量时退回逐条 `embedQuery`。
+    private func embedQueries(_ texts: [String]) async throws -> [[Float]] {
+        guard !texts.isEmpty else { return [] }
+        if let batching = embedding as? EmbeddingQueryBatching {
+            let vectors = try await batching.embedQueries(texts)
+            if vectors.count == texts.count { return vectors }
+        }
         var vectors: [[Float]] = []
+        vectors.reserveCapacity(texts.count)
         for text in texts {
             vectors.append(try await embedding.embedQuery(text))
         }
+        return vectors
+    }
+
+    /// 多个查询向量取均值并重新归一化。
+    private func averageVector(_ vectors: [[Float]]) -> [Float] {
         guard let first = vectors.first else { return [] }
         var sum = [Float](repeating: 0, count: first.count)
         for vector in vectors {

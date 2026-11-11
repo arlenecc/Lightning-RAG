@@ -640,7 +640,10 @@ struct SettingsView: View {
                     VStack(alignment: .leading, spacing: 10) {
                         HStack(spacing: 8) {
                             Text("RAG检索策略").font(.caption)
-                            Picker("", selection: $retrievalStrategy) {
+                            Picker("", selection: Binding(
+                                get: { model.knowledgeGraphBuilt ? retrievalStrategy : .naive },
+                                set: { retrievalStrategy = $0 }
+                            )) {
                                 ForEach(RAGRetrievalStrategy.allCases, id: \.self) { s in
                                     Text(s.displayName).tag(s)
                                 }
@@ -658,6 +661,14 @@ struct SettingsView: View {
                             if model.isBuildingKG {
                                 Button("停止") { model.stopKnowledgeGraphBuild() }
                             }
+                            Button(model.isResolvingEntities ? "实体消歧中…" : "实体消歧") {
+                                model.requestEntityResolution()
+                            }
+                            .disabled(model.isSyncing || model.isDeduplicating
+                                || model.isBuildingANN || model.isBuildingKG
+                                || model.isResolvingEntities || !model.knowledgeGraphBuilt)
+                            .help("用向量语义相似度对图谱内同指实体做进一步合并（全量扫描，耗时与实体数相关）；"
+                                + "抽取/构建阶段只用字符全匹配，快速且不依赖向量")
                             if model.knowledgeGraphBuilt {
                                 Text("已建 \(model.knowledgeGraphEntityCount) 实体 / \(model.knowledgeGraphRelationCount) 关系")
                                     .font(.caption2).foregroundStyle(.secondary)
@@ -1766,7 +1777,8 @@ struct SettingsView: View {
                                                     config.ragEmbeddingTokenBudgetMax)
         config.ragEmbeddingTokenBudgetStep = min(max(128, embeddingTokenBudgetStep), 8_192)
         config.ragVerifyFingerprint = verifyFingerprint
-        config.ragRetrievalStrategy = retrievalStrategy
+        // 图谱未建成（或已失效）时只允许 naive，避免保存一个不可用的策略。
+        config.ragRetrievalStrategy = model.knowledgeGraphBuilt ? retrievalStrategy : .naive
 
         if mainMode == "local", !config.localLLMModel.isEmpty,
            config.localLLMModel != model.config.localLLMModel {

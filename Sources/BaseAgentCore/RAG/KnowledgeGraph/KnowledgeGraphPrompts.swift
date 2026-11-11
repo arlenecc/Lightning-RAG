@@ -10,7 +10,12 @@ public enum KnowledgeGraphPrompts {
 
     // MARK: 实体/关系抽取（system 段）
 
-    static let entityExtractionSystem = """
+    /// 抽取 system prompt。限额来自 `KGExtractionLimits`（config.json 可调），
+    /// 直接写进提示词，让模型在生成阶段就遵守，而不是只靠事后截断。
+    static func entityExtractionSystem(
+        limits: KGExtractionLimits = .default
+    ) -> String {
+        """
 ---Role---
 You are a Knowledge Graph Specialist responsible for extracting entities and relationships from the `---Input Text---` section of user prompt.
 
@@ -46,8 +51,9 @@ You are a Knowledge Graph Specialist responsible for extracting entities and rel
 
 6. **Output Order & Deduplication:**
   - Output all extracted entities first, followed by all extracted relationships.
-  - Output at most 100 total rows across entities and relationships in this response.
-  - Output at most 40 entity rows in this response.
+  - Output at most \(limits.maxEntitiesPerChunk) entity rows in this response.
+  - Output at most \(limits.maxRelationsPerChunk) relationship rows in this response.
+  - Each `entity_description` and `relationship_description` must not exceed \(limits.maxDescriptionCharacters) characters.
   - Output fewer rows if fewer high-value items are present. Do not try to fill the limit.
   - Only output relationship rows whose source and target entities are both included in the selected entity rows for this response.
   - If the limit is reached, stop adding new rows immediately and output `<|COMPLETE|>`.
@@ -92,21 +98,33 @@ entity<|#|>Steve Jobs<|#|>Person<|#|>Co-founder of Apple.
 relation<|#|>Apple<|#|>Steve Jobs<|#|>founder, co-founder<|#|>Steve Jobs co-founded Apple in 1976.
 <|COMPLETE|>
 """
+    }
 
     /// 实体/关系抽取的 task 段（`---Input Text---` 已填入切片正文）。
-    static func entityExtractionTask(chunk: String, language: String = "中文") -> String {
+    ///
+    /// `sectionContext` 为切片所属章节层级；非空时作为背景信息提供，帮助
+    /// 消解指代，但不会从标题本身抽取实体/关系。
+    static func entityExtractionTask(chunk: String, language: String = "中文",
+                                    sectionContext: String = "",
+                                    limits: KGExtractionLimits = .default) -> String {
+        let context = sectionContext.trimmingCharacters(in: .whitespacesAndNewlines)
+        let contextSection = context.isEmpty ? "" : """
+        ---Section Context---
+        \(context)
+
         """
+        return """
 ---Task---
 Extract entities and relationships from the `---Input Text---` section below.
 
 ---Instructions---
 1. **Strict Adherence to Format:** Strictly adhere to all format requirements for entity and relationship lists, including output order, field delimiters, and proper noun handling, as specified in the system prompt.
-2. **Quantity Limits:** In this response, output at most 100 total rows and at most 40 entity rows. Output fewer rows if fewer high-value items are present. Only output relationship rows whose source and target entities are both included in this response.
+2. **Quantity Limits:** In this response, output at most \(limits.maxEntitiesPerChunk) entity rows and at most \(limits.maxRelationsPerChunk) relationship rows. Each description must not exceed \(limits.maxDescriptionCharacters) characters. Output fewer rows if fewer high-value items are present. Only output relationship rows whose source and target entities are both included in this response.
 3. **Output Content Only:** Output *only* the extracted list of entities and relationships. Do not include any introductory or concluding remarks, explanations, or additional text before or after the list.
 4. **Completion Signal:** Output `<|COMPLETE|>` as the final line after all relevant entities and relationships have been extracted and presented. If the row limit is reached, output `<|COMPLETE|>` immediately after the last allowed row.
 5. **Output Language:** Ensure the output language is \(language). Proper nouns (e.g., personal names, place names, organization names) must be kept in their original language and not translated.
 
----Input Text---
+\(contextSection)---Input Text---
 \(chunk)
 """
     }
@@ -156,8 +174,8 @@ Output:
 
     // MARK: 实体描述归纳
 
-    /// 多段描述归纳为单一摘要（`{description_name}` / `{description_list}` 已填入）。
-    static func summarizeEntityPrompt(name: String, list: String) -> String {
+    /// 多段描述归纳为单一摘要（`summarize_entity_descriptions`）。
+    static func summarizeEntityDescriptionsPrompt(name: String, list: String) -> String {
         """
 ---Role---
 You are a Knowledge Graph Specialist, proficient in data curation and synthesis.

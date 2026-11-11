@@ -388,6 +388,12 @@ public struct AgentConfig: Sendable {
     public var ragKGRelationTokenBudget: Int = 8_000
     /// KG + 原文 + system + query 的总 token 预算（默认 30000）。
     public var ragKGTotalTokenBudget: Int = 30_000
+    /// 单个切片最多保留的实体数（默认 20）。
+    public var ragKGMaxEntitiesPerChunk: Int = 20
+    /// 单个切片最多保留的关系数（默认 50）。
+    public var ragKGMaxRelationsPerChunk: Int = 50
+    /// 实体/关系描述的最大字符数（默认 100）。
+    public var ragKGMaxDescriptionChars: Int = 100
 
     // 二值粗筛（两段式检索）
     /// 检索是否先走二值向量粗筛；关闭只影响检索，入库仍维护签名。
@@ -694,6 +700,9 @@ public struct AgentConfig: Sendable {
         if let v = int("rag_kg_entity_token_budget") { ragKGEntityTokenBudget = v }
         if let v = int("rag_kg_relation_token_budget") { ragKGRelationTokenBudget = v }
         if let v = int("rag_kg_total_token_budget") { ragKGTotalTokenBudget = v }
+        if let v = int("rag_kg_max_entities_per_chunk") { ragKGMaxEntitiesPerChunk = v }
+        if let v = int("rag_kg_max_relations_per_chunk") { ragKGMaxRelationsPerChunk = v }
+        if let v = int("rag_kg_max_description_chars") { ragKGMaxDescriptionChars = v }
         if let v = bool("rag_binary_coarse_enabled") { ragBinaryCoarseEnabled = v }
         if let v = int("rag_binary_coarse_candidates") { ragBinaryCoarseCandidates = v }
 
@@ -953,6 +962,10 @@ public struct AgentConfig: Sendable {
         ragKGEntityTokenBudget = max(500, min(20_000, ragKGEntityTokenBudget))
         ragKGRelationTokenBudget = max(500, min(20_000, ragKGRelationTokenBudget))
         ragKGTotalTokenBudget = max(4_096, min(60_000, ragKGTotalTokenBudget))
+        // 抽取限额收口：实体/关系按行数上限，描述按字符数上限。
+        ragKGMaxEntitiesPerChunk = max(1, min(200, ragKGMaxEntitiesPerChunk))
+        ragKGMaxRelationsPerChunk = max(1, min(500, ragKGMaxRelationsPerChunk))
+        ragKGMaxDescriptionChars = max(10, min(2_000, ragKGMaxDescriptionChars))
     }
 
     /// 统一主/辅模型类型：mlx → mlx-lm；llama.cpp / llama_cpp → gguf。
@@ -1086,6 +1099,9 @@ public struct AgentConfig: Sendable {
             "rag_kg_entity_token_budget": ragKGEntityTokenBudget,
             "rag_kg_relation_token_budget": ragKGRelationTokenBudget,
             "rag_kg_total_token_budget": ragKGTotalTokenBudget,
+            "rag_kg_max_entities_per_chunk": ragKGMaxEntitiesPerChunk,
+            "rag_kg_max_relations_per_chunk": ragKGMaxRelationsPerChunk,
+            "rag_kg_max_description_chars": ragKGMaxDescriptionChars,
             "rag_binary_coarse_enabled": ragBinaryCoarseEnabled,
             "rag_binary_coarse_candidates": ragBinaryCoarseCandidates,
             "llm_provider": llmProvider,

@@ -1242,42 +1242,43 @@ public final class Agent: @unchecked Sendable {
         guard !Task.isCancelled, !raw.isEmpty else { return false }
         let json = Self.stripJSONFence(raw)
         guard let value = JSONValue.parse(json), let data = value.objectValue else { return true }
-        let entities = data["entities"]?.arrayValue ?? []
-        let relations = data["relations"]?.arrayValue ?? []
-        guard !entities.isEmpty || !relations.isEmpty else {
-            log("[memory] 本批对话无可持久化事实")
+        let draft = FactExtractionDraft(
+            entities: (data["entities"]?.arrayValue ?? []).compactMap { item -> FactEntityDraft? in
+                guard let object = item.objectValue else { return nil }
+                return FactEntityDraft(
+                    name: object["name"]?.stringValue ?? "",
+                    type: object["type"]?.stringValue ?? "",
+                    observations: (object["observations"]?.arrayValue ?? [])
+                        .compactMap(\.stringValue))
+            },
+            relations: (data["relations"]?.arrayValue ?? []).compactMap { item -> FactRelationDraft? in
+                guard let object = item.objectValue else { return nil }
+                return FactRelationDraft(
+                    source: object["source"]?.stringValue ?? "",
+                    target: object["target"]?.stringValue ?? "",
+                    label: object["label"]?.stringValue ?? "")
+            })
+        // 小模型会概率性犯规：空观察实体、泛化实体名、孤立关系一旦入库就是
+        // 永久噪声（createRelation 还会自动补建空实体），必须在写入前过滤。
+        let cleaned = FactExtractionValidator.sanitize(draft)
+        guard !cleaned.draft.entities.isEmpty else {
+            log("[memory] 本批对话无可持久化事实"
+                + (cleaned.report.totalDropped > 0
+                   ? "（护栏丢弃 \(cleaned.report.totalDropped) 项）" : ""))
             return true
+        }
+        if cleaned.report.totalDropped > 0 {
+            log("[memory] 事实抽取护栏丢弃：实体 \(cleaned.report.droppedEntities)、"
+                + "观察 \(cleaned.report.droppedObservations)、关系 \(cleaned.report.droppedRelations)")
         }
 
         let graph = GraphMemoryStore.shared(
             workspace: config.workspace,
             embedding: LocalModelFactory.shared.makeEmbedding(config: config))
-        var observations: [String] = []
-        for item in entities {
-            guard let entity = item.objectValue,
-                  let name = entity["name"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines),
-                  !name.isEmpty else { continue }
-            let obs = (entity["observations"]?.arrayValue ?? [])
-                .compactMap(\.stringValue)
-                .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-                .filter { !$0.isEmpty }
-            if !obs.isEmpty {
-                graph.addObservations(name, obs)
-                observations.append(contentsOf: obs)
-            } else if let type = entity["type"]?.stringValue, !type.isEmpty {
-                graph.upsertEntity(name, type: type)
-            }
-        }
-        for item in relations {
-            guard let rel = item.objectValue,
-                  let source = rel["source"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines),
-                  let target = rel["target"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines),
-                  let label = rel["label"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines),
-                  !source.isEmpty, !target.isEmpty, !label.isEmpty else { continue }
-            graph.createRelation(source: source, target: target, label: label)
-        }
-        log("[memory] 写入 memory graph：\(observations.count) 条 observation "
-            + "+ \(relations.count) 条 relation")
+        // 消歧 + 合并统一在 store 层完成：同一实体不重复入库，只追加观察与关系。
+        let merged = await graph.mergeFactDraft(cleaned.draft)
+        log("[memory] 写入 memory graph：\(cleaned.draft.entities.count) 个实体候选（已消歧合并）、"
+            + "\(merged.observations) 条 observation + \(merged.relations) 条新增 relation")
         return true
     }
 

@@ -100,17 +100,17 @@ final class MCPClientHTTPTests: XCTestCase {
         XCTAssertTrue(MCP.Version.supported.contains(negotiated),
                       "协商版本应在支持集合内：\(negotiated)")
 
-        // 2. tools/list：7 个工具（真实 RAG 工具层）。
+        // 2. tools/list：16 个工具（7 个原始 + 9 个知识图谱工具）。
         let tools = client.listTools()
-        XCTAssertEqual(tools.count, 7)
+        XCTAssertEqual(tools.count, 16)
         let names = tools.compactMap { $0.objectValue?["name"]?.stringValue }
         XCTAssertTrue(names.contains("hybrid_search_with_rerank"))
-        XCTAssertTrue(names.contains("parse_and_ingest_document"))
+        XCTAssertTrue(names.contains("ingest_document"))
 
         // 3. tools/call：入库（真实切片 + 向量化）。
         let body = String(repeating: "apple orchard manual. ", count: 40)
         let ingestOutput = try await client.callTool(
-            name: "parse_and_ingest_document",
+            name: "ingest_document",
             arguments: ["filename": .string("orchard.md"), "content": .string(body)])
         XCTAssertTrue(ingestOutput.contains("入库完成"), ingestOutput)
         XCTAssertTrue(ingestOutput.contains("orchard.md"), ingestOutput)

@@ -8,20 +8,55 @@ public struct GraphEntity: Codable, Sendable, Equatable, Identifiable {
     public var type: String
     public var observations: [String]
     public var createdAt: String
+    /// 与 `observations` 平行的写入时间戳（epoch 秒）。旧库没有该字段时
+    /// 全部按 0（时间未知、视为最旧）处理，保证向后兼容。
+    public var observationDates: [Double]
 
     public var id: String { name.lowercased() }
 
     public init(name: String, type: String = "", observations: [String] = [],
-                createdAt: String = "") {
+                createdAt: String = "", observationDates: [Double] = []) {
         self.name = name
         self.type = type
         self.observations = observations
         self.createdAt = createdAt
+        self.observationDates = Self.alignedDates(observationDates,
+                                                  count: observations.count)
     }
 
     enum CodingKeys: String, CodingKey {
         case name, type, observations
         case createdAt = "created_at"
+        case observationDates = "observation_dates"
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        name = try c.decode(String.self, forKey: .name)
+        type = try c.decode(String.self, forKey: .type)
+        observations = try c.decode([String].self, forKey: .observations)
+        createdAt = try c.decode(String.self, forKey: .createdAt)
+        let dates = try c.decodeIfPresent([Double].self, forKey: .observationDates) ?? []
+        observationDates = Self.alignedDates(dates, count: observations.count)
+    }
+
+    /// 工具输出（`get_entity` / `create_entity`）不暴露内部时间戳：
+    /// 200 条观察会平白多出几千字符，撑大工具结果。持久化由
+    /// `GraphMemoryStore.writeLocked()` 手写 `observation_dates` 字段完成。
+    public func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(name, forKey: .name)
+        try c.encode(type, forKey: .type)
+        try c.encode(observations, forKey: .observations)
+        try c.encode(createdAt, forKey: .createdAt)
+    }
+
+    /// 时间戳数组与观察数组严格对齐：不足补 0，超出截断。
+    static func alignedDates(_ dates: [Double], count: Int) -> [Double] {
+        guard count > 0 else { return [] }
+        if dates.count == count { return dates }
+        if dates.count > count { return Array(dates.suffix(count)) }
+        return dates + Array(repeating: 0, count: count - dates.count)
     }
 }
 
@@ -45,11 +80,14 @@ public struct GraphObservationHit: Sendable, Equatable {
     public var entity: String
     public var text: String
     public var score: Double
+    /// 观察写入时间（epoch 秒）；旧库无时间戳时为 0。
+    public var timestamp: Double
 
-    public init(entity: String, text: String, score: Double) {
+    public init(entity: String, text: String, score: Double, timestamp: Double = 0) {
         self.entity = entity
         self.text = text
         self.score = score
+        self.timestamp = timestamp
     }
 }
 
@@ -84,6 +122,9 @@ public final class GraphMemoryStore {
     public var maxEntities: Int = 5_000
     /// 关系总数上限（淘汰最旧）。
     public var maxRelations: Int = 20_000
+    /// 实体消歧余弦阈值：新实体名与已有实体名的向量余弦 ≥ 该值才判定为同一实体
+    /// 并合并（保守默认，宁漏勿错——误合并是持久性伤害，会逐轮复利）。
+    public var entityResolutionThreshold: Double = 0.90
 
     private let embedding: EmbeddingProvider?
     private let lock = NSRecursiveLock()
@@ -92,6 +133,7 @@ public final class GraphMemoryStore {
     private var entities: [String: GraphEntity] = [:]   // key = name.lowercased()
     private var relations: [GraphRelation] = []
     private var vectors: [String: [Float]] = [:]        // key = vectorKey(entity, text)
+    private var nameVectors: [String: [Float]] = [:]    // key = name.lowercased()（实体名，懒计算）
     private var embeddingDisabled = false
 
     public init(path: String, embedding: EmbeddingProvider? = nil) {
@@ -146,6 +188,173 @@ public final class GraphMemoryStore {
         store?.flush()
     }
 
+    // MARK: - 实体消歧
+
+    /// 把候选实体名消歧到库内已有实体的**规范名**。
+    ///
+    /// 判定顺序：
+    /// 1. 精确匹配（大小写不敏感）→ 直接返回已有实体的 `name`；
+    /// 2. 语义匹配：候选名与所有已有实体名统一用 `embedDocuments` 编码后做余弦，
+    ///    取最高分，只有 ≥ `entityResolutionThreshold` 才合并（保守，宁漏勿错）；
+    /// 3. type 冲突保护：候选 type 与命中实体 type 都非空且不同时拒绝合并；
+    /// 4. embedding 不可用 / 失败 → 回退到精确匹配（即返回原名，不语义合并）。
+    ///
+    /// 返回的规范名随后交给 `upsertEntity` / `addObservations` / `createRelation`，
+    /// 确保「同一实体」只保留一条记录，新抽取的内容以追加观察 / 更新关系的方式并入。
+    /// - Parameter semantic: 是否启用向量语义消歧。插入阶段（事实抽取）默认 `false`，
+    ///   只做字符全匹配——避免每次入库都重算全库实体名向量（大图下开销不可接受）；
+    ///   向量语义合并交给**手动触发**的离线流程，详见 `mergeFactDraft`。
+    public func resolveEntity(name: String, type: String = "",
+                              semantic: Bool = false) async -> String {
+        let normalized = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalized.isEmpty else { return name }
+
+        // 1) 精确命中 + 候选名快照（同步方法内加锁，避免 async 上下文直接持有锁）。
+        let snapshot = exactMatchAndCandidates(normalized.lowercased())
+        if let exact = snapshot.exact { return exact }
+        // 字符全匹配优先（插入阶段默认路径）：未命中也直接返回原名，不跑向量。
+        guard semantic else { return normalized }
+        let candidateNames = snapshot.candidates
+        guard !candidateNames.isEmpty, let embedding, !isEmbeddingDisabled else {
+            return normalized
+        }
+
+        // 2) 语义匹配（embedding 失败则回退精确匹配，不阻断入库）。
+        // 实体名消歧是「名字 vs 名字」的对称比较，候选与已有名字统一用
+        // `embedDocuments` 编码，避免 query/document 前缀造成系统性偏差。
+        do {
+            let queryVector = (try await embedding.embedDocuments([normalized])).first ?? []
+            guard !queryVector.isEmpty else { return normalized }
+            try await ensureNameVectors(candidateNames, embedding: embedding)
+            if let best = bestSemanticMatch(queryVector: queryVector,
+                                            candidates: candidateNames, type: type) {
+                return best
+            }
+        } catch {
+            AgentLog.warning("graph_memory: 实体消歧不可用，回退精确匹配: \(error.localizedDescription)")
+        }
+        return normalized
+    }
+
+    /// 同步：一次加锁返回精确命中的规范名与全部已有实体名快照。
+    private func exactMatchAndCandidates(_ key: String)
+        -> (exact: String?, candidates: [String]) {
+        lock.lock(); defer { lock.unlock() }
+        let exact = entities[key]?.name
+        return (exact, entities.values.map(\.name))
+    }
+
+    /// 同步：在锁内完成余弦比较，返回最高分且过阈值的规范名。
+    private func bestSemanticMatch(queryVector: [Float], candidates: [String],
+                                   type: String) -> String? {
+        lock.lock(); defer { lock.unlock() }
+        var bestName: String?
+        var bestScore = -1.0
+        for candidate in candidates {
+            guard let vector = nameVectors[candidate.lowercased()] else { continue }
+            // type 冲突：person vs project 这类不同类实体，即便名字相似也不合并。
+            if let existing = entities[candidate.lowercased()],
+               !type.isEmpty, !existing.type.isEmpty,
+               type.lowercased() != existing.type.lowercased() {
+                continue
+            }
+            let score = Self.cosine(queryVector, vector)
+            if score >= entityResolutionThreshold, score > bestScore {
+                bestName = candidate
+                bestScore = score
+            }
+        }
+        return bestName
+    }
+
+    /// 懒计算实体名向量并缓存（key = name.lowercased()）。
+    /// 锁操作封装在同步辅助方法里，避免 async 上下文直接持有锁。
+    private func ensureNameVectors(_ names: [String], embedding: EmbeddingProvider) async throws {
+        let missing = missingNameVectorNames(names)
+        guard !missing.isEmpty else { return }
+
+        var embeddedByName: [String: [Float]] = [:]
+        var offset = 0
+        while offset < missing.count {
+            try Task.checkCancellation()
+            let batch = Array(missing[offset..<min(offset + 32, missing.count)])
+            let embedded = try await embedding.embedDocuments(batch)
+            guard embedded.count == batch.count else {
+                throw AgentError.storage("graph_memory 实体名 embedding 数量不一致")
+            }
+            for (name, vector) in zip(batch, embedded) {
+                embeddedByName[name.lowercased()] = vector
+            }
+            offset += batch.count
+        }
+        cacheNameVectors(embeddedByName)
+    }
+
+    /// 同步：返回尚未缓存向量的实体名（去重）。
+    private func missingNameVectorNames(_ names: [String]) -> [String] {
+        lock.lock(); defer { lock.unlock() }
+        var missing: [String] = []
+        var seen = Set<String>()
+        for name in names {
+            let key = name.lowercased()
+            if nameVectors[key] == nil, seen.insert(key).inserted {
+                missing.append(name)
+            }
+        }
+        return missing
+    }
+
+    /// 同步：写回实体名向量缓存（不覆盖已有值）。
+    private func cacheNameVectors(_ vectors: [String: [Float]]) {
+        lock.lock(); defer { lock.unlock() }
+        for (key, vector) in vectors where nameVectors[key] == nil {
+            nameVectors[key] = vector
+        }
+    }
+
+    // MARK: - 事实抽取入库（消歧 + 合并）
+
+    /// 一批三元组入库的统一入口：先对每个实体名消歧到规范名，再写入。
+    ///
+    /// 核心保证（对应「相同实体不重复入库」）：
+    /// - 精确同名或语义同指的实体，合并到**已有**记录：只追加观察、不新建实体；
+    /// - 关系端点直接查本批「原名 → 规范名」映射，保证无论 embedding 是否可用，
+    ///   关系都指向合并后的实体，且不会触发 `createRelation` 补建空实体；
+    /// - 两端若被消歧到同一实体，跳过该自环关系。
+    ///
+    /// 调用前应已过 `FactExtractionValidator.sanitize`（关系端点必落在本批实体内）。
+    ///
+    /// - Parameter semantic: 是否对关系端点做向量语义消歧。`false`（默认）时只做
+    ///   字符全匹配，保证插入阶段不重算向量、不过度合并（宁漏勿错，且快）；
+    ///   语义合并应走手动触发的离线流程。
+    @discardableResult
+    public func mergeFactDraft(_ draft: FactExtractionDraft,
+                               semantic: Bool = false) async -> (observations: Int,
+                                                                 relations: Int) {
+        var canonicalNames: [String: String] = [:]
+        var observationCount = 0
+        for entity in draft.entities {
+            let canonical = await resolveEntity(name: entity.name, type: entity.type,
+                                                semantic: semantic)
+            canonicalNames[entity.name.lowercased()] = canonical
+            // upsert 保留已有 type（addObservations 只建空 type 实体），两者都幂等。
+            upsertEntity(canonical, type: entity.type)
+            addObservations(canonical, entity.observations)
+            observationCount += entity.observations.count
+        }
+
+        var relationCount = 0
+        for relation in draft.relations {
+            let source = canonicalNames[relation.source.lowercased()] ?? relation.source
+            let target = canonicalNames[relation.target.lowercased()] ?? relation.target
+            guard source.lowercased() != target.lowercased() else { continue }
+            if createRelation(source: source, target: target, label: relation.label) {
+                relationCount += 1
+            }
+        }
+        return (observationCount, relationCount)
+    }
+
     // MARK: - 实体
 
     /// 创建实体；同名（大小写不敏感）时合并观察。
@@ -168,9 +377,14 @@ public final class GraphMemoryStore {
                 existing.type = entityType
             }
             var known = Set(existing.observations)
+            var appended = 0
             for obs in cleaned where !known.contains(obs) {
                 existing.observations.append(obs)
                 known.insert(obs)
+                appended += 1
+            }
+            if appended > 0 {
+                existing.observationDates.append(contentsOf: Self.stampSequence(appended))
             }
             entity = existing
             entities[key] = existing
@@ -182,7 +396,8 @@ public final class GraphMemoryStore {
                 known.insert(obs)
             }
             entity = GraphEntity(name: normalized, type: entityType,
-                                 observations: unique, createdAt: Self.now())
+                                 observations: unique, createdAt: Self.now(),
+                                 observationDates: Self.stampSequence(unique.count))
             entities[key] = entity
         }
         pruneLocked()
@@ -205,6 +420,7 @@ public final class GraphMemoryStore {
             $0.source.lowercased() == key || $0.target.lowercased() == key
         }
         vectors = vectors.filter { !$0.key.hasPrefix(key + "|") }
+        nameVectors.removeValue(forKey: key)
         saveLocked()
         lock.unlock()
         return true
@@ -248,6 +464,9 @@ public final class GraphMemoryStore {
             entity.observations.append(obs)
             known.insert(obs)
             added += 1
+        }
+        if added > 0 {
+            entity.observationDates.append(contentsOf: Self.stampSequence(added))
         }
         entities[key] = entity
         pruneLocked()
@@ -340,12 +559,16 @@ public final class GraphMemoryStore {
         guard !q.isEmpty else { return [] }
         let limit = max(1, topK)
 
-        let pairs: [(entity: String, text: String)] = {
+        let pairs: [(entity: String, text: String, timestamp: Double)] = {
             lock.lock(); defer { lock.unlock() }
             return entities.values
                 .sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
                 .flatMap { entity in
-                    entity.observations.map { (entity: entity.name, text: $0) }
+                    entity.observations.enumerated().map { index, text in
+                        (entity: entity.name, text: text,
+                         timestamp: index < entity.observationDates.count
+                            ? entity.observationDates[index] : 0)
+                    }
                 }
         }()
         guard !pairs.isEmpty else { return [] }
@@ -362,7 +585,8 @@ public final class GraphMemoryStore {
                     if score >= 0.5 {
                         hits.append(GraphObservationHit(entity: pair.entity,
                                                         text: pair.text,
-                                                        score: score))
+                                                        score: score,
+                                                        timestamp: pair.timestamp))
                     }
                 }
                 lock.unlock()
@@ -381,12 +605,13 @@ public final class GraphMemoryStore {
         await search(query: text, topK: topK)
     }
 
-    private func keywordSearch(_ pairs: [(entity: String, text: String)],
+    private func keywordSearch(_ pairs: [(entity: String, text: String, timestamp: Double)],
                                query: String, topK: Int) -> [GraphObservationHit] {
         let needle = query.lowercased()
         var hits: [GraphObservationHit] = []
         for pair in pairs where pair.text.lowercased().contains(needle) {
-            hits.append(GraphObservationHit(entity: pair.entity, text: pair.text, score: 0.5))
+            hits.append(GraphObservationHit(entity: pair.entity, text: pair.text,
+                                            score: 0.5, timestamp: pair.timestamp))
             if hits.count >= topK { break }
         }
         return hits
@@ -397,7 +622,7 @@ public final class GraphMemoryStore {
         return embeddingDisabled
     }
 
-    private func ensureVectors(_ pairs: [(entity: String, text: String)],
+    private func ensureVectors(_ pairs: [(entity: String, text: String, timestamp: Double)],
                                embedding: EmbeddingProvider) async throws {
         lock.lock()
         var missingTexts: [String] = []
@@ -468,6 +693,7 @@ public final class GraphMemoryStore {
         entities = [:]
         relations = []
         vectors = [:]
+        nameVectors = [:]
         saveLocked()
         lock.unlock()
     }
@@ -499,6 +725,10 @@ public final class GraphMemoryStore {
                 let dropCount = entity.observations.count - maxObservationsPerEntity
                 let dropped = entity.observations.prefix(dropCount)
                 entity.observations.removeFirst(dropCount)
+                // 时间戳与观察数组严格对齐：一起裁掉最旧的头部。
+                entity.observationDates = GraphEntity.alignedDates(
+                    Array(entity.observationDates.dropFirst(min(dropCount, entity.observationDates.count))),
+                    count: entity.observations.count)
                 entities[key] = entity
                 for text in dropped {
                     vectors.removeValue(forKey: Self.vectorKey(entity.name, text))
@@ -518,6 +748,7 @@ public final class GraphMemoryStore {
             for (key, _) in ordered.prefix(excess) {
                 entities.removeValue(forKey: key)
                 vectors = vectors.filter { !$0.key.hasPrefix(key + "|") }
+                nameVectors.removeValue(forKey: key)
                 relations.removeAll {
                     $0.source.lowercased() == key || $0.target.lowercased() == key
                 }
@@ -567,9 +798,13 @@ public final class GraphMemoryStore {
                     .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
                     .filter { !$0.isEmpty }
                 let createdAt = object["created_at"]?.stringValue ?? ""
+                // 旧库没有 observation_dates：全部按 0（时间未知／最旧）处理。
+                let dates = (object["observation_dates"]?.arrayValue ?? [])
+                    .compactMap(\.doubleValue)
                 loadedEntities[name.lowercased()] = GraphEntity(
                     name: name, type: type, observations: observations,
-                    createdAt: createdAt.isEmpty ? Self.now() : createdAt)
+                    createdAt: createdAt.isEmpty ? Self.now() : createdAt,
+                    observationDates: dates)
             }
         }
 
@@ -628,6 +863,7 @@ public final class GraphMemoryStore {
                 "name": .string(entity.name),
                 "type": .string(entity.type),
                 "observations": .array(entity.observations.map { .string($0) }),
+                "observation_dates": .array(entity.observationDates.map { .double($0) }),
                 "created_at": .string(entity.createdAt),
             ]
             if !entity.createdAt.isEmpty { object["created_at"] = .string(entity.createdAt) }
@@ -661,6 +897,14 @@ public final class GraphMemoryStore {
         formatter.locale = Locale(identifier: "en_US_POSIX")
         formatter.dateFormat = "yyyy-MM-dd'T'HH:mm:ss"
         return formatter.string(from: Date())
+    }
+
+    /// 一批新观察的时间戳：同批内按顺序微增，保证「数组尾部 = 更新」
+    /// 这一既有语义在时间排序下依然成立。
+    private static func stampSequence(_ count: Int) -> [Double] {
+        guard count > 0 else { return [] }
+        let base = Date().timeIntervalSince1970
+        return (0..<count).map { base + Double($0) * 0.001 }
     }
 
     private static func vectorKey(_ entity: String, _ text: String) -> String {
