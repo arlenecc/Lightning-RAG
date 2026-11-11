@@ -207,6 +207,14 @@ final class AppViewModel: ObservableObject {
     @Published var isBuildingANN = false {
         didSet { if !isBuildingANN { flushQueuedSends() } }
     }
+    /// 正在构建知识图谱（辅助模型抽取实体/关系）。
+    @Published var isBuildingKG = false {
+        didSet { if !isBuildingKG { flushQueuedSends() } }
+    }
+    /// 知识图谱是否已构建（决定 4 种图谱检索策略是否可选）。
+    @Published var knowledgeGraphBuilt = false
+    @Published var knowledgeGraphEntityCount = 0
+    @Published var knowledgeGraphRelationCount = 0
     /// 维护态期间用户发来的消息：旧实现直接 return 静默丢弃，改为排队，
     /// 等维护结束（或上一轮生成结束）后依次自动发送。
     private struct QueuedSend {
@@ -604,8 +612,11 @@ final class AppViewModel: ObservableObject {
         newAgent.auxLLM = config.auxEnabled
             ? LocalModelFactory.shared.makeAuxLLM(config: config)
             : nil
+        // 知识图谱抽取/关键词提取复用辅助模型实例。
+        newAgent.ragEngine.auxLLM = newAgent.auxLLM
         agent = newAgent
         refreshRAGStatus()
+        refreshKnowledgeGraphStatus()
         Task { [weak newAgent] in
             await newAgent?.connectMCP()
         }
@@ -1921,6 +1932,109 @@ final class AppViewModel: ObservableObject {
         appendLog("用户请求停止 ANN 索引构建")
         // 引擎在每个块之间检查取消标志，块内不中断，保证已落盘数据一致。
         agent?.ragEngine.cancel()
+    }
+
+    // MARK: 知识图谱
+
+    private var kgBuildTask: Task<Void, Never>?
+
+    /// 刷新知识图谱构建状态（不加载模型，直接查 SQLite）。
+    func refreshKnowledgeGraphStatus() {
+        guard let agent else {
+            knowledgeGraphBuilt = false
+            knowledgeGraphEntityCount = 0
+            knowledgeGraphRelationCount = 0
+            return
+        }
+        let status = agent.ragEngine.knowledgeGraphStatus()
+        knowledgeGraphBuilt = status.built
+        knowledgeGraphEntityCount = status.entities
+        knowledgeGraphRelationCount = status.relationships
+    }
+
+    /// 点击「构建知识图谱」：后台用辅助模型在已完成切片上抽取实体/关系。
+    func requestKnowledgeGraphBuild() {
+        guard let agent else {
+            showInfoAlert(title: "知识图谱", message: "RAG 尚未就绪，请先在知识同步配置中应用配置。")
+            return
+        }
+        if isSyncing {
+            showInfoAlert(title: "暂不能构建知识图谱", message: "知识同步正在进行，请等同步结束后再试。")
+            return
+        }
+        if isBuildingKG {
+            showInfoAlert(title: "知识图谱构建中", message: "正在后台构建知识图谱，请稍候。")
+            return
+        }
+        if isBuildingANN || isDeduplicating {
+            showInfoAlert(title: "暂不能构建知识图谱", message: "向量索引/去重任务正在进行，请稍后再试。")
+            return
+        }
+        if isModelLoading || isWarmingUp {
+            showInfoAlert(title: "暂不能构建知识图谱", message: "模型正在加载或预热，请稍后再试。")
+            return
+        }
+        if isRunning {
+            showInfoAlert(title: "暂不能构建知识图谱", message: "对话正在生成，请等本轮结束后再试。")
+            return
+        }
+        guard agent.auxLLM != nil else {
+            showInfoAlert(title: "暂不能构建知识图谱",
+                          message: "知识图谱抽取需要辅助模型，请先在配置中启用辅助模型。")
+            return
+        }
+        cancelIdleUnload()
+        isBuildingKG = true
+        statusText = "正在构建知识图谱…"
+        let target = ObjectIdentifier(agent)
+        kgBuildTask = Task.detached(priority: .utility) { [weak self] in
+            await self?.stopSummaryIdleSession()
+            let stillValid: Bool = await MainActor.run { [weak self] in
+                guard let self, self.isBuildingKG, let current = self.agent,
+                      ObjectIdentifier(current) == target else { return false }
+                return true
+            }
+            guard stillValid else {
+                await MainActor.run { [weak self] in
+                    guard let self else { return }
+                    self.isBuildingKG = false
+                    if !self.isRunning, !self.isSyncing, !self.isDeduplicating,
+                       !self.isBuildingANN, !self.isModelLoading, !self.isWarmingUp {
+                        self.statusText = "就绪"
+                    }
+                    self.scheduleIdleUnload()
+                }
+                return
+            }
+            let stats = await agent.ragEngine.buildKnowledgeGraph(auxLLM: agent.auxLLM) { current, total, message in
+                Task { @MainActor [weak self] in
+                    guard let self, self.isBuildingKG else { return }
+                    self.statusText = total > 0 ? "\(message) \(current)/\(total)" : message
+                }
+            } log: { line in
+                Task { @MainActor [weak self] in self?.appendLog(line) }
+            }
+            await MainActor.run { [weak self] in
+                guard let self else { return }
+                self.isBuildingKG = false
+                if let current = self.agent, ObjectIdentifier(current) == target {
+                    self.refreshKnowledgeGraphStatus()
+                    self.refreshRAGStatus()
+                }
+                self.appendLog("[kg] 知识图谱构建完成：实体 \(stats.entities)、关系 \(stats.relationships)"
+                    + "（处理切片 \(stats.chunksProcessed)，失败 \(stats.failedChunks)）")
+                self.statusText = "知识图谱构建完成"
+                self.scheduleIdleUnload()
+            }
+        }
+    }
+
+    /// 停止知识图谱构建。
+    func stopKnowledgeGraphBuild() {
+        guard isBuildingKG else { return }
+        statusText = "正在停止知识图谱构建…"
+        appendLog("用户请求停止知识图谱构建")
+        kgBuildTask?.cancel()
     }
 
     private func confirmANNIndexRebuild(_ status: ANNIndexStatus,

@@ -63,6 +63,46 @@ public enum PDFEngine: String, Codable, Sendable, CaseIterable {
     }
 }
 
+// MARK: - RAG 检索策略
+
+/// 知识图谱加持的 RAG 检索策略（默认 naive = 图谱能力加入前的原始实现）。
+///
+/// - `naive`：不用图谱，只做原文切片召回（历史默认）。
+/// - `local`：从命中实体拉邻居边与关联实体，适合问具体细节。
+/// - `global`：从命中关系反查两边实体及度数，适合跨文档宏观主题/总结。
+/// - `hybrid`：实体 + 关系两个子图轮询交织合并，适合综合问题。
+/// - `mix`：实体 + 关系 + 原文切片全做，图谱语境之上保留原文兜底。
+public enum RAGRetrievalStrategy: String, Codable, Sendable, CaseIterable {
+    case local
+    case global
+    case hybrid
+    case mix
+    case naive
+
+    public init(stored: String) {
+        switch stored.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+        case "local": self = .local
+        case "global": self = .global
+        case "hybrid": self = .hybrid
+        case "mix": self = .mix
+        default: self = .naive
+        }
+    }
+
+    /// 是否依赖知识图谱（只有图谱构建完成后这四种才可选）。
+    public var usesKnowledgeGraph: Bool { self != .naive }
+
+    public var displayName: String {
+        switch self {
+        case .local: return "local（实体/邻居）"
+        case .global: return "global（关系/宏观）"
+        case .hybrid: return "hybrid（实体+关系）"
+        case .mix: return "mix（实体+关系+原文）"
+        case .naive: return "naive（原文召回）"
+        }
+    }
+}
+
 // MARK: - AgentConfig
 
 /// 运行时配置，持久化到 `~/.base-agent/config.json`。
@@ -329,6 +369,25 @@ public struct AgentConfig: Sendable {
     /// Matryoshka 截断维：默认 128。jina-v5 支持
     /// 32 / 64 / 128 / 256 / 512 / 768；其它模型沿用 128 / 256 / 512。
     public var ragMatryoshkaDim: Int = MatryoshkaDimensions.defaultValue
+
+    // 知识图谱检索
+    /// RAG 检索策略（默认 naive = 图谱能力加入前的原始实现）。
+    /// 其余四种策略需先「构建知识图谱」；图谱未就绪时自动回退 naive。
+    public var ragRetrievalStrategy: RAGRetrievalStrategy = .naive
+    /// 实体/关系关键词召回时的相似度下限（低于该余弦值的候选直接丢弃）。
+    public var ragKGSimilarityFloor: Double = 0.2
+    /// 实体召回的 top_k（默认 40）。
+    public var ragKGEntityTopK: Int = 40
+    /// 关系召回的 top_k（默认 40）。
+    public var ragKGRelationTopK: Int = 40
+    /// 实体/关系反查原文时每条最多带回的相关切片数（默认 5）。
+    public var ragKGMaxChunksPerHit: Int = 5
+    /// 实体上下文 token 预算上限（默认 6000）。
+    public var ragKGEntityTokenBudget: Int = 6_000
+    /// 关系上下文 token 预算上限（默认 8000）。
+    public var ragKGRelationTokenBudget: Int = 8_000
+    /// KG + 原文 + system + query 的总 token 预算（默认 30000）。
+    public var ragKGTotalTokenBudget: Int = 30_000
 
     // 二值粗筛（两段式检索）
     /// 检索是否先走二值向量粗筛；关闭只影响检索，入库仍维护签名。
@@ -625,6 +684,16 @@ public struct AgentConfig: Sendable {
             ragMatryoshka = parsed
         }
         if let v = int("rag_matryoshka_dim") { ragMatryoshkaDim = v }
+        if let v = string("rag_retrieval_strategy") {
+            ragRetrievalStrategy = RAGRetrievalStrategy(stored: v)
+        }
+        if let v = double("rag_kg_similarity_floor") { ragKGSimilarityFloor = v }
+        if let v = int("rag_kg_entity_top_k") { ragKGEntityTopK = v }
+        if let v = int("rag_kg_relation_top_k") { ragKGRelationTopK = v }
+        if let v = int("rag_kg_max_chunks_per_hit") { ragKGMaxChunksPerHit = v }
+        if let v = int("rag_kg_entity_token_budget") { ragKGEntityTokenBudget = v }
+        if let v = int("rag_kg_relation_token_budget") { ragKGRelationTokenBudget = v }
+        if let v = int("rag_kg_total_token_budget") { ragKGTotalTokenBudget = v }
         if let v = bool("rag_binary_coarse_enabled") { ragBinaryCoarseEnabled = v }
         if let v = int("rag_binary_coarse_candidates") { ragBinaryCoarseCandidates = v }
 
@@ -876,6 +945,14 @@ public struct AgentConfig: Sendable {
         if !MatryoshkaDimensions.jinaV5.contains(ragMatryoshkaDim) {
             ragMatryoshkaDim = MatryoshkaDimensions.defaultValue
         }
+        // 知识图谱检索参数收口：手改 config.json 可能越界。
+        ragKGSimilarityFloor = max(0, min(0.9, ragKGSimilarityFloor))
+        ragKGEntityTopK = max(1, min(200, ragKGEntityTopK))
+        ragKGRelationTopK = max(1, min(200, ragKGRelationTopK))
+        ragKGMaxChunksPerHit = max(1, min(20, ragKGMaxChunksPerHit))
+        ragKGEntityTokenBudget = max(500, min(20_000, ragKGEntityTokenBudget))
+        ragKGRelationTokenBudget = max(500, min(20_000, ragKGRelationTokenBudget))
+        ragKGTotalTokenBudget = max(4_096, min(60_000, ragKGTotalTokenBudget))
     }
 
     /// 统一主/辅模型类型：mlx → mlx-lm；llama.cpp / llama_cpp → gguf。
@@ -1001,6 +1078,14 @@ public struct AgentConfig: Sendable {
             "rag_vector_element_type": ragVectorElementType.rawValue,
             "rag_matryoshka": ragMatryoshka.rawValue,
             "rag_matryoshka_dim": ragMatryoshkaDim,
+            "rag_retrieval_strategy": ragRetrievalStrategy.rawValue,
+            "rag_kg_similarity_floor": ragKGSimilarityFloor,
+            "rag_kg_entity_top_k": ragKGEntityTopK,
+            "rag_kg_relation_top_k": ragKGRelationTopK,
+            "rag_kg_max_chunks_per_hit": ragKGMaxChunksPerHit,
+            "rag_kg_entity_token_budget": ragKGEntityTokenBudget,
+            "rag_kg_relation_token_budget": ragKGRelationTokenBudget,
+            "rag_kg_total_token_budget": ragKGTotalTokenBudget,
             "rag_binary_coarse_enabled": ragBinaryCoarseEnabled,
             "rag_binary_coarse_candidates": ragBinaryCoarseCandidates,
             "llm_provider": llmProvider,

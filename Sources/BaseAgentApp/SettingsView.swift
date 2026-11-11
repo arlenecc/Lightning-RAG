@@ -126,6 +126,8 @@ struct SettingsView: View {
     @State private var embeddingTokenBudgetStep = 512
     /// 默认信任 mtime + 大小；开启后为「保留时间戳的同尺寸改动」再校验内容指纹。
     @State private var verifyFingerprint = false
+    /// RAG 检索策略（知识图谱能力）。
+    @State private var retrievalStrategy: RAGRetrievalStrategy = .naive
     @State private var showAdvanced = false
     /// RAG MCP 服务（Streamable HTTP）：监听范围 / 端口（运行中时锁定）。
     @State private var ragMCPScope = false
@@ -636,6 +638,34 @@ struct SettingsView: View {
 
                 DisclosureGroup("高级设置", isExpanded: $showAdvanced) {
                     VStack(alignment: .leading, spacing: 10) {
+                        HStack(spacing: 8) {
+                            Text("RAG检索策略").font(.caption)
+                            Picker("", selection: $retrievalStrategy) {
+                                ForEach(RAGRetrievalStrategy.allCases, id: \.self) { s in
+                                    Text(s.displayName).tag(s)
+                                }
+                            }
+                            .labelsHidden()
+                            .frame(width: 190)
+                            .disabled(!model.knowledgeGraphBuilt)
+                            Button(model.isBuildingKG ? "图谱构建中…" : "构建知识图谱") {
+                                model.requestKnowledgeGraphBuild()
+                            }
+                            .disabled(model.isSyncing || model.isDeduplicating
+                                || model.isBuildingANN || model.isBuildingKG)
+                            .help("用辅助模型在已完成切片上抽取实体/关系并建立图谱；"
+                                + "建成后才能选择使用 local/global/hybrid/mix 四种图谱检索策略")
+                            if model.isBuildingKG {
+                                Button("停止") { model.stopKnowledgeGraphBuild() }
+                            }
+                            if model.knowledgeGraphBuilt {
+                                Text("已建 \(model.knowledgeGraphEntityCount) 实体 / \(model.knowledgeGraphRelationCount) 关系")
+                                    .font(.caption2).foregroundStyle(.secondary)
+                            } else {
+                                Text("未构建（当前用 naive）").font(.caption2).foregroundStyle(.secondary)
+                            }
+                            Spacer(minLength: 8)
+                        }
                         HStack(spacing: 8) {
                             Text("RAG MCP服务").font(.caption)
                             Picker("", selection: $ragMCPScope) {
@@ -1396,6 +1426,7 @@ struct SettingsView: View {
         embeddingTokenBudgetInitial = config.ragEmbeddingTokenBudgetInitial
         embeddingTokenBudgetStep = config.ragEmbeddingTokenBudgetStep
         verifyFingerprint = config.ragVerifyFingerprint
+        retrievalStrategy = config.ragRetrievalStrategy
         refreshEmbeddingLimit()
     }
 
@@ -1735,6 +1766,7 @@ struct SettingsView: View {
                                                     config.ragEmbeddingTokenBudgetMax)
         config.ragEmbeddingTokenBudgetStep = min(max(128, embeddingTokenBudgetStep), 8_192)
         config.ragVerifyFingerprint = verifyFingerprint
+        config.ragRetrievalStrategy = retrievalStrategy
 
         if mainMode == "local", !config.localLLMModel.isEmpty,
            config.localLLMModel != model.config.localLLMModel {

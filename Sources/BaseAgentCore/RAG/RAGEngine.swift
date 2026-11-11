@@ -544,6 +544,12 @@ public final class RAGEngine {
     private var reranker: RerankProvider?
     private var store: VectorStore?
     private let storeLock = NSLock()
+    /// 知识图谱子系统的惰性实例。
+    private var kgStore: KnowledgeGraphStore?
+    private var kgGraph: KnowledgeGraph?
+    private let kgLock = NSLock()
+    /// 知识图谱抽取/关键词提取用的辅助模型（由 AppModel 注入，与 Agent.auxLLM 同实例）。
+    public var auxLLM: LLMService?
     /// 保护「使用 store」的整段读操作；close/reload 必须等读操作结束。
     private let searchLock = NSLock()
     /// ingest/close/reload 的互斥标志。不能用 NSRecursiveLock：
@@ -930,6 +936,10 @@ public final class RAGEngine {
         storeLock.lock(); defer { storeLock.unlock() }
         store?.close()
         store = nil
+        kgLock.lock()
+        kgGraph = nil
+        kgStore = nil
+        kgLock.unlock()
     }
 
     public func reload() {
@@ -946,6 +956,78 @@ public final class RAGEngine {
         store?.close()
         store = nil
         storeLock.unlock()
+    }
+
+    // MARK: 知识图谱
+
+    /// 知识图谱快照文件路径。
+    public var knowledgeGraphSnapshotPath: String {
+        (ragDir as NSString).appendingPathComponent("knowledge_graph.snapshot.json")
+    }
+
+    /// 懒加载知识图谱存储层（独立 SQLite 连接 + embedding）。
+    private func ensureKnowledgeGraphStore() throws -> KnowledgeGraphStore {
+        kgLock.lock(); defer { kgLock.unlock() }
+        if let kgStore { return kgStore }
+        guard let embedding else {
+            throw AgentError.storage("embedding 模型不可用，无法使用知识图谱")
+        }
+        let s = try KnowledgeGraphStore(dbPath: indexDBPath, embedding: embedding)
+        kgStore = s
+        return s
+    }
+
+    /// 懒加载内存图谱（优先快照恢复，否则从数据库加载）。
+    private func ensureKnowledgeGraph() throws -> (KnowledgeGraphStore, KnowledgeGraph) {
+        let s = try ensureKnowledgeGraphStore()
+        if kgGraph == nil {
+            let g = KnowledgeGraph(snapshotPath: knowledgeGraphSnapshotPath)
+            try? g.loadOrRestore(from: s)
+            kgGraph = g
+        }
+        guard let g = kgGraph else {
+            throw AgentError.storage("知识图谱初始化失败")
+        }
+        return (s, g)
+    }
+
+    /// 图谱状态（不加载 embedding 模型，直接查 SQLite）。
+    public func knowledgeGraphStatus() -> (built: Bool, entities: Int, relationships: Int) {
+        guard let db = try? SQLiteDatabase(path: indexDBPath, readOnly: true) else {
+            return (false, 0, 0)
+        }
+        defer { db.close() }
+        let e = (try? db.scalar("SELECT COUNT(*) FROM \(KnowledgeGraphStore.entitiesTable)").intValue) ?? 0
+        let r = (try? db.scalar("SELECT COUNT(*) FROM \(KnowledgeGraphStore.relationshipsTable)").intValue) ?? 0
+        let entities = Int(e), relationships = Int(r)
+        return (built: entities > 0 || relationships > 0, entities: entities, relationships: relationships)
+    }
+
+    /// 构建知识图谱：后台用辅助模型在已完成切片上抽取实体/关系，聚合入库，
+    /// 随后建 SwiftGraph 并落快照。weight 随证据重算（不保留旧标量）。
+    @discardableResult
+    public func buildKnowledgeGraph(
+        auxLLM: LLMService? = nil,
+        progress: ((Int, Int, String) -> Void)? = nil,
+        log: ((String) -> Void)? = nil
+    ) async -> KnowledgeGraphBuilder.BuildStats {
+        var stats = KnowledgeGraphBuilder.BuildStats()
+        do {
+            let llm = auxLLM ?? self.auxLLM
+            guard let llm else {
+                log?("[kg] 辅助模型不可用，无法构建知识图谱（请先在配置中启用辅助模型）")
+                return stats
+            }
+            self.auxLLM = llm
+            let store = try ensureKnowledgeGraphStore()
+            let graph = KnowledgeGraph(snapshotPath: knowledgeGraphSnapshotPath)
+            kgGraph = graph
+            let builder = KnowledgeGraphBuilder(store: store, graph: graph, llm: llm)
+            stats = try await builder.build(progress: progress, log: log)
+        } catch {
+            log?("[kg] 知识图谱构建失败: \(error.localizedDescription)")
+        }
+        return stats
     }
 
     /// 启动时把本地 Embedding / Reranker 权重加载好并保持常驻。
@@ -2513,9 +2595,111 @@ public final class RAGEngine {
         return Array(hits.prefix(resultLimit))
     }
 
+    // MARK: 知识图谱检索
+
+    /// 知识图谱检索 + 统一 reranker 精排 + 格式化。返回 nil 表示回退原始实现。
+    private func knowledgeGraphSearchFormatted(query: String,
+                                               source: String?) async throws -> String? {
+        guard config.ragRetrievalStrategy.usesKnowledgeGraph else { return nil }
+        guard let embedding else { return nil }
+        let (kgStore, kgGraph) = try ensureKnowledgeGraph()
+        guard !kgGraph.isEmpty else {
+            AgentLog.info("[kg] 知识图谱未构建，检索回退 naive")
+            return nil
+        }
+        guard let auxLLM = self.auxLLM else {
+            AgentLog.info("[kg] 辅助模型不可用，检索回退 naive")
+            return nil
+        }
+        guard let store else { return nil }
+        let builder = KnowledgeGraphBuilder(store: kgStore, graph: kgGraph, llm: auxLLM)
+        let retriever = KnowledgeGraphRetriever(kgStore: kgStore, graph: kgGraph,
+                                                builder: builder, embedding: embedding,
+                                                config: config, chunkStore: store)
+        let candidates = try await retriever.retrieve(query: query)
+        guard !candidates.isEmpty else { return nil }
+        return await formatKnowledgeGraph(query: query, candidates: candidates)
+    }
+
+    /// 三路候选统一走同一个 reranker 精排，按实体/关系/原文分组并做 token 预算截断。
+    private func formatKnowledgeGraph(query: String,
+                                      candidates: KGRetrievalCandidates) async -> String {
+        var passages = candidates.allPassages
+        // 1) 统一 reranker 精排（失败/超时则保留图谱自身排序）。
+        if config.ragRerankEnabled, let reranker, !passages.isEmpty {
+            let texts = passages.map(\.text)
+            let scores = (try? await Self.withTimeout(config.ragRerankTimeoutSeconds) {
+                try await reranker.rerank(query: query, documents: texts)
+            }) ?? []
+            if scores.count == texts.count {
+                for i in passages.indices { passages[i].score = scores[i] }
+            }
+        }
+        // 2) 分组排序：实体按相似度，关系按 rank+weight，原文按相似度。
+        var entities = passages.filter { $0.kind == .entity }
+        var relations = passages.filter { $0.kind == .relation }
+        var chunks = passages.filter { $0.kind == .chunk }
+        entities.sort {
+            if $0.score != $1.score { return $0.score > $1.score }
+            return $0.degree > $1.degree
+        }
+        relations.sort {
+            if $0.degree != $1.degree { return $0.degree > $1.degree }
+            if $0.weight != $1.weight { return $0.weight > $1.weight }
+            return $0.score > $1.score
+        }
+        chunks.sort { $0.score > $1.score }
+
+        // 3) 预算截断：实体 6000、关系 8000，总预算 30000（原文吃剩余）。
+        let entitySection = assembleSection("实体", passages: entities,
+                                            budgetTokens: config.ragKGEntityTokenBudget)
+        let relationSection = assembleSection("关系", passages: relations,
+                                              budgetTokens: config.ragKGRelationTokenBudget)
+        let entityTokens = TokenEstimator.estimate(entitySection)
+        let relationTokens = TokenEstimator.estimate(relationSection)
+        let chunkBudget = max(1_000, config.ragKGTotalTokenBudget - entityTokens - relationTokens)
+        let chunkSection = assembleSection("原文片段", passages: chunks,
+                                           budgetTokens: chunkBudget)
+
+        var lines: [String] = []
+        let header = "从知识图谱检索到 \(entities.count) 个实体、\(relations.count) 条关系"
+            + (chunks.isEmpty ? "" : "、\(chunks.count) 个原文片段")
+            + "（\(config.ragRetrievalStrategy.rawValue) 策略"
+            + (config.ragRerankEnabled ? " + 重排序" : "") + "）："
+        lines.append(header)
+        if !entitySection.isEmpty { lines.append(""); lines.append(entitySection) }
+        if !relationSection.isEmpty { lines.append(""); lines.append(relationSection) }
+        if !chunkSection.isEmpty { lines.append(""); lines.append(chunkSection) }
+        if lines.count <= 1 { return "（知识库中未找到相关内容）" }
+        return lines.joined(separator: "\n")
+    }
+
+    /// 组装一个分组，按 token 预算截断。
+    private func assembleSection(_ title: String, passages: [KGPassage],
+                                 budgetTokens: Int) -> String {
+        guard !passages.isEmpty else { return "" }
+        var lines = ["【\(title)】"]
+        var used = TokenEstimator.estimate(title)
+        for p in passages {
+            let item = p.text
+            let tokens = TokenEstimator.estimate(item)
+            if used + tokens > budgetTokens { break }
+            lines.append(item)
+            lines.append("")
+            used += tokens + 1
+        }
+        return lines.joined(separator: "\n")
+    }
+
     public func searchFormatted(query: String, topK: Int = 3, source: String? = nil,
                                 maxCharsPerResult: Int? = nil,
                                 maxTotalChars: Int? = nil) async throws -> String {
+        // 图谱策略：非 naive 且图谱已就绪时走知识图谱检索，否则回退原始实现。
+        if config.ragRetrievalStrategy.usesKnowledgeGraph {
+            if let kgOutput = try await knowledgeGraphSearchFormatted(query: query, source: source) {
+                return kgOutput
+            }
+        }
         let hits = try await search(query: query, topK: topK, source: source)
         guard !hits.isEmpty else { return "（知识库中未找到相关内容）" }
         let perResultLimit = max(200, maxCharsPerResult ?? Self.resultCharLimit(

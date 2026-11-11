@@ -27,6 +27,8 @@ let package = Package(
         .package(path: "Vendor/mcp-swift-sdk"),
         // BaseAgentCore 自定义 Transport 需要实现官方协议的 logger 字段
         .package(url: "https://github.com/apple/swift-log.git", from: "1.5.0"),
+        // 内存知识图谱数据结构（顶点/边/度数/邻居遍历）
+        .package(url: "https://github.com/davecom/SwiftGraph", from: "4.0.0"),
     ],
     targets: [
         // sqlite-vec v0.1.9 amalgamation，静态编入进程（SQLITE_CORE 模式）
@@ -70,6 +72,7 @@ let package = Package(
                 .product(name: "SwiftSoup", package: "SwiftSoup"),
                 .product(name: "MCP", package: "mcp-swift-sdk"),
                 .product(name: "Logging", package: "swift-log"),
+                .product(name: "SwiftGraph", package: "SwiftGraph"),
             ],
             path: "Sources/BaseAgentCore",
             resources: [
