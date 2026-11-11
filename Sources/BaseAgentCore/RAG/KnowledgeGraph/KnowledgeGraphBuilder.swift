@@ -18,11 +18,9 @@ public final class KnowledgeGraphBuilder {
     /// 描述归纳温度。
     private static let summarizeTemperature = 0.1
     /// 抽取提示词版本：提示词变化时作废旧抽取缓存。
-    private static let extractionCacheVersion = "2"
+    private static let extractionCacheVersion = "3"
     /// 归纳提示词版本：参与归纳缓存 key，提示词变化时自然失效。
-    private static let summaryCacheVersion = "1"
-    /// 并发抽取/归纳上限（后端支持独立会话时生效）。
-    private static let maxConcurrency = 4
+    private static let summaryCacheVersion = "2"
     /// 抽取输出的重复关系行容忍上限。小模型收尾阶段会反复输出同一实体对
     /// （提示词明确禁止重复），继续消费只会白跑生成；超过该值即提前收流。
     /// 取 12 而不是更小值：新实体对可能夹在重复行之间出现，过早截断会丢边。
@@ -32,13 +30,19 @@ public final class KnowledgeGraphBuilder {
     private let graph: KnowledgeGraph
     private let llm: LLMService
     private let limits: KGExtractionLimits
+    private let format: KGExtractionFormat
+    private let maxConcurrency: Int
 
     public init(store: KnowledgeGraphStore, graph: KnowledgeGraph, llm: LLMService,
-                limits: KGExtractionLimits = .default) {
+                limits: KGExtractionLimits = .default,
+                format: KGExtractionFormat = .delimited,
+                maxConcurrency: Int = 1) {
         self.store = store
         self.graph = graph
         self.llm = llm
         self.limits = limits
+        self.format = format
+        self.maxConcurrency = max(1, min(4, maxConcurrency))
     }
 
     // MARK: - 累加器
@@ -209,38 +213,102 @@ public final class KnowledgeGraphBuilder {
 
     // MARK: - 抽取
 
-    /// 单个切片 → 原始输出（内部可见，供真机抽取质量测试复用同一收流逻辑）。
+    /// 单个切片 → 原始输出（内部可见，供真机抽取质量测试复用同一路径）。
+    ///
+    /// 首轮输出不完整（无 `<|COMPLETE|>`、末行残缺、空结果或被重复行保护截断）
+    /// 时追加一次补抽，只请求漏掉/需要纠正的行，再与首轮合并交给解析。
     func extractRaw(chunk: String, sectionContext: String = "") async throws -> String {
-        let system = KnowledgeGraphPrompts.entityExtractionSystem(limits: limits)
-        let prompt = KnowledgeGraphPrompts.entityExtractionTask(
-            chunk: chunk, sectionContext: sectionContext, limits: limits)
-        return try await complete(system: system, user: prompt,
-                                  temperature: Self.extractionTemperature,
-                                  stopOnDuplicateRows: true)
+        let system: String
+        let prompt: String
+        if format == .json {
+            system = KnowledgeGraphPrompts.entityExtractionJSONSystem(limits: limits)
+            prompt = KnowledgeGraphPrompts.entityExtractionJSONTask(
+                chunk: chunk, sectionContext: sectionContext, limits: limits)
+        } else {
+            system = KnowledgeGraphPrompts.entityExtractionSystem(limits: limits)
+            prompt = KnowledgeGraphPrompts.entityExtractionTask(
+                chunk: chunk, sectionContext: sectionContext, limits: limits)
+        }
+        let first = try await complete(system: system, user: prompt,
+                                       temperature: Self.extractionTemperature,
+                                       stopOnDuplicateRows: format == .delimited)
+        // JSON 输出自带结构边界，解析成功即完整；解析失败不做二次补抽，
+        // 直接按空结果处理（由调用方计入失败/空切片）。
+        guard format == .delimited else { return first.text }
+        let parsed = Self.parseExtraction(first.text, limits: limits)
+        guard shouldGlean(first: first, parsed: parsed) else { return first.text }
+        let continuePrompt = KnowledgeGraphPrompts.entityContinueExtractionTask(
+            firstOutput: first.text, chunk: chunk,
+            sectionContext: sectionContext, limits: limits)
+        let second = try await complete(system: system, user: continuePrompt,
+                                        temperature: Self.extractionTemperature,
+                                        stopOnDuplicateRows: true)
+        return first.text + "\n" + second.text
+    }
+
+    /// 是否需要二次补抽。只在「可能缺内容」时触发，避免完好的切片白跑一轮：
+    /// 命中完成标记直接结束；已达实体/关系上限也无需再补；空结果或末行字段
+    /// 残缺视为不完整。重复行触发的收流通常是模型退化复读，补抽只会再复读
+    /// 一遍同样的内容（2B 实测两轮实体对完全一致），因此不再触发补抽。
+    private func shouldGlean(
+        first: (text: String, stoppedByDuplicate: Bool),
+        parsed: KGExtractionResult
+    ) -> Bool {
+        if first.text.contains("<|COMPLETE|>") { return false }
+        if parsed.entities.count >= limits.maxEntitiesPerChunk,
+           parsed.relations.count >= limits.maxRelationsPerChunk {
+            return false
+        }
+        // 重复行收流通常意味着模型进入复读退化，补抽只会再复读一遍
+        //（2B 实测两轮实体对完全一致、耗时翻倍），因此不再补抽。
+        if first.stoppedByDuplicate { return false }
+        return parsed.isEmpty || Self.lastRowLooksIncomplete(first.text)
+    }
+
+    /// 末行是否是残缺记录（流被 token 上限截断时常见）。
+    private static func lastRowLooksIncomplete(_ output: String) -> Bool {
+        guard let line = output.split(separator: "\n", omittingEmptySubsequences: true)
+            .last?.trimmingCharacters(in: .whitespacesAndNewlines) else { return true }
+        if line == "<|COMPLETE|>" { return false }
+        let parts = line.components(separatedBy: "<|#|>")
+        // relation 行允许 4 段（缺 description 时解析器用 keywords 兜底），
+        // 因此只有少于 4 段才算残缺。
+        if parts.first == "entity" { return parts.count < 4 }
+        if parts.first == "relation" { return parts.count < 4 }
+        return true
+    }
+
+    /// 按配置的格式解析抽取输出。
+    private func parse(_ raw: String) -> KGExtractionResult {
+        format == .json
+            ? Self.parseExtractionJSON(raw, limits: limits)
+            : Self.parseExtraction(raw, limits: limits)
     }
 
     /// 单个切片 → 实体/关系抽取结果。
     func extract(chunk: String) async throws -> KGExtractionResult {
-        Self.parseExtraction(try await extractRaw(chunk: chunk), limits: limits)
+        parse(try await extractRaw(chunk: chunk))
     }
 
     /// 查询 → 高层/低层关键词（供检索使用）。
     func extractKeywords(query: String) async throws -> KGKeywords {
         let prompt = KnowledgeGraphPrompts.keywordExtractionPrompt(query: query)
         let output = try await complete(system: "", user: prompt,
-                                        temperature: Self.extractionTemperature)
+                                        temperature: Self.extractionTemperature).text
         return Self.parseKeywords(output)
     }
 
     /// 实体/关系描述归纳。
-    func summarize(name: String, descriptions: [String]) async throws -> String {
+    func summarize(name: String, descriptions: [String],
+                   descriptionType: String = "Entity") async throws -> String {
         let list = descriptions.enumerated()
             .map { "\($0.offset + 1). \($0.element)" }
             .joined(separator: "\n")
-        let prompt = KnowledgeGraphPrompts.summarizeEntityDescriptionsPrompt(name: name,
-                                                                            list: list)
+        let prompt = KnowledgeGraphPrompts.summarizeEntityDescriptionsPrompt(
+            name: name, descriptionType: descriptionType, list: list,
+            maxCharacters: limits.maxDescriptionCharacters)
         let output = try await complete(system: "", user: prompt,
-                                        temperature: Self.summarizeTemperature)
+                                        temperature: Self.summarizeTemperature).text
         let trimmed = output.trimmingCharacters(in: .whitespacesAndNewlines)
         return trimmed.isEmpty ? descriptions.joined(separator: "\n") : trimmed
     }
@@ -249,7 +317,8 @@ public final class KnowledgeGraphBuilder {
 
     private func complete(system: String, user: String,
                           temperature: Double,
-                          stopOnDuplicateRows: Bool = false) async throws -> String {
+                          stopOnDuplicateRows: Bool = false)
+        async throws -> (text: String, stoppedByDuplicate: Bool) {
         var messages: [ChatMessage] = []
         if !system.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             messages.append(ChatMessage(role: .system, content: system))
@@ -260,6 +329,7 @@ public final class KnowledgeGraphBuilder {
         var scannedLines = 0
         var seenPairs = Set<String>()
         var duplicateRows = 0
+        var stoppedByDuplicate = false
         var shouldStop = false
         let stream = llm.chatStream(messages: messages, tools: [],
                                     temperature: temperature, options: options)
@@ -274,13 +344,16 @@ public final class KnowledgeGraphBuilder {
             }
             // 模型给出完成标记后立即停止消费，避免标记之后继续生成浪费 token。
             if output.contains("<|COMPLETE|>") { shouldStop = true }
-            if duplicateRows >= Self.maxDuplicateRelationRows { shouldStop = true }
+            if duplicateRows >= Self.maxDuplicateRelationRows {
+                stoppedByDuplicate = true
+                shouldStop = true
+            }
             if event.kind == .done, event.truncated {
                 throw AgentError.llm("辅助模型输出被截断")
             }
             if shouldStop { break }
         }
-        return output
+        return (output, stoppedByDuplicate)
     }
 
     /// 扫描尚未处理过的完整行，返回新增的「重复实体对」关系行数。
@@ -299,7 +372,7 @@ public final class KnowledgeGraphBuilder {
                 .components(separatedBy: "<|#|>")
                 .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
             scannedLines += 1
-            guard parts.count >= 5, parts[0] == "relation" else { continue }
+            guard parts.count >= 3, parts[0] == "relation" else { continue }
             let pair = [parts[1].lowercased(), parts[2].lowercased()]
                 .sorted().joined(separator: "|")
             guard !pair.isEmpty else { continue }
@@ -326,7 +399,17 @@ public final class KnowledgeGraphBuilder {
         var relationAcc = relations
         var stats = BuildStats()
         let total = chunks.count
-        let hashes = chunks.map { Self.contentHash($0.text) }
+        // 缓存键同时覆盖提示词版本、输出格式、限额与章节上下文：
+        // 切换 JSON/分隔符或调整限额后不会误用旧格式的抽取结果。
+        // 而 kg_processed_chunks 里记录的是纯正文哈希，用于判断切片是否被改写
+        //（与缓存作用域无关，避免改配置时把整库误判为已修改）。
+        let cacheScope = "\(Self.extractionCacheVersion)|\(format.rawValue)"
+            + "|\(limits.maxEntitiesPerChunk)|\(limits.maxRelationsPerChunk)"
+            + "|\(limits.maxDescriptionCharacters)"
+        let contentHashes = chunks.map { Self.contentHash($0.text) }
+        let cacheHashes = chunks.map {
+            Self.contentHash(cacheScope + "|" + $0.heading + "|" + $0.text)
+        }
         var rawOutputs = [String?](repeating: nil, count: total)
         var failures = [String?](repeating: nil, count: total)
         var pending: [(index: Int, chunk: KnowledgeGraphStore.ChunkListItem)] = []
@@ -334,11 +417,11 @@ public final class KnowledgeGraphBuilder {
         for (index, chunk) in chunks.enumerated() {
             if chunk.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                 rawOutputs[index] = ""
-                stats.succeededChunkHashes[chunk.id] = hashes[index]
+                stats.succeededChunkHashes[chunk.id] = contentHashes[index]
                 continue
             }
             if let cached = store.cachedExtraction(chunkID: chunk.id,
-                                                   contentHash: hashes[index]) {
+                                                   contentHash: cacheHashes[index]) {
                 rawOutputs[index] = cached
                 stats.cacheHits += 1
             } else {
@@ -348,7 +431,7 @@ public final class KnowledgeGraphBuilder {
 
         // 串行后端并发只会堆在内部锁前，退化为逐条；支持独立会话时并发抽取。
         let concurrency = llm.supportsConcurrentIsolatedRequests
-            ? min(Self.maxConcurrency, max(1, pending.count)) : 1
+            ? min(maxConcurrency, max(1, pending.count)) : 1
         var done = total - pending.count
         if done > 0 {
             progress?(done, total, "抽取实体/关系 \(done)/\(total)")
@@ -364,14 +447,14 @@ public final class KnowledgeGraphBuilder {
             if batch.count == 1 {
                 let item = batch[0]
                 results = [await extractOne(index: item.index, chunk: item.chunk,
-                                            contentHash: hashes[item.index])]
+                                            contentHash: cacheHashes[item.index])]
             } else {
                 results = await withTaskGroup(
                     of: (Int, String?, String?, Double).self) { group in
                     for item in batch {
                         group.addTask { [self] in
                             let result = await extractOne(index: item.index, chunk: item.chunk,
-                                                          contentHash: hashes[item.index])
+                                                          contentHash: cacheHashes[item.index])
                             return (result.index, result.raw, result.error, result.seconds)
                         }
                     }
@@ -403,10 +486,10 @@ public final class KnowledgeGraphBuilder {
                 continue
             }
             let raw = rawOutputs[index] ?? ""
-            let extraction = Self.parseExtraction(raw, limits: limits)
+            let extraction = parse(raw)
             accumulate(extraction, chunkID: chunk.id, filePath: chunk.source,
                        entities: &entityAcc, relations: &relationAcc)
-            stats.succeededChunkHashes[chunk.id] = hashes[index]
+            stats.succeededChunkHashes[chunk.id] = contentHashes[index]
         }
         if !slow.isEmpty {
             let top = slow.sorted { $0.1 > $1.1 }.prefix(3)
@@ -561,10 +644,10 @@ public final class KnowledgeGraphBuilder {
 
     private func finalizeEntities(_ acc: [String: EntityAcc]) async throws -> [KGEntity] {
         let items = acc.sorted(by: { $0.key < $1.key }).map(\.value)
-        var requests: [(key: String, name: String, descriptions: [String])] = []
+        var requests: [(key: String, name: String, descriptions: [String], type: String)] = []
         for item in items where item.descriptions.count >= Self.summarizeThreshold {
             requests.append((summaryKey(item.name, item.descriptions), item.name,
-                             item.descriptions))
+                             item.descriptions, "Entity"))
         }
         let summaries = await resolveSummaries(requests)
         var result: [KGEntity] = []
@@ -603,10 +686,11 @@ public final class KnowledgeGraphBuilder {
 
     private func finalizeRelations(_ acc: [String: RelationAcc]) async throws -> [KGRelationship] {
         let items = acc.sorted(by: { $0.key < $1.key }).map(\.value)
-        var requests: [(key: String, name: String, descriptions: [String])] = []
+        var requests: [(key: String, name: String, descriptions: [String], type: String)] = []
         for item in items where item.descriptions.count >= Self.summarizeThreshold {
             let name = "\(item.src)-\(item.dst)"
-            requests.append((summaryKey(name, item.descriptions), name, item.descriptions))
+            requests.append((summaryKey(name, item.descriptions), name,
+                             item.descriptions, "Relation"))
         }
         let summaries = await resolveSummaries(requests)
         var result: [KGRelationship] = []
@@ -656,10 +740,10 @@ public final class KnowledgeGraphBuilder {
 
     /// 归纳去重：先查缓存，只对缺失项调用模型；后端支持独立会话时并发归纳。
     private func resolveSummaries(
-        _ requests: [(key: String, name: String, descriptions: [String])])
+        _ requests: [(key: String, name: String, descriptions: [String], type: String)])
         async -> [String: String] {
         var summaries: [String: String] = [:]
-        var missing: [(key: String, name: String, descriptions: [String])] = []
+        var missing: [(key: String, name: String, descriptions: [String], type: String)] = []
         for request in requests {
             if let cached = store.cachedSummary(key: request.key) {
                 summaries[request.key] = cached
@@ -670,7 +754,7 @@ public final class KnowledgeGraphBuilder {
         guard !missing.isEmpty else { return summaries }
 
         let limit = llm.supportsConcurrentIsolatedRequests
-            ? min(Self.maxConcurrency, max(1, missing.count)) : 1
+            ? min(maxConcurrency, max(1, missing.count)) : 1
         var cursor = 0
         while cursor < missing.count {
             let end = min(cursor + limit, missing.count)
@@ -679,7 +763,8 @@ public final class KnowledgeGraphBuilder {
             if batch.count == 1 {
                 let item = batch[0]
                 if let summary = try? await summarize(name: item.name,
-                                                      descriptions: item.descriptions) {
+                                                      descriptions: item.descriptions,
+                                                      descriptionType: item.type) {
                     produced.append((item.key, summary))
                 }
             } else {
@@ -687,7 +772,8 @@ public final class KnowledgeGraphBuilder {
                     for item in batch {
                         group.addTask { [self] in
                             let summary = try? await summarize(name: item.name,
-                                                               descriptions: item.descriptions)
+                                                               descriptions: item.descriptions,
+                                                               descriptionType: item.type)
                             return (item.key, summary)
                         }
                     }
@@ -761,18 +847,28 @@ public final class KnowledgeGraphBuilder {
             if parts.count >= 4, parts[0] == "entity" {
                 let name = normalizeName(parts[1])
                 guard !name.isEmpty else { continue }
+                // 纯数字/年份不是有效实体（模型偶尔会从描述里造出 “2010” 节点）。
+                guard !name.allSatisfy({ $0.isNumber }) else { continue }
                 entities.append(KGExtractedEntity(
                     name: name, type: parts[2],
                     description: truncateDescription(
                         parts[3], limit: limits.maxDescriptionCharacters)))
-            } else if parts.count >= 5, parts[0] == "relation" {
+            } else if parts.count >= 4, parts[0] == "relation" {
                 let src = normalizeName(parts[1])
                 let dst = normalizeName(parts[2])
                 guard !src.isEmpty, !dst.isEmpty else { continue }
+                // 纯数字端点（如年份 2010）不是有效实体，避免生成无意义的占位节点。
+                guard !src.allSatisfy({ $0.isNumber }),
+                      !dst.allSatisfy({ $0.isNumber }) else { continue }
+                let keywords = parts[3]
+                // 小模型偶尔只输出到 keywords（4 段），缺 description；
+                // 用 keywords 兜底，避免整条有效关系被丢弃。
+                let description = parts.count >= 5 && !parts[4].isEmpty
+                    ? parts[4] : keywords
                 relations.append(KGExtractedRelation(
-                    source: src, target: dst, keywords: parts[3],
+                    source: src, target: dst, keywords: keywords,
                     description: truncateDescription(
-                        parts[4], limit: limits.maxDescriptionCharacters)))
+                        description, limit: limits.maxDescriptionCharacters)))
             }
         }
         // 模型未严格遵守提示词时兜底：每个切片只保留前 N 个实体/关系。
@@ -783,6 +879,76 @@ public final class KnowledgeGraphBuilder {
             relations = Array(relations.prefix(limits.maxRelationsPerChunk))
         }
         return KGExtractionResult(entities: entities, relations: relations)
+    }
+
+    /// 解析 JSON 格式的抽取输出（允许模型加代码围栏或少量前后说明）。
+    static func parseExtractionJSON(_ output: String,
+                                    limits: KGExtractionLimits = .default) -> KGExtractionResult {
+        guard let object = jsonObject(in: output)?.objectValue else {
+            return KGExtractionResult()
+        }
+        var entities: [KGExtractedEntity] = []
+        var relations: [KGExtractedRelation] = []
+        for item in object["entities"]?.arrayValue ?? [] {
+            guard let obj = item.objectValue else { continue }
+            let name = normalizeName(obj["name"]?.stringValue ?? "")
+            guard !name.isEmpty, !name.allSatisfy({ $0.isNumber }) else { continue }
+            let type = obj["type"]?.stringValue ?? "Other"
+            let description = obj["description"]?.stringValue ?? ""
+            entities.append(KGExtractedEntity(
+                name: name, type: type,
+                description: truncateDescription(
+                    description, limit: limits.maxDescriptionCharacters)))
+        }
+        let relationItems = object["relationships"]?.arrayValue
+            ?? object["relations"]?.arrayValue ?? []
+        for item in relationItems {
+            guard let obj = item.objectValue else { continue }
+            let src = normalizeName(obj["source"]?.stringValue
+                ?? obj["source_entity"]?.stringValue ?? "")
+            let dst = normalizeName(obj["target"]?.stringValue
+                ?? obj["target_entity"]?.stringValue ?? "")
+            guard !src.isEmpty, !dst.isEmpty else { continue }
+            guard !src.allSatisfy({ $0.isNumber }),
+                  !dst.allSatisfy({ $0.isNumber }) else { continue }
+            let keywords = jsonKeywords(obj["keywords"] ?? obj["relationship_keywords"])
+            let rawDescription = obj["description"]?.stringValue
+                ?? obj["relationship_description"]?.stringValue ?? ""
+            let description = rawDescription.isEmpty ? keywords : rawDescription
+            relations.append(KGExtractedRelation(
+                source: src, target: dst, keywords: keywords,
+                description: truncateDescription(
+                    description, limit: limits.maxDescriptionCharacters)))
+        }
+        if entities.count > limits.maxEntitiesPerChunk {
+            entities = Array(entities.prefix(limits.maxEntitiesPerChunk))
+        }
+        if relations.count > limits.maxRelationsPerChunk {
+            relations = Array(relations.prefix(limits.maxRelationsPerChunk))
+        }
+        return KGExtractionResult(entities: entities, relations: relations)
+    }
+
+    /// 从可能包含代码围栏/说明文字的模型输出中提取 JSON 对象。
+    private static func jsonObject(in output: String) -> JSONValue? {
+        let trimmed = output.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let value = JSONValue.parse(trimmed) { return value }
+        guard let start = trimmed.firstIndex(of: "{"),
+              let end = trimmed.lastIndex(of: "}"), start < end else { return nil }
+        return JSONValue.parse(String(trimmed[start...end]))
+    }
+
+    private static func jsonKeywords(_ value: JSONValue?) -> String {
+        if let string = value?.stringValue {
+            return string.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        if let array = value?.arrayValue {
+            return array.compactMap { $0.stringValue }
+                .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                .filter { !$0.isEmpty }
+                .joined(separator: ", ")
+        }
+        return ""
     }
 
     static func parseKeywords(_ output: String) -> KGKeywords {

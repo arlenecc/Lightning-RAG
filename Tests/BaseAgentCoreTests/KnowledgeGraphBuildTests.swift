@@ -210,12 +210,208 @@ final class KnowledgeGraphBuildTests: XCTestCase {
                                         maxDescriptionCharacters: 100)
         let system = KnowledgeGraphPrompts.entityExtractionSystem(limits: limits)
         let task = KnowledgeGraphPrompts.entityExtractionTask(
-            chunk: "Alice 在 Acme 工作。", limits: limits)
+            chunk: "Alice 在 Acme 工作。", sectionContext: "H1 → 团队", limits: limits)
         for prompt in [system, task] {
             XCTAssertTrue(prompt.contains("20"))
             XCTAssertTrue(prompt.contains("50"))
             XCTAssertTrue(prompt.contains("100"))
         }
+    }
+
+    /// 输入围栏、不可信元数据标注与格式反例：防止文档标题/正文伪造 prompt 段落，
+    /// 并降低小模型把 relation 行写成 entity 的概率。
+    func testExtractionPromptWrapsInputAndLabelsContextUntrusted() {
+        let limits = KGExtractionLimits()
+        let task = KnowledgeGraphPrompts.entityExtractionTask(
+            chunk: "Alice 在 Acme 工作。", sectionContext: "H1 → 团队", limits: limits)
+        let system = KnowledgeGraphPrompts.entityExtractionSystem(limits: limits)
+
+        XCTAssertTrue(task.contains("---Input Text---\n```"))
+        XCTAssertTrue(task.hasSuffix("---Output---"))
+        XCTAssertTrue(task.contains("untrusted metadata"))
+        XCTAssertTrue(task.contains("H1 → 团队"))
+        XCTAssertTrue(system.contains("Wrong:"))
+        XCTAssertTrue(system.contains("Correct:"))
+        XCTAssertTrue(system.contains("Artifact"))
+        XCTAssertFalse(system.contains("Steve Jobs"), "模板示例不应残留真实实体")
+    }
+
+    func testSummarizePromptUsesDescriptionLimit() {
+        let prompt = KnowledgeGraphPrompts.summarizeEntityDescriptionsPrompt(
+            name: "Alice-Acme", descriptionType: "Relation",
+            list: "1. Alice 在 Acme 工作。", maxCharacters: 100)
+        XCTAssertTrue(prompt.contains("100 characters"))
+        XCTAssertTrue(prompt.contains("Relation Name: Alice-Acme"))
+        XCTAssertTrue(prompt.contains("one single paragraph"))
+        XCTAssertFalse(prompt.contains("600 tokens"))
+    }
+
+    /// 小模型偶尔只输出到 keywords（4 段），缺 description；应保留该关系并用
+    /// keywords 兜底，而不是整条丢弃。
+    func testParseRelationWithoutDescriptionFallsBackToKeywords() {
+        let raw = "relation<|#|>Alice<|#|>Acme<|#|>employed_by, works_at\n<|COMPLETE|>"
+        let parsed = KnowledgeGraphBuilder.parseExtraction(raw)
+        XCTAssertEqual(parsed.relations.count, 1)
+        XCTAssertEqual(parsed.relations[0].keywords, "employed_by, works_at")
+        XCTAssertEqual(parsed.relations[0].description, "employed_by, works_at")
+    }
+
+    func testParseSkipsNumericOnlyEntities() {
+        let raw = "entity<|#|>2010<|#|>Other<|#|>年份\n"
+            + "entity<|#|>Acme Corp<|#|>Organization<|#|>公司\n"
+            + "relation<|#|>Acme Corp<|#|>2010<|#|>founded_in<|#|>成立于 2010 年"
+        let parsed = KnowledgeGraphBuilder.parseExtraction(raw)
+        XCTAssertEqual(parsed.entities.map { $0.name }, ["Acme Corp"])
+        XCTAssertTrue(parsed.relations.isEmpty)
+    }
+
+    /// 重复行保护触发的收流通常是模型退化复读，末行仍完整时不再补抽，
+    /// 避免把同样的内容再生成一遍（2B 实测两轮实体对完全一致且耗时翻倍）。
+    func testNoGleaningAfterDuplicateStopWithCompleteLastRow() async throws {
+        var lines = [
+            "entity<|#|>Alice<|#|>Person<|#|>工程师",
+            "entity<|#|>Acme<|#|>Organization<|#|>公司",
+        ]
+        for _ in 0..<13 {
+            lines.append("relation<|#|>Alice<|#|>Acme<|#|>employed_by")
+        }
+        let llm = ScriptedExtractionLLM(outputs: [lines.joined(separator: "\n")])
+        let (store, _) = try makeStore()
+        let graph = KnowledgeGraph(snapshotPath: tempSnapshot())
+        let builder = KnowledgeGraphBuilder(store: store, graph: graph, llm: llm)
+
+        let raw = try await builder.extractRaw(chunk: "Alice 在 Acme 工作。")
+
+        XCTAssertEqual(llm.callCount, 1, "重复行收流后不应再补抽")
+        XCTAssertFalse(raw.contains("<|COMPLETE|>"))
+    }
+
+    /// 首轮残缺时追加一次补抽，并带上首轮输出作为「已抽内容」。
+    func testGleaningAddsMissedRowsWhenFirstPassIncomplete() async throws {
+        let first = "entity<|#|>Alice<|#|>Person<|#|>工程师\n"
+            + "relation<|#|>Alice<|#|>Acme"
+        let second = "relation<|#|>Alice<|#|>Acme<|#|>employed_by"
+            + "<|#|>Alice 在 Acme 工作。\n<|COMPLETE|>"
+        let llm = ScriptedExtractionLLM(outputs: [first, second])
+        let (store, _) = try makeStore()
+        let graph = KnowledgeGraph(snapshotPath: tempSnapshot())
+        let builder = KnowledgeGraphBuilder(store: store, graph: graph, llm: llm)
+
+        let raw = try await builder.extractRaw(chunk: "Alice 在 Acme 工作。")
+
+        XCTAssertEqual(llm.callCount, 2)
+        XCTAssertTrue(llm.lastUserPrompt?.contains("---Previous Extraction---") == true)
+        XCTAssertTrue(raw.contains("<|COMPLETE|>"))
+        let parsed = KnowledgeGraphBuilder.parseExtraction(raw)
+        XCTAssertTrue(parsed.relations.contains {
+            $0.source == "Alice" && $0.target == "Acme"
+        })
+    }
+
+    /// 首轮已正常收尾时不应多跑一轮补抽。
+    func testGleaningSkippedWhenFirstPassComplete() async throws {
+        let llm = ScriptedExtractionLLM(outputs: [
+            "entity<|#|>Alice<|#|>Person<|#|>工程师\n<|COMPLETE|>",
+        ])
+        let (store, _) = try makeStore()
+        let graph = KnowledgeGraph(snapshotPath: tempSnapshot())
+        let builder = KnowledgeGraphBuilder(store: store, graph: graph, llm: llm)
+
+        let raw = try await builder.extractRaw(chunk: "Alice 在 Acme 工作。")
+
+        XCTAssertEqual(llm.callCount, 1)
+        XCTAssertTrue(raw.contains("<|COMPLETE|>"))
+    }
+
+    /// `rag_kg_extraction_format` 可持久化，未知值回落到分隔符模式。
+    func testExtractionFormatConfigRoundTrip() throws {
+        let path = NSTemporaryDirectory()
+            + "kg-format-\(UUID().uuidString).json"
+        defer { try? FileManager.default.removeItem(atPath: path) }
+        var config = AgentConfig()
+        XCTAssertEqual(config.ragKGExtractionFormat, .json)
+        config.ragKGExtractionFormat = .json
+        config.ragKGMaxConcurrency = 3
+        try config.save(path)
+        let loaded = AgentConfig.load(path)
+        XCTAssertEqual(loaded.ragKGExtractionFormat, .json)
+        XCTAssertEqual(loaded.ragKGMaxConcurrency, 3)
+        XCTAssertEqual(KGExtractionFormat(stored: "JSON"), .json)
+        XCTAssertEqual(KGExtractionFormat(stored: "yaml"), .delimited)
+    }
+
+    /// JSON 模式：解析代码围栏、数组/字符串 keywords、数字端点过滤。
+    func testJSONExtractionParser() {
+        let raw = """
+        ```json
+        {
+          "entities": [
+            {"name": "Alice Chen", "type": "Person", "description": "工程师"},
+            {"name": "2010", "type": "Other", "description": "年份"}
+          ],
+          "relationships": [
+            {"source": "Alice Chen", "target": "Acme Corp",
+             "keywords": ["employed_by", "works_at"], "description": "Alice 在 Acme 工作。"},
+            {"source": "Acme Corp", "target": "2010", "keywords": "founded_in"}
+          ]
+        }
+        ```
+        """
+        let parsed = KnowledgeGraphBuilder.parseExtractionJSON(raw)
+        XCTAssertEqual(parsed.entities.map { $0.name }, ["Alice Chen"])
+        XCTAssertEqual(parsed.relations.count, 1)
+        XCTAssertEqual(parsed.relations[0].keywords, "employed_by, works_at")
+        XCTAssertEqual(parsed.relations[0].description, "Alice 在 Acme 工作。")
+    }
+
+    func testJSONExtractionParserAppliesLimitsAndDescriptionFallback() {
+        let entities = (1...25).map {
+            #"{"name":"E\#($0)","type":"Concept","description":"d"}"#
+        }.joined(separator: ",")
+        let raw = """
+        {"entities":[\(entities)],
+         "relationships":[{"source":"E1","target":"E2","keywords":"related_to"}]}
+        """
+        let limits = KGExtractionLimits(maxEntitiesPerChunk: 20,
+                                        maxRelationsPerChunk: 50,
+                                        maxDescriptionCharacters: 100)
+        let parsed = KnowledgeGraphBuilder.parseExtractionJSON(raw, limits: limits)
+        XCTAssertEqual(parsed.entities.count, 20)
+        XCTAssertEqual(parsed.relations.first?.description, "related_to")
+    }
+
+    func testJSONExtractionPrompts() {
+        let limits = KGExtractionLimits()
+        let system = KnowledgeGraphPrompts.entityExtractionJSONSystem(limits: limits)
+        let task = KnowledgeGraphPrompts.entityExtractionJSONTask(
+            chunk: "Alice 在 Acme 工作。", sectionContext: "H1 → 团队", limits: limits)
+        XCTAssertTrue(system.contains("\"entities\""))
+        XCTAssertTrue(system.contains("\"relationships\""))
+        XCTAssertTrue(system.contains("Do not use Markdown code fences"))
+        XCTAssertTrue(task.contains("Return only the JSON object"))
+        XCTAssertTrue(task.contains("---Input Text---\n```"))
+        XCTAssertTrue(task.contains("untrusted metadata"))
+    }
+
+    /// JSON 模式下按配置选择 JSON prompt 与解析器，且不做分隔符格式的补抽。
+    func testBuilderUsesJSONFormat() async throws {
+        let raw = """
+        {"entities":[{"name":"Alice Chen","type":"Person","description":"工程师"}],
+         "relationships":[{"source":"Alice Chen","target":"Acme Corp",
+                           "keywords":"employed_by","description":"Alice 在 Acme 工作。"}]}
+        """
+        let llm = ScriptedExtractionLLM(outputs: [raw])
+        let (store, _) = try makeStore()
+        let graph = KnowledgeGraph(snapshotPath: tempSnapshot())
+        let builder = KnowledgeGraphBuilder(store: store, graph: graph, llm: llm,
+                                            format: .json)
+
+        let parsed = try await builder.extract(chunk: "Alice 在 Acme 工作。")
+
+        XCTAssertEqual(llm.callCount, 1)
+        XCTAssertTrue(llm.lastUserPrompt?.contains("JSON object") == true)
+        XCTAssertEqual(parsed.entities.map { $0.name }, ["Alice Chen"])
+        XCTAssertEqual(parsed.relations.count, 1)
     }
 
     /// 小模型收尾阶段会无限复读同一实体对；抽取应在重复达阈值后提前取消生成，
@@ -234,9 +430,48 @@ final class KnowledgeGraphBuildTests: XCTestCase {
         }
         XCTAssertTrue(llm.wasCancelled, "重复行触发后应取消底层生成流")
         let parsed = KnowledgeGraphBuilder.parseExtraction(raw)
-        XCTAssertEqual(parsed.entities.count, 2)
+        XCTAssertEqual(Set(parsed.entities.map { $0.name.lowercased() }), ["alice", "acme"])
         XCTAssertGreaterThanOrEqual(parsed.relations.count, 1)
         XCTAssertLessThan(parsed.relations.count, 60, "重复关系不应无限增长")
+    }
+}
+
+/// 按调用次序返回固定输出的假模型，用于验证补抽逻辑。
+private final class ScriptedExtractionLLM: LLMService, @unchecked Sendable {
+    let identifier = "kg-scripted-llm"
+    private let outputs: [String]
+    private let lock = NSLock()
+    private var calls = 0
+    private var prompts: [String] = []
+
+    init(outputs: [String]) {
+        self.outputs = outputs
+    }
+
+    var callCount: Int {
+        lock.lock(); defer { lock.unlock() }
+        return calls
+    }
+
+    var lastUserPrompt: String? {
+        lock.lock(); defer { lock.unlock() }
+        return prompts.last
+    }
+
+    func chatStream(messages: [ChatMessage], tools: [JSONValue],
+                    temperature: Double) -> AsyncThrowingStream<LLMStreamEvent, Error> {
+        let index: Int
+        lock.lock()
+        index = calls
+        calls += 1
+        prompts.append(messages.last?.content ?? "")
+        lock.unlock()
+        let output = index < outputs.count ? outputs[index] : "<|COMPLETE|>"
+        return AsyncThrowingStream { continuation in
+            continuation.yield(LLMStreamEvent(kind: .content, content: output))
+            continuation.yield(LLMStreamEvent(kind: .done))
+            continuation.finish()
+        }
     }
 }
 

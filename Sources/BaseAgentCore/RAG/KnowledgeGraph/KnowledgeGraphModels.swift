@@ -160,6 +160,24 @@ public struct KGExtractionResult: Sendable, Equatable {
     public var isEmpty: Bool { entities.isEmpty && relations.isEmpty }
 }
 
+// MARK: - 抽取格式
+
+/// 实体/关系抽取的输出格式。
+///
+/// - `delimited`：LightRAG 风格的分隔符行（每行一条记录，`<|#|>` 分隔字段），
+///   带 `<|COMPLETE|>` 与重复行收流，适合更小或只认行格式的模型。
+/// - `json`：单个 JSON 对象（`entities` / `relationships` 数组），结构清晰、
+///   解析歧义少，2B 实测实体与关系更完整，默认值；解析失败时该切片按空结果处理。
+public enum KGExtractionFormat: String, Codable, Sendable, CaseIterable {
+    case delimited
+    case json
+
+    public init(stored: String) {
+        self = stored.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "json"
+            ? .json : .delimited
+    }
+}
+
 // MARK: - 抽取限额
 
 /// 单个切片的抽取上限（由 config.json 的 `rag_kg_max_*` 参数控制）。

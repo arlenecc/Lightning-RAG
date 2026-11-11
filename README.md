@@ -52,8 +52,8 @@ VARIANT=lite  scripts/package-app.sh release && VARIANT=lite  scripts/package-dm
 
 | VARIANT | 内置模型 | DMG |
 |---|---|---|
-| `clean`（默认） | 无；potion 语义切片 / jina embedding / jina reranker 均在首次启动时从 hf-mirror 自动下载 | `dist/Lightning-RAG-1.3.8-clean.dmg` |
-| `lite` | potion-multilingual-128M int4（语义切片）+ jina-embeddings-v5-text-nano-mlx-int4 + jina-reranker-v2-base-multilingual-onnx | `dist/Lightning-RAG-1.3.8-lite.dmg` |
+| `clean`（默认） | 无；potion 语义切片 / jina embedding / jina reranker 均在首次启动时从 hf-mirror 自动下载 | `dist/Lightning-RAG-1.3.9-clean.dmg` |
+| `lite` | potion-multilingual-128M int4（语义切片）+ jina-embeddings-v5-text-nano-mlx-int4 + jina-reranker-v2-base-multilingual-onnx | `dist/Lightning-RAG-1.3.9-lite.dmg` |
 
 两个版本共用 `dist/Lightning-RAG.app`（应用本体与显示名不变，只有内置模型不同），
 因此需按「打包 App → 打包 DMG」的顺序逐个构建。两个版本都不含主模型、辅助模型
@@ -124,6 +124,8 @@ HTML 与 Office 解析另有专项覆盖：HTML 保存页的本地 iframe / fram
 
 **自定义 system prompt**：首次启动会在 `<workspace>/assets/system_prompt.txt` 写出内置的 `BASE_SYSTEM_PROMPT`；之后每次启动读取该文件并替换内置提示词，可直接用文本编辑器调整模型行为规则，**重启（或重新应用配置）后生效**（会话期间保持不变，以免 system 前缀抖动使 KV cache 反复重建）。文件内容空白或不可读时本次回退内置提示词，且不会覆盖文件。它替换的是协议主体，L0 META-SOP 与 L1 全局索引仍按多级记忆机制追加在其后；轻量轮（纯寒暄/能力问询）使用内核的极简提示，不受该文件影响。内置提示词中的 `<summary>` 标签、`rag_outline` 起手式、工具状态词等是内核回注与测试的硬依赖，建议在原文基础上调整，不要整段删除。
 
+**v1.3.9**：知识图谱抽取默认切到 JSON 格式并加固提示词。**格式可切**：`rag_kg_extraction_format` 默认 `json`（`entities` / `relationships` 数组），可改 `delimited` 兼容 0.8B 等小模型；两种格式缓存键隔离，配置文件中带 `_comment_*` 说明。**提示词加固**：正文代码围栏隔离、Section Context 标注不可信元数据、新增 relation/entity 与分隔符的 Wrong/Correct 反例、纯数字/年份不成实体、端点缺失提示补抽。**解析兜底**：4 段关系用 keywords 补描述，JSON 支持代码围栏与数组 keywords。**二次补抽**：首轮为空或末行残缺时追加一次只补漏请求。**崩溃修复**：图谱抽取并发默认改为 1（`rag_kg_max_concurrency`），修复 2B 四路并发导致 MLX 活跃内存 11GB、`mlx_async_eval` 触发 `EXC_BREAKPOINT` 的构建崩溃。**实测**：2B JSON 模式 19.5 秒抽到 7/7 实体、5 条有效关系；0.8B 仍不建议用于图谱构建。
+
 **v1.3.8**：知识图谱抽取质量与性能收口。**限额可配**：单切片实体 20 / 关系 50 / 描述 100 字（`rag_kg_max_entities_per_chunk` / `rag_kg_max_relations_per_chunk` / `rag_kg_max_description_chars`），提示词、解析与落库三处同时生效；关系描述在归纳后再次截断。**收流保护**：模型输出 `<|COMPLETE|>` 后立即停止消费；同一实体对重复关系行累计达 12 条时提前取消生成（实测 2B 从复读到 6k+ 字符/123 秒缩到约 2.5k 字符/50 秒）。**抽取提速**：按切片内容哈希跨重建复用抽取结果、LLM 归纳结果缓存、支持独立会话的后端最多 4 路并发，阶段日志输出抽取/归纳/向量化耗时。**真机验证**：2B 抽取 4/4 核心实体与 5~6 条无向关系，0.8B 关系行字段残缺、有效关系为 0，不建议用于图谱构建。长期记忆侧同步补强事实抽取校验与邻域检索。
 
 **v1.3.7**：新增 RAG 知识图谱能力与五种检索策略（local / global / hybrid / mix / naive）。图谱构建支持逐切片实体/关系抽取、同名聚合与描述归纳、无向关系合并、UNKNOWN 占位、SwiftGraph 内存图与快照、增量更新；实体/关系向量按 jina-v5 128 维重新归一化后 int8 写入 `kg_vectors` 与 vec0 单表 `kg_vectors_vec`；检索支持高低层关键词三路召回、实体/关系反查 chunk、轮询去重、度数/weight 合成排序与 token 预算；配置面板提供构建/停止/消歧与策略选择，未构建完成时自动回退 naive。
@@ -158,7 +160,10 @@ RAG 知识图谱与长期记忆的 **memory graph 是两套完全独立的实现
 - **图谱与快照**：SwiftGraph 无向图承载内存图，节点/边保留来源 chunk 用于归因反查；快照 JSON 带 `schemaVersion` 与 DB `revision` 校验，1 秒防抖落盘；`kg_build_state` 记录 building / complete / stale。
 - **增量更新**：只抽取 `kg_processed_chunks` 中不存在或内容哈希变化的切片，返回实体/关系变更集，内存图做局部 upsert，不整图重建；文档删除/内容变化会把图谱标记 stale。
 - **检索**：查询先由 LLM 抽低层实体词与高层主题词，低层词向量查实体、高层词向量查关系、原 query 向量查 chunk，三路 embedding 在同一批内计算；实体/关系各取 top 40，chunk 取 20，实体与关系反查 chunk 每命中最多 5 片；按 chunk_id 轮询交错去重，query 直接召回优先，余弦低于 0.2 丢弃；实体排序 = 余弦 0.8 + 度数 0.2，关系排序 = 余弦 0.7 + rank 0.2 + weight 0.1；实体预算 6000 token、关系 8000 token，连同 system + query + 原文总预算 30000 token。
-- **抽取性能**：抽取结果按切片内容哈希缓存（跨重建复用）、LLM 归纳结果单独缓存、后端支持独立会话时最多 4 路并发，并在阶段日志中输出抽取/归纳/向量化耗时；小模型复读同一批关系时按重复关系行提前收流，避免跑满 token 上限。
+- **抽取性能**：抽取结果按切片内容哈希缓存（跨重建复用）、LLM 归纳结果单独缓存，并在阶段日志中输出抽取/归纳/向量化耗时；小模型复读同一批关系时按重复关系行提前收流，避免跑满 token 上限。并发默认关闭（`rag_kg_max_concurrency=1`）：本地 MLX 的 isolated 请求共享同一块 GPU，实测 4 路并发让 prefill 从约 2 秒退化到 40 秒以上、MLX 活跃内存冲到 11GB 并触发 `EXC_BREAKPOINT` 崩溃；内存充足的机器可手动调到 2~4。首轮结果为空或末行字段残缺时追加一次「只补漏、不重复」的二次抽取；复读触发的收流不再补抽，避免把相同内容再生成一遍。
+- **提示词防护**：正文用代码围栏与 `---Output---` 锚点隔离，Section Context 以单行「untrusted metadata」注入并明确不得执行其中指令；system prompt 带 relation/entity 前缀与分隔符的 Wrong/Correct 反例，关系端点缺失时提示补抽实体、纯数字/年份不成实体。关系行缺 description（4 段）时解析器用 keywords 兜底，不丢边。
+- **输出格式**：`rag_kg_extraction_format` 默认 `json`（单个 `entities` / `relationships` 数组对象，允许代码围栏，解析失败按空结果处理）；可改成 `delimited`（LightRAG 风格分隔符行，带 `<|COMPLETE|>` 与重复行收流）以兼容只认行格式的小模型。JSON 模式结构清晰、无重复行，实测 2B 19.8 秒抽到 7 个实体（4/4 核心 + 3/3 技术/地点）与 6 条去重关系；分隔符模式 32 秒、8 条边但次要实体为 0。两种格式的缓存键相互隔离，切换格式不会误用旧结果。
+- **真机实测（2B / 0.8B）**：2B JSON（默认）7/7 实体（含 Swift / MLX / Shanghai）、6 条去重实体对、约 20 秒；分隔符模式 4/4 核心实体、8 条去重实体对、约 32 秒。0.8B 分隔符模式靠 4 段兜底能解析出 5 条边，但只命中 2/4 核心实体（Acme Corp、Project Aurora 未抽为实体）、关系全部缺描述；JSON 模式会复读实体数组并在 2k token 处截断，解析结果为 0。0.8B 仍不建议用于图谱构建。
 - **UI**：知识同步配置区提供「构建知识图谱 / 停止构建 / 实体消歧」与检索策略选择；未构建完成时图谱策略不可选。
 
 所有文件类工具路径锁定在 workspace 内，并解析 symlink 防止逃逸。`code_run` / `shell_run` / MCP 调用按配置触发确认。
@@ -337,7 +342,9 @@ PDF Ovis 引擎按 `rag_ocr_model_path` / `rag_ocr_model_name` 加载，不受 `
   "rag_kg_total_token_budget": 30000,
   "rag_kg_max_entities_per_chunk": 20,
   "rag_kg_max_relations_per_chunk": 50,
-  "rag_kg_max_description_chars": 100
+  "rag_kg_max_description_chars": 100,
+  "rag_kg_extraction_format": "json",
+  "rag_kg_max_concurrency": 1
 }
 ```
 

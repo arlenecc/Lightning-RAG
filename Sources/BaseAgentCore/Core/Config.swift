@@ -394,6 +394,14 @@ public struct AgentConfig: Sendable {
     public var ragKGMaxRelationsPerChunk: Int = 50
     /// 实体/关系描述的最大字符数（默认 100）。
     public var ragKGMaxDescriptionChars: Int = 100
+    /// 实体/关系抽取的输出格式：`json`（默认，结构化对象，2B 实测更完整）/ `delimited`
+    ///（分隔符行，带 `<|COMPLETE|>` 与重复行收流，适合更小或只认行格式的模型）。
+    public var ragKGExtractionFormat: KGExtractionFormat = .json
+    /// 图谱抽取的最大并发请求数（1...4，默认 1）。
+    /// 本地 MLX 模型的 isolated 请求共享同一块 GPU，实测 4 路并发时
+    /// prefill 从 ~2s 退化到 40s+，MLX active 内存冲到 11GB 并触发
+    /// EXC_BREAKPOINT 崩溃；默认串行，内存充足的机器可手动调大。
+    public var ragKGMaxConcurrency: Int = 1
 
     // 二值粗筛（两段式检索）
     /// 检索是否先走二值向量粗筛；关闭只影响检索，入库仍维护签名。
@@ -703,6 +711,12 @@ public struct AgentConfig: Sendable {
         if let v = int("rag_kg_max_entities_per_chunk") { ragKGMaxEntitiesPerChunk = v }
         if let v = int("rag_kg_max_relations_per_chunk") { ragKGMaxRelationsPerChunk = v }
         if let v = int("rag_kg_max_description_chars") { ragKGMaxDescriptionChars = v }
+        if let v = string("rag_kg_extraction_format"), !v.isEmpty {
+            ragKGExtractionFormat = KGExtractionFormat(stored: v)
+        }
+        if let v = int("rag_kg_max_concurrency") {
+            ragKGMaxConcurrency = max(1, min(4, v))
+        }
         if let v = bool("rag_binary_coarse_enabled") { ragBinaryCoarseEnabled = v }
         if let v = int("rag_binary_coarse_candidates") { ragBinaryCoarseCandidates = v }
 
@@ -1102,6 +1116,15 @@ public struct AgentConfig: Sendable {
             "rag_kg_max_entities_per_chunk": ragKGMaxEntitiesPerChunk,
             "rag_kg_max_relations_per_chunk": ragKGMaxRelationsPerChunk,
             "rag_kg_max_description_chars": ragKGMaxDescriptionChars,
+            "rag_kg_extraction_format": ragKGExtractionFormat.rawValue,
+            // JSON 不支持原生注释，这里用 `_comment_*` 键说明可选项，加载时忽略。
+            "_comment_rag_kg_extraction_format":
+                "知识图谱抽取格式，可选 json（默认，2B 及以上推荐）/ delimited"
+                + "（分隔符行，兼容 0.8B 等小模型）。修改后需重新构建图谱才会对全量数据生效。",
+            "_comment_rag_kg_max_concurrency":
+                "知识图谱抽取并发数，范围 1~4，默认 1。本地 MLX 并发会争抢 GPU"
+                + "并可能内存超限，建议保持 1。",
+            "rag_kg_max_concurrency": ragKGMaxConcurrency,
             "rag_binary_coarse_enabled": ragBinaryCoarseEnabled,
             "rag_binary_coarse_candidates": ragBinaryCoarseCandidates,
             "llm_provider": llmProvider,

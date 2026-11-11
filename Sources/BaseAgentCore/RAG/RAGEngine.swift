@@ -1049,7 +1049,9 @@ public final class RAGEngine {
                                            try? store?.revision()
                                        })
             let builder = KnowledgeGraphBuilder(store: store, graph: graph, llm: llm,
-                                                limits: kgExtractionLimits)
+                                                limits: kgExtractionLimits,
+                                                format: config.ragKGExtractionFormat,
+                                                maxConcurrency: config.ragKGMaxConcurrency)
             stats = try await builder.build(progress: progress, log: log)
             kgLock.lock()
             kgGraph = graph
@@ -1102,7 +1104,9 @@ public final class RAGEngine {
         }
         guard let (_, graph) = try? ensureKnowledgeGraph() else { return }
         let builder = KnowledgeGraphBuilder(store: store, graph: graph, llm: llm,
-                                            limits: kgExtractionLimits)
+                                            limits: kgExtractionLimits,
+                                            format: config.ragKGExtractionFormat,
+                                            maxConcurrency: config.ragKGMaxConcurrency)
         do {
             let result = try await builder.buildIncremental()
             // 只对变更项做内存图 upsert，避免整图重建；快照交给 1 秒防抖保存。
@@ -2952,7 +2956,9 @@ public final class RAGEngine {
         // 新进程/未同步时切片库可能尚未打开，图谱检索需要按来源反查原文。
         guard let store = try? ensureStore() else { return nil }
         let builder = KnowledgeGraphBuilder(store: kgStore, graph: kgGraph, llm: auxLLM,
-                                            limits: kgExtractionLimits)
+                                            limits: kgExtractionLimits,
+                                            format: config.ragKGExtractionFormat,
+                                            maxConcurrency: config.ragKGMaxConcurrency)
         let retriever = KnowledgeGraphRetriever(kgStore: kgStore, graph: kgGraph,
                                                 builder: builder, embedding: embedding,
                                                 config: config, chunkStore: store)

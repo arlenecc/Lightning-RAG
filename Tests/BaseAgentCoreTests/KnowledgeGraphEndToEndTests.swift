@@ -144,6 +144,9 @@ final class KnowledgeGraphEndToEndTests: XCTestCase {
         config.knowledgeBase = kb.path
         config.ragRerankEnabled = false
         config.ragRetrievalStrategy = strategy
+        // 这里的假模型输出固定为分隔符行；应用默认已切到 JSON，
+        // 端到端测试显式使用分隔符格式，避免假模型与解析器错配。
+        config.ragKGExtractionFormat = .delimited
         config.ragChunkSize = 1200
         config.ragChunkOverlap = 0
         return config

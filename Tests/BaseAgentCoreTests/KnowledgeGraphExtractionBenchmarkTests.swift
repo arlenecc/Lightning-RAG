@@ -116,6 +116,11 @@ final class KnowledgeGraphExtractionBenchmarkTests: XCTestCase {
         config.ragRerankEnabled = false
         config.ragChunkSize = 1200
         config.ragChunkOverlap = 0
+        // 假模型输出分隔符行；应用默认已是 JSON，这里显式指定格式。
+        config.ragKGExtractionFormat = .delimited
+        // 并发默认关闭（本地 MLX 并发会争抢 GPU 并可能内存超限）；
+        // 基准测试显式打开 4 路，验证并发路径本身可用。
+        config.ragKGMaxConcurrency = concurrent ? 4 : 1
 
         let llm = CountingLLM(concurrent: concurrent)
         let engine = RAGEngine(config: config, knowledgeBase: kb.path,

@@ -4,7 +4,9 @@ import XCTest
 
 /// 真机模型抽取质量验证（默认跳过）。
 /// 运行：`KG_REAL_MODEL_TEST=1 swift test --filter KnowledgeGraphRealModelTests`
-/// 可选：`KG_REAL_ONLY=2B|0.8B` 只跑一个模型，`KG_REAL_PENALTY` 覆盖重复惩罚。
+/// 可选：`KG_REAL_ONLY=2B|0.8B` 只跑一个模型，`KG_REAL_MODEL_DIR` 指定权重目录
+///（默认 `models/Qwen3.5-0.8B-MLX-4bit`），`KG_REAL_FORMAT=delimited` 切回分隔符输出
+///（默认 JSON），`KG_REAL_PENALTY` 覆盖重复惩罚。
 final class KnowledgeGraphRealModelTests: XCTestCase {
 
     private let sample = """
@@ -38,10 +40,14 @@ final class KnowledgeGraphRealModelTests: XCTestCase {
         }
         // 0.8B 仅作基线对照，不判定：小模型输出会缺字段/循环，不代表当前选型。
         if only == nil || only == "0.8B" {
-            let baseline = root.appendingPathComponent("models/Qwen3.5-0.8B-MLX-4bit")
+            let baseline = ProcessInfo.processInfo.environment["KG_REAL_MODEL_DIR"]
+                .map { URL(fileURLWithPath: $0) }
+                ?? root.appendingPathComponent("models/Qwen3.5-0.8B-MLX-4bit")
             if FileManager.default.fileExists(atPath: baseline.path) {
                 try await measure(name: "Qwen3.5-0.8B-MLX-4bit", directory: baseline,
                                   maxTokens: 1_024, assertsQuality: false)
+            } else {
+                print("REAL Qwen3.5-0.8B-MLX-4bit: 模型不存在，跳过")
             }
         }
     }
@@ -53,13 +59,15 @@ final class KnowledgeGraphRealModelTests: XCTestCase {
         config.auxLLMProvider = "local"
         config.auxLocalLLMBackend = "mlx-lm"
         config.auxLocalLLMModel = directory.path
-        config.auxMaxTokens = maxTokens
         config.auxMaxContextTokens = 8_192
         config.auxLocalLLMEnableThinking = false
         let env = ProcessInfo.processInfo.environment
+        let format = KGExtractionFormat(stored: env["KG_REAL_FORMAT"] ?? "json")
         if let value = env["KG_REAL_PENALTY"].flatMap(Double.init) {
             config.auxRepetitionPenalty = value
         }
+        // JSON 模式输出比分隔符行更冗长，给足 token 预算，避免测试自身截断。
+        config.auxMaxTokens = format == .json ? max(maxTokens, 2_048) : maxTokens
 
         let llm = LocalModelFactory.shared.makeAuxLLM(config: config)
         if let preloadable = llm as? PreloadableLLMService {
@@ -77,7 +85,8 @@ final class KnowledgeGraphRealModelTests: XCTestCase {
             embedding: StubEmbedding(), enableSQLiteVec: false)
         let graph = KnowledgeGraph(
             snapshotPath: directoryTemp.appendingPathComponent("snapshot.json").path)
-        let builder = KnowledgeGraphBuilder(store: store, graph: graph, llm: llm)
+        let builder = KnowledgeGraphBuilder(store: store, graph: graph, llm: llm,
+                                            format: format)
 
         let started = Date()
         let raw = try await builder.extractRaw(
@@ -85,7 +94,9 @@ final class KnowledgeGraphRealModelTests: XCTestCase {
         let seconds = Date().timeIntervalSince(started)
         // 收流保护会取消底层生成任务；测试进程紧接着退出，先等 GPU 收尾。
         LocalModelFactory.shared.synchronizeGPU()
-        let parsed = KnowledgeGraphBuilder.parseExtraction(raw)
+        let parsed = format == .json
+            ? KnowledgeGraphBuilder.parseExtractionJSON(raw)
+            : KnowledgeGraphBuilder.parseExtraction(raw)
 
         let entityNames = Set(parsed.entities.map { $0.name.lowercased() })
         func matched(_ list: [String]) -> [String] {
@@ -100,14 +111,17 @@ final class KnowledgeGraphRealModelTests: XCTestCase {
             entityNames.contains(relation.source.lowercased())
                 && entityNames.contains(relation.target.lowercased())
         }
-        // 图谱按无向实体对合并，重复关系在入库前会被去重；这里报告去重后的有效边数。
-        let uniquePairs = Set(validRelations.map { relation in
+        // 图谱按无向实体对合并；缺失端点会以 UNKNOWN 占位落库，
+        // 因此这里统计所有解析出的实体对，而不是只看端点都在实体表内的关系。
+        let uniquePairs = Set(parsed.relations.map { relation in
             [relation.source.lowercased(), relation.target.lowercased()]
                 .sorted().joined(separator: "|")
         })
-        let completed = raw.contains("<|COMPLETE|>")
+        let completed = format == .json
+            ? (raw.contains("{") && raw.contains("}"))
+            : raw.contains("<|COMPLETE|>")
         print("""
-        REAL \(name): \(String(format: "%.1f", seconds))s chars=\(raw.count)
+        REAL \(name) [\(format.rawValue)]: \(String(format: "%.1f", seconds))s chars=\(raw.count)
           entities=\(parsed.entities.count) relations=\(parsed.relations.count)
           matchedCore=\(matchedCore.count)/\(coreEntities.count) \(matchedCore)
           matchedExtra=\(matchedExtra.count)/\(extraEntities.count) \(matchedExtra)
@@ -136,10 +150,10 @@ final class KnowledgeGraphRealModelTests: XCTestCase {
                                     "\(name) 核心实体命中不足：\(matchedCore)")
         XCTAssertGreaterThanOrEqual(validRelations.count, 3,
                                     "\(name) 有效关系不足")
-        XCTAssertGreaterThanOrEqual(uniquePairs.count, 3,
-                                    "\(name) 去重后的有效实体对不足")
-        // 未截断且提前收流生效：输出应在合理长度内结束，不会无限复读到 token 上限。
-        XCTAssertLessThan(raw.count, 6_000, "\(name) 输出过长，疑似未触发收流保护")
+        XCTAssertGreaterThanOrEqual(uniquePairs.count, 4,
+                                    "\(name) 去重后的实体对不足")
+        // 收流 + 一次补抽应让输出保持在有限长度，不会无限复读到 token 上限。
+        XCTAssertLessThan(raw.count, 8_000, "\(name) 输出过长，疑似未触发收流保护")
     }
 }
 
