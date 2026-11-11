@@ -1,8 +1,8 @@
 Lightning-RAG
 
-如果你有大量资料，希望有个轻量本地知识库，方便查询，并且还能脱离云端LLM服务器，永久本地离线免费使用，那这个软件就是你想要的，抛掉一大堆各种依赖，底层实现直接解析提取各类文件，整个软件体积只有120M，dmg只有39M，软件大小只有同类软件的1/15，向量存储磁盘空间占用可以压缩20倍，性能基本无损，打破了SQLite的功能限制，实现真正的ANN支持，可以存储不限量的文件，数据量大时，检索不会明显变慢，如果你喜欢尝鲜使用各种新的模型，可以在配置里随意切换各环节的模型，享受DIY的乐趣，随时体验最新模型的能力。
+如果你有大量资料，希望有个轻量本地知识库，方便查询，并且还能脱离云端LLM服务器，永久本地离线免费使用，那这个软件就是你想要的，抛掉一大堆各种依赖，底层实现直接解析提取各类文件，整个软件体积只有127M，dmg只有39M，软件大小只有同类软件的1/15，向量存储磁盘空间占用可以压缩20倍，性能基本无损，打破了SQLite的功能限制，实现真正的ANN支持，可以存储不限量的文件，数据量大时，检索不会明显变慢，如果你喜欢尝鲜使用各种新的模型，可以在配置里随意切换各环节的模型，享受DIY的乐趣，随时体验最新模型的能力。
 
-Lightning-RAG 一个使用swift实现的极简超轻量RAG，可以纯本地使用（2B以上模型即可，所有主流电脑都可以无压力运行，如果要使用agent能力，建议主模型4B以上，如果只是当知识库使用，可以直接使用2B模型，辅助模型可选2B或0.8B（0.8B可能对长文本的摘要效果会差一些，虽然已经使用了map-reduce方式处理长文本，但是效果仍然不如2B模型，主要会影响后台自动生成的全书摘要和章节摘要的质量，不过速度相比2B会快2倍，资源占用更少），并指定使用各环节使用的模型，swift直接实现针对pdf，epub，word，html等各类文件的解析、识别、抽取、清洗、格式化，也提供可单独使用的信息抽取工具，速度极快，可作为本地知识库使用，或阅读辅助工具使用，内置极简Agent，交互过程中进行多层信息压缩，把上下文控制在30k以内，可以从skill库学习和检索，并自动蒸馏使用过程中的经验形成新的skill，在使用中形成个性化的各项能力，具备成长性
+Lightning-RAG 一个使用swift实现的极简超轻量RAG，可以纯本地使用（2B以上模型即可，所有主流电脑都可以无压力运行，如果要使用agent能力，建议主模型4B以上，如果只是当知识库使用，可以直接使用2B模型，辅助模型建议2B（知识图谱抽取实测 0.8B 无法稳定输出完整关系行，只能抽出个别实体，不建议用于图谱构建；0.8B 对长文本摘要效果也偏弱，虽然已经使用了map-reduce方式处理长文本，但主要影响后台自动生成的全书摘要和章节摘要的质量，优点是速度约为 2B 的两倍、资源占用更少），并指定使用各环节使用的模型，swift直接实现针对pdf，epub，word，html等各类文件的解析、识别、抽取、清洗、格式化，也提供可单独使用的信息抽取工具，速度极快，可作为本地知识库使用，或阅读辅助工具使用，内置极简Agent，交互过程中进行多层信息压缩，把上下文控制在30k以内，可以从skill库学习和检索，并自动蒸馏使用过程中的经验形成新的skill，在使用中形成个性化的各项能力，具备成长性
 
 macOS 原生自主 Agent。控制流是**三态自动机 + 五级上下文压缩**，能力层是工具集，经验层是事实抽取与 L4 蒸馏，知识层是 **SQLite + sqlite-vec + FTS5** 的本地 RAG。
 
@@ -52,23 +52,24 @@ VARIANT=lite  scripts/package-app.sh release && VARIANT=lite  scripts/package-dm
 
 | VARIANT | 内置模型 | DMG |
 |---|---|---|
-| `clean`（默认） | 无；potion 语义切片 / jina embedding / jina reranker 均在首次启动时从 hf-mirror 自动下载 | `dist/Lightning-RAG-1.3.4-clean.dmg` |
-| `lite` | potion-multilingual-128M int4（语义切片）+ jina-embeddings-v5-text-nano-mlx-int4 + jina-reranker-v2-base-multilingual-onnx | `dist/Lightning-RAG-1.3.4-lite.dmg` |
+| `clean`（默认） | 无；potion 语义切片 / jina embedding / jina reranker 均在首次启动时从 hf-mirror 自动下载 | `dist/Lightning-RAG-1.3.8-clean.dmg` |
+| `lite` | potion-multilingual-128M int4（语义切片）+ jina-embeddings-v5-text-nano-mlx-int4 + jina-reranker-v2-base-multilingual-onnx | `dist/Lightning-RAG-1.3.8-lite.dmg` |
 
 两个版本共用 `dist/Lightning-RAG.app`（应用本体与显示名不变，只有内置模型不同），
 因此需按「打包 App → 打包 DMG」的顺序逐个构建。两个版本都不含主模型、辅助模型
-与 OCR，需要在配置中指定本地模型路径。`clean` 把体积压到最小（DMG 约 37MB），
+与 OCR，需要在配置中指定本地模型路径。`clean` 把体积压到最小（DMG 约 39MB），
 适合网络良好的环境；`lite` 内置三个基础 RAG 模型（DMG 约 449MB），首次启动即可
 离线使用语义切片、Embedding 与重排。版本号可通过 `VERSION` 环境变量或
-`package-dmg.sh` 的参数覆盖；旧版的 `all-in-one`（主模型 / 辅助模型 / OCR 一并打包）
-已移除，相关模型改为在配置窗口指定或由启动下载流程补齐。
+`package-dmg.sh` 的参数覆盖。
 
-测试覆盖（当前 700+ 个 XCTest；真实模型 E2E 在本地权重存在时随每次测试自动运行，缺少权重或需要外网/GGUF 等环境的用例会跳过）：sqlite-vec 事务写入/回滚、两段式 KNN、二值签名编码与 LSB-first 位打包、
+测试覆盖（当前 1000+ 个 XCTest；真实模型 E2E 在本地权重存在时随每次测试自动运行，缺少权重或需要外网/GGUF 等环境的用例会跳过）：sqlite-vec 事务写入/回滚、两段式 KNN、二值签名编码与 LSB-first 位打包、
     bin 表同 rowid 写入与覆盖率计数器、两阶段粗筛精排与 ANN 旁路、
     FTS5 中文分词、RRF 混合检索、RAG 增量/删除清理、重排序 TopN 决定最终条数（关闭时回到调用方 top_k）、内置 reranker 的打包清单与默认配置解析（`localRerankerModel` / `localRerankerModelPath` 留空时仍回落到 App 内置 jina reranker）、EPUB/DOCX/HTML 解析、扫描版 EPUB 归一化 + OCR、PDF 文本层、Ovis 文本页快路径、NaturalLanguage 切片、切片参数一致性（模型窗口收口、检索呈现上限随切片放大、切片参数变化触发重建）、配置迁移与旧键兼容（含 `auto_preload_main` / `aux_enabled` 默认值、主/辅助 KV 复用与量化键的缺省跟随与读写往返）、Agent 工具循环、ask_user 续跑、checkpoint 同步、code_run 写护栏、L3 去重、大纲围栏，以及摘要溢出保留、代码围栏/中文换行/正文数字保留、技能索引入口回退、空库维度自愈、`models/` 相对路径解析，以及 KV 复用增量与完整 prompt 的逐 token 模板对齐、预热前缀对齐、清空对话时失效 KV cache；GGUF 模型路径/mmproj 解析、进程内 llama.cpp 框架加载、ONNX 缺少权重时的明确报错，合成 ONNX decoder 图的 past/present 管线，简单 HTML 表格转 Markdown、复杂表格保留 HTML、Markdown 语法/缩进保留、纯文本 HTML/实体/噪声清理、空行与空格密度压缩、跨目录副本与 content_hash 去重、手动向量去重保留最早入库切片并写副本 tombstone，以及切片缺失/旧版 manifest/失败页文件的增量重建。真实模型链路覆盖：jina-v5 的 `Query: `/`Document: ` 前缀 → 可配置 Matryoshka 维度（默认 128，可选 32/64/128/256/512/768）截断 → 重新 L2 归一化 → 用户选择的元素类型入库（默认 int8，128 维时 128B/行），同时从截断前原生
     768 维生成二值签名写入 `chunk_vectors_bin` → 查询 top1 与 `rag_search` 全链路；jina-v3 的切片 → embedding → 256 维 Matryoshka 截断 → 重新归一化 → int8 入库（256B/行）→ 查询 top1；nomic-int8 的 int8 + Matryoshka 512 召回与 fp32 全维（768）基线对比；以及内置 jina reranker 经 `LocalModelFactory` 加载 ONNX 后对相关段落打分（达到默认 0.45 阈值且高于强无关基线）；`RAGPipelineVerificationTests` 使用仓库 `models/`（可用 `EMBED_BENCH_MODELS_DIR` 指向 App 包模型）跑通 6 篇文档入库 → 22 切片 int8 → 混合检索 + RRF → 重排 → ANN → `rag_search` / `rag_outline` / `rag_status` 全链路。
 
 HTML 与 Office 解析另有专项覆盖：HTML 保存页的本地 iframe / frameset 接力（取正文最多的一份）、big5 等老编码嗅探、依赖 JavaScript 的页面给出明确失败原因、含 `h1` 的 `<header>` 保留、裸文本节点与 `<li>` 内块级元素、结构化清洗档保留 URL/IP 与段落空行；DOCX 编号列表与 `w:br`/`xml:space`、脚注编号与末尾列表、`styles.xml` 样式名解析标题；XLSX 日期与百分比格式、注音跳过、多行单元格不拆表；PPTX 演讲者备注与段内换行。旧版 Office 另有专项覆盖：OLE2 复合文档扇区/FAT/miniFAT 读取与损坏文件拒绝、`.doc` 字号标题/粗斜体/中文、`.xls` BIFF8 共享字符串/日期/百分比/公式与多 sheet、`.ppt` 幻灯片顺序、标题正文、演讲者备注与 Windows-1252 文本，以及 PPT95/加密/空文档/记录超限的明确报错。独立 Markdown 转换另覆盖单文件输出、目录相对结构、同名后缀、单文件失败不中断整批、输出目录跳过与不支持格式拒绝。
+
+知识图谱有独立测试文件（与长期记忆 memory graph 测试互不混用）：`KnowledgeGraphBuildTests`（实体/关系合并、快照、限额与收流保护）、`KnowledgeGraphVec0Tests`（vec0 与精确扫描一致、单表分区、旧库迁移）、`KnowledgeGraphIncrementalTests`（覆盖式更新、Section Context、三元组去重）、`KnowledgeGraphEndToEndTests`（多文档全链路 + 五种策略 + 新增文档增量）、`KnowledgeGraphExtractionBenchmarkTests`（缓存命中与并发抽取）、`KnowledgeGraphRealModelTests`（`KG_REAL_MODEL_TEST=1` 时用真实 2B/0.8B 验证抽取质量）。
 
 ## RAG MCP 服务（对外接入）
 
@@ -114,7 +115,7 @@ HTML 与 Office 解析另有专项覆盖：HTML 保存页的本地 iframe / fram
   - 辅助模型：标题后带「启用」复选框（对应 `aux_enabled`，默认关闭）。本地模式同主模型布局（含独立的「KV复用」「KV量化」开关），默认 `models/Qwen3.5-2B-MLX-4bit`；未启用时「加载模型 / 重新加载」按钮禁用。
   - 启动时按 `auto_preload_main`（默认开启）预加载主模型；辅助模型仅在 `aux_enabled=true` 时加载。关闭主模型启动预加载后，需在配置窗口手动点「加载模型」；同步结束后的模型恢复不受影响。未指定模型时使用默认主模型 `models/qwen3.5-4b-agentic-coder-v4-4bit-mlx`。加载会真正把参数应用到新创建的模型实例。
   - Agent 区底部「运行参数」行：「最大迭代」（`max_iterations`，默认 15，1...50），修改后点该行「应用配置」保存。
-- **配置窗口（知识同步）**：`工作目录` 单独一行；`源目录`（原「知识库目录」）行内紧跟四个操作按钮：应用配置 / 同步知识 / 停止同步 / 向量去重（排查并清理向量库内重复的切片，保留入库时间最早的一份），按钮与目录选择在同一行排列（窗口较窄时不拆分）。Embedding 行 = 类型（FastEmbed / ONNX / MLX / GGUF）+ 本地路径 + 选择… +「语义切片」开关 /「切片大小」/「overlap」；Reranker 行 = 同布局 +「启用重排序」开关 /「TopN」/「候选池」/「阈值」。「启用重排序」对应 `rag_rerank_enabled`（默认开启），「TopN」对应 `rag_rerank_top_n`（默认 3，1...20），「候选池」对应 `rag_rerank_candidate_multiplier`（默认 3，1...5：候选池 = `max(调用方 top_k, TopN) × 倍数`），「阈值」对应 `rag_rerank_threshold`（默认 0.45，0...1），表示 reranker 之后保留的结果数量、候选池放大倍数与分数过滤下限；`rag_rerank_timeout_seconds`（默认 5s，0 = 不限制）控制 rerank 墙钟超时，超时回退 RRF 并只返回前 3 条。Reranker 行之后依次是「二值粗筛」开关与候选数 Stepper、`ANN设置` 分组标签、向量库与 ANN 索引合并行：向量元素类型（默认 int8；可选 int8 / fp32 / fp16 / bin）/ Matryoshka 模式与截断维（jina-v5 六档 32 / 64 / 128 / 256 / 512 / 768，其它模型保留 128 / 256 / 512） /「ANN 检索」与「自动构建」开关 / ANN 索引摘要与「构建 ANN 索引 / 停止构建 / 删除索引」，「重建向量库」按钮固定在该组行末。「ANN 检索」对应 `rag_ann_enabled`，「自动构建」对应 `rag_ann_auto_build`。「二值粗筛」开关对应 `rag_binary_coarse_enabled`（默认开启），候选数对应 `rag_binary_coarse_candidates`（默认 200，50...1000，步进 50，关闭时禁用）。二值可用时全局检索由它取代 ANN，不可用或定向检索时自动回退原流程；主存储为 BIN 时该功能停用，旧库需重新同步后才会生效。高级区保留 PDF/EPUB OCR 引擎、OCR 模型（MLX / GGUF / ONNX）、mmproj、归一化/二值化，以及「RAG 参数设置」中的「查询超时」（`rag_query_timeout_seconds`，默认 5s，0 = 关闭）和「同步参数设置」中的「启动时自动同步」（`rag_auto_ingest`，默认关闭；开启后每次启动会自动增量扫描知识库，首次全量同步可能长时间占用 embedding 模型与磁盘 IO）、「同步并发」（`rag_ingest_concurrency`）、「OCR 并发」（`rag_vision_concurrency`）、「MLX 缓存」（`mlx_cache_limit_mb`）与「MLX 上限」（`mlx_memory_limit_mb`，0 = 自动）。向量库待重建时，红色提示显示在该合并行下方。
+- **配置窗口（知识同步）**：`工作目录` 单独一行；`源目录`（原「知识库目录」）行内紧跟四个操作按钮：应用配置 / 同步知识 / 停止同步 / 向量去重（排查并清理向量库内重复的切片，保留入库时间最早的一份），按钮与目录选择在同一行排列（窗口较窄时不拆分）。同一区域提供 RAG 检索策略下拉（local / global / hybrid / mix / naive）与「构建知识图谱 / 停止构建 / 实体消歧」；图谱未构建完成时四种图谱策略不可选。Embedding 行 = 类型（FastEmbed / ONNX / MLX / GGUF）+ 本地路径 + 选择… +「语义切片」开关 /「切片大小」/「overlap」；Reranker 行 = 同布局 +「启用重排序」开关 /「TopN」/「候选池」/「阈值」。「启用重排序」对应 `rag_rerank_enabled`（默认开启），「TopN」对应 `rag_rerank_top_n`（默认 3，1...20），「候选池」对应 `rag_rerank_candidate_multiplier`（默认 3，1...5：候选池 = `max(调用方 top_k, TopN) × 倍数`），「阈值」对应 `rag_rerank_threshold`（默认 0.45，0...1），表示 reranker 之后保留的结果数量、候选池放大倍数与分数过滤下限；`rag_rerank_timeout_seconds`（默认 5s，0 = 不限制）控制 rerank 墙钟超时，超时回退 RRF 并只返回前 3 条。Reranker 行之后依次是「二值粗筛」开关与候选数 Stepper、`ANN设置` 分组标签、向量库与 ANN 索引合并行：向量元素类型（默认 int8；可选 int8 / fp32 / fp16 / bin）/ Matryoshka 模式与截断维（jina-v5 六档 32 / 64 / 128 / 256 / 512 / 768，其它模型保留 128 / 256 / 512） /「ANN 检索」与「自动构建」开关 / ANN 索引摘要与「构建 ANN 索引 / 停止构建 / 删除索引」，「重建向量库」按钮固定在该组行末。「ANN 检索」对应 `rag_ann_enabled`，「自动构建」对应 `rag_ann_auto_build`。「二值粗筛」开关对应 `rag_binary_coarse_enabled`（默认开启），候选数对应 `rag_binary_coarse_candidates`（默认 200，50...1000，步进 50，关闭时禁用）。二值可用时全局检索由它取代 ANN，不可用或定向检索时自动回退原流程；主存储为 BIN 时该功能停用，旧库需重新同步后才会生效。高级区保留 PDF/EPUB OCR 引擎、OCR 模型（MLX / GGUF / ONNX）、mmproj、归一化/二值化，以及「RAG 参数设置」中的「查询超时」（`rag_query_timeout_seconds`，默认 5s，0 = 关闭）和「同步参数设置」中的「启动时自动同步」（`rag_auto_ingest`，默认关闭；开启后每次启动会自动增量扫描知识库，首次全量同步可能长时间占用 embedding 模型与磁盘 IO）、「同步并发」（`rag_ingest_concurrency`）、「OCR 并发」（`rag_vision_concurrency`）、「MLX 缓存」（`mlx_cache_limit_mb`）与「MLX 上限」（`mlx_memory_limit_mb`，0 = 自动）。向量库待重建时，红色提示显示在该合并行下方。
   - 高级区的「PDF OCR 设置」行末提供「转换工具」按钮，打开独立窗口，把单个文件或整个目录批量转换为 Markdown。复用知识同步的解析器（PDF / EPUB / HTML / TXT / 图片，Office 支持现代格式 `.docx` / `.xlsx` / `.pptx` 与旧版 `.doc` / `.xls` / `.ppt`），沿用打开窗口时面板上的 OCR / PDF / 归一化设置快照；不写回 `config.json`，也不重建 Agent。目录递归时保留相对子目录结构，输出目录位于输入目录内会自动跳过；同批同名（如 `a.txt` 与 `a.html`）依次生成 `a-2.md`、`a-3.md`；单个文件失败不会中断整批。进度区显示当前文件、当前环节（解析 / 图片归一化 / 图片识别 / 清洗与 Markdown 转换）与总体进度，关闭窗口会取消仍在进行的转换。转换按文件体积分批并发：达到 32MB 的文件单独成批串行，其余文件按同步并发（最多 6）并行；PDF 解析按体积收紧页级 worker / 在途页并分批产图，内嵌大图先按目标尺寸降采样，超过 200MP 回退有界栅格化。转换只到写出 Markdown，不做切片、embedding 与入库。
 - 确认弹窗默认按钮为「拒绝」；`ask_user` 的回答作为工具结果继续同一轮推理。
 - RAG 状态在后台线程查询，不在主线程建库/COUNT；状态只读取来源总数与前 256 个来源名，大知识库不会把全部路径读入内存。连续应用配置只生效最后一次，旧同步完成后只重载它自己的引擎，不会影响新 Agent。
@@ -123,27 +124,9 @@ HTML 与 Office 解析另有专项覆盖：HTML 保存页的本地 iframe / fram
 
 **自定义 system prompt**：首次启动会在 `<workspace>/assets/system_prompt.txt` 写出内置的 `BASE_SYSTEM_PROMPT`；之后每次启动读取该文件并替换内置提示词，可直接用文本编辑器调整模型行为规则，**重启（或重新应用配置）后生效**（会话期间保持不变，以免 system 前缀抖动使 KV cache 反复重建）。文件内容空白或不可读时本次回退内置提示词，且不会覆盖文件。它替换的是协议主体，L0 META-SOP 与 L1 全局索引仍按多级记忆机制追加在其后；轻量轮（纯寒暄/能力问询）使用内核的极简提示，不受该文件影响。内置提示词中的 `<summary>` 标签、`rag_outline` 起手式、工具状态词等是内核回注与测试的硬依赖，建议在原文基础上调整，不要整段删除。
 
-**v1.3.4**：完善 `web_scan` 的网页信息提取流程，参考 `simphtml.py` 的可见性/布局清洗思路，更有效地提取有用信息、丢弃垃圾信息。**静态解析路径（`ToolSupport.htmlToText`）**：解析前扩大噪音标签移除范围（新增 meta/link/template/colgroup/col/param/source/head/title/svg），按内联 `style` 的 `display:none`/`visibility:hidden`/`opacity:0` 与 `aria-hidden="true"` 启发式剪掉隐藏子树，把表单控件标注成 `[input #id name= type= "placeholder"]`（隐藏域跳过）、按块级元素换行。**WebKit 渲染路径（`WebRenderer`）**：正文提取改用可见性感知的清洗脚本（真实 DOM 的 `getComputedStyle`+`getBoundingClientRect` 判定隐藏、`iframe`/`shadow DOM` 内联、表单控件标注），失败自动回退裸 `innerText`；该路径被 GGUF/MLX 数据接口返回的 HTML、静态主文档与同源 iframe 复用。新增 6 项确定性单测覆盖隐藏剔除/表单标注/噪音移除/块级换行，离线 web 测试全过，无回归。
+**v1.3.8**：知识图谱抽取质量与性能收口。**限额可配**：单切片实体 20 / 关系 50 / 描述 100 字（`rag_kg_max_entities_per_chunk` / `rag_kg_max_relations_per_chunk` / `rag_kg_max_description_chars`），提示词、解析与落库三处同时生效；关系描述在归纳后再次截断。**收流保护**：模型输出 `<|COMPLETE|>` 后立即停止消费；同一实体对重复关系行累计达 12 条时提前取消生成（实测 2B 从复读到 6k+ 字符/123 秒缩到约 2.5k 字符/50 秒）。**抽取提速**：按切片内容哈希跨重建复用抽取结果、LLM 归纳结果缓存、支持独立会话的后端最多 4 路并发，阶段日志输出抽取/归纳/向量化耗时。**真机验证**：2B 抽取 4/4 核心实体与 5~6 条无向关系，0.8B 关系行字段残缺、有效关系为 0，不建议用于图谱构建。长期记忆侧同步补强事实抽取校验与邻域检索。
 
-**v1.3.3**：修复 Spark-X2.6 工具调用在两种后端上的解析失败（不影响其它模型）。**MLX**：上游 `GLM4ToolCallParser` 要求至少一个 `<arg_key>`，会把 Spark 的零参数工具（`<tool_call>rag_status</tool_call>`）误判为 `malformedSyntax`，导致整轮「工具调用未完成」并连续三轮全量重建；改为仅当 `rejected.format == .glm4` 时从 `RejectedToolCall.rawTextPreview` 按 GLM47 方言恢复，恢复成功即非截断，内核不再注入误导提示、不再关思考/清空 KV。**GGUF**：历史 `tool_calls` 回灌时 `arguments` 被传成 JSON 字符串，而 Spark 模板要求 `tool_call.function.arguments` 是 mapping，会 `raise_exception('... must be a dictionary')`；改为仅对「含 `<arg_key>` 且显式 iter/判 mapping」的模板把参数转成字典，其它模型模板逐字不变、KV 缓存仍然命中。**隔离性**：两处修复都只对 Spark/GLM47 方言生效，纯函数与 Qwen3.5 2B/4B GGUF 对照回归全过，全量 913 项零新增失败。
-
-**v1.3.2**：新增 Spark-X2.6 自定义架构的 MLX 与 GGUF 双后端支持。**MLX**：`model_type=spark2_5` 不在 mlx-swift-lm 内置表，应用内手写计算图（headwise sigmoid 输出门、逐层双 RoPE、sliding(512)/full 混合注意力、GEGLU、tied 量化 embedding）并在加载容器前注册 `LLMTypeRegistry`；**GGUF**：llama.cpp 原生识别 `general.architecture=spark2_5`，单文件由 `GGUFFileResolver` 直接解析。两个后端的 `tokenizer.chat_template` 都含 HF 专有 `tojson(separators=(...))`，统一由 `ChatTemplateCompatibility` 去掉该参数；工具调用按 `glm47` → `.glm4` 解析，并把 GLM47 `<arg_key>/<arg_value>`（含零参数）文本兜底抽成 `LocalToolCallParser.glm4Payload` 供三端共用。新增「不回归护栏」：非 Spark 模板逐字不变、既有 JSON / Qwen XML / JSON 围栏解析结果不变、对照 GGUF 元数据模板不变。真机验证覆盖 MLX 4bit 与 GGUF i1-Q4_K_M 的加载生成、thinking、工具调用参数、跨轮 KV、FA+q8_0、warmup 全流程；Qwen3.5 2B/4B GGUF 回归全过。
-
-**v1.3.1**：修复 cnn.com 新闻任务真机复现的「什么都不做、连报 3 次失败直接结束」与「已抓到数据却被一句元标记覆盖」两类回归。**内核**：模型只输出 `<summary>…</summary>` 元标签时不再按空正文重试（旧提示只要求「输出简短正文」，反而诱导继续复述元陈述），改判意图空转并给出可照抄的 `web_scan` 调用参数；3 轮仍不发工具调用时由内核代发一次 `web_scan` 兜底抓取（结果只进下一轮 user 提示，不伪造 `tool_calls`，KV 前缀仍严格对齐），绝不空手结束。**成果核验**：只在至少一次工具真正成功返回时开启；`<review>fix</review>` 等纯元标记、核验轮空输出一律收下上一轮候选；核验轮不再请求级关闭 thinking。**工具**：`web_scan`/`web_render` 接受裸域名（如 `cnn.com`）并自动补 `https://`，其它 scheme 仍被 SSRF 策略拒绝。**性能**：请求级 thinking 覆盖改用可复用的持久 MLX 副本（`kvReuse=true`），避免连续重试每轮全量 prefill（真机约 80s/轮）。系统提示显式禁止「本地 agent 无法访问外部网站」的推诿。新增 8 项 cnn.com 事故回归测试；相关 61 项测试与 release 构建通过。
-
-**v1.2.26**：`web_scan` 现在能独立处理动态 JS 列表页——注入脚本捕获页面自身发出的 XHR/fetch，同源 GET 重放数据接口，把 JSON/HTML 响应结构化精简，并自动合并当天分页；XHR 响应体捕获补齐 `readystatechange`/`loadend` 双时机，扫描版 PDF 无文本层时的渲染全白也有流级兜底。KV/预热方面：MLX 折叠边界改为复用已有前缀快照（不再每 8 轮重跑约 18s 全量 prefill），轻量轮（寒暄/能力问询）改为本地直答且不进 LLM 上下文、跳过周期性折叠，启动预热期间允许发送并排队，正式请求复用刚建好的 system+tools 前缀；GGUF 侧修正生成计时起点（`tps` 日志不再失真）、缓存完好时跳过重复预热、卸载时重置 `seq_rm` 能力探测。真机模拟正式用户与双后端回归用例已补齐；hybrid/recurrent GGUF 的 `llama_memory_seq_rm` 不支持 partial sequence 裁剪，这类模型仍会在分叉轮整段重建。全量 842 项测试与 release 构建通过。
-
-**v1.2.27**：围绕「交互延迟」做了一轮系统治理。**GGUF hybrid KV**：`llama_memory_seq_rm` 不支持 partial sequence 裁剪时改走消息级增量 append（锚点差分求新消息 token，不重渲染 assistant），Qwen3.5 GGUF 真机用户流程 59.6s → 31.5s、正式轮 17.2/8.7/25.9s → 2.2/2.0/14.6s；任何一步不匹配都回退原路径。**内核门控**：修复「创建计划」元陈述被当最终答复的死循环（有界收敛 + 明确失败说明）；规划前置门不再丢弃模型已生成的工具调用，改当轮执行；`planFinish` 门识别结果性答复直接收下，不再逼模型重答 3 次；反思门上限与 `autoContinue` 段数收紧；`planGateHint` 一段只注入一次、文案精简，消除逐轮重复训诫造成的上下文膨胀——**已写入历史的内容一个字节不改**，MLX 消息级 delta / token 级前缀匹配与 GGUF delta-append 的 KV 对齐保持不变；轮次耗尽时汇总已取得的工具结果并交付用户，不再只回模板句。**体验与工具**：维护态（同步/去重/ANN）期间输入排队并明确提示，闲时摘要让出 GPU 的有界等待，历史归档移出请求关键路径，UI 首 chunk 立即上屏，`web_scan` 当天分页改并发。全量 851 项测试（含 GGUF 真机）、release 构建通过。
-
-**v1.3.0**：基础工具层架构级增强（新增 2 个工具 + 6 项能力补齐）。**新增 `file_list`**：workspace 目录枚举（glob 过滤 / 递归深度 / 条目上限，隐藏目录自动跳过），agent 不再依赖 shell_run 才能看到工作区结构。**新增 `file_search`**：grep 式正则内容搜索（`path:line: text` 输出、glob 收窄、上下文行、二进制与超大文件自动跳过、扫描字节预算），行号可直接用于 file_modify 定位。**file_read**：新增按行分页（offset/limit）与 `line_numbers=true` 行号输出；编码回退 UTF-8 → GB18030（中文场景常见，带控制字符占比防误判）→ 二进制 base64。**file_modify**：成功报告替换处数；`old` 未命中给出缩进/CRLF/内容已变的排查指引而非裸报错。**shell_run**：新增 `shell` 参数（sh/bash，bash 语法不再静默失败）与 `env` 参数（键名校验、合并进净化环境保留 PATH）。**web_scan**：429/503 按 Retry-After 自动重试一次；403/412 给出反爬降级指引（改用 web_render / RSS / 移动版）；**RSS/Atom feed 结构化解析**（标题/链接/日期列表、CDATA 剥离、自闭合 link href 回退），feed 从二等公民转正。**code_run**：Python 预置 OS 级资源限额（RLIMIT_CPU / RLIMIT_FSIZE，macOS 可靠的两项）。全量 874 项测试 0 失败（新增 16 项工具回归）、release 构建通过。
-
-**v1.2.31**：新增**成果核验反思**环节，补齐「执行后质量把关」——以从业 10 年的领域资深专家身份审视最终结果（完整性/真实性/准确性/表达四个维度），质量不达标最多打回 2 次完善。只在「多步任务 + 有实质工作」时开启（轻量轮/单步操作不核验）；核验轮关闭思考模式并明确要求直接输出，避免 2B 模型被「专家审视」诱发长思考空正文；反思未带来实质改进（只把结论重复堆叠）时直接收下干净候选，不再为「完善」反复刷屏。至此反思链路完整覆盖：规划门（建计划）→ planFinish 门（未动手强制）→ finishNudge 反思门（计划未完继续）→ 意图空转/重复调用/成功复用拦截（防空转）→ 成果核验（专家把关）。全量 858 项测试 0 失败、release 构建通过。
-
-**v1.2.30**：继续以 cnn.com 新闻任务真机定位「拿到工具结果却反复重发刷屏、不总结」的根因——旧逻辑只在事后给软提示，2B 模型无视后连刷 4~5 次才被终止。新增**成功签名复用拦截**：成功返回过结果的调用（web_scan / rag_search 等读类工具）再以完全相同参数重发时，在 preset 阶段直接拦下并强令「基于已有结果作答或换参数/换工具」，不再重复执行（真机 199s → 66s）；`rag_outline` / `update_plan` 等控制类工具重复执行有状态变化，排除在拦截之外。重复调用警告/终止阈值提前（warn 2→1、limit 4→3）。配合 v1.2.28/v1.2.29 的计划代建、意图空转扩词、失败标 blocked 与进展汇总，实现「制定计划→更新面板→执行→失败可见→尝试新方法→有界收尾」的完整闭环。全量 856 项测试 0 失败、release 构建通过。
-
-**v1.2.29**：以 cnn.com 新闻任务做了端到端真机验证，定位并修复「计划任务推进不了」的**真正根因**——不是规划门，而是 `looksLikeIntentOnly` 的识别词过窄：「建立计划 / 同步执行 / 获取…并总结 / 已拿到…可继续提取」这类**计划性元陈述与虚假进度声明**只命中 1 个关键词，被当成正常正文收下，于是「没执行工具就判定结束」「反复刷屏到轮次耗尽」。扩展识别词覆盖上述模式（阈值 ≥2），并在意图空转分支内**补建最小计划**，确保计划面板在空转场景也不一直为空；空转达上限返回明确失败说明。撤销了上一轮冗余的 `executeNowHint` 机制（与既有意图空转强令调工具重复且被 `continue` 跳过，从未生效）。cnn.com 真机验证：计划面板正常建立、模型真实调用 web_scan 拿到头条、重复调用被终止并标 blocked + 进展汇总、有界结束。全量 856 项测试 0 失败、release 构建通过。
-
-**v1.2.28**：以 cnn.com 新闻任务做了端到端真机验证（MLX 2B + 真实网络），修复并强化了「计划全链路」与 web 工具。**计划面板保障**：模型不自觉建计划时内核代建最小计划（不拦截工具执行，模型可随时 create/patch 覆盖）；未执行工具的「已完成」不再被当最终答复；多步任务识别词表补上「获取/查询/搜索」类动作；轮次耗尽把 doing 步骤标 blocked、最后一段自动续跑强制「不再调工具、立即作答」；空正文/重复调用耗尽时汇总已取得进展并明确失败原因，绝不空手退出。**GGUF hybrid KV**：`seq_rm` 不支持裁剪时改走消息级增量 append，真机用户流程 59.6s → 31.5s。**空正文自愈**：thinking 长思考耗尽预算/未闭合 `</think>` 导致正文为空时，重试自动请求级关闭 thinking；生成预算不足时抛 context 错误触发历史收缩。**web_scan 增强**：全部请求带浏览器 UA；超长页面从 `<body>` 起提取（cnn.com 首页 5.9MB 静态提取 0 → 749 字符，不再误判纯动态）；素材目录下的伪数据接口（如价格素材 JSON）不再顶到结果头部；`raw` 输出跳过超长 head；schema 引导模型优先用 web_scan 而非自写爬虫。**交互治理**：维护态输入排队、闲时摘要有界等待、历史归档后台化、UI 首 chunk 立即上屏、当天分页并发、启动去除人为 sleep、动态上下文/规划提示一次请求只注入一次（保持 KV 对齐）。新增 cnn.com 端到端真机回归；全量 856 项测试、release 构建通过。
+**v1.3.7**：新增 RAG 知识图谱能力与五种检索策略（local / global / hybrid / mix / naive）。图谱构建支持逐切片实体/关系抽取、同名聚合与描述归纳、无向关系合并、UNKNOWN 占位、SwiftGraph 内存图与快照、增量更新；实体/关系向量按 jina-v5 128 维重新归一化后 int8 写入 `kg_vectors` 与 vec0 单表 `kg_vectors_vec`；检索支持高低层关键词三路召回、实体/关系反查 chunk、轮询去重、度数/weight 合成排序与 token 预算；配置面板提供构建/停止/消歧与策略选择，未构建完成时自动回退 naive。
 
 ## 核心设计
 
@@ -154,7 +137,7 @@ HTML 与 Office 解析另有专项覆盖：HTML 保存页的本地 iframe / fram
 - **L0**：工具返回即捕获，硬上限 20k 字符。
 - **L1**：注入前按预算裁剪工具结果（head + tail，HTML 标签白名单去噪，保留源码尖括号）。
 - **L2**：旧轮次折叠为 `<summary>` / 工具名摘要。
-- **L3**：超预算时折叠到 `raw_turns + 1` 轮，每 24 轮主动 consolidate（周期下限 8 轮）；raw 窗口至少覆盖一个 consolidate 周期，避免每个用户回合都因窗口滑动而重建 KV cache；连续重复摘要按正文合并。
+- **L3**：超预算时折叠到 `raw_turns + 1` 轮，每 `kernelConsolidateEvery` 轮主动 consolidate（默认 8，构造时以 `kernelRawTurns` 为上钳位）；raw 窗口至少覆盖一个 consolidate 周期，避免每个用户回合都因窗口滑动而重建 KV cache；连续重复摘要按正文合并。
 - **L4**：`start_long_term_update` 或长任务结束时用 LLM 蒸馏事实、经验与技能；自动续跑会跨段累计蒸馏请求，不会因分段而丢失。
 
 ### 2. 工具与能力层
@@ -164,6 +147,19 @@ HTML 与 Office 解析另有专项覆盖：HTML 保存页的本地 iframe / fram
 能力工具：`update_plan`、`update_working_checkpoint`、`start_long_term_update`、`work_memory`、`memory_graph`、`memory_search`、`skill_search`、`skill_semantic_search`、`skill_load`、`skill_save`、`rag_search`、`rag_outline`、`rag_status`、`rag_ingest`、MCP 动态工具。
 
 **RAG 检索策略（少而精）**：用户问书/文档内容时，先 `rag_outline` 获取全书/章节摘要与结构树；若大纲摘要已覆盖问题则直接引用、**不再检索**；整体性问题（全书大意/主题）只搜前言/引言/导论，针对性问题只搜目标章节（检索词带上章节标题，`source=书名`）。内核在每次 `rag_outline`（或每次 `run()`）之后对 `rag_search` 设**硬上限（默认 3 次）**：超出部分不再真正调用，直接预置失败并提示「基于已检索内容与大纲摘要直接综合作答」，彻底杜绝同一问题反复换关键词 scatter 检索。
+
+#### 知识图谱（RAG Knowledge Graph）
+
+RAG 知识图谱与长期记忆的 **memory graph 是两套完全独立的实现**：前者面向知识库文档、按切片抽取实体/关系并参与检索；后者是 Agent 的长期记忆，二者数据、存储与测试互不混用。
+
+- **五种检索策略**（`rag_retrieval_strategy`）：`naive`（原文召回，图谱能力加入前的实现，默认）、`local`（命中实体拉一跳邻居与关联边）、`global`（命中关系反查两端实体与度数）、`hybrid`（实体 + 关系轮询交织）、`mix`（实体 + 关系 + 原文切片）。只有图谱构建状态为 `complete` 时其余四种才可在配置面板选择；内容变化或图谱未完成时自动回退 `naive`。
+- **构建**：在已完成切片上由辅助模型逐片抽取 `entity<|#|>name<|#|>type<|#|>desc` 与 `relation<|#|>src<|#|>dst<|#|>keywords<|#|>desc`，注入所在章节层级作为 Section Context。单切片限额可配：实体 20、关系 50、描述 100 字（`rag_kg_max_entities_per_chunk` / `rag_kg_max_relations_per_chunk` / `rag_kg_max_description_chars`）；同名实体聚合、类型 `/` 合并、文件来源合并，描述在至少 2 条时由 LLM 归纳；无向关系按实体对合并，`weight = max(累加权重, 去重来源数)`；关系中缺失的端点落 UNKNOWN 占位实体。
+- **向量**：实体文本 `name\ndescription`，关系文本 `keywords\tsrc\ndst\ndescription`，关系额外写入正/反序两条 id（`#rev`）；文本先按 1000 token 截断，jina-v5 取 128 维后重新 L2 归一化并量化 int8；查询侧同样加 `Query: ` 前缀并做相同变换。向量写入 `kg_vectors`（普通表 int8 BLOB）与单张 `kg_vectors_vec` vec0 表（`target_type` 分区键区分实体/关系），vec0 不可用时回退精确余弦扫描。
+- **图谱与快照**：SwiftGraph 无向图承载内存图，节点/边保留来源 chunk 用于归因反查；快照 JSON 带 `schemaVersion` 与 DB `revision` 校验，1 秒防抖落盘；`kg_build_state` 记录 building / complete / stale。
+- **增量更新**：只抽取 `kg_processed_chunks` 中不存在或内容哈希变化的切片，返回实体/关系变更集，内存图做局部 upsert，不整图重建；文档删除/内容变化会把图谱标记 stale。
+- **检索**：查询先由 LLM 抽低层实体词与高层主题词，低层词向量查实体、高层词向量查关系、原 query 向量查 chunk，三路 embedding 在同一批内计算；实体/关系各取 top 40，chunk 取 20，实体与关系反查 chunk 每命中最多 5 片；按 chunk_id 轮询交错去重，query 直接召回优先，余弦低于 0.2 丢弃；实体排序 = 余弦 0.8 + 度数 0.2，关系排序 = 余弦 0.7 + rank 0.2 + weight 0.1；实体预算 6000 token、关系 8000 token，连同 system + query + 原文总预算 30000 token。
+- **抽取性能**：抽取结果按切片内容哈希缓存（跨重建复用）、LLM 归纳结果单独缓存、后端支持独立会话时最多 4 路并发，并在阶段日志中输出抽取/归纳/向量化耗时；小模型复读同一批关系时按重复关系行提前收流，避免跑满 token 上限。
+- **UI**：知识同步配置区提供「构建知识图谱 / 停止构建 / 实体消歧」与检索策略选择；未构建完成时图谱策略不可选。
 
 所有文件类工具路径锁定在 workspace 内，并解析 symlink 防止逃逸。`code_run` / `shell_run` / MCP 调用按配置触发确认。
 
@@ -202,7 +198,7 @@ PDF 文本层对所有引擎共用一套有界提取（`PDFTextExtractor`）：�
 
 统一清洗（`DocumentCleaner`）会先暂存围栏代码块与行内代码（占位符使用私用区字符，不会被控制字符归一化破坏），再处理 Ovis OCR 输出的 HTML `<table>`：简单表格转成 GFM Markdown（兼容缺失闭合标签、`<br>`），而含 `colspan`/`rowspan` 合并单元格、嵌套表格、`caption`、多行表头或单元格内列表/图片/公式等无法无损表达的复杂表格会保留原始 HTML `<table>`，避免信息丢失。之后才清理标签/实体/噪声。HTML 解码会把 `&amp;`、`&nbsp;`、`&hellip;` 等还原为实际字符，而不是统一替换成空格；块级标签保留段落换行，内联标签直接删除；脚本/样式/SVG/iframe 等容器整块移除，属性与 CSS 残片单独清理。自动识别 Markdown 后，标题、列表、引用、链接、表格、分隔线、代码块与缩进都会被保留，纯文本则把链接压成文字并去掉 URL/邮箱。Unicode 层会删除 NBSP/零宽字符/软连字符/BOM/替换字符（U+FFFD）/变体选择符/私用区/非字符与孤立组合符；合并汉字之间的 OCR 空格（「新 中 新」→「新中新」）；把 `......` 归一为 `……`、压缩重复中文标点；连续装饰符号与符号密度过高的噪声行会丢弃，连续重复行只保留一条。中文硬换行在两侧都是 CJK 时不补空格；纯数字行只在页首/页尾 3 行内视为页码，正文中的年份/编号不会被误删。最后做密度压缩：去掉行尾空格，页标记、连续列表项、表格行、引用行之间不保留空行；短 OCR 行直接合并，长段落之间保留一个空行；标题、代码块与保留的 HTML 表格前后保留结构分隔。实测一本 2101 行的 OCR Markdown 从 1050 个空行压到 47 个。清洗规则变化会使 `pipeline_version` 递增，下一次同步会重建旧文件的索引。
 
-`rag_pdf_engine` 与 `rag_epub_ocr_engine` 接受 `ovis` / `vision` / `hybrid`；旧配置中的 `docling` / `marker` 自动归一化为 `ovis`。`hybrid` 是 PDF 的推荐模式：扫描页按 8 页一批渲染，批内非表格页并发走 Apple Vision OCR（跨文件总量受全局信号量限制到 CPU 核心数），只有检测到表格线框或 Vision 文本过少的页面才串行交给 OvisOCR2 保留表格结构；纯文本页仍走 PDFKit 文本层，文本页中的表格继续交给 Ovis。文件级由 `rag_ingest_concurrency` 控制（默认 6、上限 6）；纯 `ovis` 模式默认创建两个 Ovis 实例，实际 OCR 并发为 2；`hybrid` 的 Vision 页可随文件 worker 并行。扫描版 EPUB 默认使用 `vision`（无需额外模型），选择 `ovis` 时需要可用的 OvisOCR2 权重；两条路径都会先做同一套图像归一化，`rag_ocr_preprocess` / `rag_ocr_binarize` 可分别关闭归一化与二值化。
+`rag_pdf_engine` 与 `rag_epub_ocr_engine` 接受 `ovis` / `vision` / `hybrid`；旧配置中的 `docling` / `marker` 等未知值统一归一化为 `vision`（默认先走 Apple Vision，避免旧值把 OCR 默默带回纯 Ovis 路径）。`hybrid` 是 PDF 的推荐模式：扫描页按 8 页一批渲染，批内非表格页并发走 Apple Vision OCR（跨文件总量受全局信号量限制到 CPU 核心数），只有检测到表格线框或 Vision 文本过少的页面才串行交给 OvisOCR2 保留表格结构；纯文本页仍走 PDFKit 文本层，文本页中的表格继续交给 Ovis。文件级由 `rag_ingest_concurrency` 控制（默认 6、上限 6）；纯 `ovis` 模式默认创建两个 Ovis 实例，实际 OCR 并发为 2；`hybrid` 的 Vision 页可随文件 worker 并行。扫描版 EPUB 默认使用 `vision`（无需额外模型），选择 `ovis` 时需要可用的 OvisOCR2 权重；两条路径都会先做同一套图像归一化，`rag_ocr_preprocess` / `rag_ocr_binarize` 可分别关闭归一化与二值化。
 
 OvisOCR2 的 MLX 权重使用 `model_type=qwen3_5`（Qwen3.5-0.8B 后训练），可直接复用 mlx-swift-lm 的 Qwen3.5 VLM 实现；真正未注册的 Ovis2 架构会明确报错。
 
@@ -330,7 +326,18 @@ PDF Ovis 引擎按 `rag_ocr_model_path` / `rag_ocr_model_name` 加载，不受 `
   "rag_sqlite_vec_enabled": true,
   "rag_rrf_k": 60,
   "rag_vector_overfetch": 4,
-  "rag_fts_overfetch": 4
+  "rag_fts_overfetch": 4,
+  "rag_retrieval_strategy": "naive",
+  "rag_kg_similarity_floor": 0.2,
+  "rag_kg_entity_top_k": 40,
+  "rag_kg_relation_top_k": 40,
+  "rag_kg_max_chunks_per_hit": 5,
+  "rag_kg_entity_token_budget": 6000,
+  "rag_kg_relation_token_budget": 8000,
+  "rag_kg_total_token_budget": 30000,
+  "rag_kg_max_entities_per_chunk": 20,
+  "rag_kg_max_relations_per_chunk": 50,
+  "rag_kg_max_description_chars": 100
 }
 ```
 
@@ -362,9 +369,10 @@ Sources/
       Parsers/                 # PDFKit / Ovis / Vision / EPUB / Office / HTML
       Chunking/                # NaturalLanguage 切片与大纲
       Storage/                 # SQLite、sqlite-vec、FTS5、VectorStore
+      KnowledgeGraph/          # 实体/关系抽取、vec0 向量、SwiftGraph、五策略检索
       RAGEngine.swift          # 同步、Manifest、检索、rerank
     Tools/                     # 原子工具、RAG/记忆/技能/MCP 工具
-    Memory/                    # 工作记忆、长期记忆、知识图谱
+    Memory/                    # 工作记忆、长期记忆、memory graph（与 RAG 知识图谱独立）
     Skills/                    # 技能发现、索引、语义检索
     Agent/                     # Agent 门面、工具工厂、系统提示
   BaseAgentApp/                # SwiftUI 界面
@@ -375,6 +383,7 @@ docs/软件设计文档.md
 
 ## 已知限制
 
+- 知识图谱依赖辅助模型的抽取质量：2B 能稳定抽到核心实体与主干关系，但次要实体（技术/地点）和个别关系类型可能漏抽或误标；0.8B 实测无法稳定输出完整关系行，不建议用于图谱构建。图谱规模远小于切片全库，vec0 不可用时回退精确余弦扫描。
 - PDFKit 不暴露内嵌图片与表格区域坐标：Ovis 引擎用「文本列对齐」启发式判断表格页并整页交给 VLM，未实现参考项目的表格裁剪回填与内嵌原图优先。
 - EPUB 以 spine 文件为章节单位，未按 TOC 锚点二次切章。扫描版 EPUB 仅在「章节文字层低于阈值且含图片」时对该章图片逐页 OCR；纯 CSS 背景图、SVG 矢量图（非 `<image>` 引用）和加密字体渲染的文字不在识别范围内。
 - 子进程未使用 `setsid`，超时/取消通过递归进程树终止实现；极端的双重 fork 守护进程仍可能逃逸。

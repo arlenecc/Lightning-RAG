@@ -5,8 +5,8 @@ import Foundation
 /// 知识图谱的 SQLite 持久化层：`entities` / `relationships` / `kg_vectors` 三张表。
 ///
 /// 与 `VectorStore`（切片主存储）共享同一个 SQLite 文件，但使用**独立的连接**
-/// 打开（WAL 模式下多连接安全），互不阻塞。向量默认 int8 落盘，检索走精确
-/// 余弦扫描（图谱规模远小于切片全库，无需 vec0 ANN）。
+/// 打开（WAL 模式下多连接安全），互不阻塞。向量默认 int8 落盘，优先写单张
+/// vec0 分区表 `kg_vectors_vec` 做 KNN；vec0 不可用时回退精确余弦扫描。
 public final class KnowledgeGraphStore: @unchecked Sendable {
     public static let entitiesTable = "entities"
     public static let relationshipsTable = "relationships"
