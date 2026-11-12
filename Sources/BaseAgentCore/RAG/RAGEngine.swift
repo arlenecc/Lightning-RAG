@@ -767,6 +767,13 @@ public final class RAGEngine {
         guard let embedding else {
             throw AgentError.storage("embedding 模型不可用，无法打开向量库；请检查 local_embedding_model 配置")
         }
+        // 占位 provider（模型缺失/未下载）给出的维度和指纹不代表真实配置：
+        // 若照常打开向量库，会把占位维度当成新配置，误报「向量库需要重建」
+        // 甚至改写 meta。此时直接不打开，模型就绪后重启即可恢复。
+        guard embedding.isAvailable else {
+            throw AgentError.storage(
+                "embedding 模型未就绪，暂不打开向量库；模型下载完成后重启即可恢复向量检索")
+        }
         let newStore = try VectorStore(dbPath: self.indexDBPath,
                                        dimension: embedding.dimension,
                                        enableSQLiteVec: config.ragSQLiteVecEnabled,

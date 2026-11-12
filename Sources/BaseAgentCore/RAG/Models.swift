@@ -103,6 +103,9 @@ public struct DocumentRecord: Sendable, Equatable {
 public protocol EmbeddingProvider: AnyObject, Sendable {
     var identifier: String { get }
     var dimension: Int { get }
+    /// provider 是否已就绪。模型缺失时的占位实现返回 false，
+    /// 此时 `dimension` / `identifier` 不代表真实配置，不能用于索引一致性校验。
+    var isAvailable: Bool { get }
     func embedDocuments(_ texts: [String]) async throws -> [[Float]]
     func embedQuery(_ text: String) async throws -> [Float]
     /// 预加载权重并做一次最小推理（分配 session / 编译图），让首次检索不再现加载。
@@ -112,6 +115,11 @@ public protocol EmbeddingProvider: AnyObject, Sendable {
     /// 底层模型可安全并发推理的调用数：ONNX session.run 线程安全可并发；
     /// MLX 受全局 Metal 队列限制只能串行。调度器据此限流。
     var maxConcurrentRuns: Int { get }
+}
+
+public extension EmbeddingProvider {
+    /// 默认实现：真实 provider 一律就绪，只有占位实现覆盖为 false。
+    var isAvailable: Bool { true }
 }
 
 /// 批量查询嵌入（可选能力）：一次把多条检索文本送进模型，避免逐条调用。

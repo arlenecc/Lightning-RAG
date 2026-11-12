@@ -920,6 +920,8 @@ private final class FailingEmbeddingProvider: EmbeddingProvider, @unchecked Send
     let identifier: String
     let error: Error
     var dimension: Int { 768 }
+    /// 占位实现：模型缺失，维度和指纹都不代表真实配置。
+    var isAvailable: Bool { false }
 
     init(identifier: String, error: Error) {
         self.identifier = identifier

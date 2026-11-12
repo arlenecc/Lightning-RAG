@@ -164,4 +164,115 @@ final class MarkdownConversionServiceTests: XCTestCase {
             }
         }
     }
+
+    // MARK: - 增量转换
+
+    func testIncrementalSkipsUnchangedFilesOnSecondRun() async throws {
+        let input = root.appendingPathComponent("input")
+        let output = root.appendingPathComponent("out")
+        try FileManager.default.createDirectory(at: input, withIntermediateDirectories: true)
+        try "alpha text".write(to: input.appendingPathComponent("a.txt"),
+                               atomically: true, encoding: .utf8)
+        try "beta text".write(to: input.appendingPathComponent("b.txt"),
+                              atomically: true, encoding: .utf8)
+
+        let first = try await MarkdownConversionService().convert(
+            request: MarkdownConversionRequest(sourceURL: input,
+                                               outputDirectory: output,
+                                               config: AgentConfig()))
+        XCTAssertEqual(first.succeededCount, 2)
+        XCTAssertEqual(first.skippedCount, 0)
+        XCTAssertTrue(FileManager.default.fileExists(
+            atPath: output.appendingPathComponent(
+                MarkdownConversionService.stateFileName).path))
+        let firstWrite = try FileManager.default.attributesOfItem(
+            atPath: output.appendingPathComponent("a.md").path)[.modificationDate] as? Date
+
+        let second = try await MarkdownConversionService().convert(
+            request: MarkdownConversionRequest(sourceURL: input,
+                                               outputDirectory: output,
+                                               config: AgentConfig()))
+        XCTAssertEqual(second.succeededCount, 2)
+        XCTAssertEqual(second.failedCount, 0)
+        XCTAssertEqual(second.skippedCount, 2)
+        XCTAssertTrue(second.results.allSatisfy(\.skipped))
+        // 跳过的文件不应再次写盘。
+        let secondWrite = try FileManager.default.attributesOfItem(
+            atPath: output.appendingPathComponent("a.md").path)[.modificationDate] as? Date
+        XCTAssertEqual(firstWrite, secondWrite)
+    }
+
+    func testIncrementalReconvertsChangedFileOnly() async throws {
+        let input = root.appendingPathComponent("input")
+        let output = root.appendingPathComponent("out")
+        try FileManager.default.createDirectory(at: input, withIntermediateDirectories: true)
+        try "alpha text".write(to: input.appendingPathComponent("a.txt"),
+                               atomically: true, encoding: .utf8)
+        try "beta text".write(to: input.appendingPathComponent("b.txt"),
+                              atomically: true, encoding: .utf8)
+
+        _ = try await MarkdownConversionService().convert(
+            request: MarkdownConversionRequest(sourceURL: input,
+                                               outputDirectory: output,
+                                               config: AgentConfig()))
+
+        // 改写其中一个文件（体积/修改时间都变化）后只重转它。
+        try "alpha text updated with more content".write(
+            to: input.appendingPathComponent("a.txt"),
+            atomically: true, encoding: .utf8)
+        let second = try await MarkdownConversionService().convert(
+            request: MarkdownConversionRequest(sourceURL: input,
+                                               outputDirectory: output,
+                                               config: AgentConfig()))
+        XCTAssertEqual(second.succeededCount, 2)
+        XCTAssertEqual(second.skippedCount, 1)
+        let reconverted = second.results.filter { !$0.skipped }.map(\.source.lastPathComponent)
+        XCTAssertEqual(reconverted, ["a.txt"])
+        XCTAssertTrue(try String(contentsOf: output.appendingPathComponent("a.md"),
+                                 encoding: .utf8).contains("updated with more content"))
+    }
+
+    func testIncrementalDisabledReconvertsEverything() async throws {
+        let input = root.appendingPathComponent("input")
+        let output = root.appendingPathComponent("out")
+        try FileManager.default.createDirectory(at: input, withIntermediateDirectories: true)
+        try "alpha text".write(to: input.appendingPathComponent("a.txt"),
+                               atomically: true, encoding: .utf8)
+
+        _ = try await MarkdownConversionService().convert(
+            request: MarkdownConversionRequest(sourceURL: input,
+                                               outputDirectory: output,
+                                               config: AgentConfig()))
+        let second = try await MarkdownConversionService().convert(
+            request: MarkdownConversionRequest(sourceURL: input,
+                                               outputDirectory: output,
+                                               config: AgentConfig(),
+                                               incremental: false))
+        XCTAssertEqual(second.skippedCount, 0)
+        XCTAssertEqual(second.succeededCount, 1)
+    }
+
+    func testConfigChangeInvalidatesIncrementalState() async throws {
+        let input = root.appendingPathComponent("input")
+        let output = root.appendingPathComponent("out")
+        try FileManager.default.createDirectory(at: input, withIntermediateDirectories: true)
+        try "alpha text".write(to: input.appendingPathComponent("a.txt"),
+                               atomically: true, encoding: .utf8)
+
+        let base = AgentConfig()
+        _ = try await MarkdownConversionService().convert(
+            request: MarkdownConversionRequest(sourceURL: input,
+                                               outputDirectory: output,
+                                               config: base))
+
+        // 更换 PDF 引擎（解析参数变化）后，即使源文件没变也必须重转。
+        var changed = base
+        changed.ragPDFEngine = base.ragPDFEngine == .vision ? .ovis : .vision
+        let second = try await MarkdownConversionService().convert(
+            request: MarkdownConversionRequest(sourceURL: input,
+                                               outputDirectory: output,
+                                               config: changed))
+        XCTAssertEqual(second.skippedCount, 0)
+        XCTAssertEqual(second.succeededCount, 1)
+    }
 }

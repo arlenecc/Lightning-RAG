@@ -24,7 +24,6 @@ private final class PartialFailureParser: DocumentParser {
 private final class RagFakeEmbedding: EmbeddingProvider {
     let identifier = "rag-fake"
     let dimension = 8
-
     func embedDocuments(_ texts: [String]) async throws -> [[Float]] {
         texts.map { text in
             var vector = [Float](repeating: 0, count: dimension)
@@ -37,6 +36,21 @@ private final class RagFakeEmbedding: EmbeddingProvider {
 
     func embedQuery(_ text: String) async throws -> [Float] {
         try await embedDocuments([text])[0]
+    }
+}
+
+/// 模型缺失时的占位 embedding：维度/标识都不代表真实配置。
+private final class RagUnavailableEmbedding: EmbeddingProvider {
+    let identifier = "rag-unavailable"
+    let dimension = 768
+    let isAvailable = false
+
+    func embedDocuments(_ texts: [String]) async throws -> [[Float]] {
+        throw AgentError.storage("embedding 模型未就绪")
+    }
+
+    func embedQuery(_ text: String) async throws -> [Float] {
+        throw AgentError.storage("embedding 模型未就绪")
     }
 }
 
@@ -161,6 +175,50 @@ final class RAGEngineTests: XCTestCase {
         let afterDelete = try await engine.search(query: "apple", topK: 3)
         XCTAssertTrue(afterDelete.isEmpty)
         engine.close()
+    }
+
+    /// embedding 模型未就绪（占位 provider）时不能用占位维度做索引一致性校验：
+    /// 旧行为会把占位 768 与库里的真实维度相比，误报「向量库需要重建」。
+    func testUnavailableEmbeddingDoesNotFlagRebuild() async throws {
+        let root = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("base-agent-rag-unavailable-\(UUID().uuidString)")
+        let kb = root.appendingPathComponent("kb")
+        try FileManager.default.createDirectory(at: kb, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let markdown = """
+        # 第一章 水果
+
+        Apple and banana are common fruits. 苹果和香蕉都是常见水果。
+        Apple is a common fruit in daily meals. 苹果是日常饮食中的常见水果.
+        Bananas are rich in potassium and are popular among athletes.
+        Oranges provide vitamin C and are widely grown in warm regions.
+        Grapes can be eaten fresh or used to make wine in many countries.
+        """
+        try markdown.write(to: kb.appendingPathComponent("fruits.md"),
+                           atomically: true, encoding: .utf8)
+
+        var config = AgentConfig()
+        config.workspace = root.path
+        config.knowledgeBase = kb.path
+        config.ragRerankEnabled = false
+        config.ragChunkSize = 40
+        config.ragChunkOverlap = 5
+
+        let engine = RAGEngine(config: config, knowledgeBase: kb.path,
+                               embedding: RagFakeEmbedding(), reranker: nil)
+        let stats = await engine.ingest()
+        XCTAssertGreaterThan(stats.chunks, 0)
+        engine.close()
+
+        // 模型缺失：provider 是占位实现，维度 768 不代表真实配置。
+        let reopened = RAGEngine(config: config, knowledgeBase: kb.path,
+                                 embedding: RagUnavailableEmbedding(), reranker: nil)
+        let snapshot = reopened.status(maxAge: 0)
+        XCTAssertNotEqual(snapshot["vector_rebuild_required"], .bool(true),
+                          "占位 embedding 不能让已有索引被判成需要重建")
+        XCTAssertNil(snapshot["rebuild_reason"]?.stringValue)
+        reopened.close()
     }
 
     func testShortDocumentIsDiscardedAndSkippedNextRun() async throws {

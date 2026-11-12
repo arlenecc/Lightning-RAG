@@ -66,6 +66,12 @@ struct MarkdownConvertView: View {
                 if state.isRunning {
                     Button("停止") { state.cancel() }
                 }
+
+                Toggle("增量转换", isOn: $state.incremental)
+                    .toggleStyle(.checkbox)
+                    .disabled(state.isRunning)
+                    .help("开启时跳过上次已成功转换且源文件未变化的文件；\n"
+                        + "关闭后强制重新转换全部文件")
             }
 
             HStack(spacing: 8) {
@@ -122,7 +128,7 @@ struct MarkdownConvertView: View {
                     .truncationMode(.tail)
                 Spacer(minLength: 8)
                 if state.fileTotal > 0 {
-                    Text("已成功 \(state.completedFiles) · 失败 \(state.failedFiles)"
+                    Text("已完成 \(state.completedFiles) · 失败 \(state.failedFiles)"
                         + " · 共 \(state.fileTotal)")
                         .font(.caption2)
                         .foregroundStyle(.secondary)
@@ -140,7 +146,9 @@ struct MarkdownConvertView: View {
             HStack(spacing: 6) {
                 Text("转换结果").font(.caption).bold()
                 if let report = state.report {
-                    Text("成功 \(report.succeededCount) · 失败 \(report.failedCount)")
+                    Text("成功 \(report.succeededCount - report.skippedCount)"
+                        + " · 跳过 \(report.skippedCount)"
+                        + " · 失败 \(report.failedCount)")
                         .font(.caption2)
                         .foregroundStyle(.secondary)
                 }
@@ -183,10 +191,12 @@ struct MarkdownConvertView: View {
 
     private func resultRow(_ item: MarkdownConversionResult) -> some View {
         HStack(alignment: .top, spacing: 6) {
-            Image(systemName: item.succeeded
-                  ? "checkmark.circle.fill" : "xmark.circle.fill")
+            Image(systemName: item.skipped
+                  ? "arrow.right.circle"
+                  : (item.succeeded ? "checkmark.circle.fill" : "xmark.circle.fill"))
                 .font(.caption2)
-                .foregroundStyle(item.succeeded ? .green : .red)
+                .foregroundStyle(item.skipped
+                    ? Color.secondary : (item.succeeded ? .green : .red))
                 .padding(.top, 1)
 
             VStack(alignment: .leading, spacing: 1) {
@@ -213,7 +223,7 @@ struct MarkdownConvertView: View {
 
             Spacer(minLength: 6)
 
-            Text(String(format: "%.1fs", item.elapsed))
+            Text(item.skipped ? "跳过" : String(format: "%.1fs", item.elapsed))
                 .font(.caption2.monospacedDigit())
                 .foregroundStyle(.secondary)
         }
@@ -245,6 +255,8 @@ final class MarkdownConverterState: ObservableObject {
     @Published var statusMessage = ""
     @Published var results: [MarkdownConversionResult] = []
     @Published var report: MarkdownConversionReport?
+    /// 增量转换：跳过上次已成功且源文件未变化的文件。
+    @Published var incremental = true
 
     private var task: Task<Void, Never>?
 
@@ -329,7 +341,8 @@ final class MarkdownConverterState: ObservableObject {
 
         let request = MarkdownConversionRequest(sourceURL: source,
                                                 outputDirectory: output,
-                                                config: config)
+                                                config: config,
+                                                incremental: incremental)
         task = Task { [weak self] in
             let service = MarkdownConversionService()
             do {
@@ -354,10 +367,14 @@ final class MarkdownConverterState: ObservableObject {
                     self.overallFraction = report.wasCancelled
                         ? self.overallFraction : 1
                     self.currentStage = report.wasCancelled ? "已取消" : "转换完成"
+                    let skipped = report.skippedCount > 0
+                        ? " · 跳过 \(report.skippedCount)" : ""
                     self.statusMessage = report.wasCancelled
-                        ? "已取消：成功 \(report.succeededCount) · 失败 \(report.failedCount)"
-                        : "转换完成：成功 \(report.succeededCount) · 失败 \(report.failedCount)"
-                        + "（用时 \(String(format: "%.1f", report.elapsed))s）"
+                        ? "已取消：成功 \(report.succeededCount)\(skipped)"
+                            + " · 失败 \(report.failedCount)"
+                        : "转换完成：成功 \(report.succeededCount)\(skipped)"
+                            + " · 失败 \(report.failedCount)"
+                            + "（用时 \(String(format: "%.1f", report.elapsed))s）"
                 }
             } catch {
                 await MainActor.run { [weak self] in
