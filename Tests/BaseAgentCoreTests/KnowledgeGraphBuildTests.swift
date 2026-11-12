@@ -393,6 +393,97 @@ final class KnowledgeGraphBuildTests: XCTestCase {
         XCTAssertTrue(task.contains("untrusted metadata"))
     }
 
+    // MARK: - JSON 收流保护
+
+    /// 正常 JSON 输出不应触发收流停止。
+    func testJSONGuardAllowsNormalOutput() {
+        var state = KnowledgeGraphBuilder.JSONExtractionGuard(rescanInterval: 8)
+        let entities = (1...10).map {
+            #"{"name":"实体\#($0)","type":"Concept","description":"这是第 \#($0) 个实体的描述内容。"}"#
+        }.joined(separator: ",")
+        let output = #"{"entities":[\#(entities)],"relationships":[]}"#
+        XCTAssertFalse(state.shouldStop(output: output),
+                       "正常完整输出不应触发收流：\(state.stoppedReason)")
+        XCTAssertEqual(state.stoppedReason, "")
+    }
+
+    /// 同一实体名重复出现（实体数组复读）→ 快停。
+    func testJSONGuardStopsOnRepeatedEntityArray() {
+        var state = KnowledgeGraphBuilder.JSONExtractionGuard(rescanInterval: 8)
+        let entity = #"{"name":"Alice Chen","type":"Person","description":"工程师，团队负责人。"}"#
+        let first = #"{"entities":[\#(entity)],"relationships":[]}"#
+        XCTAssertFalse(state.shouldStop(output: first))
+        // 复读：完整对象之后又重新输出实体数组。
+        let repeated = first + #" {"entities":[\#(entity),\#(entity)]"#
+        XCTAssertTrue(state.shouldStop(output: repeated),
+                      "实体数组复读应触发收流")
+        XCTAssertTrue(state.stoppedReason.contains("Alice Chen"),
+                      "停止原因应指出重复的实体名：\(state.stoppedReason)")
+    }
+
+    /// 关系端点合法重复（枢纽实体）不快停；流式输出长时间无新增唯一值
+    /// 触发停滞停（模拟真实收流：每次增长后调用一次判定）。
+    func testJSONGuardStallsWithoutNewContent() {
+        var state = KnowledgeGraphBuilder.JSONExtractionGuard(
+            rescanInterval: 8, stallChars: 120)
+        let relation = #"{"source":"枢纽实体","target":"已知目标","keywords":"related_to","description":"重复引用同一对端点的关系描述，内容较长。"},"#
+        var output = #"{"entities":[],"relationships":["#
+        var stopped = false
+        for _ in 0..<6 {
+            output += relation
+            if state.shouldStop(output: output) {
+                stopped = true
+                break
+            }
+        }
+        XCTAssertTrue(stopped, "无新增唯一值的流式输出应触发停滞收流")
+        XCTAssertTrue(state.stoppedReason.contains("未产生新的实体或关系"),
+                      "应为停滞原因：\(state.stoppedReason)")
+        // 对照：每步都有新端点值时不应停滞。
+        var healthy = KnowledgeGraphBuilder.JSONExtractionGuard(
+            rescanInterval: 8, stallChars: 120)
+        var growing = #"{"entities":[],"relationships":["#
+        for i in 0..<6 {
+            growing += #"{"source":"枢纽实体","target":"目标\#(i)","keywords":"related_to","description":"每条关系都引入新的端点值。"},"#
+            XCTAssertFalse(healthy.shouldStop(output: growing),
+                           "持续出现新端点的正常输出不应收流：\(healthy.stoppedReason)")
+        }
+    }
+
+    /// 复读尾巴：第一个配平对象应被完整解析，复读内容被丢弃。
+    func testJSONParseSalvagesFirstBalancedObject() {
+        let good = """
+        {"entities":[{"name":"Alice Chen","type":"Person","description":"工程师"}],
+         "relationships":[{"source":"Alice Chen","target":"Acme Corp","keywords":"works_at"}]}
+        """
+        let repeatTail = #" {"entities":[{"name":"Alice Chen","type":"Person""#
+        let parsed = KnowledgeGraphBuilder.parseExtractionJSON(good + repeatTail)
+        XCTAssertEqual(parsed.entities.map { $0.name }, ["Alice Chen"])
+        XCTAssertEqual(parsed.relations.count, 1)
+    }
+
+    /// 收流截断：半截 JSON 应补齐括号后恢复已输出的实体/关系。
+    func testJSONParseRecoversTruncatedOutput() {
+        // 截断在数组中间（元素完整、数组未闭合）。
+        let truncatedArray = """
+        {"entities":[{"name":"Alice Chen","type":"Person","description":"工程师"},
+                     {"name":"Acme Corp","type":"Organization","description":"科技公司"},
+        """
+        let parsed = KnowledgeGraphBuilder.parseExtractionJSON(truncatedArray)
+        XCTAssertEqual(parsed.entities.map { $0.name }, ["Alice Chen", "Acme Corp"])
+        // 截断在字符串中间。
+        let truncatedString = #"{"entities":[{"name":"Alice Chen","type":"Pers"#
+        let parsed2 = KnowledgeGraphBuilder.parseExtractionJSON(truncatedString)
+        XCTAssertEqual(parsed2.entities.map { $0.name }, ["Alice Chen"])
+        // 截断在悬空键名处（丢弃不完整项后恢复）。
+        let danglingKey = #"{"entities":[{"name":"Alice Chen","type":"Pers"}], "rel"#
+        let parsed3 = KnowledgeGraphBuilder.parseExtractionJSON(danglingKey)
+        XCTAssertEqual(parsed3.entities.map { $0.name }, ["Alice Chen"])
+        // 完全无法配平的内容仍返回空。
+        let garbage = "这不是 JSON 输出，没有任何结构化内容。"
+        XCTAssertTrue(KnowledgeGraphBuilder.parseExtractionJSON(garbage).isEmpty)
+    }
+
     /// JSON 模式下按配置选择 JSON prompt 与解析器，且不做分隔符格式的补抽。
     func testBuilderUsesJSONFormat() async throws {
         let raw = """

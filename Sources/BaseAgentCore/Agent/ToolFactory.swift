@@ -12,13 +12,11 @@ public enum AgentToolFactory {
                              skillManager: SkillManager,
                              skillIndex: SkillIndex,
                              skillRetriever: SkillRetriever,
-                             workMemory: WorkMemory? = nil,
+                             checkpointCompressor: ((String) async -> String?)? = nil,
                              sopTracker: SOPReadTracker = SOPReadTracker()) -> ToolRegistry {
         let registry = ToolRegistry(config: config, callbacks: callbacks)
         registry.session = session
         registry.ragEngine = ragEngine
-        let sharedWorkMemory = workMemory ?? WorkMemory(workspace: config.workspace)
-        registry.workMemory = sharedWorkMemory
         // 改进5：file_read 使用调用方（Agent）持有的 tracker，reset() 才能清空。
         let sharedSOPTracker = sopTracker
 
@@ -136,10 +134,8 @@ public enum AgentToolFactory {
             ShellRunTool(config: config, callbacks: callbacks, registry: registry),
             AskUserTool(config: config, callbacks: callbacks, registry: registry),
 
-            WorkMemoryTool(config: config, callbacks: callbacks, registry: registry,
-                           workMemory: sharedWorkMemory),
-
-            UpdateWorkingCheckpointTool(config: config, callbacks: callbacks, registry: registry),
+            UpdateWorkingCheckpointTool(config: config, callbacks: callbacks, registry: registry,
+                                        compressor: checkpointCompressor),
             StartLongTermUpdateTool(config: config, callbacks: callbacks, registry: registry),
             UpdatePlanTool(config: config, callbacks: callbacks, registry: registry),
         ]

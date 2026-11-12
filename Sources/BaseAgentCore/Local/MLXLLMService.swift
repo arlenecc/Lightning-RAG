@@ -71,6 +71,22 @@ public final class MLXLLMService: LLMService, PreloadableLLMService,
     private let thinkingCopyLock = NSLock()
     private var thinkingCopies: [Bool: MLXLLMService] = [:]
 
+    /// 复用稳定 system 前缀的隔离副本池。
+    ///
+    /// 知识图谱抽取的 system prompt 整轮不变，但每个切片都是一次独立请求。
+    /// 旧实现每个请求新建副本（没有预热快照），导致每片都要重新 prefill
+    /// system 段。这里按「system prompt + tools + thinking」缓存已预热的副本：
+    /// 首次借出时预热一次，之后每个请求从快照复制，只 prefill 切片正文。
+    private struct IsolatedPoolKey: Hashable {
+        let systemPrompt: String
+        let toolsKey: String
+        let thinking: Bool
+    }
+    private var isolatedPool: [IsolatedPoolKey: [MLXLLMService]] = [:]
+    private let isolatedPoolLock = NSLock()
+    /// 每个前缀最多保留的空闲副本数：并发路数上限 4，留 2 个足够周转。
+    private static let maxIdleIsolatedCopies = 2
+
     private func setActiveWarmup(_ task: Task<Void, Error>?) {
         warmupLock.lock(); activeWarmup = task; warmupLock.unlock()
     }
@@ -689,10 +705,19 @@ public final class MLXLLMService: LLMService, PreloadableLLMService,
             return chatStream(messages: messages, tools: tools, temperature: temperature)
         }
         if options.isolated {
-            // 并行摘要分片：一次性副本，不保留半截历史污染其它请求。
-            let isolated = MLXLLMService(sharing: self, enableThinking: thinking)
-            return isolated.chatStream(messages: messages, tools: tools,
-                                       temperature: temperature)
+            let systemPrompt = messages.first(where: { $0.role == .system })?.content ?? ""
+            // 没有 system 前缀可复用（描述归纳、关键词抽取）：维持一次性副本，
+            // 这类请求的 user 段各不相同，复用同一份缓存没有收益。
+            guard !systemPrompt.isEmpty else {
+                let isolated = MLXLLMService(sharing: self, enableThinking: thinking)
+                return isolated.chatStream(messages: messages, tools: tools,
+                                           temperature: temperature)
+            }
+            // 抽取类请求：system prompt 整轮稳定，复用预热好的前缀快照。
+            return isolatedSessionStream(messages: messages, tools: tools,
+                                         temperature: temperature,
+                                         systemPrompt: systemPrompt,
+                                         thinking: thinking)
         }
         // 仅覆盖 thinking（空正文重试等）：复用持久副本。它与主服务各自
         // 持有独立 KV/轨迹，但副本内部允许跨轮前缀复用，避免每次重试都
@@ -711,6 +736,84 @@ public final class MLXLLMService: LLMService, PreloadableLLMService,
                                temperature: temperature)
     }
 
+    /// 复用稳定 system 前缀的隔离会话流。
+    ///
+    /// 借出副本时它已经预热过 system 前缀；请求结束只丢弃本轮生成段
+    /// （`invalidateKVCache` 保留预热快照），再把副本归还池中。
+    private func isolatedSessionStream(
+        messages: [ChatMessage],
+        tools: [JSONValue],
+        temperature: Double,
+        systemPrompt: String,
+        thinking: Bool
+    ) -> AsyncThrowingStream<LLMStreamEvent, Error> {
+        let key = IsolatedPoolKey(systemPrompt: systemPrompt,
+                                  toolsKey: Self.toolsKey(tools),
+                                  thinking: thinking)
+        return AsyncThrowingStream { continuation in
+            let task = Task { [self] in
+                do {
+                    let copy = try await borrowIsolatedCopy(
+                        key: key, systemPrompt: systemPrompt,
+                        tools: tools, thinking: thinking)
+                    for try await event in copy.chatStream(
+                        messages: messages, tools: tools, temperature: temperature) {
+                        continuation.yield(event)
+                    }
+                    // 只清本轮生成段与轨迹，预热快照仍在，下个切片直接复用。
+                    copy.resetSessionForPool()
+                    returnIsolatedCopy(copy, key: key)
+                    continuation.finish()
+                } catch {
+                    continuation.finish(throwing: error)
+                }
+            }
+            continuation.onTermination = { _ in task.cancel() }
+        }
+    }
+
+    private func borrowIsolatedCopy(
+        key: IsolatedPoolKey,
+        systemPrompt: String,
+        tools: [JSONValue],
+        thinking: Bool
+    ) async throws -> MLXLLMService {
+        isolatedPoolLock.lock()
+        let pooled = isolatedPool[key]?.popLast()
+        isolatedPoolLock.unlock()
+        if let pooled { return pooled }
+        let copy = MLXLLMService(sharing: self, enableThinking: thinking,
+                                 kvReuse: true)
+        try await copy.warmup(systemPrompt: systemPrompt, tools: tools)
+        // 预热会把 rawCache 指向 system 段缓存。若直接发首个请求，会走
+        // 「消息级增量」路径：它按消息边界切分 user 段，而预热缓存里已含
+        // `<|im_start|>user` 头，会重复渲染导致质量下降（2B 实测有效关系
+        // 6→2）。清掉会话缓存、只留预热快照，让每个请求统一走逐 token
+        // 前缀比对，只 prefill 精确的剩余片段。
+        copy.resetSessionForPool()
+        return copy
+    }
+
+    private func returnIsolatedCopy(_ copy: MLXLLMService, key: IsolatedPoolKey) {
+        isolatedPoolLock.lock(); defer { isolatedPoolLock.unlock() }
+        var list = isolatedPool[key] ?? []
+        guard list.count < Self.maxIdleIsolatedCopies else { return }
+        list.append(copy)
+        isolatedPool[key] = list
+    }
+
+    /// 归还池前只丢弃本轮会话与生成段，保留预热好的 system 前缀快照。
+    /// 不复用 `invalidateKVCache`：那条路径会为每片打一行日志，几百片太吵。
+    private func resetSessionForPool() {
+        rawCache = nil
+        rawState = nil
+        cachedTokenCount = 0
+        cachedTokens = []
+        sessionTranscript = []
+        pendingGeneratedAssistant = false
+        cachedToolsKey = nil
+    }
+
     // MARK: - 加载 / 卸载
 
     /// 主动加载权重与 chat template，供配置窗口的「加载模型」使用。
@@ -724,6 +827,7 @@ public final class MLXLLMService: LLMService, PreloadableLLMService,
     ///
     /// 只做 prefill、不进入解码；缓存的是正式请求的第一段前缀，因此不能包含
     /// generation prompt。工具清单参与该前缀渲染，所以也必须一起传入。
+    /// **不包含** `<earlier_context>`：它每次折叠都变，会击穿快照复用。
     public func warmup(systemPrompt: String, tools: [JSONValue]) async throws {
         // 预热放在独立 Task：它要跑完整段 prefill（首次还含 Metal shader 编译），
         // chatStream 通过 currentWarmup() 等它结束，就能让启动期间发出的第一句

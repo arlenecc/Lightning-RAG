@@ -180,7 +180,7 @@ public enum FactExtractionValidator {
     /// 助手自身工具/能力名，不是用户事实。
     private static let assistantToolNames: Set<String> = [
         "rag_tools", "file_tools", "shell_run", "code_run", "web_scan", "long_memory",
-        "work_memory", "update_plan", "update_working_checkpoint", "start_long_term_update",
+        "update_plan", "update_working_checkpoint", "start_long_term_update",
         "ask_user", "skill_tools", "memory_graph", "rag_search", "code_interpreter", "mcp",
     ]
 

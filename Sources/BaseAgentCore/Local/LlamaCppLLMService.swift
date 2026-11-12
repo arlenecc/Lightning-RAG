@@ -40,6 +40,12 @@ public final class LlamaCppLLMService: LLMService, PreloadableLLMService,
     private var warmupSystemPrompt: String?
     private var warmupToolsKey: String?
     private var warmupTokens: [llama_token] = []
+    /// 预热前缀的 KV 状态快照（`llama_state_seq_*`）。
+    ///
+    /// GGUF 无法像 MLX 那样复制 KV 对象，但可以把整个序列状态存成字节。
+    /// 隔离请求（知识图谱抽取）每片 system 前缀相同，恢复快照后只需
+    /// prefill 切片正文；混合 SSM（无法按位置裁剪）同样适用。
+    private var warmupStateData: Data?
     /// `llama_memory_seq_rm` 是否可用。llama.h 明确：partial sequence 裁剪
     /// 在 hybrid/recurrent memory 上会返回 false（只有删除整个序列才保证
     /// 成功）。Qwen3.5 等混合 SSM 模型因此每轮生成后的 `trim` 都会走到
@@ -141,6 +147,7 @@ public final class LlamaCppLLMService: LLMService, PreloadableLLMService,
         warmupSystemPrompt = nil
         warmupToolsKey = nil
         warmupTokens = []
+        warmupStateData = nil
         // 换模型后要重新探测：旧实例是混合 SSM，新实例可能是标准 attention。
         seqRmSupported = true
         lock.unlock()
@@ -186,67 +193,105 @@ public final class LlamaCppLLMService: LLMService, PreloadableLLMService,
             defer { lock.unlock() }
 
             let loaded = try ensureLoadedLocked()
-            let toolsKey = Self.toolsKey(tools)
-            // 前缀签名一致且缓存里仍完整保留该前缀 → 无需再 prefill。
-            // 折叠/清空历史后 invalidation 会清掉 cachedTokens，此时条件
-            // 不成立，warmup 必须重跑：GGUF 没有可复制的 KV 快照，重跑
-            // 前缀正是让下一轮 mode=append 只算增量的唯一途径。
-            if systemPrompt == warmupSystemPrompt,
-               toolsKey == warmupToolsKey,
-               !warmupTokens.isEmpty,
-               cachedTokens.count >= warmupTokens.count,
-               Array(cachedTokens.prefix(warmupTokens.count)) == warmupTokens {
-                AgentLog.info("[gguf-warmup] 复用已就绪前缀 tokens=\(warmupTokens.count) "
-                    + "（跳过全量 prefill）")
-                return
-            }
-            cachedTokens = []
-            cachedToolsKey = nil
-
-            // 部分模板要求至少有一条 user 消息；多渲染一条占位 user，
-            // system+tools 前缀仍然可复用，正式请求会裁掉占位尾巴。
-            let marker = "__WARMUP_\(UUID().uuidString)__"
-            let rendered: String
-            do {
-                rendered = try LlamaCppPromptRenderer.render(
-                    template: loaded.model.chatTemplate,
-                    model: loaded.model,
-                    messages: [
-                        ChatMessage(role: .system, content: systemPrompt),
-                        ChatMessage(role: .user, content: marker),
-                    ],
-                    tools: tools,
-                    enableThinking: enableThinking,
-                    addGenerationPrompt: false)
-            } catch {
-                AgentLog.warning("[gguf-warmup] 模板不支持前缀预热，跳过："
-                    + error.localizedDescription)
-                return
-            }
-            // 只保留到占位 user 内容之前：system + tools + user 头。
-            // 正式请求的第一条 user 消息天然以这段为前缀，可精确续写，
-            // 对混合 SSM 模型也无需回滚 KV。
-            guard let markerRange = rendered.range(of: marker) else {
-                AgentLog.warning("[gguf-warmup] 渲染结果缺少占位标记，跳过")
-                return
-            }
-            let prompt = String(rendered[..<markerRange.lowerBound])
-            let tokens = try loaded.model.tokenize(prompt, addSpecial: true)
-            guard tokens.count >= 32, tokens.count <= contextWindow - 1_024 else {
-                AgentLog.warning("[gguf-warmup] 跳过：前缀 token 数 \(tokens.count) 不适合预热")
-                return
-            }
-            llama_memory_clear(loaded.memory, true)
-            try LlamaCppContext.decode(tokens: tokens,
-                                       context: loaded.context,
-                                       chunkSize: loaded.batchSize)
-            cachedTokens = tokens
-            cachedToolsKey = toolsKey
-            warmupSystemPrompt = systemPrompt
-            warmupToolsKey = toolsKey
-            warmupTokens = tokens
-            AgentLog.info("[gguf-warmup] prefill tokens=\(tokens.count) tools=\(tools.count)")
+            try warmupLocked(loaded: loaded, systemPrompt: systemPrompt, tools: tools)
+            // 不在公共 warmup 里抓快照：主模型的对话前缀可能上万 token，
+            // 常驻一份 KV 字节副本会明显多占内存，而主模型不会走隔离请求。
+            // 快照只为隔离请求（知识图谱抽取）按需生成，见 run()。
         }
+    }
+
+    /// 预填充 system + tools 前缀（调用方需持有 gate 与 lock）。
+    ///
+    /// 只包含永不变化的 system + tools；`<earlier_context>` 每次折叠都会变，
+    /// 由 run() 的 token 级公共前缀复用处理，不作为预热前缀。
+    private func warmupLocked(loaded: Loaded, systemPrompt: String,
+                              tools: [JSONValue]) throws {
+        let toolsKey = Self.toolsKey(tools)
+        // 前缀签名一致且缓存里仍完整保留该前缀 → 无需再 prefill。
+        // 折叠/清空历史后 invalidation 会清掉 cachedTokens，此时条件
+        // 不成立，warmup 必须重跑：GGUF 没有可复制的 KV 快照，重跑
+        // 前缀正是让下一轮 mode=append 只算增量的唯一途径。
+        if systemPrompt == warmupSystemPrompt,
+           toolsKey == warmupToolsKey,
+           !warmupTokens.isEmpty,
+           cachedTokens.count >= warmupTokens.count,
+           Array(cachedTokens.prefix(warmupTokens.count)) == warmupTokens {
+            AgentLog.info("[gguf-warmup] 复用已就绪前缀 tokens=\(warmupTokens.count) "
+                + "（跳过全量 prefill）")
+            return
+        }
+        cachedTokens = []
+        cachedToolsKey = nil
+
+        // 部分模板要求至少有一条 user 消息；多渲染一条占位 user，
+        // system+tools 前缀仍然可复用，正式请求会裁掉占位尾巴。
+        let marker = "__WARMUP_\(UUID().uuidString)__"
+        let rendered: String
+        do {
+            rendered = try LlamaCppPromptRenderer.render(
+                template: loaded.model.chatTemplate,
+                model: loaded.model,
+                messages: [
+                    ChatMessage(role: .system, content: systemPrompt),
+                    ChatMessage(role: .user, content: marker),
+                ],
+                tools: tools,
+                enableThinking: enableThinking,
+                addGenerationPrompt: false)
+        } catch {
+            AgentLog.warning("[gguf-warmup] 模板不支持前缀预热，跳过："
+                + error.localizedDescription)
+            return
+        }
+        // 只保留到占位 user 内容之前：system + tools + user 头。
+        // 正式请求的第一条 user 消息天然以这段为前缀，可精确续写，
+        // 对混合 SSM 模型也无需回滚 KV。
+        guard let markerRange = rendered.range(of: marker) else {
+            AgentLog.warning("[gguf-warmup] 渲染结果缺少占位标记，跳过")
+            return
+        }
+        let prompt = String(rendered[..<markerRange.lowerBound])
+        let tokens = try loaded.model.tokenize(prompt, addSpecial: true)
+        guard tokens.count >= 32, tokens.count <= contextWindow - 1_024 else {
+            AgentLog.warning("[gguf-warmup] 跳过：前缀 token 数 \(tokens.count) 不适合预热")
+            return
+        }
+        llama_memory_clear(loaded.memory, true)
+        try LlamaCppContext.decode(tokens: tokens,
+                                   context: loaded.context,
+                                   chunkSize: loaded.batchSize)
+        cachedTokens = tokens
+        cachedToolsKey = toolsKey
+        warmupSystemPrompt = systemPrompt
+        warmupToolsKey = toolsKey
+        warmupTokens = tokens
+        AgentLog.info("[gguf-warmup] prefill tokens=\(tokens.count) tools=\(tools.count)")
+    }
+
+    /// 抓取序列 0 的完整 KV 状态（含混合 SSM 的递归状态）。
+    private static func captureSequenceState(context: OpaquePointer) -> Data? {
+        let size = llama_state_seq_get_size(context, 0)
+        guard size > 0 else { return nil }
+        var data = Data(count: size)
+        let written = data.withUnsafeMutableBytes { buffer -> Int in
+            guard let base = buffer.baseAddress?.assumingMemoryBound(to: UInt8.self) else {
+                return 0
+            }
+            return llama_state_seq_get_data(context, base, size, 0)
+        }
+        guard written == size else { return nil }
+        return data
+    }
+
+    /// 把快照恢复到序列 0；调用前需清空内存。
+    private static func restoreSequenceState(_ data: Data, context: OpaquePointer) -> Bool {
+        let written = data.withUnsafeBytes { buffer -> Int in
+            guard let base = buffer.baseAddress?.assumingMemoryBound(to: UInt8.self) else {
+                return 0
+            }
+            return llama_state_seq_set_data(context, base, data.count, 0)
+        }
+        return written == data.count
     }
 
     // MARK: - 生成
@@ -304,15 +349,64 @@ public final class LlamaCppLLMService: LLMService, PreloadableLLMService,
             }
 
             let toolsKey = Self.toolsKey(tools)
+            // 隔离请求的前缀复用（知识图谱抽取等）：system 前缀整轮不变。
+            // 首次按需预热并抓取状态快照，之后每个请求恢复快照，
+            // 只 prefill 切片正文；混合 SSM 无法裁剪也能用。
+            let systemPrompt = messages.first(where: { $0.role == .system })?.content ?? ""
+            var restoredPrefix = false
+            var didWarmPrefix = false
+            func prefixMatches() -> Bool {
+                warmupToolsKey == toolsKey
+                    && !warmupTokens.isEmpty
+                    && tokens.count > warmupTokens.count
+                    && Array(tokens.prefix(warmupTokens.count)) == warmupTokens
+            }
+            // 注意：隔离前缀复用与 kv_reuse 开关解耦（与 MLX 行为一致）。
+            // 该开关管的是主对话跨轮缓存；抽取任务的 system 前缀整轮不变，
+            // 快照按需生成/恢复、请求后账目清零，不依赖也不污染会话缓存。
+            if isolated, !systemPrompt.isEmpty {
+                // 快照缺失时也要重跑一次前缀预热：内存里可能还带着上次
+                // 对话/生成的位置，无法直接抓出「干净的前缀」。
+                if !prefixMatches()
+                    || (warmupStateData == nil && cachedTokens != warmupTokens) {
+                    try warmupLocked(loaded: loaded, systemPrompt: systemPrompt, tools: tools)
+                    didWarmPrefix = true
+                }
+                if warmupStateData == nil, warmupToolsKey == toolsKey,
+                   !warmupTokens.isEmpty, cachedTokens == warmupTokens,
+                   warmupTokens.count <= 8_192 {
+                    // 仅在内存恰好停在前缀（刚预热完）时抓快照，
+                    // 避免把上轮生成的位置一并存进去导致恢复后错位。
+                    warmupStateData = Self.captureSequenceState(context: loaded.context)
+                }
+                if prefixMatches() {
+                    if didWarmPrefix {
+                        // 预热后内存正好停在前缀，无需再恢复一遍。
+                        cachedToolsKey = toolsKey
+                        restoredPrefix = true
+                    } else if let snapshot = warmupStateData {
+                        llama_memory_clear(loaded.memory, true)
+                        if Self.restoreSequenceState(snapshot, context: loaded.context) {
+                            cachedTokens = warmupTokens
+                            cachedToolsKey = toolsKey
+                            restoredPrefix = true
+                            AgentLog.info("[gguf-kv] 恢复前缀快照 tokens=\(warmupTokens.count) "
+                                + "只 prefill \(tokens.count - warmupTokens.count)")
+                        } else {
+                            AgentLog.warning("[gguf-kv] 前缀快照恢复失败，回退整段重建")
+                        }
+                    }
+                }
+            }
             let reuseAllowed = kvReuse && !isolated
-            if !reuseAllowed {
+            if !reuseAllowed && !restoredPrefix {
                 // 关闭复用或一次性请求：丢弃上一轮缓存并整段重建，
                 // 避免把其它分片/会话的 KV 当作当前 prompt 的前缀。
                 llama_memory_clear(loaded.memory, true)
                 cachedTokens = []
                 cachedToolsKey = nil
             }
-            let toolsMatch = reuseAllowed && cachedToolsKey == toolsKey
+            let toolsMatch = (reuseAllowed || restoredPrefix) && cachedToolsKey == toolsKey
             var common = toolsMatch
                 ? LlamaCppContext.commonPrefix(cachedTokens, tokens) : 0
             if common == tokens.count {
@@ -446,6 +540,11 @@ public final class LlamaCppLLMService: LLMService, PreloadableLLMService,
             if !isolated {
                 cachedTokens = effectiveTokens + generated
                 cachedToolsKey = toolsKey
+            } else {
+                // 本轮生成了切片正文与输出，内存已偏离前缀快照；
+                // 账目标记为未知，下次隔离请求从快照恢复。
+                cachedTokens = []
+                cachedToolsKey = nil
             }
             continuation.yield(LLMStreamEvent(
                 kind: .done,

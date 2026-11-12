@@ -267,7 +267,7 @@ public final class KernelLoop {
         let resolved = session ?? Session(
             budget: ContextBudget(total: config.kernelMaxContextTokens),
             rawTurns: config.kernelRawTurns == 0 ? 10 : config.kernelRawTurns,
-            maxDigestLines: config.kernelMaxDigestLines == 0 ? 40 : config.kernelMaxDigestLines
+            maxDigestLines: config.kernelMaxDigestLines == 0 ? 20 : config.kernelMaxDigestLines
         )
         self.session = resolved
         // 必须与 Session 共用同一个预算对象，否则内核记的账和 Session 折叠时
@@ -390,8 +390,8 @@ public final class KernelLoop {
         let groups: [(String, (String) -> Bool)] = [
             ("文件与执行", { $0 == "file_tools" || $0 == "code_run" || $0 == "shell_run" }),
             ("知识库检索", { $0 == "rag_tools" }),
-            ("记忆与计划", { $0 == "long_memory" || $0 == "work_memory"
-                || $0 == "update_plan" || $0 == "update_working_checkpoint"
+            ("记忆与计划", { $0 == "long_memory" || $0 == "update_plan"
+                || $0 == "update_working_checkpoint"
                 || $0 == "start_long_term_update" || $0 == "ask_user" }),
             ("网页与技能", { $0 == "web_scan" || $0 == "skill_tools" }),
         ]
@@ -505,9 +505,9 @@ public final class KernelLoop {
                 state = .consolidate
                 lastConsolidatedTurn = session.currentTurn
                 let foldReason: String
-                // needsAutoShrink = 已用超过 90% 最大上下文：唯一允许把旧
-                // 上下文摘要回注到 <earlier_context> 的路径（逐轮自带
-                // summary 的确定性折叠，不调 LLM）。
+                // needsAutoShrink = 已用超过 90% 最大上下文：经上层
+                // shrinkSession 折叠到 60% 回水线（逐轮自带 summary 的
+                // 确定性折叠，不调 LLM），被折叠轮的摘要行回注 <earlier_context>。
                 // 注意不用 totalOver（79% 输出预留线），那是预算分配量。
                 if budget.needsAutoShrink, shrinkGuard < 3 {
                     foldReason = "context-90"
@@ -518,14 +518,15 @@ public final class KernelLoop {
                     if shrunk {
                         runtime.invalidateKV?()
                     } else {
-                        // 没有可用辅助模型：退化成丢弃式折叠，保证不死循环。
+                        // 上层没有接住（如未绑定回调）：退化成确定性折叠，
+                        // 摘要行同样回注 earlier_context，保证不死循环。
                         let dropped = session.discardHistory(keepingRecent: 2)
                         if dropped > 0 { runtime.invalidateKV?() }
                     }
                 } else {
                     foldReason = "periodic"
-                    // 常规主动折叠：旧上下文丢弃、不回注摘要，但保留最近
-                    // 2 轮原文，避免折叠处上下文断裂。
+                    // 常规主动折叠：折叠掉的历史轮摘要行回注 earlier_context，
+                    // 并保留最近 2 轮原文，避免折叠处上下文断裂。
                     let dropped = session.discardHistory(keepingRecent: 2)
                     if dropped > 0 { runtime.invalidateKV?() }
                     log("[kernel] CONSOLIDATE (每 \(consolidateEvery) 轮) "

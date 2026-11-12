@@ -99,7 +99,7 @@ final class ContextFoldingPolicyTests: XCTestCase {
         XCTAssertTrue(budget.needsAutoShrink)
     }
 
-    // MARK: - 常规折叠：丢弃 + 从 system 重启
+    // MARK: - 常规折叠：确定性折叠回注 + 从 system 重启
 
     func testRegularConsolidationKeepsLastTwoTurns() async {
         let session = Session(budget: ContextBudget(total: 30_000), rawTurns: 10)
@@ -107,7 +107,7 @@ final class ContextFoldingPolicyTests: XCTestCase {
             let rec = session.startTurn(prompt: "u\(index)")
             session.finishTurn(rec, assistantText: "a\(index)", summary: "s\(index)")
         }
-        // 模拟上一周期残留的摘要：常规折叠必须把它一起清掉。
+        // 模拟上一周期残留的摘要：折叠后随新摘要行一起保留在 earlier_context。
         session.appendDigest("stale-digest")
         let captured = Captured()
         let loop = KernelLoop(runtime: makeRuntime(captured),
@@ -121,19 +121,25 @@ final class ContextFoldingPolicyTests: XCTestCase {
 
         XCTAssertTrue(captured.reasons.isEmpty,
                       "周期性折叠不应调用摘要收缩钩子：\(captured.reasons)")
-        XCTAssertTrue(session.extraDigest.isEmpty, "旧摘要必须全部丢弃")
+        // 折叠掉的 6 轮摘要行回注 earlier_context，残留的 stale-digest 一并保留。
+        XCTAssertEqual(session.extraDigest.count, 7)
+        XCTAssertTrue(session.extraDigest.contains("stale-digest"))
         XCTAssertGreaterThanOrEqual(captured.invalidations, 1, "前缀已变，KV 需失效一次")
         let messages = captured.messages
-        // system + 保留的 2 轮原文（user/assistant ×2）+ 本轮 user。
-        XCTAssertEqual(messages.count, 6, "折叠后应保留最近 2 轮原文：\(messages.count)")
+        // system + earlier_context + 保留的 2 轮原文（user/assistant ×2）+ 本轮 user。
+        XCTAssertEqual(messages.count, 7,
+                       "折叠后保留最近 2 轮原文 + 回注摘要：\(messages.count)")
         XCTAssertEqual(messages.first?.content, "SYS")
-        XCTAssertFalse(messages.contains { $0.content.contains("earlier_context") })
-        XCTAssertFalse(messages.contains { $0.content.contains("stale-digest") })
+        XCTAssertTrue(messages.contains { $0.content.contains("earlier_context") },
+                      "被折叠轮的摘要行回注 <earlier_context>")
+        XCTAssertTrue(messages.contains { $0.content.contains("stale-digest") })
+        XCTAssertTrue(messages.contains { $0.content.contains("[T1] s1") },
+                      "被折叠轮的逐轮摘要行仍在上下文中")
         XCTAssertTrue(messages.contains { $0.content == "u7" })
         XCTAssertTrue(messages.contains { $0.content == "u8" })
         for index in 1...6 {
             XCTAssertFalse(messages.contains { $0.content == "u\(index)" },
-                           "第 \(index) 轮已属于旧历史，应被丢弃")
+                           "第 \(index) 轮已属于旧历史，原文不再发送")
         }
     }
 
@@ -146,7 +152,10 @@ final class ContextFoldingPolicyTests: XCTestCase {
         session.appendDigest("stale")
         XCTAssertEqual(session.discardHistory(keepingRecent: 2), 6)
         XCTAssertEqual(session.turns.map(\.prompt), ["u7", "u8"])
-        XCTAssertTrue(session.extraDigest.isEmpty)
+        // 摘要行回注：残留 digest + 6 条被折叠轮摘要行（无 summary 回退首句）。
+        XCTAssertEqual(session.extraDigest.count, 7)
+        XCTAssertTrue(session.extraDigest.contains("stale"))
+        XCTAssertTrue(session.extraDigest.contains("[T1] a1"))
     }
 
     func testSlidOutOldTurnsAreDiscardedNotSummarized() {
@@ -269,8 +278,8 @@ final class ContextFoldingPolicyTests: XCTestCase {
                        "应只折叠一次：\(captured.foldReasons)")
         XCTAssertGreaterThanOrEqual(captured.invalidations, 1)
         XCTAssertEqual(session.turns.count, 3, "保留 2 个已完成轮 + 当前轮")
-        XCTAssertTrue(session.extraDigest.isEmpty, "提前折叠绝不回注摘要")
-        XCTAssertFalse(captured.messages.contains { $0.content.contains("earlier_context") })
+        XCTAssertEqual(session.extraDigest.count, 3, "提前折叠同样回注摘要行")
+        XCTAssertTrue(captured.messages.contains { $0.content.contains("earlier_context") })
     }
 
     /// C/D：周期性折叠也会通知边界钩子（刷新 system 前缀 + 预热 KV）。
@@ -289,5 +298,23 @@ final class ContextFoldingPolicyTests: XCTestCase {
                               maxTurns: 1)
         _ = await loop.run("hello")
         XCTAssertEqual(captured.foldReasons.first, "periodic")
+    }
+
+    /// 折叠边界预热用的 earlier 前缀必须与正式请求的消息逐字节一致，
+    /// 否则 warmup 的 KV 前缀无法命中，折叠后首轮又变回全量重建。
+    func testEarlierContextTextMatchesRenderedMessage() {
+        let session = Session(budget: ContextBudget(total: 30_000), rawTurns: 8)
+        XCTAssertTrue(session.earlierContextText.isEmpty, "无折叠时不应有前缀")
+
+        session.appendDigest("[T1] 要点一")
+        _ = session.startTurn(prompt: "now")
+        let messages = session.buildMessages(systemPrompt: "SYS")
+        let earlier = session.earlierContextText
+
+        XCTAssertFalse(earlier.isEmpty)
+        XCTAssertEqual(messages.count > 1 ? messages[1].role : nil, .user)
+        XCTAssertEqual(messages.count > 1 ? messages[1].content : nil, earlier,
+                       "预热前缀必须与正式请求的第 2 条消息一致")
+        XCTAssertTrue(earlier.hasPrefix("<earlier_context>"))
     }
 }

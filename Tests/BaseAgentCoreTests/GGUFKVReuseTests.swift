@@ -45,6 +45,46 @@ final class GGUFKVReuseTests: XCTestCase {
         XCTAssertFalse(output.isEmpty, "ENABLED + q8_0 KV 组合应能正常生成")
     }
 
+    /// `kv_reuse` 开关关闭（辅助模型默认 `aux_llm_kv_reuse=false`）时，
+    /// 隔离请求的稳定前缀复用仍应生效：它与主对话跨轮缓存是两套机制。
+    func testIsolatedPrefixReuseIndependentOfKVReuseToggle() async throws {
+        let modelURL = try modelURL()
+        let service = LlamaCppLLMService(
+            modelPath: modelURL.path,
+            contextWindow: 8_192, maxTokens: 24,
+            topP: 1, minP: 0, topK: 0, repetitionPenalty: 1,
+            enableThinking: false, gpuLayers: 99,
+            kvReuse: false)
+        defer { service.close() }
+
+        let collector = LogBox()
+        let system = ChatMessage(role: .system, content: """
+        你是知识图谱抽取助手。请从用户提供的文本中抽取实体与关系，\
+        只输出 JSON 对象，不要输出解释、前后缀或 Markdown 代码围栏。\
+        实体字段为 name、type、description；关系字段为 source、target、\
+        keywords、description。实体数量不超过 20 个，关系不超过 50 个，\
+        每条描述不超过 100 个字符。若文本中没有可抽取的内容，输出空数组。
+        """)
+        func isolated(_ user: String) async throws {
+            try await AgentLog.withTaskSink({ collector.append($0) }) {
+                let stream = service.chatStream(
+                    messages: [system, ChatMessage(role: .user, content: user)],
+                    tools: [], temperature: 0,
+                    options: LLMRequestOptions(enableThinking: false, isolated: true))
+                for try await event in stream {
+                    if event.kind == .done { break }
+                }
+            }
+        }
+
+        try await isolated("切片一：Alice 在 Acme 公司工作，负责 Aurora 项目。")
+        try await isolated("切片二：Bob 在 Beta 公司工作，负责 Delta 项目。")
+
+        let restored = collector.lines.filter { $0.contains("恢复前缀快照") }
+        XCTAssertEqual(restored.count, 1,
+                       "kv_reuse=false 时隔离请求也应恢复前缀快照：\(collector.lines)")
+    }
+
     private func modelURL() throws -> URL {
         let path = ProcessInfo.processInfo.environment["GGUF_KV_TEST_MODEL"] ?? ""
         guard !path.isEmpty, FileManager.default.fileExists(atPath: path) else {
@@ -135,6 +175,49 @@ final class GGUFKVReuseTests: XCTestCase {
                 "裁剪失败后必须走消息级增量，避免每轮整段重建 7~8s："
                 + "\(collector.lines.filter { $0.contains("[gguf-") })")
         }
+    }
+
+    /// 隔离请求（知识图谱抽取）：system 前缀整轮相同，首次预热抓快照，
+    /// 之后每次恢复快照，只 prefill 切片正文。
+    func testIsolatedRequestsReuseWarmPrefix() async throws {
+        let modelURL = try modelURL()
+        let service = LlamaCppLLMService(
+            modelPath: modelURL.path,
+            contextWindow: 8_192, maxTokens: 24,
+            topP: 1, minP: 0, topK: 0, repetitionPenalty: 1,
+            enableThinking: false, gpuLayers: 99)
+        defer { service.close() }
+
+        let collector = LogBox()
+        let system = ChatMessage(role: .system, content: """
+        你是知识图谱抽取助手。请从用户提供的文本中抽取实体与关系，\
+        只输出 JSON 对象，不要输出解释、前后缀或 Markdown 代码围栏。\
+        实体字段为 name、type、description；关系字段为 source、target、\
+        keywords、description。实体数量不超过 20 个，关系不超过 50 个，\
+        每条描述不超过 100 个字符。若文本中没有可抽取的内容，输出空数组。
+        """)
+        func isolated(_ user: String) async throws {
+            try await AgentLog.withTaskSink({ collector.append($0) }) {
+                let stream = service.chatStream(
+                    messages: [system, ChatMessage(role: .user, content: user)],
+                    tools: [], temperature: 0,
+                    options: LLMRequestOptions(enableThinking: false, isolated: true))
+                for try await event in stream {
+                    if event.kind == .done { break }
+                }
+            }
+        }
+
+        try await isolated("切片一：Alice 在 Acme 公司工作，负责 Aurora 项目。")
+        try await isolated("切片二：Bob 在 Beta 公司工作，负责 Delta 项目。")
+        try await isolated("切片三：Carol 在 Gamma 公司工作，负责 Omega 项目。")
+
+        let restored = collector.lines.filter { $0.contains("恢复前缀快照") }
+        XCTAssertEqual(restored.count, 2,
+                       "第 2、3 次隔离请求应恢复前缀快照：\(collector.lines)")
+        let warmups = collector.lines.filter { $0.contains("[gguf-warmup] prefill") }
+        XCTAssertEqual(warmups.count, 1,
+                       "同一 system 前缀只应预热一次：\(collector.lines)")
     }
 
     private final class LogBox: @unchecked Sendable {

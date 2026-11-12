@@ -38,6 +38,16 @@ final class KnowledgeGraphRealModelTests: XCTestCase {
                 print("REAL Qwen3.5-2B-MLX-4bit: 模型不存在，跳过")
             }
         }
+        // 4B 主模型也可用作辅助模型：用于对照「更慢但更稳」的取舍。
+        if only == nil || only == "4B" {
+            let main = root.appendingPathComponent("models/qwen3.5-4b-agentic-coder-v4-4bit-mlx")
+            if FileManager.default.fileExists(atPath: main.path) {
+                try await measure(name: "qwen3.5-4b-agentic-coder-v4", directory: main,
+                                  maxTokens: 1_024, assertsQuality: true)
+            } else {
+                print("REAL qwen3.5-4b-agentic-coder-v4: 模型不存在，跳过")
+            }
+        }
         // 0.8B 仅作基线对照，不判定：小模型输出会缺字段/循环，不代表当前选型。
         if only == nil || only == "0.8B" {
             let baseline = ProcessInfo.processInfo.environment["KG_REAL_MODEL_DIR"]

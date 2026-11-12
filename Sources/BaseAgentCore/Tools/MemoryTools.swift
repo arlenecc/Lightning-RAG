@@ -29,68 +29,6 @@ private func roundedScore(_ value: Double) -> Double {
     (value * 10_000).rounded() / 10_000
 }
 
-// MARK: - work_memory
-
-/// 工作记忆工具：等价于 Python `WorkMemoryTool`。
-public final class WorkMemoryTool: AgentTool {
-    public let name = "work_memory"
-    public let description = "管理当前任务的工作记忆（workspace 内持久化）。op=set 保存键值，get 读取，list 列出全部，clear 清空。"
-    public let parameters: JSONValue = .object([
-        "type": .string("object"),
-        "properties": .object([
-            "op": .object([
-                "type": .string("string"),
-                "enum": .array([.string("set"), .string("get"), .string("list"), .string("clear")]),
-                "description": .string("操作类型"),
-            ]),
-            "key": .object([
-                "type": .string("string"),
-                "description": .string("键名（set/get 必填）"),
-            ]),
-            "value": .object([
-                "type": .string("string"),
-                "description": .string("保存的文本值（set 必填）"),
-            ]),
-        ]),
-        "required": .array([.string("op")]),
-    ])
-
-    private let workMemory: WorkMemory
-
-    public init(config: AgentConfig,
-                callbacks: AgentCallbacks? = nil,
-                registry: ToolRegistry? = nil,
-                workMemory: WorkMemory? = nil) {
-        self.workMemory = workMemory ?? registry?.workMemory
-            ?? WorkMemory(workspace: config.workspace)
-    }
-
-    public func run(_ args: [String: JSONValue]) async throws -> ToolResult {
-        let op = args.trimmedString("op")
-        switch op {
-        case "set":
-            let key = args.trimmedString("key")
-            guard !key.isEmpty else { return .fail("缺少参数: key") }
-            guard let value = args["value"]?.stringValue else {
-                return .fail("缺少参数: value")
-            }
-            workMemory.set(key, value)
-            return .ok("set \(key)")
-        case "get":
-            let key = args.trimmedString("key")
-            guard !key.isEmpty else { return .fail("缺少参数: key") }
-            return .ok(workMemory.get(key) ?? "")
-        case "list":
-            return .ok(encodeJSON(workMemory.list(), pretty: true))
-        case "clear":
-            workMemory.clear()
-            return .ok("cleared")
-        default:
-            return .fail("未知 op: \(op)（可用: set/get/list/clear）")
-        }
-    }
-}
-
 // MARK: - memory_graph
 
 /// 知识图谱工具：等价于 Python `MemoryGraphTool`。

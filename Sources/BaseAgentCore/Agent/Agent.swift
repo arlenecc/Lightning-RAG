@@ -186,9 +186,9 @@ private final class AgentKernelHooks: KernelHooks {
     weak var agent: Agent?
     init(agent: Agent) { self.agent = agent }
 
-    /// 只在「上下文占用 >90%」的自动收缩时回注旧上下文摘要（逐轮自带
-    /// summary 的确定性折叠，不调 LLM）。
-    /// 每 8 轮的周期性折叠走丢弃式路径（保留最近 2 轮原文），不经过这里、不回注任何内容。
+    /// 只在「上下文占用 >90%」的自动收缩时折叠到 60% 回水线（逐轮自带
+    /// summary 的确定性折叠，不调 LLM），摘要行回注 <earlier_context>。
+    /// 每 8 轮的周期性折叠在内核内确定性折叠（同样回注摘要行），不经过这里。
     func consolidated(_ session: Session, reason: String) async -> Bool {
         guard reason == "context-90" else { return false }
         return await agent?.shrinkSession(reason: reason) ?? false
@@ -223,12 +223,11 @@ public final class Agent: @unchecked Sendable {
     public let skillIndex: SkillIndex
     public let skillRetriever: SkillRetriever
     public let ragEngine: RAGEngine
-    public let workMemory: WorkMemory
     public let session: Session
     /// 协议主体（BASE）system prompt。默认内置常量；应用启动时可由
     /// `<workspace>/assets/system_prompt.txt` 替换，见 `SystemPromptFile`。
     public let baseSystemPrompt: String
-    /// 多级记忆目录（L0–L4）。与 `.agent/` 下既有 WorkMemory/GraphMemory 并存。
+    /// 多级记忆目录（L0–L4）。与 `.agent/` 下既有 GraphMemory 并存。
     public let memoryDirectory: MemoryDirectory
     public let rawSessionStore: RawSessionStore
     /// 历史归档串行链：避免 zip/大文件读取卡住用户请求，同时保证同一天
@@ -314,7 +313,6 @@ public final class Agent: @unchecked Sendable {
         let embedding = LocalModelFactory.shared.makeEmbedding(config: config)
         self.skillRetriever = SkillRetriever(manager: self.skills, embedding: embedding)
         self.ragEngine = RAGEngine(config: config, embedding: embedding)
-        self.workMemory = WorkMemory(workspace: config.workspace)
         let memoryDir = MemoryDirectory(workspace: config.workspace)
         memoryDir.ensureLayout()
         self.memoryDirectory = memoryDir
@@ -334,17 +332,26 @@ public final class Agent: @unchecked Sendable {
             rawTurns: max(8,
                           config.kernelRawTurns == 0 ? 10 : config.kernelRawTurns,
                           (config.kernelConsolidateEvery == 0 ? 8 : config.kernelConsolidateEvery) + 2),
-            maxDigestLines: config.kernelMaxDigestLines == 0 ? 40 : config.kernelMaxDigestLines
+            maxDigestLines: config.kernelMaxDigestLines == 0 ? 20 : config.kernelMaxDigestLines
         )
 
         if let toolRegistry {
             self.tools = toolRegistry
         } else {
+            // init 未完成前不能在逃逸闭包里捕获 self（存储属性尚未全部初始化），
+            // 先用局部转发闭包占位，注册完成后再指向真正的压缩实现。
+            var compressorForward: ((String) async -> String?)?
             self.tools = AgentToolFactory.build(
                 config: config, callbacks: callbacks, session: self.session,
                 ragEngine: self.ragEngine, skillManager: self.skills,
                 skillIndex: self.skillIndex, skillRetriever: self.skillRetriever,
-                workMemory: self.workMemory, sopTracker: sharedSOPTracker)
+                checkpointCompressor: { text in
+                    await compressorForward?(text)
+                },
+                sopTracker: sharedSOPTracker)
+            compressorForward = { [weak self] text in
+                await self?.compressCheckpointText(text)
+            }
         }
         self.tools.session = self.session
         self.tools.ragEngine = self.ragEngine
@@ -515,7 +522,6 @@ public final class Agent: @unchecked Sendable {
         ragEngine.close()
         GraphMemoryStore.flushShared()
         GraphMemoryStore.releaseShared(workspace: config.workspace)
-        workMemory.flush()
         (llm as? ClosableLLMService)?.close()
         if let auxLLM, auxLLM !== llm {
             (auxLLM as? ClosableLLMService)?.close()
@@ -547,7 +553,6 @@ public final class Agent: @unchecked Sendable {
         mcpClients.removeAll()
         skillRetriever.close()
         ragEngine.close()
-        workMemory.flush()
         if let service = llm as? AsyncUnloadableLLMService {
             await service.unloadAndWait()
         } else {
@@ -855,6 +860,8 @@ public final class Agent: @unchecked Sendable {
         guard let warmup = llm as? WarmupLLMService else { return }
         let current = takeRequestSystemPrompt() ?? buildStaticSystemPrompt()
         do {
+            // 只预热永不变化的 system + tools 前缀。earlier_context 每次折叠
+            // 都会变，交给 chatStream 从快照复制前缀、只 prefill 增量。
             try await warmup.warmup(systemPrompt: current, tools: tools)
             log("[context] 折叠后已预热 system 前缀（\(reason)）")
         } catch {
@@ -931,24 +938,6 @@ public final class Agent: @unchecked Sendable {
         if let cachedDynamicContext { return cachedDynamicContext }
         var sections: [String] = []
 
-        // 工作记忆。事实抽取只写 memory graph，不再维护/回注当日 `__auto_facts__`。
-        let work = tools.workMemory ?? workMemory
-        var compact: [String: String] = [:]
-        var workMemoryChars = 0
-        for (key, value) in work.list().sorted(by: { $0.key < $1.key }) {
-            // 旧版本残留的自动事实键直接跳过：事实统一由 memory graph 检索。
-            if key == "__auto_facts__" { continue }
-            guard compact.count < SystemPromptLimits.maxWorkMemoryKeys,
-                  workMemoryChars < SystemPromptLimits.maxWorkMemoryChars else { continue }
-            let capped = value.count > 200 ? String(value.prefix(200)) + "…" : value
-            compact[key] = capped
-            workMemoryChars += capped.count
-        }
-        if !compact.isEmpty {
-            sections.append("# Work memory (scratchpad)\n"
-                + JSONValue.object(compact.mapValues { .string($0) }).jsonString())
-        }
-
         // 检查点常驻注入：优先 Session（本轮工具实时更新），其次持久化文件。
         let checkpoint = session.getKeyInfo().isEmpty
             ? CheckpointStore.readPersisted(config)
@@ -1002,31 +991,30 @@ public final class Agent: @unchecked Sendable {
         ragEngine.cachedStatus(maxAge: .infinity)
     }
 
-    // MARK: 上下文 >90% 自动收缩（唯一会回注旧摘要的路径）
+    // MARK: 上下文 >90% 自动收缩（带回水线的摘要回注路径）
 
-    /// 旧轮自带逐轮摘要（`TurnRecord.summary` → `digestLine()`），不再为此
-    /// 额外调一次 LLM：这次调用原本在内核循环里同步 await，上下文已经吃紧
-    /// 时还要等辅助模型（或主模型 isolated 副本）生成几百字，会直接卡住
-    /// 当前轮响应。改为确定性折叠（合并连续重复 + 保留最近若干行）。
-    /// 周期性折叠走 `discardHistory`，连回注都不做，两条路径都不调模型。
+    /// 触发线 90%（`Budget.needsAutoShrink`），收缩目标 = 可用预算的 60%
+    ///（触发线下 30 个百分点回水）：`foldToRewatermark` 从最老轮逐轮折叠、
+    /// 每轮摘要行回注 `<earlier_context>`，降到位即停——收缩一次到位，
+    /// 避免贴着触发线反复收缩、反复付 KV 重建。全程不调 LLM（逐轮摘要
+    /// 早在响应时存入 `TurnRecord.summary`）。
+    /// 周期性折叠走 `discardHistory`，同样回注摘要行，两条路径都不调模型。
     func shrinkSession(reason: String) async -> Bool {
         guard session.turns.count > 1 else { return false }
-        let old = Array(session.turns.dropLast())
-        let final = l3Fold(old.map { $0.digestLine() },
-                           maxLines: session.maxDigestLines)
-        guard !final.isEmpty else { return false }
+        let foldedLines = session.foldToRewatermark(targetRatio: 0.60, keepingRecent: 1)
+        guard !foldedLines.isEmpty else { return false }
+        // memory.md / UI 展示用的折叠总览（与回注行同源，只读不改上下文）。
+        let final = l3Fold(foldedLines, maxLines: session.maxDigestLines)
         appendMemorySummary(final, reason: reason)
-        let folded = session.discardTurns(old.count)
         // 回注区有字数上限：保头保尾，避免只留最老几轮、丢掉最近的结论。
         let brief = final.count <= 400
             ? final
             : String(final.prefix(200)) + "\n…\n" + String(final.suffix(180))
         let digestLine = "[摘要 \(Self.timeString())] \(brief)"
-        session.appendDigest(digestLine)
-        // 改进2：折叠摘要也追加进当天 digest 文件，保证"当天对话摘要历史"
-        // 不因只统计逐轮快照而缺项。
+        // 折叠摘要追加进当天 digest 文件，保证"当天对话摘要历史"不缺项。
         rawSessionStore.appendFoldedDigest([digestLine])
-        log("[context] 自动收缩：丢弃 \(folded) 轮，回注逐轮自带摘要（reason: \(reason)）")
+        log("[context] 自动收缩：折叠 \(foldedLines.count) 轮（回水目标 60%），"
+            + "摘要行已回注 earlier_context（reason: \(reason)）")
         callbacks.onContextShrunk(final, reason)
         return true
     }
@@ -1036,6 +1024,33 @@ public final class Agent: @unchecked Sendable {
         let existing = (try? String(contentsOfFile: path, encoding: .utf8)) ?? ""
         let entry = "\n## 上下文摘要 - \(Self.timestamp())\n- 触发原因: \(reason)\n\n\(summary)\n"
         try? AtomicFile.write(existing + entry, to: path)
+    }
+
+    // MARK: update_working_checkpoint 超长压缩
+
+    /// 便签超过 `CheckpointStore.maxKeyInfo` 字符时的一次有损压缩（工具经
+    /// ToolFactory 注入此入口）。与其它后台任务同策略：辅助模型优先、主模型
+    /// isolated 兜底；失败/不可用返回 nil，由工具侧走保头保尾兜底。
+    /// 工具执行点在主模型两轮生成之间，GPU 空闲，可直接用 `collectChat`；
+    /// `beginBackgroundIfIdle` 顺带挡住与后台记忆任务并发抢辅助模型。
+    func compressCheckpointText(_ text: String) async -> String? {
+        guard beginBackgroundIfIdle() else { return nil }
+        defer { endBackground() }
+        let system = "你负责压缩 Agent 的工作便签。只输出压缩后的便签正文，不要任何解释或前后缀。"
+        let user = """
+        把下面的工作便签压缩到 \(CheckpointStore.maxKeyInfo) 字符以内（硬上限）。
+        保留全部具体事实：已验证的路径/ID/端口/命令、决策及其理由、已排除的方案、
+        下一步计划。删除重复表述、流水账和与当前任务无关的内容。只输出压缩后的正文。
+        --- 便签 ---
+        \(text)
+        """
+        let output = await collectChat(
+            [ChatMessage(role: .system, content: system),
+             ChatMessage(role: .user, content: user)],
+            temperature: 0.1)
+        let compressed = output.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !compressed.isEmpty else { return nil }
+        return compressed
     }
 
     // MARK: 结束后：后台事实抽取 + L4 蒸馏

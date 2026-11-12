@@ -68,6 +68,8 @@ public final class UpdateWorkingCheckpointTool: AgentTool {
     private let config: AgentConfig
     private let callbacks: AgentCallbacks?
     private weak var registry: ToolRegistry?
+    /// 超长便签的 LLM 压缩器（Agent 注入辅助模型）。nil 或压缩失败时退化保头保尾。
+    public let compressor: ((String) async -> String?)?
 
     public var parameters: JSONValue {
         ToolSupport.objectSchema(
@@ -81,19 +83,30 @@ public final class UpdateWorkingCheckpointTool: AgentTool {
             required: ["key_info"])
     }
 
-    public init(config: AgentConfig, callbacks: AgentCallbacks?, registry: ToolRegistry? = nil) {
+    public init(config: AgentConfig, callbacks: AgentCallbacks?, registry: ToolRegistry? = nil,
+                compressor: ((String) async -> String?)? = nil) {
         self.config = config
         self.callbacks = callbacks
         self.registry = registry
+        self.compressor = compressor
     }
 
     public func run(_ args: [String: JSONValue]) async throws -> ToolResult {
         do {
             let keyInfo = try ToolSupport.requireString(args, "key_info")
             let persist = ToolSupport.optionalBool(args, "persist") ?? false
-            let text = String(keyInfo
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-                .prefix(CheckpointStore.maxKeyInfo))
+            var text = keyInfo.trimmingCharacters(in: .whitespacesAndNewlines)
+            if text.count > CheckpointStore.maxKeyInfo {
+                // 超长不直接截断丢信息：先请辅助模型压缩一次；压缩失败或
+                // 仍超长时保头保尾（显式标注中间省略），损失可控可见。
+                if let compressed = await compressor?(text),
+                   !compressed.isEmpty, compressed.count <= CheckpointStore.maxKeyInfo {
+                    text = compressed
+                } else {
+                    text = String(text.prefix(2_600)) + "\n[…中间已省略]\n"
+                        + String(text.suffix(1_200))
+                }
+            }
 
             guard let session = registry?.session else {
                 return .fail("working checkpoint unavailable (no kernel session bound)")

@@ -111,8 +111,9 @@ public final class ContextBudget: @unchecked Sendable {
         Int(Double(total) * Self.autoShrinkRatio)
     }
 
-    /// 是否触发「摘要回注式」自动收缩：唯一允许把旧上下文摘要写回
-    /// `<earlier_context>` 的条件。周期性折叠走丢弃式路径，不读这个值。
+    /// 是否触发「回水线收缩」：占用超线时经上层 shrinkSession 用
+    /// `foldToRewatermark` 折叠到触发线下 30 个百分点（摘要行回注）。
+    /// 周期性/提前折叠不读这个值。
     public var needsAutoShrink: Bool {
         used() > autoShrinkThreshold
     }

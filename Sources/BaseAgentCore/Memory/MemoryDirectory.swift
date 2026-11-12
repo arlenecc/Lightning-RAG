@@ -2,8 +2,8 @@ import Foundation
 
 /// 工作目录下 `memory/` 多级记忆的统一路径与文件设施。
 ///
-/// 与现有 `.agent/` 下的 `WorkMemory` / `GraphMemoryStore` **并存、互不影响**：
-/// 后者是键值/知识图谱，这里是基于纯文本文件的 L0–L4 分层。
+/// 与现有 `.agent/` 下的 `GraphMemoryStore` **并存、互不影响**：
+/// 后者是知识图谱，这里是基于纯文本文件的 L0–L4 分层。
 ///
 /// ```
 /// <workspace>/memory/

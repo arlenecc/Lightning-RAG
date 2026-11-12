@@ -299,8 +299,6 @@ public final class ToolRegistry {
     public var session: Session?
     /// 懒初始化的 RAG 引擎引用，供 rag_* 工具与系统提示复用。
     public var ragEngine: RAGEngine?
-    /// 全工具共享的工作记忆实例，避免多个实例各自持有旧缓存互相覆盖。
-    public var workMemory: WorkMemory?
 
     public init(config: AgentConfig, callbacks: AgentCallbacks? = nil) {
         self.config = config

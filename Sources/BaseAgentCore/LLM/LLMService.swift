@@ -113,6 +113,11 @@ public protocol PreloadableLLMService: AnyObject {
 /// 支持用稳定 system prompt 预填充 KV cache 的本地 LLM。
 ///
 /// 预热只做 prefill，不生成 token；正式请求可以直接在这段前缀后追加。
+///
+/// 前缀只包含**永不变化**的 `system + tools`：折叠摘要（`<earlier_context>`）
+/// 每次折叠都会变，放进预热会让签名命中失效、并清掉稳定前缀快照，反而逼出
+/// 「预热 + 正式请求」两次全量 prefill。动态历史由 chatStream 的正常增量
+/// 复用（从快照复制前缀、只 prefill 变化段）处理。
 public protocol WarmupLLMService: AnyObject {
     func warmup(systemPrompt: String, tools: [JSONValue]) async throws
 }

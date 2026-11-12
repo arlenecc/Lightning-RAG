@@ -265,12 +265,9 @@ final class KVPrefixReuseTests: XCTestCase {
 
         XCTAssertEqual(llm.defaultCallCount, 3, "主模型只服务前台对话")
         XCTAssertEqual(llm.optionCallCount, 0, "不得回退主模型做事实抽取")
-        XCTAssertNil(agent.workMemory.get("__auto_facts__"),
-                     "当日工作记忆不再维护")
     }
 
-    /// 有辅助模型时按 4h 文件游标抽取：多轮（含周期性折叠）只跑一次，
-    /// 且只写 memory graph，不写当日工作记忆。
+    /// 有辅助模型时按 4h 文件游标抽取：多轮（含周期性折叠）只跑一次，只写 memory graph。
     func testFactExtractionUsesFileCursorAndAuxOnly() async {
         let llm = RecordingLLM(supportsIsolated: true, reply: "Hello there!")
         let aux = RecordingLLM(supportsIsolated: false, reply: "facts")
@@ -290,13 +287,13 @@ final class KVPrefixReuseTests: XCTestCase {
         XCTAssertEqual(llm.optionCallCount, 0, "辅助可用时主模型不得被后台调用")
         XCTAssertEqual(aux.defaultCallCount + aux.optionCallCount, 1,
             "4 小时内只抽一次，折叠边界不额外触发")
-        XCTAssertNil(agent.workMemory.get("__auto_facts__"),
-                     "事实只写 memory graph，不再维护当日工作记忆")
     }
 
     /// 上下文 >90% 的自动收缩也必须零 LLM 调用：被折掉的每一轮自带
     /// `TurnRecord.summary`，直接折成 `<earlier_context>` 即可。旧实现在
     /// 内核循环里同步 await 一次摘要模型，会直接卡住当前轮响应。
+    /// 回水线语义：从最老轮逐轮折叠，预估占用降到 60% 目标以下即停——
+    /// 本例内容极小，折 1 轮就远低于目标，因此只折叠最老 1 轮。
     func testShrinkSessionUsesPerTurnSummariesWithoutLLM() async {
         let llm = RecordingLLM(supportsIsolated: true, reply: "Hello there!")
         let agent = makeAgent(llm: llm)
@@ -312,12 +309,40 @@ final class KVPrefixReuseTests: XCTestCase {
         XCTAssertTrue(shrunk)
         XCTAssertEqual(llm.defaultCallCount, 0, "收缩不得再调用主模型")
         XCTAssertEqual(llm.optionCallCount, 0, "收缩不得再发起后台模型请求")
-        XCTAssertEqual(agent.session.turns.count, 1, "旧轮应被丢弃")
+        XCTAssertEqual(agent.session.turns.count, 2,
+                       "回水线：预估占用已远低于 60% 目标，只折叠最老 1 轮")
+        let digest = agent.session.extraDigest.joined(separator: "\n")
+        XCTAssertTrue(digest.contains("要点-1"), digest)
+        XCTAssertFalse(digest.contains("要点-2"),
+                       "未折叠轮的摘要不应出现在回注区：\(digest)")
+        XCTAssertEqual(agent.session.turns.last?.summary, "要点-3",
+                       "最近一轮保留原文，不需要回注自己的摘要")
+    }
+
+    /// 收缩压力充足时逐轮折叠到只剩最近一轮：每折一轮就重估占用，
+    /// 全部折叠轮的摘要行回注 `<earlier_context>`，仍零 LLM 调用。
+    func testShrinkSessionFoldsToRewatermarkUnderPressure() async {
+        let llm = RecordingLLM(supportsIsolated: true, reply: "Hello there!")
+        let agent = makeAgent(llm: llm)
+        defer { agent.close() }
+
+        for index in 1...3 {
+            let rec = agent.session.startTurn(prompt: "u\(index)")
+            agent.session.finishTurn(rec, assistantText: "a\(index)",
+                                     summary: "要点-\(index)")
+        }
+        // 记账推高 system 占用，模拟真实 90% 触发时的压力：不折满就回不到 60%。
+        agent.session.budget.setUsed("system", tokens: 22_000)
+        let shrunk = await agent.shrinkSession(reason: "context-90")
+
+        XCTAssertTrue(shrunk)
+        XCTAssertEqual(llm.defaultCallCount, 0, "收缩不得再调用主模型")
+        XCTAssertEqual(agent.session.turns.count, 1, "压力充足时应折叠到只剩最近一轮")
         let digest = agent.session.extraDigest.joined(separator: "\n")
         XCTAssertTrue(digest.contains("要点-1"), digest)
         XCTAssertTrue(digest.contains("要点-2"), digest)
-        XCTAssertEqual(agent.session.turns.last?.summary, "要点-3",
-                       "最近一轮保留原文，不需要回注自己的摘要")
+        XCTAssertFalse(digest.contains("要点-3"),
+                       "最近一轮保留原文，不回注自己的摘要：\(digest)")
     }
 
     // MARK: - 工具预算

@@ -231,9 +231,11 @@ public final class KnowledgeGraphBuilder {
         }
         let first = try await complete(system: system, user: prompt,
                                        temperature: Self.extractionTemperature,
-                                       stopOnDuplicateRows: format == .delimited)
+                                       stopOnDuplicateRows: format == .delimited,
+                                       jsonGuard: format == .json)
         // JSON 输出自带结构边界，解析成功即完整；解析失败不做二次补抽，
         // 直接按空结果处理（由调用方计入失败/空切片）。
+        // 收流截断的 JSON 由 parseExtractionJSON 的配平兜底恢复。
         guard format == .delimited else { return first.text }
         let parsed = Self.parseExtraction(first.text, limits: limits)
         guard shouldGlean(first: first, parsed: parsed) else { return first.text }
@@ -315,9 +317,102 @@ public final class KnowledgeGraphBuilder {
 
     // MARK: - 单次直答
 
+    /// JSON 抽取输出的收流保护。
+    ///
+    /// JSON 模式没有 `<|COMPLETE|>` 标记与逐行结构，模型一旦进入复读
+    ///（重复输出实体数组/关系数组）会一直跑到 token 上限。这里做两级检测：
+    /// - 快停：同一个 `"name"` 值出现多次（正常输出里每个实体名只出现一次，
+    ///   实体数组复读会立刻让所有名字翻倍）；
+    /// - 停滞：连续 stallChars 字符没有新增唯一实体名/关系端点值，
+    ///   说明输出不再产生新信息（关系复读、纯文本空转都会命中）。
+    /// 关系端点值允许合法重复（枢纽实体会被多条关系引用），因此只参与
+    /// 停滞统计、不参与快停；实体名在 schema 上只会出现一次，可安全快停。
+    struct JSONExtractionGuard {
+        /// 每增长多少字符重新扫描一次（输出仅几 KB，全量重扫开销可忽略）。
+        let rescanInterval: Int
+        /// 同名实体出现次数阈值：达到即判定复读。
+        let maxNameOccurrences: Int
+        /// 无新增唯一值的最长容忍字符数。
+        let stallChars: Int
+
+        init(rescanInterval: Int = 256, maxNameOccurrences: Int = 3,
+             stallChars: Int = 3_072) {
+            self.rescanInterval = rescanInterval
+            self.maxNameOccurrences = maxNameOccurrences
+            self.stallChars = stallChars
+        }
+
+        private var lastScannedCount = 0
+        private var nameCounts: [String: Int] = [:]
+        private var progressTokens: Set<String> = []
+        private var lastProgressAt = 0
+        private(set) var stoppedReason = ""
+
+        /// 返回 true 表示应收流停止。
+        mutating func shouldStop(output: String) -> Bool {
+            guard stoppedReason.isEmpty else { return true }
+            // 统一用 UTF-16 偏移：跨多次重扫（字符串在增长）保持可比。
+            let length = (output as NSString).length
+            guard length - lastScannedCount >= rescanInterval else { return false }
+            lastScannedCount = length
+            rescan(output)
+            if let (name, count) = nameCounts.first(where: { $0.value >= maxNameOccurrences }) {
+                stoppedReason = "实体「\(name)」重复出现 \(count) 次（疑似复读）"
+                return true
+            }
+            if length - lastProgressAt > stallChars {
+                stoppedReason = "连续 \(stallChars) 字符未产生新的实体或关系"
+                return true
+            }
+            return false
+        }
+
+        private static let namePattern = try! NSRegularExpression(
+            pattern: #"\"name\"\s*:\s*\"((?:[^"\\]|\\.)*)\""#)
+        private static let sourcePattern = try! NSRegularExpression(
+            pattern: #"\"source(?:_entity)?\"\s*:\s*\"((?:[^"\\]|\\.)*)\""#)
+        private static let targetPattern = try! NSRegularExpression(
+            pattern: #"\"target(?:_entity)?\"\s*:\s*\"((?:[^"\\]|\\.)*)\""#)
+
+        private mutating func rescan(_ output: String) {
+            let ns = output as NSString
+            let full = NSRange(location: 0, length: ns.length)
+            func captures(_ regex: NSRegularExpression) -> [(String, Int)] {
+                regex.matches(in: output, range: full).compactMap { match in
+                    guard match.range(at: 1).location != NSNotFound else { return nil }
+                    return (ns.substring(with: match.range(at: 1)),
+                            match.range(at: 1).upperBound)
+                }
+            }
+            let names = captures(Self.namePattern)
+            nameCounts = names.reduce(into: [:]) { $0[$1.0, default: 0] += 1 }
+            var tokens = Set(names.map { "n:\($0.0)" })
+            // 进度位置取「最后一个匹配值的结束偏移」：新值出现在哪里，
+            // 停滞计时就从哪里重新起算，而不是重扫发生的时刻。
+            var lastMatchEnd = 0
+            for (value, end) in names {
+                lastMatchEnd = max(lastMatchEnd, end)
+                tokens.insert("n:\(value)")
+            }
+            for (value, end) in captures(Self.sourcePattern) {
+                lastMatchEnd = max(lastMatchEnd, end)
+                tokens.insert("s:\(value)")
+            }
+            for (value, end) in captures(Self.targetPattern) {
+                lastMatchEnd = max(lastMatchEnd, end)
+                tokens.insert("t:\(value)")
+            }
+            if tokens.count > progressTokens.count {
+                lastProgressAt = max(lastProgressAt, lastMatchEnd)
+            }
+            progressTokens = tokens
+        }
+    }
+
     private func complete(system: String, user: String,
                           temperature: Double,
-                          stopOnDuplicateRows: Bool = false)
+                          stopOnDuplicateRows: Bool = false,
+                          jsonGuard: Bool = false)
         async throws -> (text: String, stoppedByDuplicate: Bool) {
         var messages: [ChatMessage] = []
         if !system.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
@@ -331,6 +426,7 @@ public final class KnowledgeGraphBuilder {
         var duplicateRows = 0
         var stoppedByDuplicate = false
         var shouldStop = false
+        var jsonGuardState = JSONExtractionGuard()
         let stream = llm.chatStream(messages: messages, tools: [],
                                     temperature: temperature, options: options)
         for try await event in stream {
@@ -340,6 +436,10 @@ public final class KnowledgeGraphBuilder {
                     duplicateRows += Self.countDuplicateRelationRows(
                         in: output, scannedLines: &scannedLines,
                         seenPairs: &seenPairs)
+                } else if jsonGuard, jsonGuardState.shouldStop(output: output) {
+                    stoppedByDuplicate = true
+                    shouldStop = true
+                    AgentLog.info("[kg] JSON 收流：\(jsonGuardState.stoppedReason)")
                 }
             }
             // 模型给出完成标记后立即停止消费，避免标记之后继续生成浪费 token。
@@ -884,7 +984,7 @@ public final class KnowledgeGraphBuilder {
     /// 解析 JSON 格式的抽取输出（允许模型加代码围栏或少量前后说明）。
     static func parseExtractionJSON(_ output: String,
                                     limits: KGExtractionLimits = .default) -> KGExtractionResult {
-        guard let object = jsonObject(in: output)?.objectValue else {
+        guard let object = extractionJSONObject(in: output)?.objectValue else {
             return KGExtractionResult()
         }
         var entities: [KGExtractedEntity] = []
@@ -936,6 +1036,100 @@ public final class KnowledgeGraphBuilder {
         guard let start = trimmed.firstIndex(of: "{"),
               let end = trimmed.lastIndex(of: "}"), start < end else { return nil }
         return JSONValue.parse(String(trimmed[start...end]))
+    }
+
+    /// 收流保护可能产生「完整对象 + 复读尾巴」或「半截 JSON」，
+    /// 因此解析按四级兜底：整段 → 首{}截取 → 第一个配平对象（丢弃复读）
+    /// → 补齐缺失括号（截断恢复，尽量保留已输出的实体/关系）。
+    static func extractionJSONObject(in output: String) -> JSONValue? {
+        if let value = jsonObject(in: output) { return value }
+        if let balanced = firstBalancedObject(in: output),
+           let value = JSONValue.parse(balanced) { return value }
+        if let closed = closedTruncatedObject(in: output),
+           let value = JSONValue.parse(closed) { return value }
+        return nil
+    }
+
+    /// 返回第一个配平的顶层 `{...}` 子串（字符串内的括号不计深度）。
+    /// 复读场景：完整对象后面跟着重复内容，取第一个即丢弃复读。
+    static func firstBalancedObject(in output: String) -> String? {
+        guard let start = output.firstIndex(of: "{") else { return nil }
+        var depth = 0
+        var inString = false
+        var escaped = false
+        var index = start
+        while index < output.endIndex {
+            let ch = output[index]
+            if escaped {
+                escaped = false
+            } else if inString && ch == "\\" {
+                escaped = true
+            } else if ch == "\"" {
+                inString.toggle()
+            } else if !inString {
+                if ch == "{" {
+                    depth += 1
+                } else if ch == "}" {
+                    depth -= 1
+                    if depth == 0 { return String(output[start...index]) }
+                }
+            }
+            index = output.index(after: index)
+        }
+        return nil
+    }
+
+    /// 截断 JSON 兜底：补齐缺失的 `]` `}` 使其可解析。
+    /// 先尝试直接补齐；失败则丢弃最后一个不完整项（字符串外的最后一个
+    /// 逗号之后的内容）再补齐。字符串截半、悬空键名都由后者处理。
+    static func closedTruncatedObject(in output: String) -> String? {
+        guard let start = output.firstIndex(of: "{") else { return nil }
+        func close(_ prefix: Substring) -> String? {
+            var stack: [Character] = []
+            var inString = false
+            var escaped = false
+            var index = prefix.startIndex
+            while index < prefix.endIndex {
+                let ch = prefix[index]
+                if escaped {
+                    escaped = false
+                } else if inString && ch == "\\" {
+                    escaped = true
+                } else if ch == "\"" {
+                    inString.toggle()
+                } else if !inString {
+                    if ch == "{" { stack.append("}") }
+                    else if ch == "[" { stack.append("]") }
+                    else if ch == "}" || ch == "]" { _ = stack.popLast() }
+                }
+                index = output.index(after: index)
+            }
+            var closed = String(prefix)
+            if inString { closed += "\"" }
+            closed += String(stack.reversed())
+            return JSONValue.parse(closed) == nil ? nil : closed
+        }
+        if let closed = close(output[start...]) { return closed }
+        // 找最后一个字符串外的逗号，丢弃其后可能残缺的键值对/元素。
+        var lastComma: String.Index?
+        var inString = false
+        var escaped = false
+        var index = start
+        while index < output.endIndex {
+            let ch = output[index]
+            if escaped {
+                escaped = false
+            } else if inString && ch == "\\" {
+                escaped = true
+            } else if ch == "\"" {
+                inString.toggle()
+            } else if !inString && ch == "," {
+                lastComma = index
+            }
+            index = output.index(after: index)
+        }
+        guard let comma = lastComma else { return nil }
+        return close(output[start..<comma])
     }
 
     private static func jsonKeywords(_ value: JSONValue?) -> String {

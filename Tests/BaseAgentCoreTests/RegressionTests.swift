@@ -85,6 +85,44 @@ final class RegressionTests: XCTestCase {
         XCTAssertTrue(CheckpointStore.readPersisted(config).isEmpty)
     }
 
+    /// 超长便签不再直接截断：先走注入的压缩器（LLM 压缩）；压缩器不可用
+    /// 或输出仍超长时，保头保尾并显式标注中间省略，总长仍受 maxKeyInfo 约束。
+    func testCheckpointOverlongCompressesInsteadOfTruncating() async throws {
+        var config = AgentConfig()
+        config.workspace = directory.path
+        let session = Session(budget: ContextBudget(total: 30_000))
+        let registry = ToolRegistry(config: config)
+        registry.session = session
+        let long = String(repeating: "A", count: 3_000) + "B"
+            + String(repeating: "C", count: 2_000)
+
+        // 压缩器正常：直接采用压缩结果，不丢任何内容。
+        let compressed = UpdateWorkingCheckpointTool(
+            config: config, callbacks: nil, registry: registry,
+            compressor: { _ in "compressed-summary" })
+        let result = try await compressed.run(["key_info": .string(long)])
+        XCTAssertTrue(result.success)
+        XCTAssertEqual(session.getKeyInfo(), "compressed-summary")
+
+        // 压缩器不可用（nil）：保头保尾，中间显式省略。
+        let fallback = UpdateWorkingCheckpointTool(config: config, callbacks: nil, registry: registry)
+        let result2 = try await fallback.run(["key_info": .string(long)])
+        XCTAssertTrue(result2.success)
+        let stored = session.getKeyInfo()
+        XCTAssertLessThanOrEqual(stored.count, CheckpointStore.maxKeyInfo)
+        XCTAssertTrue(stored.hasPrefix(String(repeating: "A", count: 100)))
+        XCTAssertTrue(stored.contains("[…中间已省略]"))
+        XCTAssertTrue(stored.hasSuffix("CCC"))
+
+        // 压缩器输出仍超长：同样退回保头保尾。
+        let badCompressor = UpdateWorkingCheckpointTool(
+            config: config, callbacks: nil, registry: registry,
+            compressor: { _ in String(repeating: "X", count: 5_000) })
+        let result3 = try await badCompressor.run(["key_info": .string(long)])
+        XCTAssertTrue(result3.success)
+        XCTAssertLessThanOrEqual(session.getKeyInfo().count, CheckpointStore.maxKeyInfo)
+    }
+
     func testAskUserAnswerIsInjectedAndRunContinues() async {
         var config = AgentConfig()
         config.workspace = directory.path

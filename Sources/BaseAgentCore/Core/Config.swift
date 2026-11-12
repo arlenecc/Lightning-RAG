@@ -193,13 +193,13 @@ public struct AgentConfig: Sendable {
     /// 不会中途滑窗挤掉最老轮（那会让 KV 前缀每轮变化、反复全量 prefill）。
     /// 它同时也是 CONSOLIDATE 周期的上钳位（见 `Loop.swift` 构造）。
     public var kernelRawTurns: Int = 10
-    /// 周期性主动折叠间隔（轮），默认 8。触发时丢弃旧历史，但**保留最近 2 轮
-    /// 原文**以防折叠处上下文断裂；不回注任何摘要、不给上下文加负担，KV 只
-    /// 重建一次（旧历史已由 `onTurnFinished` 逐轮落盘，交给 L2 摘要 / L3 折叠
+    /// 周期性主动折叠间隔（轮），默认 8。触发时摘掉旧历史并把每轮摘要行回注
+    /// `<earlier_context>`，**保留最近 2 轮原文**以防折叠处上下文断裂；KV 只
+    /// 重建一次（完整历史已由 `onTurnFinished` 逐轮落盘，交给 L2 摘要 / L3 折叠
     /// 历史 / L4 长期记忆维护）。
     /// 实际生效周期 = `min(max(1, 本值), kernelRawTurns)`；配大于 rawTurns 会被钳住。
-    /// **唯一例外**：上下文占用超过最大上下文 90%（`ContextBudget.needsAutoShrink`）时
-    /// 触发自动收缩，才会用 LLM 生成旧上下文摘要并回注 `<earlier_context>`。
+    /// **例外**：上下文占用超过最大上下文 90%（`ContextBudget.needsAutoShrink`）时
+    /// 走 `foldToRewatermark` 收缩到回水线（触发线下 30 个百分点）。
     public var kernelConsolidateEvery: Int = 8
     /// L1 工具结果字符上限。与 RAG 输出总上限（ragSearchMaxTotalChars=12000）
     /// 取较小值生效：默认 8000 让 RAG 结果不会被内核二次静默截断。
@@ -208,7 +208,11 @@ public struct AgentConfig: Sendable {
     /// 沿用 L1 的 `kernelMaxToolChars`。RAG 结果通常 bulky，单独收紧只保留最相关
     /// 头部、丢弃尾部，避免几千字符的结果把历史 / KV 前缀撑大、拖慢后续每轮生成。
     public var kernelRagHistoryChars: Int = 2_000
-    public var kernelMaxDigestLines: Int = 40
+    /// `<earlier_context>` 保留的折叠摘要行数上限（含 1 行「更早轮已省略」标记）。
+    /// 默认 20：超过 20 轮的历史摘要对当前任务作用有限，而折叠周期内还有
+    /// 8~10 轮原文窗口，20 条摘要 + 近期原文已足够衔接。改小更省上下文，
+    /// 代价是更早轮次只剩省略标记。
+    public var kernelMaxDigestLines: Int = 20
 
     // RAG
     /// 切片大小（token，含 overlap）。默认 800：jina-embeddings-v3 声明

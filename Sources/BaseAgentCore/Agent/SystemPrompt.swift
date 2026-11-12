@@ -52,7 +52,7 @@ You are base-agent, a local autonomous agent. Complete tasks by reasoning, plann
   勿 scattershot；单次 outline 后 `rag_tools(op="search")` 至多 3 次且目标互异（内核硬上限）。另有 `rag_tools(op="ingest")` / `rag_tools(op="status")`。
 - 外置经验：复杂任务先 `skill_tools(op="semantic_search")`，无果再 `skill_tools(op="search")`（索引不同目录），命中后 `skill_tools(op="load")` 遵循；要浏览全部技能用 `skill_tools(op="list")`；可复用多步流程才 `skill_tools(op="save")`。
 - 记忆与便签：`long_memory(op="search")` 召回既往、`long_memory(op="graph")` 记持久偏好与实体关系、
-  `work_memory` 存任务草稿、`update_working_checkpoint(key_info=...)` 写便签（每轮回注）、
+  `update_working_checkpoint(key_info=...)` 写便签（每轮回注）、
   `update_plan` 管理计划、`start_long_term_update` 提纯长期记忆、`ask_user` 见行动原则。
 
 ## 多级记忆（L0–L4，规范见下方常驻 META-SOP）
@@ -71,9 +71,6 @@ Paths are relative to the workspace. `code_run`, `shell_run`, writes under `memo
 
 public enum SystemPromptLimits {
     public static let maxSkillPromptChars = 1_500
-    /// 工作记忆注入上限：模型自建 key 不受上下文压缩约束，必须在注入侧封顶。
-    public static let maxWorkMemoryKeys = 20
-    public static let maxWorkMemoryChars = 2_000
     /// L0 META-SOP 与 L1 索引常驻 system prompt 的字符上限。
     /// 二者直接占用 `ContextBudget` 的 system 分区，会等比压缩 rawCeiling，
     /// 因此必须硬封顶（L1 另受 ≤30 行约束，见 `MemoryDirectory.loadL1`）。
@@ -106,7 +103,7 @@ public let FACT_EXTRACT_SYSTEM = """
 
 禁止输出的实体名（出现即丢弃）：
 - 泛指名词：项目、代码、问题、方案、工具、文件、数据、任务、内容、系统、模型、对话、结果、错误、方法、步骤、信息、测试、配置、环境、状态、其他、东西、事情，以及 project / code / issue / tool / file / data / task / content / system / model / conversation / result / error / other / unknown / item / thing。
-- 助手自身的工具与能力：rag_tools、file_tools、shell_run、code_run、web_scan、long_memory、work_memory、update_plan 等。
+- 助手自身的工具与能力：rag_tools、file_tools、shell_run、code_run、web_scan、long_memory、update_plan 等。
 - 代词、纯数字、占位符（<entity_name>、xxx、todo、example）。
 
 ## 观察准入（全部满足才输出）

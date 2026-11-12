@@ -91,7 +91,7 @@ final class AgentIntegrationTests: XCTestCase {
         let agent = Agent(llm: ScriptedLLM(), config: config, callbacks: NoopCallbacks())
         let names = Set(agent.tools.allTools.map(\.name))
         for expected in ["file_tools", "web_scan", "rag_tools", "long_memory", "skill_tools",
-                         "code_run", "shell_run", "ask_user", "work_memory",
+                         "code_run", "shell_run", "ask_user",
                          "update_working_checkpoint", "start_long_term_update", "update_plan"] {
             XCTAssertTrue(names.contains(expected), "缺少工具 \(expected)")
         }
