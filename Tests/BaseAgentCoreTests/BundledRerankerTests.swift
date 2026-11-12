@@ -25,6 +25,65 @@ final class BundledRerankerTests: XCTestCase {
         if let temporaryRoot { try? FileManager.default.removeItem(at: temporaryRoot) }
     }
 
+    /// HF ONNX 仓库常把权重放在 `onnx/` 子目录、tokenizer 与 config 放在根目录。
+    /// 读取目录必须回到根目录，否则加载时报「缺少 tokenizer：<root>/onnx/tokenizer.json」。
+    func testONNXSupportDirectoryHandlesNestedWeightLayout() throws {
+        let nested = temporaryRoot.appendingPathComponent("nested-reranker", isDirectory: true)
+        let onnxDir = nested.appendingPathComponent("onnx", isDirectory: true)
+        try FileManager.default.createDirectory(at: onnxDir, withIntermediateDirectories: true)
+        let nestedWeight = onnxDir.appendingPathComponent("model_quantized.onnx")
+        FileManager.default.createFile(
+            atPath: nestedWeight.path, contents: Data(repeating: 1, count: 64))
+        FileManager.default.createFile(
+            atPath: nested.appendingPathComponent("config.json").path,
+            contents: Data("{}".utf8))
+        FileManager.default.createFile(
+            atPath: nested.appendingPathComponent("tokenizer.json").path,
+            contents: Data("{}".utf8))
+
+        XCTAssertEqual(
+            LocalModelRegistry.onnxSupportDirectory(modelURL: nestedWeight, modelRoot: nested).path,
+            nested.path, "权重在 onnx/ 时应回到模型根目录读 tokenizer")
+
+        // provider 自身也必须用根目录，避免真实加载时仍报缺少 tokenizer。
+        let reranker = ONNXReranker(directory: nested, modelName: "nested-layout")
+        XCTAssertEqual(reranker.directory.path, nested.path)
+
+        // 平铺布局：权重与 tokenizer 同在根目录。
+        let flat = temporaryRoot.appendingPathComponent("flat-reranker", isDirectory: true)
+        try FileManager.default.createDirectory(at: flat, withIntermediateDirectories: true)
+        let flatWeight = flat.appendingPathComponent("model_quantized.onnx")
+        FileManager.default.createFile(
+            atPath: flatWeight.path, contents: Data(repeating: 1, count: 64))
+        FileManager.default.createFile(
+            atPath: flat.appendingPathComponent("tokenizer.json").path,
+            contents: Data("{}".utf8))
+        XCTAssertEqual(
+            LocalModelRegistry.onnxSupportDirectory(modelURL: flatWeight, modelRoot: flat).path,
+            flat.path)
+
+        // tokenizer 也放在 onnx/ 子目录的布局要能继续用。
+        let nestedTokenizer = temporaryRoot.appendingPathComponent("onnx-tokenizer", isDirectory: true)
+        let nestedOnnx = nestedTokenizer.appendingPathComponent("onnx", isDirectory: true)
+        try FileManager.default.createDirectory(at: nestedOnnx, withIntermediateDirectories: true)
+        let nestedOnnxWeight = nestedOnnx.appendingPathComponent("model_quantized.onnx")
+        FileManager.default.createFile(
+            atPath: nestedOnnxWeight.path, contents: Data(repeating: 1, count: 64))
+        FileManager.default.createFile(
+            atPath: nestedOnnx.appendingPathComponent("tokenizer.json").path,
+            contents: Data("{}".utf8))
+        XCTAssertEqual(
+            LocalModelRegistry.onnxSupportDirectory(
+                modelURL: nestedOnnxWeight, modelRoot: nestedTokenizer).path,
+            nestedOnnx.path)
+
+        // 显式传单个 .onnx 文件：root 归一到其父目录。
+        XCTAssertEqual(
+            LocalModelRegistry.onnxSupportDirectory(
+                modelURL: flatWeight, modelRoot: flatWeight).path,
+            flat.path)
+    }
+
     /// 打包脚本必须复制 reranker 的全部运行时文件，避免发布包缺权重。
     func testPackageScriptBundlesRerankerRuntimeFiles() throws {
         let repoRoot = URL(fileURLWithPath: #filePath)

@@ -22,12 +22,28 @@ public final class LocalModelFactory: @unchecked Sendable {
 
     private init() {
         Self.configureMetallibPath()
+        Self.installMLXErrorHandler()
         // MLX 默认缓存可达统一内存 75%，长文 OCR/对话容易把 footprint 顶到很高。
         // 16GB 机器上实测 1024MB 的 buffer cache 对 decode 提速约 5-8%
         //（512MB 时 prefill 大 buffer 会把 decode 复用的小 buffer 挤出，导致
         // 每 token 频繁重新分配 Metal buffer），超出部分仍会回收给系统。
         setCacheLimitMB(1024)
         setMemoryLimitMB(0)
+    }
+
+    /// 安装 MLX 全局错误处理器。
+    ///
+    /// MLX C++ 层（Metal 分配失败、形状越界等）报错时，mlx-swift 默认直接
+    /// `fatalError`，崩溃报告里只有 `_mlx_error` 栈、看不到具体原因。这里先把
+    /// 消息写进应用日志，再维持原来的 fail-fast 行为，便于在其它机器上定位。
+    /// 有 `withError` 任务级处理器的路径不受影响（task-local 优先）。
+    private static func installMLXErrorHandler() {
+        // 该 API 已标记 deprecated，但它是唯一能覆盖「无 task-local handler」的全局入口。
+        setErrorHandler { message, _ in
+            let text = message.map { String(cString: $0) } ?? "unknown"
+            AgentLog.error("[mlx] fatal: \(text)")
+            fatalError(text)
+        }
     }
 
     /// 打包成 .app 后，MLX 只会在 `<bundleURL>/mlx-swift_Cmlx.bundle/…` 与已加载的

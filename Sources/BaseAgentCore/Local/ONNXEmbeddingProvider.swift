@@ -75,10 +75,11 @@ public final class ONNXEmbeddingProvider: EmbeddingProvider, EmbeddingTokenCount
         self.modelURL = resolved
         self.preflightError = loadError
 
-        // 权重文件的所在目录：显式选文件时取父目录，按目录解析时即目录本身。
-        // config / tokenizer 均从此目录读取。
-        let modelDir = resolved?.pathExtension.lowercased() == "onnx"
-            ? resolved!.deletingLastPathComponent() : directory
+        // config / tokenizer 的读取目录：权重在 `onnx/` 子目录、tokenizer 在
+        // 根目录时不能只看权重父目录，否则会误报缺少 tokenizer.json。
+        let modelDir = resolved.map {
+            LocalModelRegistry.onnxSupportDirectory(modelURL: $0, modelRoot: directory)
+        } ?? directory
         self.directory = modelDir
 
         // 模型窗口可能很大（jina-v3 8192），推理前统一压到 1024 token。

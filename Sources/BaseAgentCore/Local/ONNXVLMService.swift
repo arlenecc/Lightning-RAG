@@ -114,8 +114,9 @@ private final class ONNXVLMLoaded: @unchecked Sendable {
 
     static func load(modelLocation: URL, tokenizerDirectory: URL?, modelName: String) async throws -> ONNXVLMLoaded {
         let modelURL = try LocalModelRegistry.resolveONNXModel(in: modelLocation, kind: .vlm)
-        let modelDir = modelURL.pathExtension.lowercased() == "onnx"
-            ? modelURL.deletingLastPathComponent() : modelLocation
+        // 权重可能在 onnx/ 子目录而 tokenizer/config 在根目录，不能只看权重父目录。
+        let modelDir = LocalModelRegistry.onnxSupportDirectory(
+            modelURL: modelURL, modelRoot: modelLocation)
         let tokenizer = try await LocalTokenizer.load(directory: tokenizerDirectory ?? modelDir)
 
         let vlm = VLMGraphConfig.load(directory: modelDir)

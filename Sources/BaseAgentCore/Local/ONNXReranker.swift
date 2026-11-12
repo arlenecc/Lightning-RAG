@@ -30,10 +30,12 @@ public final class ONNXReranker: RerankProvider, @unchecked Sendable {
         self.modelURL = resolved
         self.preflightError = loadError
 
-        // 若显式指定了 .onnx 文件，config / tokenizer 应去其所在目录读取。
-        let modelDir = resolved?.pathExtension.lowercased() == "onnx"
-            ? resolved!.deletingLastPathComponent() : directory
-        self.directory = modelDir
+        // config / tokenizer 的读取目录：权重在 `onnx/` 子目录、tokenizer 在
+        // 根目录时不能只看权重父目录，否则会误报缺少 tokenizer.json。
+        self.directory = resolved.map {
+            LocalModelRegistry.onnxSupportDirectory(modelURL: $0, modelRoot: directory)
+        } ?? directory
+        let modelDir = self.directory
         // XLM-R 系 ONNX 图内自算 position id（cumsum + padding_idx=1），
         // 有效长度是 tokenizer 声明的 model_max_length（如 base 为 512），
         // 直接用 config 的 max_position_embeddings（514）会在长 pair 上 Gather 越界。

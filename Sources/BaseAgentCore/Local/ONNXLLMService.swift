@@ -489,9 +489,9 @@ private final class ONNXLoaded: @unchecked Sendable {
                      tokenizerDirectory: URL?,
                      modelName: String) async throws -> ONNXLoaded {
         let modelURL = try LocalModelRegistry.resolveONNXModel(in: directory, kind: .llm)
-        // 若显式指定了 .onnx 文件，tokenizer / config 应去其所在目录读取。
-        let modelDir = modelURL.pathExtension.lowercased() == "onnx"
-            ? modelURL.deletingLastPathComponent() : directory
+        // 权重可能在 onnx/ 子目录而 tokenizer/config 在根目录，不能只看权重父目录。
+        let modelDir = LocalModelRegistry.onnxSupportDirectory(
+            modelURL: modelURL, modelRoot: directory)
         let tokenizer = try await LocalTokenizer.load(
             directory: tokenizerDirectory ?? modelDir)
         let session = try OrtSession(modelPath: modelURL.path)

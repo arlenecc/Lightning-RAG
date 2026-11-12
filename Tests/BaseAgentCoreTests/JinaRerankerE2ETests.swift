@@ -72,6 +72,38 @@ final class JinaRerankerE2ETests: XCTestCase {
         XCTAssertEqual(truncated.last, eos)
     }
 
+    /// 自动下载的 HF ONNX 仓库布局：权重在 `onnx/` 子目录、tokenizer 在根目录。
+    /// 旧实现把 tokenizer 目录取成 `onnx/`，加载报「缺少 tokenizer.json」。
+    func testNestedONNXLayoutLoadsTokenizerFromModelRoot() async throws {
+        let source = try modelDirectory()
+        let temp = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("nested-onnx-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: temp) }
+        let onnxDir = temp.appendingPathComponent("onnx", isDirectory: true)
+        try FileManager.default.createDirectory(at: onnxDir, withIntermediateDirectories: true)
+        let fm = FileManager.default
+        for name in ["config.json", "tokenizer.json", "tokenizer_config.json",
+                     "special_tokens_map.json"] {
+            let src = source.appendingPathComponent(name)
+            if fm.fileExists(atPath: src.path) {
+                try fm.copyItem(at: src, to: temp.appendingPathComponent(name))
+            }
+        }
+        // 权重用符号链接，避免复制 280MB。
+        try fm.createSymbolicLink(
+            atPath: onnxDir.appendingPathComponent("model_quantized.onnx").path,
+            withDestinationPath: source.appendingPathComponent("model_quantized.onnx").path)
+
+        let reranker = ONNXReranker(directory: temp, modelName: "nested-layout")
+        XCTAssertEqual(reranker.directory.path, temp.path,
+                       "tokenizer 应回到模型根目录读取")
+        let scores = try await reranker.rerank(
+            query: "光合作用需要什么",
+            documents: ["植物需要阳光进行光合作用", "今天股市上涨"])
+        XCTAssertEqual(scores.count, 2)
+        XCTAssertGreaterThan(scores[0], scores[1])
+    }
+
     /// 真实 hard negative 对照。q4-doc04 的 logit 恰为正数且落在 [0,1]，
     /// 若把 logit 误当概率直接返回，分数会从 0.55 掉到 0.18。
     func testHardNegativePassagesRankCorrectly() async throws {

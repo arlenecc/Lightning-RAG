@@ -340,6 +340,32 @@ public enum LocalModelRegistry {
             kind, directory: directory.path, expected: onnxCandidateNames)
     }
 
+    /// ONNX 模型运行时读取 config / tokenizer 的目录。
+    ///
+    /// HF ONNX 仓库常见两种布局：权重与 tokenizer/config 同在模型根目录，
+    /// 或权重放在 `onnx/` 子目录、tokenizer/config 在根目录。因此不能简单取
+    /// 权重文件的父目录——那会把 tokenizer 目录误判成 `onnx/`，加载时报
+    /// 「模型目录缺少 tokenizer 文件：<root>/onnx/tokenizer.json」。
+    /// 优先权重所在目录，其次模型根目录。
+    public static func onnxSupportDirectory(modelURL: URL, modelRoot: URL) -> URL {
+        let fm = FileManager.default
+        var root = modelRoot
+        var isDirectory: ObjCBool = false
+        if fm.fileExists(atPath: root.path, isDirectory: &isDirectory),
+           !isDirectory.boolValue {
+            root = root.deletingLastPathComponent()
+        }
+        let weightDir = modelURL.deletingLastPathComponent()
+        for candidate in [weightDir, root] {
+            if fm.fileExists(atPath: candidate.appendingPathComponent("tokenizer.json").path) {
+                return candidate
+            }
+        }
+        // 两处都没有 tokenizer.json：返回模型根目录，让报错指向用户应放文件的位置。
+        return root
+    }
+
+
     /// ONNX 权重候选文件名（按优先级）：量化/int8 > int4 > 未量化(FP16)。
     /// 先当前目录，再 `onnx/` 子目录。
     ///
