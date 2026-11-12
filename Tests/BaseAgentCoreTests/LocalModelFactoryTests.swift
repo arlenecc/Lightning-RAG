@@ -47,6 +47,37 @@ final class LocalModelFactoryTests: XCTestCase {
         XCTAssertEqual(provider.dimension, 128, "V5 provider 必须直接输出 128 维")
     }
 
+    /// reranker 目录解析失败不缓存：模型下载/补全到位后，下一次 makeReranker
+    /// 必须能重新解析成功，而不是一直拿到缓存的 Failing 实例（必须重启）。
+    func testRerankerFailureIsNotCachedAndRecovers() throws {
+        let dir = temporaryRoot.appendingPathComponent("late-reranker", isDirectory: true)
+        var config = AgentConfig()
+        config.workspace = temporaryRoot.path
+        config.rerankerProvider = "local"
+        config.localRerankerBackend = "onnx"
+        config.localRerankerModel = ""
+        config.ragRerankModel = ""
+        config.localRerankerModelPath = dir.path
+        defer { LocalModelFactory.shared.clearCaches() }
+
+        // 目录尚不存在：首次解析失败，拿不到真实 provider。
+        XCTAssertFalse(LocalModelFactory.shared.makeReranker(config: config)
+            is ONNXReranker)
+
+        // 模型补全（权重 + tokenizer.json）后同一份配置应恢复。
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        XCTAssertTrue(FileManager.default.createFile(
+            atPath: dir.appendingPathComponent("model_quantized.onnx").path,
+            contents: Data(repeating: 1, count: 8_192)))
+        XCTAssertTrue(FileManager.default.createFile(
+            atPath: dir.appendingPathComponent("tokenizer.json").path,
+            contents: Data("{}".utf8)))
+
+        let recovered = LocalModelFactory.shared.makeReranker(config: config)
+        XCTAssertTrue(recovered is ONNXReranker,
+                      "目录就位后不应继续返回缓存的 Failing：\(String(describing: recovered))")
+    }
+
     func testFactoryDefaultsMLXEmbeddingToJinaV5() throws {
         let modelsRoot = EmbeddingBenchmarkTests.resolveModelsRoot()
         let directory = modelsRoot.appendingPathComponent(Self.modelName)

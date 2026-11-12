@@ -272,24 +272,16 @@ public final class LocalModelFactory: @unchecked Sendable {
             : config.localRerankerModelPath
         let key = "reranker:\(backend):\(value)"
 
-        return rerankers.value(for: key) {
+        // 与 Embedding 一致：目录解析失败不进缓存。模型可能正在下载或刚补到
+        // 新位置，旧实现把 Failing 实例缓存进 LRU，文件就位后仍会一直失败
+        //（要重启或改配置才恢复）；这里失败后下次调用重新解析即可自愈。
+        if backend == "gguf" {
             do {
-                if backend == "gguf" {
-                    let file = try GGUFFileResolver.resolve(
-                        kind: .reranker, value: value, config: config)
-                    return LlamaCppReranker(modelPath: file.path)
+                let file = try GGUFFileResolver.resolve(
+                    kind: .reranker, value: value, config: config)
+                return rerankers.value(for: key) {
+                    LlamaCppReranker(modelPath: file.path)
                 }
-                let directory = try LocalModelRegistry.resolveONNXDirectory(
-                    kind: .reranker,
-                    value: value,
-                    config: config
-                )
-                if backend == "mlx" {
-                    return MLXReranker(directory: directory, modelName: value)
-                }
-                return ONNXReranker(
-                    directory: directory,
-                    modelName: value)
             } catch {
                 AgentLog.warning("本地 Reranker 不可用：\(error.localizedDescription)")
                 return FailingRerankProvider(
@@ -297,6 +289,28 @@ public final class LocalModelFactory: @unchecked Sendable {
                     error: error
                 )
             }
+        }
+        let directory: URL
+        do {
+            directory = try LocalModelRegistry.resolveONNXDirectory(
+                kind: .reranker,
+                value: value,
+                config: config
+            )
+        } catch {
+            AgentLog.warning("本地 Reranker 不可用：\(error.localizedDescription)")
+            return FailingRerankProvider(
+                identifier: "local:\(backend):\(value)",
+                error: error
+            )
+        }
+        return rerankers.value(for: key) {
+            if backend == "mlx" {
+                return MLXReranker(directory: directory, modelName: value)
+            }
+            return ONNXReranker(
+                directory: directory,
+                modelName: value)
         }
     }
 

@@ -409,7 +409,7 @@ final class AppViewModel: ObservableObject {
     private var downloadPromptShown = false
     private let hfDownloader = HFModelDownloader()
 
-    /// 检查当前配置引用的本地模型是否就绪（目录含权重文件）。
+    /// 检查当前配置引用的本地模型是否就绪（权重 + MLX/ONNX 必需的 tokenizer）。
     func checkDefaultModels() {
         missingDefaultModels = RequiredModelCatalog.missingModels(for: config)
     }
@@ -512,6 +512,13 @@ final class AppViewModel: ObservableObject {
         }
         guard totalBytes > 0 else {
             checkDefaultModels()
+            // 清单里没有任何待下载文件却仍判缺失：远端仓库本身缺少运行必需
+            // 的文件（通常是没有 tokenizer.json），必须报错，不能提示已就绪。
+            if let still = missingDefaultModels.first {
+                throw HFModelDownloader.HFError.badResponse(
+                    "\(still.repo) 缺少运行必需的文件（权重或 tokenizer.json），"
+                        + "镜像仓库可能不完整，请在配置窗口指定其它已就绪的模型")
+            }
             isDownloadingModels = false
             statusText = "默认模型已就绪"
             return
@@ -540,10 +547,24 @@ final class AppViewModel: ObservableObject {
                 completedBytes += file.size
                 modelDownloadProgress = Double(completedBytes) / Double(totalBytes)
             }
+            // 逐模型校验：只有权重下完、tokenizer 还没下（或远端缺文件）时
+            // 不能宣布就绪，否则启动加载会报「缺少 tokenizer」且不再触发补全。
+            guard RequiredModelCatalog.isComplete(entry.model) else {
+                throw HFModelDownloader.HFError.badResponse(
+                    "\(entry.model.repo) 下载完成后仍缺少权重或 tokenizer.json，"
+                        + "请再次点击下载（支持断点续传）或手动指定可用模型")
+            }
             appendLog("[models] 已就绪：\(entry.model.repo)")
         }
 
         checkDefaultModels()
+        if let still = missingDefaultModels.first {
+            isDownloadingModels = false
+            statusText = "模型下载未完成"
+            modelDownloadStatusText = "\(still.repo) 仍未就绪"
+            throw HFModelDownloader.HFError.badResponse(
+                "\(still.repo) 仍未就绪（缺少权重或 tokenizer.json），请在配置窗口检查模型目录")
+        }
         isDownloadingModels = false
         statusText = "默认模型已就绪"
         modelDownloadStatusText = ""

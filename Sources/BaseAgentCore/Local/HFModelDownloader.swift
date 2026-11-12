@@ -418,15 +418,21 @@ public struct RequiredModel: Sendable, Equatable, Identifiable {
     /// ONNX 后端只认 `resolveONNXModel` 候选名单里的名字，避免把仓库里
     /// `model_fp16.onnx` / 原版 `model.safetensors` 这类永远不读的权重拉下来。
     public let allowedWeightNames: Set<String>?
+    /// 是否必须存在 tokenizer 文件（MLX / ONNX 模型的加载前置）。
+    /// GGUF 的 tokenizer 内嵌在权重里，目录下载不带 tokenizer 文件，
+    /// 这类模型必须为 false，否则会被永远判定缺失。
+    public let requiresTokenizer: Bool
 
     public init(kind: String, repo: String, directory: URL,
                 subpath: String? = nil,
-                allowedWeightNames: Set<String>? = nil) {
+                allowedWeightNames: Set<String>? = nil,
+                requiresTokenizer: Bool = true) {
         self.kind = kind
         self.repo = repo
         self.directory = directory
         self.subpath = subpath
         self.allowedWeightNames = allowedWeightNames
+        self.requiresTokenizer = requiresTokenizer
     }
 }
 
@@ -469,8 +475,13 @@ public enum RequiredModelCatalog {
             switch registryKind {
             case .reranker: backend = config.localRerankerBackend
             case .embedding: backend = config.localEmbeddingBackend
+            case .llm, .aux: backend = config.localLLMBackend
             default: backend = ""
             }
+            // GGUF 的 tokenizer 内嵌在权重里，下载目录不含 tokenizer.json；
+            // 这类模型不能要求 tokenizer，否则会被判成永远缺失。
+            let requiresTokenizer = !trimmed.lowercased().hasSuffix(".gguf")
+                && !backend.lowercased().contains("gguf")
             // 用户显式选定了一个具体权重文件（config 里写的是文件路径）时，
             // registry 会把它归一成父目录，但运行时按用户选的文件直接采用，
             // 文件名不必在候选名单里 —— 这类不能套白名单，否则永远判缺失。
@@ -487,7 +498,8 @@ public enum RequiredModelCatalog {
                 kind: kind,
                 repo: "\(HFModelDownloader.repoOwner)/\(repoName)",
                 directory: dir,
-                allowedWeightNames: weightNames))
+                allowedWeightNames: weightNames,
+                requiresTokenizer: requiresTokenizer))
         }
 
         if config.llmProvider == "local" {
@@ -572,9 +584,36 @@ public enum RequiredModelCatalog {
         models(for: config).filter { !isComplete($0) }
     }
 
-    /// 与运行时同源的就绪判定：只认可加载文件名，且体积必须达标。
+    /// 与运行时同源的就绪判定：只认可加载文件名，且体积必须达标；
+    /// MLX / ONNX 还必须有 tokenizer 文件，否则「权重已下完、tokenizer 还没下」
+    /// 会被误判为就绪，启动加载时才报缺少 tokenizer。
     public static func isComplete(_ model: RequiredModel) -> Bool {
-        isComplete(model.directory, allowedWeightNames: model.allowedWeightNames)
+        guard isComplete(model.directory, allowedWeightNames: model.allowedWeightNames)
+        else { return false }
+        return !model.requiresTokenizer || hasTokenizerFile(in: model.directory)
+    }
+
+    /// 加载必需的 tokenizer 文件是否存在。
+    ///
+    /// 只认 `tokenizer.json`：运行时 `LocalTokenizer.load` 明确要求它，
+    /// 只有 `tokenizer.model` / `spiece.model` 时模型同样加载失败。
+    /// ONNX 仓库可能把 tokenizer 放在 `onnx/` 子目录，两处都查。
+    static func hasTokenizerFile(in directory: URL) -> Bool {
+        let fm = FileManager.default
+        var isDirectory: ObjCBool = false
+        guard fm.fileExists(atPath: directory.path, isDirectory: &isDirectory) else {
+            return false
+        }
+        // 显式指定的单文件模型（如部分 GGUF）不需要目录内 tokenizer。
+        guard isDirectory.boolValue else { return true }
+        let scopes = [directory, directory.appendingPathComponent("onnx", isDirectory: true)]
+        for scope in scopes {
+            let url = scope.appendingPathComponent("tokenizer.json")
+            if fm.fileExists(atPath: url.path), HFModelDownloader.fileSize(at: url) > 0 {
+                return true
+            }
+        }
+        return false
     }
 
     /// 宽松版（不限制权重文件名），供按目录查询使用。

@@ -118,10 +118,10 @@ final class HFModelDownloaderTests: XCTestCase {
         let potion = try! XCTUnwrap(all.first { $0.kind == "语义切片" })
         XCTAssertEqual(potion.repo, "arlenecc/potion-multilingual-128M-onnx")
         XCTAssertEqual(potion.subpath, "int4")
-        let potionReady = RequiredModelCatalog.isComplete(potion.directory)
+        let potionReady = RequiredModelCatalog.isComplete(potion)
         XCTAssertEqual(missing.count, all.count - (potionReady ? 1 : 0))
 
-        // 目录里出现任一权重文件即视为就绪（与 registry 同源判定）。
+        // 目录里出现权重 + tokenizer.json 即视为就绪（与 registry 同源判定）。
         let embedding = try! XCTUnwrap(
             RequiredModelCatalog.models(for: config).first { $0.kind == "Embedding" })
         try! FileManager.default.createDirectory(
@@ -129,6 +129,13 @@ final class HFModelDownloaderTests: XCTestCase {
         FileManager.default.createFile(
             atPath: embedding.directory.appendingPathComponent("model.safetensors").path,
             contents: Self.fakeWeight())
+        // 只有权重、没有 tokenizer.json 时仍判缺失（加载器要求 tokenizer.json）。
+        XCTAssertTrue(RequiredModelCatalog.missingModels(for: config)
+            .contains { $0.kind == "Embedding" },
+                      "权重齐全但缺 tokenizer.json 不能判就绪")
+        FileManager.default.createFile(
+            atPath: embedding.directory.appendingPathComponent("tokenizer.json").path,
+            contents: Data("{}".utf8))
         let after = RequiredModelCatalog.missingModels(for: config)
         XCTAssertFalse(after.contains { $0.kind == "Embedding" })
         XCTAssertEqual(after.count, missing.count - 1)
@@ -148,6 +155,9 @@ final class HFModelDownloaderTests: XCTestCase {
         FileManager.default.createFile(
             atPath: embeddingDir.appendingPathComponent("model.safetensors").path,
             contents: Self.fakeWeight())
+        FileManager.default.createFile(
+            atPath: embeddingDir.appendingPathComponent("tokenizer.json").path,
+            contents: Data("{}".utf8))
         defer { try? FileManager.default.removeItem(at: bundleRoot) }
 
         // bundledModelsDirectory 参数化接口本身就是 bundle 搜索的实现，
@@ -207,6 +217,9 @@ final class HFModelDownloaderTests: XCTestCase {
         FileManager.default.createFile(
             atPath: cfgModelDir.appendingPathComponent("model.safetensors").path,
             contents: Self.fakeWeight())
+        FileManager.default.createFile(
+            atPath: cfgModelDir.appendingPathComponent("tokenizer.json").path,
+            contents: Data("{}".utf8))
         defer { try? FileManager.default.removeItem(at: cfgModelDir) }
 
         let resolved = try LocalModelRegistry.resolveDirectory(
@@ -229,9 +242,13 @@ final class HFModelDownloaderTests: XCTestCase {
         var config = AgentConfig()
         config.workspace = root.path
 
-        // 1) 显式指定单个 .onnx 权重文件（registry 直接返回文件 URL）。
+        // 1) 显式指定单个 .onnx 权重文件（registry 归一成其父目录）。
         let onnxFile = root.appendingPathComponent("my-reranker.onnx")
         FileManager.default.createFile(atPath: onnxFile.path, contents: Self.fakeWeight())
+        // ONNX 的 tokenizer 从权重所在目录加载，必须与权重同目录。
+        FileManager.default.createFile(
+            atPath: root.appendingPathComponent("tokenizer.json").path,
+            contents: Data("{}".utf8))
         config.localRerankerModelPath = onnxFile.path
         config.localRerankerBackend = "onnx"
         XCTAssertFalse(RequiredModelCatalog.missingModels(for: config)
@@ -246,6 +263,9 @@ final class HFModelDownloaderTests: XCTestCase {
         FileManager.default.createFile(
             atPath: onnxDir.appendingPathComponent("onnx/model_quantized.onnx").path,
             contents: Self.fakeWeight())
+        FileManager.default.createFile(
+            atPath: onnxDir.appendingPathComponent("tokenizer.json").path,
+            contents: Data("{}".utf8))
         config.localEmbeddingModelPath = onnxDir.path
         config.localEmbeddingBackend = "onnx"
         XCTAssertFalse(RequiredModelCatalog.missingModels(for: config)
@@ -363,6 +383,94 @@ final class HFModelDownloaderTests: XCTestCase {
         try! Self.fakeWeight().write(to: weight)
         XCTAssertTrue(RequiredModelCatalog.isComplete(dir),
                       "体积达标后应判就绪")
+    }
+
+    /// 权重齐全但 tokenizer.json 未下载（自动下载按仓库顺序先下权重、后下
+    /// tokenizer，中途退出/断网正是这种状态）时不能判就绪，否则启动加载
+    /// 报「缺少 tokenizer」且 missingModels 为空、无法再次触发补全。
+    func testReadinessRequiresTokenizerJSON() {
+        let root = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("hf-tokenizer-\(UUID().uuidString)", isDirectory: true)
+        try! FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let mlxDir = root.appendingPathComponent("mlx-model", isDirectory: true)
+        try! FileManager.default.createDirectory(at: mlxDir, withIntermediateDirectories: true)
+        FileManager.default.createFile(
+            atPath: mlxDir.appendingPathComponent("model.safetensors").path,
+            contents: Self.fakeWeight())
+
+        let mlx = RequiredModel(kind: "主模型", repo: "arlenecc/mlx-model",
+                                directory: mlxDir)
+        XCTAssertTrue(mlx.requiresTokenizer)
+        XCTAssertFalse(RequiredModelCatalog.isComplete(mlx),
+                       "缺 tokenizer.json 不能判就绪")
+
+        // tokenizer.model 不能替代 tokenizer.json：加载器只认后者。
+        FileManager.default.createFile(
+            atPath: mlxDir.appendingPathComponent("tokenizer.model").path,
+            contents: Data([1]))
+        XCTAssertFalse(RequiredModelCatalog.isComplete(mlx))
+
+        FileManager.default.createFile(
+            atPath: mlxDir.appendingPathComponent("tokenizer.json").path,
+            contents: Data("{}".utf8))
+        XCTAssertTrue(RequiredModelCatalog.isComplete(mlx),
+                      "补齐 tokenizer.json 后应判就绪")
+
+        // ONNX 仓库把 tokenizer 放在 onnx/ 子目录时同样认得。
+        let onnxDir = root.appendingPathComponent("onnx-model", isDirectory: true)
+        try! FileManager.default.createDirectory(
+            at: onnxDir.appendingPathComponent("onnx", isDirectory: true),
+            withIntermediateDirectories: true)
+        FileManager.default.createFile(
+            atPath: onnxDir.appendingPathComponent("onnx/model_quantized.onnx").path,
+            contents: Self.fakeWeight())
+        let onnx = RequiredModel(kind: "Reranker", repo: "arlenecc/onnx-model",
+                                 directory: onnxDir)
+        XCTAssertFalse(RequiredModelCatalog.isComplete(onnx))
+        FileManager.default.createFile(
+            atPath: onnxDir.appendingPathComponent("onnx/tokenizer.json").path,
+            contents: Data("{}".utf8))
+        XCTAssertTrue(RequiredModelCatalog.isComplete(onnx))
+
+        // GGUF 的 tokenizer 内嵌在权重里：不要求 tokenizer.json。
+        let ggufDir = root.appendingPathComponent("gguf-model", isDirectory: true)
+        try! FileManager.default.createDirectory(at: ggufDir, withIntermediateDirectories: true)
+        FileManager.default.createFile(
+            atPath: ggufDir.appendingPathComponent("model.gguf").path,
+            contents: Self.fakeWeight())
+        let gguf = RequiredModel(kind: "主模型", repo: "arlenecc/gguf-model",
+                                 directory: ggufDir, requiresTokenizer: false)
+        XCTAssertTrue(RequiredModelCatalog.isComplete(gguf))
+    }
+
+    /// 清单按后端/权重格式决定是否要求 tokenizer：GGUF 不要求，MLX/ONNX 要求。
+    func testCatalogTokenizerRequirementByBackend() {
+        let root = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("hf-gguf-\(UUID().uuidString)", isDirectory: true)
+        try! FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let ggufFile = root.appendingPathComponent("custom-model.gguf")
+        FileManager.default.createFile(atPath: ggufFile.path, contents: Self.fakeWeight())
+
+        var config = AgentConfig()
+        config.workspace = root.path
+        config.llmProvider = "local"
+        config.localLLMModel = ggufFile.path
+        let llm = RequiredModelCatalog.models(for: config).first { $0.kind == "主模型" }
+        XCTAssertEqual(llm?.requiresTokenizer, false)
+        XCTAssertFalse(RequiredModelCatalog.missingModels(for: config)
+            .contains { $0.kind == "主模型" },
+                       "GGUF 目录没有 tokenizer.json 也应判就绪")
+
+        // 默认 MLX 主模型要求 tokenizer。
+        var mlxConfig = AgentConfig()
+        mlxConfig.workspace = root.path
+        mlxConfig.localLLMModel = root.appendingPathComponent("mlx-model").path
+        let mlxLLM = RequiredModelCatalog.models(for: mlxConfig).first { $0.kind == "主模型" }
+        XCTAssertEqual(mlxLLM?.requiresTokenizer, true)
     }
 
     /// 语义切片条目跟随 rag_semantic_chunking 开关：关闭时不出现在清单里。

@@ -542,7 +542,10 @@ public enum LocalModelRegistry {
         }
 
         for root in localRoots {
-            for name in names {
+            // 本地 roots 本身就是模型根目录（应用 models / 配置 models 等），
+            // 带 `models/` 前缀的名字只保留去前缀形式，避免拼出
+            // `<root>/models/<name>` 这种不存在的候选（错误提示里会误导人）。
+            for name in names where !name.hasPrefix("models/") {
                 if name.contains("/") {
                     // 支持 models/<org>/<name> 以及 models/<name> 两种本地布局。
                     append(root.appendingPathComponent(name, isDirectory: true))
