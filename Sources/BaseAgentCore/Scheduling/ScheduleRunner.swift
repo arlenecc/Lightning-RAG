@@ -75,6 +75,7 @@ public final class ScheduleRunner: @unchecked Sendable {
         } catch {
             onLog?("[schedule] 无法更新任务「\(task.title)」的运行时间：\(error.localizedDescription)")
         }
+        disableIfOneShot(task)
         onLog?("[schedule] 手动触发任务：\(task.title)")
         onTaskDue?(task)
     }
@@ -92,8 +93,20 @@ public final class ScheduleRunner: @unchecked Sendable {
                     + error.localizedDescription)
                 continue
             }
+            // 一次性任务执行后自动停用，避免 lastRunAt 更新后仍被当成到期任务。
+            disableIfOneShot(task)
             onLog?("[schedule] 定时任务到期：\(task.title)")
             onTaskDue?(task)
+        }
+    }
+
+    private func disableIfOneShot(_ task: ScheduledTask) {
+        guard task.rule.kind == .once else { return }
+        do {
+            _ = try store.setEnabled(id: task.id, false)
+        } catch {
+            onLog?("[schedule] 一次性任务「\(task.title)」执行后停用失败："
+                + error.localizedDescription)
         }
     }
 }

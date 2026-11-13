@@ -67,7 +67,7 @@ VARIANT=lite  scripts/package-app.sh release && VARIANT=lite  scripts/package-dm
     FTS5 中文分词、RRF 混合检索、RAG 增量/删除清理、重排序 TopN 决定最终条数（关闭时回到调用方 top_k）、内置 reranker 的打包清单与默认配置解析（`localRerankerModel` / `localRerankerModelPath` 留空时仍回落到 App 内置 jina reranker）、EPUB/DOCX/HTML 解析、扫描版 EPUB 归一化 + OCR、PDF 文本层、Ovis 文本页快路径、NaturalLanguage 切片、切片参数一致性（模型窗口收口、检索呈现上限随切片放大、切片参数变化触发重建）、配置迁移与旧键兼容（含 `auto_preload_main` / `aux_enabled` 默认值、主/辅助 KV 复用与量化键的缺省跟随与读写往返）、Agent 工具循环、ask_user 续跑、checkpoint 同步、code_run 写护栏、L3 去重、大纲围栏，以及摘要溢出保留、代码围栏/中文换行/正文数字保留、技能索引入口回退、空库维度自愈、`models/` 相对路径解析，以及 KV 复用增量与完整 prompt 的逐 token 模板对齐、预热前缀对齐、清空对话时失效 KV cache；GGUF 模型路径/mmproj 解析、进程内 llama.cpp 框架加载、ONNX 缺少权重时的明确报错，合成 ONNX decoder 图的 past/present 管线，简单 HTML 表格转 Markdown、复杂表格保留 HTML、Markdown 语法/缩进保留、纯文本 HTML/实体/噪声清理、空行与空格密度压缩、跨目录副本与 content_hash 去重、手动向量去重保留最早入库切片并写副本 tombstone，以及切片缺失/旧版 manifest/失败页文件的增量重建。真实模型链路覆盖：jina-v5 的 `Query: `/`Document: ` 前缀 → 可配置 Matryoshka 维度（默认 128，可选 32/64/128/256/512/768）截断 → 重新 L2 归一化 → 用户选择的元素类型入库（默认 int8，128 维时 128B/行），同时从截断前原生
     768 维生成二值签名写入 `chunk_vectors_bin` → 查询 top1 与 `rag_tools(op="search")` 全链路；jina-v3 的切片 → embedding → 256 维 Matryoshka 截断 → 重新归一化 → int8 入库（256B/行）→ 查询 top1；nomic-int8 的 int8 + Matryoshka 512 召回与 fp32 全维（768）基线对比；以及内置 jina reranker 经 `LocalModelFactory` 加载 ONNX 后对相关段落打分（达到默认 0.45 阈值且高于强无关基线）；`RAGPipelineVerificationTests` 使用仓库 `models/`（可用 `EMBED_BENCH_MODELS_DIR` 指向 App 包模型）跑通 6 篇文档入库 → 22 切片 int8 → 混合检索 + RRF → 重排 → ANN → `rag_tools` 的 search / outline / status 全链路。
 
-定时任务有独立测试文件 `ScheduledTaskTests`：每日/间隔规则与跨月滚动、`schedules.json` 原子往返与缺字段容错、变更通知、`DispatchSourceTimer` 到期只触发一次、停用不触发、`run_now` 立即执行并更新运行时间、`schedule_task` 的 CRUD 与非法参数拒绝、工具 schema 与确认策略、Agent 注册工具并在关闭时停止调度器，以及 `runIsolated` 的计划隔离与恢复。
+定时任务有独立测试文件 `ScheduledTaskTests`：间隔/每日/每周/一次性规则与跨天跨月滚动、一次性任务只触发一次并自动停用、`schedules.json` 原子往返与缺字段容错、变更通知、`DispatchSourceTimer` 到期只触发一次、停用不触发、`run_now` 立即执行并更新运行时间、`schedule_task` 的 CRUD 与非法规则组合拒绝、工具 schema 与确认策略、Agent 注册工具并在关闭时停止调度器，以及 `runIsolated` 的计划隔离与恢复。
 
 HTML 与 Office 解析另有专项覆盖：HTML 保存页的本地 iframe / frameset 接力（取正文最多的一份）、big5 等老编码嗅探、依赖 JavaScript 的页面给出明确失败原因、含 `h1` 的 `<header>` 保留、裸文本节点与 `<li>` 内块级元素、结构化清洗档保留 URL/IP 与段落空行；DOCX 编号列表与 `w:br`/`xml:space`、脚注编号与末尾列表、`styles.xml` 样式名解析标题；XLSX 日期与百分比格式、注音跳过、多行单元格不拆表；PPTX 演讲者备注与段内换行。旧版 Office 另有专项覆盖：OLE2 复合文档扇区/FAT/miniFAT 读取与损坏文件拒绝、`.doc` 字号标题/粗斜体/中文、`.xls` BIFF8 共享字符串/日期/百分比/公式与多 sheet、`.ppt` 幻灯片顺序、标题正文、演讲者备注与 Windows-1252 文本，以及 PPT95/加密/空文档/记录超限的明确报错。独立 Markdown 转换另覆盖单文件输出、目录相对结构、同名后缀、单文件失败不中断整批、输出目录跳过与不支持格式拒绝。
 
@@ -207,14 +207,14 @@ RAG 知识图谱与长期记忆的 **memory graph 是两套完全独立的实现
 
 用户可以直接在对话里说「每天早上 9 点帮我整理昨天的日志」「每 30 分钟检查一次服务状态」，模型会调用 `schedule_task(op="create", prompt=..., time="09:00" 或 every_minutes=30)` 建立任务：
 
-- **规则**：`every_minutes`（1...10080 分钟）或 `time`（每天 `HH:mm`，本地时区）；`prompt` 必须自包含，到点后在没有当前对话的情况下交给 Agent 执行，可调用任意工具（`shell_run` / `code_run` / MCP 外部工具 / `file_tools` / `rag_tools` 等），因此支持「调用外部自定义工具或代码」。
+- **规则**：支持四种形态——`every_minutes`（每 1...10080 分钟）、`time`（每天 `HH:mm`）、`weekday` 1...7 + `time`（每周，1=周一）、`date`（`YYYY-MM-DD`）+ `time`（指定日期一次性），以及 `in_minutes` / `in_hours`（从现在起 N 分钟/小时后一次性）。一次性任务执行后自动停用。`prompt` 必须自包含，到点后在没有当前对话的情况下交给 Agent 执行，可调用任意工具（`shell_run` / `code_run` / MCP 外部工具 / `file_tools` / `rag_tools` 等），因此支持「调用外部自定义工具或代码」。
 - **持久化**：任务清单写入 `<workspace>/.agent/schedules.json`（`AtomicFile` 原子写，字段容错解码），启动时自动恢复；任务 id、标题、规则、启停状态、上次运行时间与结果摘要一并保存。
-- **调度**：`ScheduleRunner` 用单个 `DispatchSourceTimer` 每秒扫描一次（串行队列），到期任务先落盘 `lastRunAt` 再回调，保证同一时间点不会被重复触发；`run_now` 也会先更新运行时间。
+- **调度**：`ScheduleRunner` 用单个 `DispatchSourceTimer` 每秒扫描一次（串行队列），到期任务先落盘 `lastRunAt` 再回调，保证同一时间点不会被重复触发；`run_now` 也会先更新运行时间。一次性任务触发后自动停用并在侧栏标记「已完成」。
 - **执行与展示**：App 在空闲时执行到期任务，忙时排队（用户消息优先）；执行前在对话内插入「⏰ 定时任务开始执行」系统气泡，结果以助手气泡流式输出。定时任务使用 `Agent.runIsolated`，运行前暂存并清空用户当前计划，结束后恢复，避免无人值守时误续跑用户遗留的步骤。
 - **无人值守策略**：执行期间没有人工确认通道——需要确认的高风险工具按任务创建时用户批准的指令自动放行，每次放行都写入日志；`ask_user` 自动跳过。定时任务运行期间禁止再创建/修改/删除定时任务，防止自我调度循环。
 - **管理**：右侧「定时任务」面板显示规则、下次执行时间与上次结果，支持启用/停用、立即执行与删除；也可在对话里用 `schedule_task(op="list"/"delete"/"enable"/"disable"/"run_now")` 管理。
 
-已知行为：系统睡眠期间 timer 不触发，唤醒后补跑一次；规则仅支持「每 N 分钟」与「每天 HH:mm」两种。
+已知行为：系统睡眠期间 timer 不触发，唤醒后补跑一次；一次性任务若在应用退出期间到点，会在下次启动时补跑一次并自动停用；不支持 cron / 每月 / 农历表达式。
 
 ### 3. RAG 文档解析
 
@@ -427,7 +427,7 @@ docs/软件设计文档.md
 - EPUB 以 spine 文件为章节单位，未按 TOC 锚点二次切章。扫描版 EPUB 仅在「章节文字层低于阈值且含图片」时对该章图片逐页 OCR；纯 CSS 背景图、SVG 矢量图（非 `<image>` 引用）和加密字体渲染的文字不在识别范围内。
 - 子进程未使用 `setsid`，超时/取消通过递归进程树终止实现；极端的双重 fork 守护进程仍可能逃逸。
 - 本地 MLX/ONNX/GGUF 权重未随仓库提供；首次使用需自行下载到 `<workspace>/models/<name>` 或 `~/base-agent/models/<name>`。真实模型推理需在目标机器验证。
-- 定时任务由 App 进程内的 `DispatchSourceTimer` 驱动：应用退出后不会继续执行，系统睡眠期间不触发（唤醒后补跑一次）；规则仅支持「每 N 分钟」与「每天 HH:mm」，不支持 cron / 每周 / 每月表达式。无人值守执行时高风险工具按用户创建任务时批准的指令自动放行，请只创建可信任务。
+- 定时任务由 App 进程内的 `DispatchSourceTimer` 驱动：应用退出后不会继续执行，系统睡眠期间不触发（唤醒后补跑一次）；规则支持「每 N 分钟」「每天 HH:mm」「每周 X HH:mm」「指定日期 HH:mm」与「N 分钟/小时后一次性」，不支持 cron / 每月 / 农历表达式。无人值守执行时高风险工具按用户创建任务时批准的指令自动放行，请只创建可信任务。
 - 主/辅 LLM 支持 MLX-LM / MLX-VLM / GGUF / ONNX；OCR VLM 支持 MLX / GGUF+mmproj（ONNX VLM 暂无通用图适配）；Embedding / Reranker 支持 ONNX / FastEmbed / MLX / GGUF。FastEmbed 复用 ONNX 运行时及其缓存目录。GGUF 与 ONNX 均在进程内运行，不需要外部 server 或 Python。
 - ONNX LLM 的空 KV 按 float32 + `config.json` 的层数/KV 头数/head_dim 初始化；fp16 past 或非标准 KV 布局的导出会给出明确错误，需要针对性适配。
 - 本机已实测：GGUF LLM（Qwen3.5-9B，CPU 与 Metal GPU，工具调用正常）、GGUF VLM（Qwythos-9B + mmproj，OCR 输出正确）、GGUF Embedding（nomic-embed-text-v1.5，768 维）、GGUF system 前缀预热复用、MLX-VLM 主模型（Qwen3.5-2B）。ONNX LLM、ONNX VLM 与 GGUF Reranker 的代码路径已接入，但当前机器没有对应模型，未做推理实测；缺少模型或运行时会给出明确错误。

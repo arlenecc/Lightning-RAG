@@ -115,6 +115,41 @@ final class ScheduledTaskTests: XCTestCase {
         XCTAssertNil(store.all().first?.lastRunAt)
     }
 
+    func testWeeklyRuleNextFire() {
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = TimeZone(secondsFromGMT: 0)!
+        func date(_ year: Int, _ month: Int, _ day: Int,
+                  _ hour: Int, _ minute: Int) -> Date {
+            calendar.date(from: DateComponents(year: year, month: month, day: day,
+                                               hour: hour, minute: minute))!
+        }
+
+        // 2026-11-13 是周五；下一次「周一 09:00」应为 11-16。
+        let friday = date(2026, 11, 13, 10, 0)
+        XCTAssertEqual(calendar.component(.weekday, from: friday), 6)
+        let rule = ScheduleRule.weekly(weekday: 1, hour: 9, minute: 0)
+        XCTAssertEqual(rule.nextFireDate(after: friday, calendar: calendar),
+                       date(2026, 11, 16, 9, 0))
+        // 周一当天尚未到点 → 当天 09:00；已过点 → 下周一。
+        XCTAssertEqual(rule.nextFireDate(after: date(2026, 11, 16, 8, 0), calendar: calendar),
+                       date(2026, 11, 16, 9, 0))
+        XCTAssertEqual(rule.nextFireDate(after: date(2026, 11, 16, 10, 0), calendar: calendar),
+                       date(2026, 11, 23, 9, 0))
+        XCTAssertEqual(rule.summary, "每周一 09:00")
+    }
+
+    func testOneShotRuleDueOnlyUntilRun() {
+        let future = Date().addingTimeInterval(3_600)
+        var task = ScheduledTask(title: "一次", prompt: "ping", rule: .once(at: future))
+        XCTAssertFalse(task.isDue(), "未到时间不应触发")
+        XCTAssertFalse(task.isCompleted)
+
+        task.lastRunAt = Date()
+        XCTAssertFalse(task.isDue(), "一次性任务执行后不应再次触发")
+        XCTAssertTrue(task.isCompleted)
+        XCTAssertEqual(task.rule.summary.hasPrefix("一次性 · "), true)
+    }
+
     // MARK: 调度器
 
     func testRunnerFiresOverdueTaskExactlyOnce() throws {
@@ -175,6 +210,36 @@ final class ScheduledTaskTests: XCTestCase {
         XCTAssertNotNil(store.all().first?.lastRunAt,
                         "立即执行后应更新运行时间，避免下一 tick 重复触发")
         XCTAssertEqual(store.all().count, 1)
+    }
+
+    func testOneShotRunnerFiresOnceThenDisables() throws {
+        let store = ScheduleStore(path: storePath())
+        let created = try store.create(title: "一次性",
+                                       prompt: "ping",
+                                       rule: .once(at: Date().addingTimeInterval(-1)))
+        let runner = ScheduleRunner(store: store)
+        runner.tickInterval = 0.03
+        let fired = expectation(description: "一次性触发")
+        fired.assertForOverFulfill = true
+        let counter = NSLock()
+        var fireCount = 0
+        runner.onTaskDue = { _ in
+            counter.lock(); fireCount += 1; counter.unlock()
+            fired.fulfill()
+        }
+        runner.start()
+        wait(for: [fired], timeout: 2)
+        Thread.sleep(forTimeInterval: 0.2)
+        runner.stop()
+        counter.lock()
+        let finalCount = fireCount
+        counter.unlock()
+        XCTAssertEqual(finalCount, 1, "一次性任务只能触发一次")
+
+        let reloaded = ScheduleStore(path: store.filePath)
+        XCTAssertEqual(reloaded.all().first?.id, created.id)
+        XCTAssertEqual(reloaded.all().first?.enabled, false, "执行后应自动停用")
+        XCTAssertEqual(reloaded.all().first?.isCompleted, true)
     }
 
     func testStoreNotifiesChanges() throws {
@@ -276,6 +341,86 @@ final class ScheduledTaskTests: XCTestCase {
         XCTAssertTrue(store.all().isEmpty)
     }
 
+    func testToolCreatesWeeklyDateAndDelayRules() async throws {
+        var config = AgentConfig()
+        config.workspace = temporaryDirectory()
+        let store = ScheduleStore(path: (config.workspace as NSString)
+            .appendingPathComponent(".agent/schedules.json"))
+        let tool = ScheduleTaskTool(config: config, callbacks: NoopCallbacks(),
+                                    store: store, runner: ScheduleRunner(store: store))
+
+        let weekly = try await tool.run([
+            "op": .string("create"),
+            "prompt": .string("生成周报"),
+            "weekday": .int(1),
+            "time": .string("09:00"),
+        ])
+        XCTAssertTrue(weekly.success, weekly.error)
+        XCTAssertEqual(store.all().last?.rule.kind, .weekly)
+        XCTAssertEqual(store.all().last?.rule.summary, "每周一 09:00")
+
+        let delay = try await tool.run([
+            "op": .string("create"),
+            "prompt": .string("提醒"),
+            "in_minutes": .int(30),
+        ])
+        XCTAssertTrue(delay.success, delay.error)
+        XCTAssertEqual(store.all().last?.rule.kind, .once)
+        XCTAssertEqual(store.all().last?.rule.at?.timeIntervalSinceNow ?? 0,
+                       1_800, accuracy: 10)
+
+        let dated = try await tool.run([
+            "op": .string("create"),
+            "prompt": .string("指定日期任务"),
+            "date": .string("2027-01-05"),
+            "time": .string("08:15"),
+        ])
+        XCTAssertTrue(dated.success, dated.error)
+        guard let at = store.all().last?.rule.at else {
+            return XCTFail("缺少一次性任务时间")
+        }
+        let comps = Calendar.current.dateComponents(
+            [.year, .month, .day, .hour, .minute], from: at)
+        XCTAssertEqual(comps.year, 2027)
+        XCTAssertEqual(comps.month, 1)
+        XCTAssertEqual(comps.day, 5)
+        XCTAssertEqual(comps.hour, 8)
+        XCTAssertEqual(comps.minute, 15)
+        XCTAssertTrue(dated.output.contains("一次性任务"), "create 输出应说明一次性语义")
+    }
+
+    func testToolRejectsInvalidRuleCombinations() async throws {
+        var config = AgentConfig()
+        config.workspace = temporaryDirectory()
+        let store = ScheduleStore(path: (config.workspace as NSString)
+            .appendingPathComponent(".agent/schedules.json"))
+        let tool = ScheduleTaskTool(config: config, callbacks: NoopCallbacks(),
+                                    store: store, runner: ScheduleRunner(store: store))
+
+        let cases: [[String: JSONValue]] = [
+            // date 缺 time
+            ["op": .string("create"), "prompt": .string("p"),
+             "date": .string("2027-01-01")],
+            // date 与 weekday 互斥
+            ["op": .string("create"), "prompt": .string("p"),
+             "date": .string("2027-01-01"), "time": .string("09:00"), "weekday": .int(1)],
+            // 一次性延迟与 time 互斥
+            ["op": .string("create"), "prompt": .string("p"),
+             "time": .string("09:00"), "in_minutes": .int(5)],
+            // weekday 越界
+            ["op": .string("create"), "prompt": .string("p"),
+             "weekday": .int(8), "time": .string("09:00")],
+            // 延迟为 0
+            ["op": .string("create"), "prompt": .string("p"),
+             "in_hours": .int(0)],
+        ]
+        for args in cases {
+            let result = try await tool.run(args)
+            XCTAssertFalse(result.success, "应拒绝非法组合：\(args)")
+        }
+        XCTAssertTrue(store.all().isEmpty)
+    }
+
     func testToolParsesTimeWithFullWidthColon() {
         let parsed = ScheduleTaskTool.parseTime("9：05")
         XCTAssertEqual(parsed?.hour, 9)
@@ -290,7 +435,8 @@ final class ScheduledTaskTests: XCTestCase {
         let schema = tool.parameters.objectValue
         XCTAssertEqual(schema?["type"]?.stringValue, "object")
         let properties = schema?["properties"]?.objectValue
-        for key in ["op", "title", "prompt", "every_minutes", "time", "id"] {
+        for key in ["op", "title", "prompt", "every_minutes", "time",
+                    "weekday", "date", "in_minutes", "in_hours", "id"] {
             XCTAssertNotNil(properties?[key], "缺少参数 \(key)")
         }
         XCTAssertEqual(schema?["required"]?.arrayValue?.compactMap(\.stringValue), ["op"])

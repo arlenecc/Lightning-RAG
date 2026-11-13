@@ -2,7 +2,7 @@ import Foundation
 
 // MARK: - 触发规则
 
-/// 定时任务的触发规则：每 N 分钟，或每天固定时刻（本地时区）。
+/// 定时任务的触发规则：每 N 分钟、每天/每周固定时刻，或指定时刻执行一次。
 ///
 /// 用扁平字段而不是带关联值的枚举，保证 `schedules.json` 可手工编辑、
 /// 字段缺失时也能稳定解码。
@@ -12,25 +12,40 @@ public struct ScheduleRule: Codable, Sendable, Equatable {
         case everyMinutes = "every_minutes"
         /// 每天 HH:mm。
         case daily
+        /// 每周某天 HH:mm。
+        case weekly
+        /// 指定时刻执行一次（含「N 分钟/小时后」的一次性任务）。
+        case once
     }
 
     public var kind: Kind
     /// `everyMinutes` 的间隔分钟数。
     public var minutes: Int
-    /// `daily` 的小时（0-23）。
+    /// `daily` / `weekly` / `once` 的小时（0-23）。
     public var hour: Int
-    /// `daily` 的分钟（0-59）。
+    /// `daily` / `weekly` / `once` 的分钟（0-59）。
     public var minute: Int
+    /// `weekly` 的星期：1=周一 … 7=周日。
+    public var weekday: Int
+    /// `once` 的绝对触发时刻（本地时区）。
+    public var at: Date?
 
-    public init(kind: Kind, minutes: Int = 0, hour: Int = 0, minute: Int = 0) {
+    public init(kind: Kind,
+                minutes: Int = 0,
+                hour: Int = 0,
+                minute: Int = 0,
+                weekday: Int = 0,
+                at: Date? = nil) {
         self.kind = kind
         self.minutes = minutes
         self.hour = hour
         self.minute = minute
+        self.weekday = weekday
+        self.at = at
     }
 
     enum CodingKeys: String, CodingKey {
-        case kind, minutes, hour, minute
+        case kind, minutes, hour, minute, weekday, at
     }
 
     /// 容错解码：手工编辑 `schedules.json` 时缺失的数值字段按 0 处理，
@@ -41,6 +56,8 @@ public struct ScheduleRule: Codable, Sendable, Equatable {
         minutes = try container.decodeIfPresent(Int.self, forKey: .minutes) ?? 0
         hour = try container.decodeIfPresent(Int.self, forKey: .hour) ?? 0
         minute = try container.decodeIfPresent(Int.self, forKey: .minute) ?? 0
+        weekday = try container.decodeIfPresent(Int.self, forKey: .weekday) ?? 0
+        at = try container.decodeIfPresent(Date.self, forKey: .at)
     }
 
     public static func everyMinutes(_ value: Int) -> ScheduleRule {
@@ -51,12 +68,26 @@ public struct ScheduleRule: Codable, Sendable, Equatable {
         ScheduleRule(kind: .daily, hour: hour, minute: minute)
     }
 
+    /// `weekday`：1=周一 … 7=周日。
+    public static func weekly(weekday: Int, hour: Int, minute: Int) -> ScheduleRule {
+        ScheduleRule(kind: .weekly, hour: hour, minute: minute, weekday: weekday)
+    }
+
+    public static func once(at date: Date) -> ScheduleRule {
+        ScheduleRule(kind: .once, at: date)
+    }
+
     public var isValid: Bool {
         switch kind {
         case .everyMinutes:
             return (1...10_080).contains(minutes)
         case .daily:
             return (0...23).contains(hour) && (0...59).contains(minute)
+        case .weekly:
+            return (1...7).contains(weekday)
+                && (0...23).contains(hour) && (0...59).contains(minute)
+        case .once:
+            return at != nil
         }
     }
 
@@ -68,6 +99,11 @@ public struct ScheduleRule: Codable, Sendable, Equatable {
             return "每 \(minutes) 分钟"
         case .daily:
             return String(format: "每天 %02d:%02d", hour, minute)
+        case .weekly:
+            return String(format: "每周%@ %02d:%02d", Self.weekdayName(weekday), hour, minute)
+        case .once:
+            guard let at else { return "一次性（时间未设置）" }
+            return "一次性 · \(scheduleLocalTimeText(at))"
         }
     }
 
@@ -94,7 +130,38 @@ public struct ScheduleRule: Codable, Sendable, Equatable {
                 return next
             }
             return reference.addingTimeInterval(86_400)
+        case .weekly:
+            guard (1...7).contains(weekday) else { return reference.addingTimeInterval(7 * 86_400) }
+            let hour = min(max(hour, 0), 23)
+            let minute = min(max(minute, 0), 59)
+            // Calendar 的 weekday 是 1=周日 … 7=周六；这里换算成 1=周一 … 7=周日。
+            let target = weekday % 7 + 1
+            let day = calendar.startOfDay(for: reference)
+            var components = DateComponents()
+            components.hour = hour
+            components.minute = minute
+            for offset in 0...7 {
+                guard let candidateDay = calendar.date(byAdding: .day, value: offset, to: day),
+                      calendar.component(.weekday, from: candidateDay) == target else {
+                    continue
+                }
+                if let candidate = calendar.date(byAdding: components, to: candidateDay),
+                   candidate > reference {
+                    return candidate
+                }
+            }
+            return reference.addingTimeInterval(7 * 86_400)
+        case .once:
+            // 一次性任务的时间固定；`ScheduledTask.isDue` 还要求从未运行过。
+            return at ?? reference.addingTimeInterval(86_400)
         }
+    }
+
+    /// 1=周一 … 7=周日。
+    static func weekdayName(_ weekday: Int) -> String {
+        let names = ["一", "二", "三", "四", "五", "六", "日"]
+        guard (1...7).contains(weekday) else { return "?" }
+        return names[weekday - 1]
     }
 }
 
@@ -140,9 +207,18 @@ public struct ScheduledTask: Codable, Sendable, Equatable, Identifiable {
         rule.nextFireDate(after: lastRunAt ?? createdAt)
     }
 
-    /// 当前是否已到期。禁用或规则非法时不触发。
+    /// 当前是否已到期。禁用或规则非法时不触发；一次性任务只触发一次。
     public func isDue(now: Date = Date()) -> Bool {
-        enabled && rule.isValid && now >= nextRunDate()
+        guard enabled, rule.isValid else { return false }
+        if rule.kind == .once {
+            return lastRunAt == nil && now >= nextRunDate()
+        }
+        return now >= nextRunDate()
+    }
+
+    /// 一次性任务是否已经执行过（执行后自动停用，不再参与调度）。
+    public var isCompleted: Bool {
+        rule.kind == .once && lastRunAt != nil
     }
 
     enum CodingKeys: String, CodingKey {

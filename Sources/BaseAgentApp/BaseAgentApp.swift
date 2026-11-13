@@ -265,16 +265,23 @@ struct MainView: View {
     private func scheduleRow(_ task: ScheduledTask) -> some View {
         VStack(alignment: .leading, spacing: 3) {
             HStack(alignment: .firstTextBaseline, spacing: 5) {
-                Button {
-                    model.setScheduledTaskEnabled(task, enabled: !task.enabled)
-                } label: {
-                    Image(systemName: task.enabled
-                          ? "checkmark.circle.fill" : "circle")
+                if task.isCompleted {
+                    Image(systemName: "checkmark.seal.fill")
                         .font(.caption)
-                        .foregroundStyle(task.enabled ? Color.accentColor : Color.secondary)
+                        .foregroundStyle(Color.green)
+                        .help("一次性任务已完成")
+                } else {
+                    Button {
+                        model.setScheduledTaskEnabled(task, enabled: !task.enabled)
+                    } label: {
+                        Image(systemName: task.enabled
+                              ? "checkmark.circle.fill" : "circle")
+                            .font(.caption)
+                            .foregroundStyle(task.enabled ? Color.accentColor : Color.secondary)
+                    }
+                    .buttonStyle(.borderless)
+                    .help(task.enabled ? "停用任务" : "启用任务")
                 }
-                .buttonStyle(.borderless)
-                .help(task.enabled ? "停用任务" : "启用任务")
 
                 Text(task.title)
                     .font(.caption)
@@ -310,7 +317,9 @@ struct MainView: View {
 
     private func scheduleDetail(_ task: ScheduledTask) -> String {
         var parts = [task.rule.summary]
-        if task.enabled {
+        if task.isCompleted {
+            parts.append("已完成（一次性）")
+        } else if task.enabled {
             let next = task.nextRunDate()
             parts.append(Date() >= next
                 ? "已到期（等待执行）"
