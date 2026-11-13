@@ -386,16 +386,18 @@ public struct AgentConfig: Sendable {
     public var ragKGRelationTopK: Int = 40
     /// 实体/关系反查原文时每条最多带回的相关切片数（默认 5）。
     public var ragKGMaxChunksPerHit: Int = 5
-    /// 实体上下文 token 预算上限（默认 3000）。
-    public var ragKGEntityTokenBudget: Int = 3_000
-    /// 关系上下文 token 预算上限（默认 4000）。
-    public var ragKGRelationTokenBudget: Int = 4_000
-    /// 原文片段上下文 token 预算上限（默认 12000）。
-    /// 实体 + 关系 + 原文默认合计 19000，加上标题行仍在总预算 20000 内，
+    /// 实体上下文 token 预算上限（默认 600）。
+    public var ragKGEntityTokenBudget: Int = 600
+    /// 关系上下文 token 预算上限（默认 800）。
+    public var ragKGRelationTokenBudget: Int = 800
+    /// 原文片段上下文 token 预算上限（默认 3000）。
+    /// 实体 + 关系 + 原文默认合计 4400，加上标题行仍在总预算 5000 内，
     /// 保证图谱输出能完整交给下游摘要，不因中间截断丢信息。
-    public var ragKGChunkTokenBudget: Int = 12_000
-    /// 图谱输出的总 token 预算（默认 20000）：实体 + 关系 + 原文的硬上限。
-    public var ragKGTotalTokenBudget: Int = 20_000
+    public var ragKGChunkTokenBudget: Int = 3_000
+    /// 图谱输出的总 token 预算（默认 5000）：实体 + 关系 + 原文的硬上限。
+    /// 上游摘要（map-reduce）按 4000 字符分片，5000 token 输出只需 2~3 片
+    /// 即可完成压缩，检索链路端到端延迟显著低于大预算。
+    public var ragKGTotalTokenBudget: Int = 5_000
     /// 单个切片最多保留的实体数（默认 20）。
     public var ragKGMaxEntitiesPerChunk: Int = 20
     /// 单个切片最多保留的关系数（默认 50）。

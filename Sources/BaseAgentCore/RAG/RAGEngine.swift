@@ -3172,12 +3172,16 @@ public final class RAGEngine {
         }
 
         // map：逐章节分片摘要；单片失败时保留该片原文，不让结果凭空缺失。
+        // 输出硬截断到 600 字：小模型常无视提示词把原文整段抄回，
+        // 一旦 map 输出不比输入短，reduce 会多轮膨胀、检索耗时失控。
         var parts: [String] = []
         parts.reserveCapacity(chunks.count)
         for chunk in chunks {
             let input = "【\(chunk.title)】\n\(chunk.text)"
             if let condensed = await condenser(input, .chapter), !condensed.isEmpty {
-                parts.append("【\(chunk.title)】\n\(condensed)")
+                let clipped = condensed.count > 600
+                    ? String(condensed.prefix(600)) + "…" : condensed
+                parts.append("【\(chunk.title)】\n\(clipped)")
             } else {
                 parts.append(input)
             }

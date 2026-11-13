@@ -808,12 +808,18 @@ public final class KernelLoop {
                             "\n可直接照抄这一条（不要改写 URL）："
                                 + "web_scan({\"url\": \"\(url)\"})。"
                         } ?? ""
+                        // 问「知识库里有什么」时同样给出可照抄的调用：
+                        // 实测 4B 模型会连轮只输出 <summary> 而不发 tool_call。
+                        let kbExample = Self.looksLikeKnowledgeBaseQuestion(userInput)
+                            ? "\n可直接照抄这一条：rag_tools({\"op\": \"status\"})。"
+                            : ""
                         pending = """
                         [System] 上一条回复只是描述了你打算做什么，没有发出任何工具调用，任务没有任何进展。
                         历史里此前「我要创建计划」「现在开始执行第一步」之类的文字都是无效回复，不要复述它们。
                         注意：<summary>…</summary> 只是内部摘要，既不是给用户的答复，也不能代替工具调用。
+                        本轮**禁止输出 `<summary>` 标签**，也不要输出任何正文。
                         现在**跳过 update_plan**，不要再创建计划、不要复述任务、不要输出「我需要」「让我」「现在开始」这类文字。
-                        直接发出一个真实工具调用去获取所需信息，然后基于工具返回结果作答。\(urlExample)
+                        直接发出一个真实工具调用去获取所需信息，然后基于工具返回结果作答。\(urlExample)\(kbExample)
                         可用工具：\(toolList)。
                         本轮只输出工具调用本身，不要输出其它解释文字。
                         """
@@ -1696,6 +1702,12 @@ public final class KernelLoop {
         if text.isEmpty { return true }
         if text.count > 60 { return false }
         return !isMultistep(text)
+    }
+
+    /// 用户是否在问「知识库里有什么」：这类问题应走 `rag_tools(op="status")`。
+    static func looksLikeKnowledgeBaseQuestion(_ userInput: String) -> Bool {
+        let text = userInput.lowercased()
+        return text.contains("知识库") || text.contains("knowledge base")
     }
 
     /// 回复是否只是「声明要做什么」的元陈述，而不是任务结果。
