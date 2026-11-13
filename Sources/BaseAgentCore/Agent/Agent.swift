@@ -219,6 +219,9 @@ public final class Agent: @unchecked Sendable {
     public var auxLLM: LLMService?
     public let callbacks: AgentCallbacks
     public let tools: ToolRegistry
+    /// 定时任务存储/调度器（随 Agent 构建；App 侧负责启动与消费到期回调）。
+    public var scheduleStore: ScheduleStore? { tools.scheduleStore }
+    public var scheduleRunner: ScheduleRunner? { tools.scheduleRunner }
     public let skills: SkillManager
     public let skillIndex: SkillIndex
     public let skillRetriever: SkillRetriever
@@ -245,6 +248,9 @@ public final class Agent: @unchecked Sendable {
 
     private var kernelStorage: KernelLoop?
     private var turnIndex = 0
+    /// 计划被显式清空的次数：`runIsolated` 据此判断执行期间用户是否手动清空过计划，
+    /// 有则不要再用旧快照覆盖。
+    private var planEpoch = 0
     private var lastUserText = ""
     /// 动态上下文按「一次用户请求」冻结：同一轮内的多次工具循环复用同一段，
     /// 保证 system + 历史前缀稳定，KV cache 才能跨调用命中。
@@ -505,6 +511,7 @@ public final class Agent: @unchecked Sendable {
         let hadPersisted = PlanStore.load(config) != nil
         session.clearPlan()
         PlanStore.clear(config)
+        planEpoch += 1
         return hadPersisted
     }
 
@@ -611,6 +618,44 @@ public final class Agent: @unchecked Sendable {
         }) {
             await self.runInternal(userInput, images: images)
         }
+    }
+
+    /// 以「独立任务」方式运行一次（供定时任务使用）。
+    ///
+    /// 定时任务在后台无人值守执行，不能续跑用户此前遗留的计划：运行前把
+    /// 计划（内存 + `plan.json`）暂存并清空，结束后恢复。否则 9:00 的提醒
+    /// 可能被模型理解成「继续上次未完成的步骤」而执行错误动作；运行结束时
+    /// 也会丢弃定时任务自己建立的计划，避免污染用户接下来的对话。
+    @discardableResult
+    public func runIsolated(_ userInput: String) async -> String {
+        let savedPlan = PlanStore.load(config) ?? session.getPlan()
+        let savedBoundary = session.working["__plan_boundary__"]
+        let epoch = planEpoch
+        if savedPlan != nil {
+            session.clearPlan()
+            PlanStore.clear(config)
+            session.working.removeValue(forKey: "__plan_boundary__")
+            callbacks.onPlanUpdated(nil)
+        }
+        defer {
+            // 执行期间用户手动清空过计划：尊重用户操作，不要恢复旧快照。
+            if planEpoch == epoch {
+                if let savedPlan {
+                    try? PlanStore.save(savedPlan, config: config)
+                    session.setPlan(savedPlan)
+                    if let savedBoundary {
+                        session.working["__plan_boundary__"] = savedBoundary
+                    }
+                    callbacks.onPlanUpdated(savedPlan)
+                } else {
+                    session.clearPlan()
+                    PlanStore.clear(config)
+                    session.working.removeValue(forKey: "__plan_boundary__")
+                    callbacks.onPlanUpdated(nil)
+                }
+            }
+        }
+        return await run(userInput)
     }
 
     private func runInternal(_ userInput: String, images: [Data]) async -> String {

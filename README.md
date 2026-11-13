@@ -65,7 +65,9 @@ VARIANT=lite  scripts/package-app.sh release && VARIANT=lite  scripts/package-dm
 测试覆盖（当前 1000+ 个 XCTest；真实模型 E2E 在本地权重存在时随每次测试自动运行，缺少权重或需要外网/GGUF 等环境的用例会跳过）：sqlite-vec 事务写入/回滚、两段式 KNN、二值签名编码与 LSB-first 位打包、
     bin 表同 rowid 写入与覆盖率计数器、两阶段粗筛精排与 ANN 旁路、
     FTS5 中文分词、RRF 混合检索、RAG 增量/删除清理、重排序 TopN 决定最终条数（关闭时回到调用方 top_k）、内置 reranker 的打包清单与默认配置解析（`localRerankerModel` / `localRerankerModelPath` 留空时仍回落到 App 内置 jina reranker）、EPUB/DOCX/HTML 解析、扫描版 EPUB 归一化 + OCR、PDF 文本层、Ovis 文本页快路径、NaturalLanguage 切片、切片参数一致性（模型窗口收口、检索呈现上限随切片放大、切片参数变化触发重建）、配置迁移与旧键兼容（含 `auto_preload_main` / `aux_enabled` 默认值、主/辅助 KV 复用与量化键的缺省跟随与读写往返）、Agent 工具循环、ask_user 续跑、checkpoint 同步、code_run 写护栏、L3 去重、大纲围栏，以及摘要溢出保留、代码围栏/中文换行/正文数字保留、技能索引入口回退、空库维度自愈、`models/` 相对路径解析，以及 KV 复用增量与完整 prompt 的逐 token 模板对齐、预热前缀对齐、清空对话时失效 KV cache；GGUF 模型路径/mmproj 解析、进程内 llama.cpp 框架加载、ONNX 缺少权重时的明确报错，合成 ONNX decoder 图的 past/present 管线，简单 HTML 表格转 Markdown、复杂表格保留 HTML、Markdown 语法/缩进保留、纯文本 HTML/实体/噪声清理、空行与空格密度压缩、跨目录副本与 content_hash 去重、手动向量去重保留最早入库切片并写副本 tombstone，以及切片缺失/旧版 manifest/失败页文件的增量重建。真实模型链路覆盖：jina-v5 的 `Query: `/`Document: ` 前缀 → 可配置 Matryoshka 维度（默认 128，可选 32/64/128/256/512/768）截断 → 重新 L2 归一化 → 用户选择的元素类型入库（默认 int8，128 维时 128B/行），同时从截断前原生
-    768 维生成二值签名写入 `chunk_vectors_bin` → 查询 top1 与 `rag_search` 全链路；jina-v3 的切片 → embedding → 256 维 Matryoshka 截断 → 重新归一化 → int8 入库（256B/行）→ 查询 top1；nomic-int8 的 int8 + Matryoshka 512 召回与 fp32 全维（768）基线对比；以及内置 jina reranker 经 `LocalModelFactory` 加载 ONNX 后对相关段落打分（达到默认 0.45 阈值且高于强无关基线）；`RAGPipelineVerificationTests` 使用仓库 `models/`（可用 `EMBED_BENCH_MODELS_DIR` 指向 App 包模型）跑通 6 篇文档入库 → 22 切片 int8 → 混合检索 + RRF → 重排 → ANN → `rag_search` / `rag_outline` / `rag_status` 全链路。
+    768 维生成二值签名写入 `chunk_vectors_bin` → 查询 top1 与 `rag_tools(op="search")` 全链路；jina-v3 的切片 → embedding → 256 维 Matryoshka 截断 → 重新归一化 → int8 入库（256B/行）→ 查询 top1；nomic-int8 的 int8 + Matryoshka 512 召回与 fp32 全维（768）基线对比；以及内置 jina reranker 经 `LocalModelFactory` 加载 ONNX 后对相关段落打分（达到默认 0.45 阈值且高于强无关基线）；`RAGPipelineVerificationTests` 使用仓库 `models/`（可用 `EMBED_BENCH_MODELS_DIR` 指向 App 包模型）跑通 6 篇文档入库 → 22 切片 int8 → 混合检索 + RRF → 重排 → ANN → `rag_tools` 的 search / outline / status 全链路。
+
+定时任务有独立测试文件 `ScheduledTaskTests`：每日/间隔规则与跨月滚动、`schedules.json` 原子往返与缺字段容错、变更通知、`DispatchSourceTimer` 到期只触发一次、停用不触发、`run_now` 立即执行并更新运行时间、`schedule_task` 的 CRUD 与非法参数拒绝、工具 schema 与确认策略、Agent 注册工具并在关闭时停止调度器，以及 `runIsolated` 的计划隔离与恢复。
 
 HTML 与 Office 解析另有专项覆盖：HTML 保存页的本地 iframe / frameset 接力（取正文最多的一份）、big5 等老编码嗅探、依赖 JavaScript 的页面给出明确失败原因、含 `h1` 的 `<header>` 保留、裸文本节点与 `<li>` 内块级元素、结构化清洗档保留 URL/IP 与段落空行；DOCX 编号列表与 `w:br`/`xml:space`、脚注编号与末尾列表、`styles.xml` 样式名解析标题；XLSX 日期与百分比格式、注音跳过、多行单元格不拆表；PPTX 演讲者备注与段内换行。旧版 Office 另有专项覆盖：OLE2 复合文档扇区/FAT/miniFAT 读取与损坏文件拒绝、`.doc` 字号标题/粗斜体/中文、`.xls` BIFF8 共享字符串/日期/百分比/公式与多 sheet、`.ppt` 幻灯片顺序、标题正文、演讲者备注与 Windows-1252 文本，以及 PPT95/加密/空文档/记录超限的明确报错。独立 Markdown 转换另覆盖单文件输出、目录相对结构、同名后缀、单文件失败不中断整批、输出目录跳过与不支持格式拒绝。
 
@@ -104,7 +106,7 @@ HTML 与 Office 解析另有专项覆盖：HTML 保存页的本地 iframe / fram
 
 ## 界面
 
-- **主窗口**：左侧约 3/4 为对话区（流式正文、50ms 合并增量、自动滚动、工具调用气泡），底部居中 tokens 计数与输入框；右侧为任务计划（目标/步骤/当前进行中标记）与思考过程，下方状态栏显示模型、同步进度与 RAG 统计。模型协议里的 `<summary>…</summary>` 不进入对话正文，其内容转入右侧思考过程。
+- **主窗口**：左侧约 3/4 为对话区（流式正文、50ms 合并增量、自动滚动、工具调用气泡），底部居中 tokens 计数与输入框；右侧为任务计划（目标/步骤/当前进行中标记）、定时任务（规则/下次执行/上次结果，启停、立即执行、删除）与思考过程三段，下方状态栏显示模型、同步进度与 RAG 统计。模型协议里的 `<summary>…</summary>` 不进入对话正文，其内容转入右侧思考过程。
 - 输入框 Enter 发送、Shift+Enter 换行；中文输入法正在组合候选词时 Enter 放行给 IME 确认候选，不会误发送或清空已输入内容。
 - 底部状态栏按顺序显示「模型加载中… → 模型加载成功 → 模型预热中… → 预热结束 → 就绪」，加载/预热期间带进度指示并禁用发送；失败时显示「模型加载失败」或「预热失败」。
 - **右上角按钮**：「配置」和「日志」各自打开独立窗口；日志窗口含日志/工具调用两个页签。
@@ -122,7 +124,7 @@ HTML 与 Office 解析另有专项覆盖：HTML 保存页的本地 iframe / fram
 
 配置保存在 `~/.base-agent/config.json`，可在配置窗口修改；工作区默认 `~/base-agent-workspace`。
 
-**自定义 system prompt**：首次启动会在 `<workspace>/assets/system_prompt.txt` 写出内置的 `BASE_SYSTEM_PROMPT`；之后每次启动读取该文件并替换内置提示词，可直接用文本编辑器调整模型行为规则，**重启（或重新应用配置）后生效**（会话期间保持不变，以免 system 前缀抖动使 KV cache 反复重建）。文件内容空白或不可读时本次回退内置提示词，且不会覆盖文件。它替换的是协议主体，L0 META-SOP 与 L1 全局索引仍按多级记忆机制追加在其后；轻量轮（纯寒暄/能力问询）使用内核的极简提示，不受该文件影响。内置提示词中的 `<summary>` 标签、`rag_outline` 起手式、工具状态词等是内核回注与测试的硬依赖，建议在原文基础上调整，不要整段删除。
+**自定义 system prompt**：首次启动会在 `<workspace>/assets/system_prompt.txt` 写出内置的 `BASE_SYSTEM_PROMPT`；之后每次启动读取该文件并替换内置提示词，可直接用文本编辑器调整模型行为规则，**重启（或重新应用配置）后生效**（会话期间保持不变，以免 system 前缀抖动使 KV cache 反复重建）。文件内容空白或不可读时本次回退内置提示词，且不会覆盖文件。它替换的是协议主体，L0 META-SOP 与 L1 全局索引仍按多级记忆机制追加在其后；轻量轮（纯寒暄/能力问询）使用内核的极简提示，不受该文件影响。内置提示词中的 `<summary>` 标签、`rag_tools(op="outline")` 起手式、工具状态词等是内核回注与测试的硬依赖，建议在原文基础上调整，不要整段删除。
 
 **v1.3.9**：知识图谱抽取默认切到 JSON 格式并加固提示词。**格式可切**：`rag_kg_extraction_format` 默认 `json`（`entities` / `relationships` 数组），可改 `delimited` 兼容 0.8B 等小模型；两种格式缓存键隔离，配置文件中带 `_comment_*` 说明。**提示词加固**：正文代码围栏隔离、Section Context 标注不可信元数据、新增 relation/entity 与分隔符的 Wrong/Correct 反例、纯数字/年份不成实体、端点缺失提示补抽。**解析兜底**：4 段关系用 keywords 补描述，JSON 支持代码围栏与数组 keywords。**二次补抽**：首轮为空或末行残缺时追加一次只补漏请求。**崩溃修复**：图谱抽取并发默认改为 1（`rag_kg_max_concurrency`），修复 2B 四路并发导致 MLX 活跃内存 11GB、`mlx_async_eval` 触发 `EXC_BREAKPOINT` 的构建崩溃。**实测**：2B JSON 模式 19.5 秒抽到 7/7 实体、5 条有效关系；0.8B 仍不建议用于图谱构建。
 
@@ -144,13 +146,25 @@ HTML 与 Office 解析另有专项覆盖：HTML 保存页的本地 iframe / fram
 
 ### 2. 工具与能力层
 
-原子工具：`file_read` / `file_write` / `file_modify`（别名 `file_patch`）、`code_run`、`shell_run`、`web_scan`、`webexec_js`（别名 `web_execute_js`）、`ask_user`。
+工具由 `AgentToolFactory` 统一装配，按「合并后的组合工具 + 少量独立工具」组织（模型侧只看到下表的工具名，子操作通过 `op` 参数选择）：
 
-能力工具：`update_plan`、`update_working_checkpoint`、`start_long_term_update`、`work_memory`、`memory_graph`、`memory_search`、`skill_search`、`skill_semantic_search`、`skill_load`、`skill_save`、`rag_search`、`rag_outline`、`rag_status`、`rag_ingest`、MCP 动态工具。
+| 工具 | 形式 | 子操作 |
+| --- | --- | --- |
+| `file_tools` | 组合 | `read` / `write` / `modify`（别名 `patch`）/ `list` / `search` |
+| `web_scan` | 组合 | `scan`（抓取并提取正文，JS 页面自动渲染）/ `render`（WebKit 渲染、等待选择器、执行 JS、截图） |
+| `long_memory` | 组合 | `graph`（实体 / 关系 / 观察）/ `search`（语义召回） |
+| `skill_tools` | 组合 | `search` / `semantic_search` / `load` / `save` / `list` |
+| `rag_tools` | 组合 | `search` / `outline` / `status` / `ingest` |
+| `code_run` | 独立 | 受控进程内运行 Python |
+| `shell_run` | 独立 | 受控 shell 命令 |
+| `ask_user` | 独立 | 中断本轮并向用户提问 |
+| `update_plan` / `update_working_checkpoint` / `start_long_term_update` | 独立 | 计划、工作便签、长期记忆蒸馏 |
+| `schedule_task` | 独立 | `create` / `list` / `delete` / `enable` / `disable` / `run_now` |
+| MCP 工具 | 动态 | `mcp_<server>_<tool>`（随服务端工具清单变化热更新） |
 
-**RAG 检索策略（少而精）**：用户问书/文档内容时，先 `rag_outline` 获取全书/章节摘要与结构树；若大纲摘要已覆盖问题则直接引用、**不再检索**；整体性问题（全书大意/主题）只搜前言/引言/导论，针对性问题只搜目标章节（检索词带上章节标题，`source=书名`）。内核在每次 `rag_outline`（或每次 `run()`）之后对 `rag_search` 设**硬上限（默认 3 次）**：超出部分不再真正调用，直接预置失败并提示「基于已检索内容与大纲摘要直接综合作答」，彻底杜绝同一问题反复换关键词 scatter 检索。
+**RAG 检索策略（少而精）**：用户问书/文档内容时，先 `rag_tools(op="outline")` 获取全书/章节摘要与结构树；若大纲摘要已覆盖问题则直接引用、**不再检索**；整体性问题（全书大意/主题）只搜前言/引言/导论，针对性问题只搜目标章节（检索词带上章节标题，`source=书名`）。内核在每次 `rag_tools(op="outline")`（或每次 `run()`）之后对 `rag_tools(op="search")` 设**硬上限（默认 3 次）**：超出部分不再真正调用，直接预置失败并提示「基于已检索内容与大纲摘要直接综合作答」，彻底杜绝同一问题反复换关键词 scatter 检索。
 
-**检索即展示（Retrieval-as-Presentation）**：`rag_search` 的全部召回切片不再全量进模型上下文——只有相关度最高的 1 条切片进上下文供模型总结作答（图谱策略下实体/关系仍全量进上下文，原文片段同样只留 1 条），其余切片通过 `AgentCallbacks.onRetrievedChunks` 附加到回复气泡后供用户点开查看（含模型参考的 top-1，星标高亮）。点击气泡在独立「引用切片」窗口显示切片原文，`⌘[` / `⌘]` 或左右按钮切换同一回复内的相邻切片，避免切片截断造成的阅读断裂。无 UI 消费方（RAG MCP 服务）仍沿用 `searchFormatted` 的全量切片行为。
+**检索即展示（Retrieval-as-Presentation）**：`rag_tools(op="search")` 的全部召回切片不再全量进模型上下文——只有相关度最高的 1 条切片进上下文供模型总结作答（图谱策略下实体/关系仍全量进上下文，原文片段同样只留 1 条），其余切片通过 `AgentCallbacks.onRetrievedChunks` 附加到回复气泡后供用户点开查看（含模型参考的 top-1，星标高亮）。点击气泡在独立「引用切片」窗口显示切片原文，`⌘[` / `⌘]` 或左右按钮切换同一回复内的相邻切片，避免切片截断造成的阅读断裂。无 UI 消费方（RAG MCP 服务）仍沿用 `searchFormatted` 的全量切片行为。
 
 #### 知识图谱（RAG Knowledge Graph）
 
@@ -168,11 +182,11 @@ RAG 知识图谱与长期记忆的 **memory graph 是两套完全独立的实现
 - **真机实测（2B / 0.8B）**：2B JSON（默认）7/7 实体（含 Swift / MLX / Shanghai）、6 条去重实体对、约 20 秒；分隔符模式 4/4 核心实体、8 条去重实体对、约 32 秒。0.8B 分隔符模式靠 4 段兜底能解析出 5 条边，但只命中 2/4 核心实体（Acme Corp、Project Aurora 未抽为实体）、关系全部缺描述；JSON 模式会复读实体数组并在 2k token 处截断，解析结果为 0。0.8B 仍不建议用于图谱构建。
 - **UI**：知识同步配置区提供「构建知识图谱 / 停止构建 / 实体消歧」与检索策略选择；未构建完成时图谱策略不可选。
 
-所有文件类工具路径锁定在 workspace 内，并解析 symlink 防止逃逸。`code_run` / `shell_run` / MCP 调用按配置触发确认。
+所有文件类工具（`file_tools`）路径锁定在 workspace 内，并解析 symlink 防止逃逸。`code_run` / `shell_run` / MCP 调用按配置触发确认；`schedule_task` 的创建、删除与立即执行同样需要用户确认（确认框展示完整任务指令）。
 
 技能保存会同时写 `SKILL.md` 与 `skill.json`：前者供模型加载，后者供关键词索引扫描；只有主技能目录是 `<workspace>/skills` 时才额外镜像到 `.agent/skills`，不会出现 `.agent/.agent/skills` 的嵌套路径。索引入口缺失时会自动回退到实际存在的 `SKILL.md` / `prompt.md`。
 
-技能建议只针对真正的多步骤任务：寒暄、问候、简单问询与一次性查询不进入重复请求统计；只有本轮创建过 ≥2 步的计划且所有步骤都已 `done`，或模型显式调用 `start_long_term_update`，才会提示固化。没有计划的对话也不会注入 `skill_save` 的周期性 TIPS，系统提示同样禁止对这类请求询问是否保存技能。
+技能建议只针对真正的多步骤任务：寒暄、问候、简单问询与一次性查询不进入重复请求统计；只有本轮创建过 ≥2 步的计划且所有步骤都已 `done`，或模型显式调用 `start_long_term_update`，才会提示固化。没有计划的对话也不会注入 `skill_tools(op="save")` 的周期性 TIPS，系统提示同样禁止对这类请求询问是否保存技能。
 
 ### 2.1 安全与资源
 
@@ -188,6 +202,19 @@ RAG 知识图谱与长期记忆的 **memory graph 是两套完全独立的实现
 - 流式回复每 50ms 合并一次；内容更新时滚动不再逐帧动画，日志窗口复用同一个 `DateFormatter`，长会话下重绘更稳定。
 - LLM 流带 200ms 取消看门狗：服务端静默时用户点「终止」也能立即退出，不必等到请求超时。
 - 知识图谱写盘防抖；裁剪只在真正超限时执行，向量缓存按文本去重并分批嵌入；切换 workspace 时释放旧共享实例。
+
+### 2.2 定时任务（Scheduled Tasks）
+
+用户可以直接在对话里说「每天早上 9 点帮我整理昨天的日志」「每 30 分钟检查一次服务状态」，模型会调用 `schedule_task(op="create", prompt=..., time="09:00" 或 every_minutes=30)` 建立任务：
+
+- **规则**：`every_minutes`（1...10080 分钟）或 `time`（每天 `HH:mm`，本地时区）；`prompt` 必须自包含，到点后在没有当前对话的情况下交给 Agent 执行，可调用任意工具（`shell_run` / `code_run` / MCP 外部工具 / `file_tools` / `rag_tools` 等），因此支持「调用外部自定义工具或代码」。
+- **持久化**：任务清单写入 `<workspace>/.agent/schedules.json`（`AtomicFile` 原子写，字段容错解码），启动时自动恢复；任务 id、标题、规则、启停状态、上次运行时间与结果摘要一并保存。
+- **调度**：`ScheduleRunner` 用单个 `DispatchSourceTimer` 每秒扫描一次（串行队列），到期任务先落盘 `lastRunAt` 再回调，保证同一时间点不会被重复触发；`run_now` 也会先更新运行时间。
+- **执行与展示**：App 在空闲时执行到期任务，忙时排队（用户消息优先）；执行前在对话内插入「⏰ 定时任务开始执行」系统气泡，结果以助手气泡流式输出。定时任务使用 `Agent.runIsolated`，运行前暂存并清空用户当前计划，结束后恢复，避免无人值守时误续跑用户遗留的步骤。
+- **无人值守策略**：执行期间没有人工确认通道——需要确认的高风险工具按任务创建时用户批准的指令自动放行，每次放行都写入日志；`ask_user` 自动跳过。定时任务运行期间禁止再创建/修改/删除定时任务，防止自我调度循环。
+- **管理**：右侧「定时任务」面板显示规则、下次执行时间与上次结果，支持启用/停用、立即执行与删除；也可在对话里用 `schedule_task(op="list"/"delete"/"enable"/"disable"/"run_now")` 管理。
+
+已知行为：系统睡眠期间 timer 不触发，唤醒后补跑一次；规则仅支持「每 N 分钟」与「每天 HH:mm」两种。
 
 ### 3. RAG 文档解析
 
@@ -239,7 +266,7 @@ OvisOCR2 的 MLX 权重使用 `model_type=qwen3_5`（Qwen3.5-0.8B 后训练）�
 - **向量元素类型**：`rag_vector_element_type` 支持 int8（默认）/ fp32 / fp16 / bin；典型体积为 128 维 int8 128B/行（jina-v5 默认）、128 维 fp16 256B/行、256 维 bin 32B/行（汉明距离）。int8 用对称量化 `round(x×127)`，入库与查询都包 `vec_int8(?)`；fp16 是真正的 IEEE 754 half（每维 2 字节），因 sqlite-vec 0.1.9 没有 fp16 列类型，改用普通表存储 + 精确余弦扫描（`vector_backend=sqlite-exact`），ANN 索引仍可用（构建时解码为 Float 再量化）；bin 用符号位 + LSB-first 位图，查询包 `vec_bit(?)`。jina-v5 与其它模型一样使用用户配置的元素类型，不再强制 int8；`RAGEngine.effectiveVectorElementType` 仅在 provider 通过 `EmbeddingVectorElementConstraining` 声明硬约束时才覆盖（当前内置模型均无约束）；
 - **二值粗筛**：独立 `chunk_vectors_bin`（vec0 `bit[N]`，固定汉明距离，不能写 `distance_metric`），rowid 与 `chunks` 严格一致；签名取 `x > 0` 的符号位、LSB-first 打包，位宽按模型原生维补齐到 8 的倍数，jina-v5 从截断前原生 768 维生成。查询先用汉明 KNN 取 top N（`rag_binary_coarse_candidates`，默认 200，50...1000，实际不低于 RRF 内层候选数且不超过 4096），再按 rowid 读主向量做余弦精排，最后与 FTS5 BM25 做 RRF 融合。二值可用时取代 ANN 召回；开关关闭、覆盖率不足、签名长度不符、provider 不支持、sqlite-vec 不可用、主类型 bin 或定向检索时完整回退原流程。bin 表是派生数据，维度/来源/量化版本变化时直接 DROP 重建；覆盖率用 `binary_rows` / `chunks_count` 计数器 O(1) 计算，不执行 `COUNT(*)`，相关 meta 不进入主索引指纹，开关或截断维变化不会触发主库重建。
 - **Matryoshka**：默认 `rag_matryoshka=auto`（nomic / jina-v3 / jina-v5 启用），截断维由 `rag_matryoshka_dim` 指定（默认 128）。jina-v5 只接受模型声明的 32 / 64 / 128 / 256 / 512 / 768，由 provider 内部按配置维截断并重新归一化，`MatryoshkaEmbedding.wrap` 直接放行，不会二次截断；nomic / jina-v3 先截断，**强制重新归一化**，再按生效元素类型量化入库；查询侧执行完全相同的变换。关闭 Matryoshka 时 jina-v5 输出原生 768 维，其它模型不截断；
-- sqlite-vec 静态编入进程（`SQLITE_CORE` 模式），无需安装扩展；若初始化失败则显式退化为精确余弦扫描，并在 `rag_status` 中标注。
+- sqlite-vec 静态编入进程（`SQLITE_CORE` 模式），无需安装扩展；若初始化失败则显式退化为精确余弦扫描，并在 `rag_tools(op="status")` 中标注。
 
 向量维度、元素类型与索引指纹（`embedding.identifier | dimension | matryoshkaDim | elementType`）写入 `meta`。配置变化时不再自动清空旧索引：非空库标记待重建，向量检索暂停、同步拒绝写入、全文检索仍可用，用户在设置面板执行「重建向量库」后才清空并按当前配置全量重新同步；空库直接采纳新配置。若向量库被删除但 manifest 残留，同步会自动识别并全量重建。空库遇到首次推理才发现的真实维度时会按实际输出维度重建。
 
@@ -381,7 +408,9 @@ Sources/
       Storage/                 # SQLite、sqlite-vec、FTS5、VectorStore
       KnowledgeGraph/          # 实体/关系抽取、vec0 向量、SwiftGraph、五策略检索
       RAGEngine.swift          # 同步、Manifest、检索、rerank
-    Tools/                     # 原子工具、RAG/记忆/技能/MCP 工具
+    Tools/                     # 组合工具（file_tools/web_scan/long_memory/skill_tools/rag_tools）
+                               # + 独立工具（code_run/shell_run/ask_user/plan/schedule_task/MCP）
+    Scheduling/                # 定时任务模型、schedules.json 存储、DispatchSourceTimer 调度器
     Memory/                    # 工作记忆、长期记忆、memory graph（与 RAG 知识图谱独立）
     Skills/                    # 技能发现、索引、语义检索
     Agent/                     # Agent 门面、工具工厂、系统提示
@@ -398,6 +427,7 @@ docs/软件设计文档.md
 - EPUB 以 spine 文件为章节单位，未按 TOC 锚点二次切章。扫描版 EPUB 仅在「章节文字层低于阈值且含图片」时对该章图片逐页 OCR；纯 CSS 背景图、SVG 矢量图（非 `<image>` 引用）和加密字体渲染的文字不在识别范围内。
 - 子进程未使用 `setsid`，超时/取消通过递归进程树终止实现；极端的双重 fork 守护进程仍可能逃逸。
 - 本地 MLX/ONNX/GGUF 权重未随仓库提供；首次使用需自行下载到 `<workspace>/models/<name>` 或 `~/base-agent/models/<name>`。真实模型推理需在目标机器验证。
+- 定时任务由 App 进程内的 `DispatchSourceTimer` 驱动：应用退出后不会继续执行，系统睡眠期间不触发（唤醒后补跑一次）；规则仅支持「每 N 分钟」与「每天 HH:mm」，不支持 cron / 每周 / 每月表达式。无人值守执行时高风险工具按用户创建任务时批准的指令自动放行，请只创建可信任务。
 - 主/辅 LLM 支持 MLX-LM / MLX-VLM / GGUF / ONNX；OCR VLM 支持 MLX / GGUF+mmproj（ONNX VLM 暂无通用图适配）；Embedding / Reranker 支持 ONNX / FastEmbed / MLX / GGUF。FastEmbed 复用 ONNX 运行时及其缓存目录。GGUF 与 ONNX 均在进程内运行，不需要外部 server 或 Python。
 - ONNX LLM 的空 KV 按 float32 + `config.json` 的层数/KV 头数/head_dim 初始化；fp16 past 或非标准 KV 布局的导出会给出明确错误，需要针对性适配。
 - 本机已实测：GGUF LLM（Qwen3.5-9B，CPU 与 Metal GPU，工具调用正常）、GGUF VLM（Qwythos-9B + mmproj，OCR 输出正确）、GGUF Embedding（nomic-embed-text-v1.5，768 维）、GGUF system 前缀预热复用、MLX-VLM 主模型（Qwen3.5-2B）。ONNX LLM、ONNX VLM 与 GGUF Reranker 的代码路径已接入，但当前机器没有对应模型，未做推理实测；缺少模型或运行时会给出明确错误。

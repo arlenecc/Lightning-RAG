@@ -299,6 +299,22 @@ public final class ToolRegistry {
     public var session: Session?
     /// 懒初始化的 RAG 引擎引用，供 rag_* 工具与系统提示复用。
     public var ragEngine: RAGEngine?
+    /// 定时任务存储与调度器：由 ToolFactory 装配，App 侧启动并驱动执行。
+    public var scheduleStore: ScheduleStore?
+    public var scheduleRunner: ScheduleRunner?
+    private let unattendedLock = NSLock()
+    private var unattendedValue = false
+
+    /// 定时任务无人值守执行期间为 true。
+    /// 工具层据此拒绝「自己创建/修改定时任务」这类会造成无限自我调度的操作。
+    public var isUnattended: Bool {
+        unattendedLock.lock(); defer { unattendedLock.unlock() }
+        return unattendedValue
+    }
+
+    public func setUnattended(_ value: Bool) {
+        unattendedLock.lock(); unattendedValue = value; unattendedLock.unlock()
+    }
 
     public init(config: AgentConfig, callbacks: AgentCallbacks? = nil) {
         self.config = config

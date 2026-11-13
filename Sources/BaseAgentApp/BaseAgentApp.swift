@@ -200,14 +200,128 @@ struct MainView: View {
         VStack(spacing: 0) {
             VSplitView {
                 planPane
-                    .frame(minHeight: 220, maxHeight: .infinity)
+                    .frame(minHeight: 200, maxHeight: .infinity)
+                schedulePane
+                    .frame(minHeight: 120, maxHeight: .infinity)
                 thinkingPane
-                    .frame(minHeight: 140, maxHeight: .infinity)
+                    .frame(minHeight: 120, maxHeight: .infinity)
             }
             Divider()
             statusBar
         }
         .background(Color(nsColor: .windowBackgroundColor))
+    }
+
+    // MARK: 定时任务
+
+    private var schedulePane: some View {
+        VStack(spacing: 0) {
+            HStack(spacing: 6) {
+                Text("定时任务").font(.caption).bold()
+                if !model.scheduledTasks.isEmpty {
+                    Text("\(model.scheduledTasks.filter(\.enabled).count)/\(model.scheduledTasks.count)")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+                Spacer(minLength: 4)
+                Button {
+                    model.refreshScheduledTasks()
+                } label: {
+                    Image(systemName: "arrow.clockwise")
+                }
+                .buttonStyle(.borderless)
+                .help("刷新定时任务")
+            }
+            .padding(.horizontal, 8)
+            .padding(.vertical, 6)
+
+            Divider()
+
+            ScrollView {
+                if model.scheduledTasks.isEmpty {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("暂无定时任务。")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                        Text("在对话里说「每天早上 9 点帮我……」即可创建；"
+                            + "到点后自动执行，结果显示在对话里。")
+                            .font(.caption2)
+                            .foregroundStyle(.tertiary)
+                    }
+                    .padding(10)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                } else {
+                    VStack(alignment: .leading, spacing: 8) {
+                        ForEach(model.scheduledTasks) { task in
+                            scheduleRow(task)
+                        }
+                    }
+                    .padding(8)
+                }
+            }
+        }
+    }
+
+    private func scheduleRow(_ task: ScheduledTask) -> some View {
+        VStack(alignment: .leading, spacing: 3) {
+            HStack(alignment: .firstTextBaseline, spacing: 5) {
+                Button {
+                    model.setScheduledTaskEnabled(task, enabled: !task.enabled)
+                } label: {
+                    Image(systemName: task.enabled
+                          ? "checkmark.circle.fill" : "circle")
+                        .font(.caption)
+                        .foregroundStyle(task.enabled ? Color.accentColor : Color.secondary)
+                }
+                .buttonStyle(.borderless)
+                .help(task.enabled ? "停用任务" : "启用任务")
+
+                Text(task.title)
+                    .font(.caption)
+                    .fontWeight(task.enabled ? .semibold : .regular)
+                    .foregroundStyle(task.enabled ? .primary : .secondary)
+                    .lineLimit(2)
+                Spacer(minLength: 2)
+                Button {
+                    model.runScheduledTaskNow(task)
+                } label: {
+                    Image(systemName: "play.circle").font(.caption)
+                }
+                .buttonStyle(.borderless)
+                .help("立即执行一次")
+                .disabled(model.isRunning || model.isModelLoading
+                    || model.isWarmingUp || model.isSyncing || model.isBuildingANN)
+                Button {
+                    model.deleteScheduledTask(task)
+                } label: {
+                    Image(systemName: "trash").font(.caption)
+                }
+                .buttonStyle(.borderless)
+                .help("删除任务")
+            }
+            Text(scheduleDetail(task))
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+                .lineLimit(3)
+                .fixedSize(horizontal: false, vertical: true)
+                .padding(.leading, 18)
+        }
+    }
+
+    private func scheduleDetail(_ task: ScheduledTask) -> String {
+        var parts = [task.rule.summary]
+        if task.enabled {
+            let next = task.nextRunDate()
+            parts.append(Date() >= next
+                ? "已到期（等待执行）"
+                : "下次 \(scheduleLocalTimeText(next))")
+        } else {
+            parts.append("已停用")
+        }
+        if let result = task.lastResult, !result.isEmpty {
+            parts.append("上次：\(result)")
+        }
+        return parts.joined(separator: " · ")
     }
 
     // MARK: 任务计划

@@ -50,16 +50,34 @@ final class CancelFlag: @unchecked Sendable {
     }
 }
 
+/// 无人值守标志：定时任务执行期间置位。此时没有用户坐在屏幕前等待
+/// 确认弹窗，`confirm` 自动放行（并记录日志）、`askUser` 直接返回 nil。
+/// 与 `CancelFlag` 一样用锁做跨线程读取。
+final class UnattendedFlag: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value = false
+    var isOn: Bool {
+        lock.lock(); defer { lock.unlock() }
+        return value
+    }
+    func set(_ newValue: Bool) {
+        lock.lock(); value = newValue; lock.unlock()
+    }
+}
+
 // MARK: - Callbacks
 
 /// 把 AgentCallbacks 的事件桥接到主线程 UI。
 final class UICallbacks: AgentCallbacks, @unchecked Sendable {
     private weak var model: AppViewModel?
     private let cancel: CancelFlag
+    /// 定时任务执行期间为 true：无人值守，确认自动放行。
+    private let unattended: UnattendedFlag
 
-    init(model: AppViewModel, cancel: CancelFlag) {
+    init(model: AppViewModel, cancel: CancelFlag, unattended: UnattendedFlag) {
         self.model = model
         self.cancel = cancel
+        self.unattended = unattended
     }
 
     func isCancelled() -> Bool { cancel.isCancelled }
@@ -130,7 +148,18 @@ final class UICallbacks: AgentCallbacks, @unchecked Sendable {
     }
 
     func confirm(_ message: String) -> Bool {
-        runOnMain {
+        // 定时任务无人值守执行：没有用户可以点击确认。高风险工具按任务创建时
+        // 用户批准的 prompt 自动放行，但把每一次放行显式写进日志，便于事后审计。
+        if unattended.isOn {
+            DispatchQueue.main.async { [weak self] in
+                self?.model?.appendLog(
+                    "[schedule] 无人值守：自动批准一次工具调用（"
+                    + String(message.prefix(120)).replacingOccurrences(of: "\n", with: " ")
+                    + "…）")
+            }
+            return true
+        }
+        return runOnMain {
             let alert = NSAlert()
             alert.messageText = "需要确认"
             alert.alertStyle = .warning
@@ -162,7 +191,16 @@ final class UICallbacks: AgentCallbacks, @unchecked Sendable {
     }
 
     func askUser(_ prompt: String) -> String? {
-        runOnMain {
+        if unattended.isOn {
+            DispatchQueue.main.async { [weak self] in
+                self?.model?.appendLog(
+                    "[schedule] 无人值守：跳过提问，改为由 Agent 自行决策（"
+                    + String(prompt.prefix(120)).replacingOccurrences(of: "\n", with: " ")
+                    + "…）")
+            }
+            return nil
+        }
+        return runOnMain {
             let alert = NSAlert()
             alert.messageText = "需要补充信息"
             alert.informativeText = prompt
@@ -200,12 +238,19 @@ final class AppViewModel: ObservableObject {
     @Published var chatItems: [ChatItem] = []
     /// 引用切片查看窗口当前展示的位置；nil 表示窗口显示占位内容。
     @Published var citationViewer: CitationViewerState?
+    /// 定时任务列表（侧栏展示，来自 ScheduleStore 的变更通知）。
+    @Published var scheduledTasks: [ScheduledTask] = []
     @Published var reasoning = ""
     @Published var logs: [LogLine] = []
     @Published var toolEvents: [ToolEvent] = []
     @Published var plan: Plan?
     @Published var isRunning = false {
-        didSet { if !isRunning { flushQueuedSends() } }
+        didSet {
+            if !isRunning {
+                flushQueuedSends()
+                drainScheduledTasks()
+            }
+        }
     }
     @Published var statusText = "就绪"
     @Published var totalTokens = 0
@@ -259,6 +304,8 @@ final class AppViewModel: ObservableObject {
     @Published var auxModelLoaded = false
 
     let cancelFlag = CancelFlag()
+    /// 定时任务执行期间置位，供 UICallbacks 判断无人值守。
+    let unattendedFlag = UnattendedFlag()
     /// 最近一次构建 Agent 时加载的 BASE system prompt
     /// （来自 `<workspace>/assets/system_prompt.txt`）。只在启动 / 应用配置时刷新，
     /// 会话进行中不重读，避免 system 前缀抖动导致 KV cache 全量重建；
@@ -268,6 +315,13 @@ final class AppViewModel: ObservableObject {
     private var streamingID: UUID?
     private var pendingToolIndices: [String: [Int]] = [:]
     private var runTask: Task<Void, Never>?
+    /// 已到期但还没执行的定时任务（对话/维护占用时排队）。
+    private var scheduledQueue: [ScheduledTask] = []
+    /// 忙时重试等待：避免每 5 秒重建一个 Task。
+    private var scheduledRetryTask: Task<Void, Never>?
+    /// 启动瞬间预加载的异步 Task 可能还没置位 `isModelLoading`，
+    /// 给一次 5 秒宽限，避免把刚恢复的任务误判为「模型未加载」直接跳过。
+    private var didWaitForInitialPreload = false
     private var syncTask: Task<Void, Never>?
     /// 空闲内存回收：无前台活动 3 分钟后释放可重建的 OCR 权重。
     private var idleUnloadTask: Task<Void, Never>?
@@ -646,7 +700,7 @@ final class AppViewModel: ObservableObject {
                 + "\(config.effectiveAuxContextTokens) tokens")
         }
         let llm = LocalModelFactory.shared.makeLLM(config: config)
-        let callbacks = UICallbacks(model: self, cancel: cancelFlag)
+        let callbacks = UICallbacks(model: self, cancel: cancelFlag, unattended: unattendedFlag)
         let newAgent = Agent(llm: llm, config: config, callbacks: callbacks,
                              baseSystemPrompt: baseSystemPrompt)
         // 未启用时保持 auxLLM 为 nil：RAG 精简会直接跳过，后台任务回退主模型，
@@ -657,6 +711,7 @@ final class AppViewModel: ObservableObject {
         // 知识图谱抽取/关键词提取复用辅助模型实例。
         newAgent.ragEngine.auxLLM = newAgent.auxLLM
         agent = newAgent
+        bindScheduler()
         refreshRAGStatus()
         refreshKnowledgeGraphStatus()
         Task { [weak newAgent] in
@@ -691,6 +746,9 @@ final class AppViewModel: ObservableObject {
                 guard self.configGeneration == generation else { return }
                 self.cancelIdleUnload()
                 self.clearStreamingState()
+                // 旧 Agent 的在途运行已被取消；立即退出无人值守模式，
+                // 避免用户紧接着发消息时确认弹窗被自动放行。
+                self.unattendedFlag.set(false)
                 self.isWarmingUp = false
                 self.config = newConfig
                 do {
@@ -814,6 +872,10 @@ final class AppViewModel: ObservableObject {
         let generation = configGeneration
         cancelFlag.set(true)
         oldTask?.cancel()
+        // 必须在 isRunning=false 之前清掉无人值守：这里会让排队消息立刻开跑，
+        // 否则用户消息可能继承定时任务的自动放行状态。
+        unattendedFlag.set(false)
+        agent?.tools.setUnattended(false)
         cancelIdleUnload()
         isRunning = false
         isModelLoading = true
@@ -1094,6 +1156,9 @@ final class AppViewModel: ObservableObject {
                 self.clearStreamingState()
                 self.agent?.reset()
                 self.cancelFlag.set(false)
+                // 清空对话后不应残留无人值守状态。
+                self.unattendedFlag.set(false)
+                self.agent?.tools.setUnattended(false)
                 self.isRunning = false
                 self.totalTokens = 0
                 self.tokenSpeed = 0
@@ -1191,6 +1256,9 @@ final class AppViewModel: ObservableObject {
         totalTokens = 0
         tokenSpeed = 0
         cancelFlag.set(false)
+        // 用户主动发起的对话永远是有人值守的：清除可能残留的定时任务无人值守状态。
+        unattendedFlag.set(false)
+        agent.tools.setUnattended(false)
 
         runTask = Task { [weak self, weak agent] in
             guard let self, let agent else { return }
@@ -1238,6 +1306,204 @@ final class AppViewModel: ObservableObject {
         await LocalModelFactory.shared.unloadAllForTermination()
         LocalModelFactory.shared.unloadLLMCaches()
         LocalModelFactory.shared.synchronizeGPU()
+    }
+
+    // MARK: 定时任务
+
+    /// 绑定当前 Agent 的调度器：恢复任务列表、接线到期回调并启动扫描。
+    /// Agent 重建（应用配置）后由 `buildAgent` 重新调用；旧 runner 随旧 Agent
+    /// 的 `close()` 停止。
+    private func bindScheduler() {
+        // 重建 Agent（通常是切换工作区/配置）时，旧任务属于旧 store，
+        // 不能继续用新 Agent 的会话/工具执行。
+        scheduledRetryTask?.cancel()
+        scheduledRetryTask = nil
+        didWaitForInitialPreload = false
+        if !scheduledQueue.isEmpty {
+            appendLog("[schedule] Agent 已重建，丢弃 \(scheduledQueue.count) 个排队中的旧任务")
+            scheduledQueue.removeAll()
+        }
+        guard let store = agent?.scheduleStore, let runner = agent?.scheduleRunner else {
+            scheduledTasks = []
+            return
+        }
+        store.onChange = { [weak self] tasks in
+            Task { @MainActor [weak self] in self?.scheduledTasks = tasks }
+        }
+        runner.onTaskDue = { [weak self] task in
+            Task { @MainActor [weak self] in self?.enqueueScheduledTask(task) }
+        }
+        runner.onLog = { [weak self] line in
+            Task { @MainActor [weak self] in self?.appendLog(line) }
+        }
+        scheduledTasks = store.all()
+        if !scheduledTasks.isEmpty {
+            appendLog("[schedule] 已恢复 \(scheduledTasks.count) 个定时任务")
+        }
+        runner.start()
+    }
+
+    /// 到期任务先入队：对话/维护进行中时不打断当前工作，空闲后自动执行。
+    private func enqueueScheduledTask(_ task: ScheduledTask) {
+        // 过滤旧 store 的迟到回调（配置重建时旧 runner 可能还有一个 tick
+        // 正在执行）以及已删除的任务。
+        guard let store = agent?.scheduleStore,
+              store.all().contains(where: { $0.id == task.id }) else {
+            appendLog("[schedule] 忽略过期任务「\(task.title)」")
+            return
+        }
+        guard !scheduledQueue.contains(where: { $0.id == task.id }) else { return }
+        scheduledQueue.append(task)
+        drainScheduledTasks()
+    }
+
+    private func drainScheduledTasks() {
+        guard !scheduledQueue.isEmpty else { return }
+        // 启动预加载还没把 mainModelLoaded 置位时（异步任务尚未开始），
+        // 不能把任务判成「模型未加载」直接跳过；只宽限一次，避免预加载
+        // 失败后任务无限等待。
+        let waitingForPreload = config.llmProvider == "local"
+            && !mainModelLoaded && config.autoPreloadMain
+            && missingDefaultModels.isEmpty && !didWaitForInitialPreload
+        if waitingForPreload { didWaitForInitialPreload = true }
+        // 与用户消息共用同一个模型/会话，必须串行。
+        guard !isRunning, !isModelLoading, !isWarmingUp, !isSyncing,
+              !isDeduplicating, !isBuildingANN, !isBuildingKG,
+              !isResolvingEntities, !waitingForPreload else {
+            scheduleScheduledRetry()
+            return
+        }
+        guard let store = agent?.scheduleStore else {
+            scheduledQueue.removeAll()
+            return
+        }
+        // 排队期间任务可能已被用户删除：以 store 为准，避免执行幽灵任务。
+        while !scheduledQueue.isEmpty {
+            let queued = scheduledQueue.removeFirst()
+            guard let live = store.all().first(where: { $0.id == queued.id }) else {
+                appendLog("[schedule] 任务「\(queued.title)」已被删除，跳过执行")
+                continue
+            }
+            executeScheduledTask(live)
+            return
+        }
+    }
+
+    /// 忙态解除没有统一的 didSet 时，用 5 秒轮询兜底（队列非空才会创建）。
+    private func scheduleScheduledRetry() {
+        guard scheduledRetryTask == nil else { return }
+        scheduledRetryTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: 5_000_000_000)
+            guard let self else { return }
+            self.scheduledRetryTask = nil
+            self.drainScheduledTasks()
+        }
+    }
+
+    /// 在对话里执行一个定时任务：系统气泡标记开始，Assistant 气泡流式展示结果。
+    /// 执行期间置位 `unattendedFlag`：没有人工确认通道，`confirm` 自动放行并记日志。
+    private func executeScheduledTask(_ task: ScheduledTask) {
+        guard let agent else { return }
+        guard missingDefaultModels.isEmpty else {
+            let note = "⏰ 定时任务「\(task.title)」已跳过：默认模型未就绪"
+            appendSystem(note)
+            try? agent.scheduleStore?.setLastResult(id: task.id, summary: note)
+            return
+        }
+        // 本地模型未加载时执行只会得到一个错误回复，直接说明原因更清楚。
+        if config.llmProvider == "local", !mainModelLoaded {
+            let note = "⏰ 定时任务「\(task.title)」已跳过：主模型未加载"
+            appendSystem(note)
+            appendLog("[schedule] \(note)，请在配置中加载模型后等待下次触发")
+            try? agent.scheduleStore?.setLastResult(id: task.id, summary: note)
+            return
+        }
+
+        cancelIdleUnload()
+        runGeneration += 1
+        let generation = runGeneration
+        if chatItems.count > 1_000 { chatItems.removeFirst(chatItems.count - 1_000) }
+        clearStreamingState()
+        appendSystem("⏰ 定时任务「\(task.title)」开始执行（\(scheduleLocalTimeText(Date()))）")
+        let item = ChatItem(role: .assistant, content: "")
+        chatItems.append(item)
+        streamingID = item.id
+        reasoning = ""
+        toolEvents.removeAll()
+        pendingToolIndices.removeAll()
+        isRunning = true
+        statusText = "定时任务执行中：\(task.title)"
+        totalTokens = 0
+        tokenSpeed = 0
+        cancelFlag.set(false)
+        unattendedFlag.set(true)
+        // 工具层据此拒绝任务自我调度（无人值守期间禁止增删改定时任务）。
+        agent.tools.setUnattended(true)
+
+        runTask = Task { [weak self, weak agent] in
+            guard let self, let agent else { return }
+            await self.stopSummaryIdleSession(timeout: 1.5)
+            let answer: String
+            if Task.isCancelled || self.runGeneration != generation {
+                answer = ""
+            } else {
+                // 独立运行：不继承/不遗留用户当前计划，避免无人值守时续跑旧任务。
+                answer = await agent.runIsolated(task.prompt)
+            }
+            await MainActor.run {
+                // 只有本轮仍是当前轮时才重置无人值守：若已开始新的一轮（用户消息
+                // 或下一个定时任务），状态归新任务所有，不能在这里清掉。
+                guard self.runGeneration == generation else { return }
+                self.unattendedFlag.set(false)
+                agent.tools.setUnattended(false)
+                self.finishSummaryFilter()
+                self.flushBuffers()
+                self.finalizeStreaming(with: answer)
+                self.statusText = "就绪"
+                self.cancelFlag.set(false)
+                self.refreshRAGStatus()
+                self.scheduleIdleUnload()
+                let summary = Self.scheduledResultSummary(answer)
+                try? self.agent?.scheduleStore?.setLastResult(id: task.id, summary: summary)
+                self.appendLog("[schedule] 任务「\(task.title)」执行完成：\(summary)")
+                // 最后再置空闲：didSet 会立刻启动排队的用户消息/下一个定时任务，
+                // 提前置 false 会让本方法的收尾语句覆盖新任务的“思考中…”状态。
+                self.isRunning = false
+            }
+        }
+    }
+
+    private static func scheduledResultSummary(_ text: String) -> String {
+        let cleaned = text
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .replacingOccurrences(of: "\n", with: " ")
+        return cleaned.isEmpty ? "（无输出）" : String(cleaned.prefix(160))
+    }
+
+    /// 侧栏「立即执行」：与自然到点走同一条执行链路。
+    func runScheduledTaskNow(_ task: ScheduledTask) {
+        agent?.scheduleRunner?.triggerNow(task)
+    }
+
+    /// 手动刷新任务列表（正常情况下由 ScheduleStore 的变更通知自动刷新）。
+    func refreshScheduledTasks() {
+        scheduledTasks = agent?.scheduleStore?.all() ?? []
+    }
+
+    func setScheduledTaskEnabled(_ task: ScheduledTask, enabled: Bool) {
+        do {
+            _ = try agent?.scheduleStore?.setEnabled(id: task.id, enabled)
+        } catch {
+            appendLog("[schedule] 更新任务状态失败：\(error.localizedDescription)")
+        }
+    }
+
+    func deleteScheduledTask(_ task: ScheduledTask) {
+        do {
+            _ = try agent?.scheduleStore?.remove(id: task.id)
+        } catch {
+            appendLog("[schedule] 删除任务失败：\(error.localizedDescription)")
+        }
     }
 
     // MARK: 空闲内存回收

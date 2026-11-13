@@ -131,6 +131,13 @@ public enum AgentToolFactory {
                                          engine: ragEngine)),
             ]))
 
+        // 定时任务：任务清单落盘到 workspace，ScheduleRunner 由 App 启动。
+        let scheduleStore = ScheduleStore(
+            path: ToolSupport.stateFile("schedules.json", workspace: config.workspace))
+        let scheduleRunner = ScheduleRunner(store: scheduleStore)
+        registry.scheduleStore = scheduleStore
+        registry.scheduleRunner = scheduleRunner
+
         // 未合并的独立工具。
         let standaloneTools: [AgentTool] = [
             CodeRunTool(config: config, callbacks: callbacks, registry: registry),
@@ -141,6 +148,8 @@ public enum AgentToolFactory {
                                         compressor: checkpointCompressor),
             StartLongTermUpdateTool(config: config, callbacks: callbacks, registry: registry),
             UpdatePlanTool(config: config, callbacks: callbacks, registry: registry),
+            ScheduleTaskTool(config: config, callbacks: callbacks, registry: registry,
+                             store: scheduleStore, runner: scheduleRunner),
         ]
         tools.append(contentsOf: standaloneTools)
 
