@@ -386,12 +386,16 @@ public struct AgentConfig: Sendable {
     public var ragKGRelationTopK: Int = 40
     /// 实体/关系反查原文时每条最多带回的相关切片数（默认 5）。
     public var ragKGMaxChunksPerHit: Int = 5
-    /// 实体上下文 token 预算上限（默认 6000）。
-    public var ragKGEntityTokenBudget: Int = 6_000
-    /// 关系上下文 token 预算上限（默认 8000）。
-    public var ragKGRelationTokenBudget: Int = 8_000
-    /// KG + 原文 + system + query 的总 token 预算（默认 30000）。
-    public var ragKGTotalTokenBudget: Int = 30_000
+    /// 实体上下文 token 预算上限（默认 3000）。
+    public var ragKGEntityTokenBudget: Int = 3_000
+    /// 关系上下文 token 预算上限（默认 4000）。
+    public var ragKGRelationTokenBudget: Int = 4_000
+    /// 原文片段上下文 token 预算上限（默认 12000）。
+    /// 实体 + 关系 + 原文默认合计 19000，加上标题行仍在总预算 20000 内，
+    /// 保证图谱输出能完整交给下游摘要，不因中间截断丢信息。
+    public var ragKGChunkTokenBudget: Int = 12_000
+    /// 图谱输出的总 token 预算（默认 20000）：实体 + 关系 + 原文的硬上限。
+    public var ragKGTotalTokenBudget: Int = 20_000
     /// 单个切片最多保留的实体数（默认 20）。
     public var ragKGMaxEntitiesPerChunk: Int = 20
     /// 单个切片最多保留的关系数（默认 50）。
@@ -711,6 +715,7 @@ public struct AgentConfig: Sendable {
         if let v = int("rag_kg_max_chunks_per_hit") { ragKGMaxChunksPerHit = v }
         if let v = int("rag_kg_entity_token_budget") { ragKGEntityTokenBudget = v }
         if let v = int("rag_kg_relation_token_budget") { ragKGRelationTokenBudget = v }
+        if let v = int("rag_kg_chunk_token_budget") { ragKGChunkTokenBudget = v }
         if let v = int("rag_kg_total_token_budget") { ragKGTotalTokenBudget = v }
         if let v = int("rag_kg_max_entities_per_chunk") { ragKGMaxEntitiesPerChunk = v }
         if let v = int("rag_kg_max_relations_per_chunk") { ragKGMaxRelationsPerChunk = v }
@@ -979,6 +984,7 @@ public struct AgentConfig: Sendable {
         ragKGMaxChunksPerHit = max(1, min(20, ragKGMaxChunksPerHit))
         ragKGEntityTokenBudget = max(500, min(20_000, ragKGEntityTokenBudget))
         ragKGRelationTokenBudget = max(500, min(20_000, ragKGRelationTokenBudget))
+        ragKGChunkTokenBudget = max(500, min(40_000, ragKGChunkTokenBudget))
         ragKGTotalTokenBudget = max(4_096, min(60_000, ragKGTotalTokenBudget))
         // 抽取限额收口：实体/关系按行数上限，描述按字符数上限。
         ragKGMaxEntitiesPerChunk = max(1, min(200, ragKGMaxEntitiesPerChunk))
@@ -1116,6 +1122,7 @@ public struct AgentConfig: Sendable {
             "rag_kg_max_chunks_per_hit": ragKGMaxChunksPerHit,
             "rag_kg_entity_token_budget": ragKGEntityTokenBudget,
             "rag_kg_relation_token_budget": ragKGRelationTokenBudget,
+            "rag_kg_chunk_token_budget": ragKGChunkTokenBudget,
             "rag_kg_total_token_budget": ragKGTotalTokenBudget,
             "rag_kg_max_entities_per_chunk": ragKGMaxEntitiesPerChunk,
             "rag_kg_max_relations_per_chunk": ragKGMaxRelationsPerChunk,

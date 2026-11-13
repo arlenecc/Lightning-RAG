@@ -2979,17 +2979,12 @@ public final class RAGEngine {
                                                 config: config, chunkStore: store)
         let candidates = try await retriever.retrieve(query: query, source: source)
         guard !candidates.isEmpty else { return nil }
-        // 总预算 = system prompt + query + 图谱 + 原文。
-        let reserved = TokenEstimator.estimate(query)
-            + TokenEstimator.estimate(BASE_SYSTEM_PROMPT)
-        return await formatKnowledgeGraph(query: query, candidates: candidates,
-                                          reservedTokens: reserved)
+        return await formatKnowledgeGraph(query: query, candidates: candidates)
     }
 
     /// 三路候选统一走同一个 reranker 精排，按实体/关系/原文分组并做 token 预算截断。
     private func formatKnowledgeGraph(query: String,
-                                      candidates: KGRetrievalCandidates,
-                                      reservedTokens: Int) async -> String {
+                                      candidates: KGRetrievalCandidates) async -> String {
         var passages = candidates.allPassages
         // 1) 统一 reranker 精排（失败/超时则保留图谱自身排序）。
         if config.ragRerankEnabled, let reranker, !passages.isEmpty {
@@ -3014,15 +3009,17 @@ public final class RAGEngine {
             }
             .map(\.element)
 
-        // 3) 预算截断：实体 6000、关系 8000；总预算 30000 含 system + query。
+        // 3) 预算截断：实体 3000、关系 4000、原文 12000，总输出 ≤20000 token。
+        //    原文预算再被「总预算 − 实体实际 − 关系实际」收口，三者之和不会越顶。
         let entitySection = assembleSection("实体", passages: entities,
                                             budgetTokens: config.ragKGEntityTokenBudget)
         let relationSection = assembleSection("关系", passages: relations,
                                               budgetTokens: config.ragKGRelationTokenBudget)
         let entityTokens = TokenEstimator.estimate(entitySection)
         let relationTokens = TokenEstimator.estimate(relationSection)
-        let chunkBudget = max(0, config.ragKGTotalTokenBudget
-            - entityTokens - relationTokens - reservedTokens)
+        let chunkBudget = max(0, min(config.ragKGChunkTokenBudget,
+                                     config.ragKGTotalTokenBudget
+                                        - entityTokens - relationTokens))
         let chunkSection = assembleSection("原文片段", passages: chunks,
                                            budgetTokens: chunkBudget)
 
@@ -3063,7 +3060,7 @@ public final class RAGEngine {
         // 图谱策略：非 naive 且图谱已就绪时走知识图谱检索，否则回退原始实现。
         if config.ragRetrievalStrategy.usesKnowledgeGraph {
             if let kgOutput = try await knowledgeGraphSearchFormatted(query: query, source: source) {
-                return kgOutput
+                return await condenseIfNeeded(kgOutput)
             }
         }
         let hits = try await search(query: query, topK: topK, source: source)
@@ -3143,18 +3140,35 @@ public final class RAGEngine {
         let documentCount = Set(hits.map(\.source)).count
         guard Self.shouldCondense(outputChars: output.count,
                                   documentCount: documentCount,
-                                  config: config),
-              let condenser = auxCondenser else { return output }
-
+                                  config: config) else { return output }
         let chunks = Self.condenseSections(hits: hits,
                                            limit: Self.condenseChapterChars,
                                            maxTotal: config.ragAuxSummarizeMaxChars)
-        // 单块（单文档单章节且未超分片上限）：一次整理即可，不必多一轮。
+        return await runCondense(output, chunks: chunks)
+    }
+
+    /// 知识图谱路径：输出形如 `【实体】…【关系】…【原文片段】…`，天然是多源
+    /// 汇总，按长度触发；直接按标题分节后走同一套 map-reduce。
+    /// 这里**不再按 `ragAuxSummarizeMaxChars` 截断**：图谱总输出已由
+    /// `ragKGTotalTokenBudget` 控制，map-reduce 本身按 4000 字符分片，
+    /// 任何一次模型调用都不会超上下文，截断只会白白丢信息。
+    private func condenseIfNeeded(_ output: String) async -> String {
+        guard output.count >= config.ragAuxSummarizeMinChars else { return output }
+        let chunks = Self.sectionsFromHeadings(output, limit: Self.condenseChapterChars)
+        return await runCondense(output, chunks: chunks)
+    }
+
+    /// 共用编排：单块直接整理，多块先逐片摘要（map）再合并去重（reduce）。
+    private func runCondense(_ output: String,
+                             chunks: [(title: String, text: String)]) async -> String {
+        guard let condenser = auxCondenser else { return output }
         guard chunks.count > 1 else {
-            if let condensed = await condenser(output, .merge), !condensed.isEmpty {
+            let single = output.count <= Self.condenseChapterChars
+                ? output : (chunks.first?.text ?? output)
+            if let condensed = await condenser(single, .merge), !condensed.isEmpty {
                 return condensed
             }
-            return output
+            return single
         }
 
         // map：逐章节分片摘要；单片失败时保留该片原文，不让结果凭空缺失。
@@ -3229,6 +3243,39 @@ public final class RAGEngine {
                 let text = piece.count > remaining ? String(piece.prefix(remaining)) : piece
                 sections.append((title, text))
                 used += text.count
+            }
+        }
+        return sections
+    }
+
+    /// 按 `【标题】` 行把文本分节（知识图谱输出：实体 / 关系 / 原文片段），
+    /// 每节超 limit 时按行再切；首个标题之前的内容归入「概览」。
+    static func sectionsFromHeadings(_ text: String, limit: Int)
+        -> [(title: String, text: String)] {
+        var ordered: [(String, String)] = []
+        var title = "概览"
+        var body = ""
+        func flush() {
+            let trimmed = body.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !trimmed.isEmpty { ordered.append((title, trimmed)) }
+            body = ""
+        }
+        for line in text.components(separatedBy: "\n") {
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            if trimmed.hasPrefix("【"), let close = trimmed.range(of: "】") {
+                flush()
+                title = String(trimmed[trimmed.index(after: trimmed.startIndex)..<close.lowerBound])
+                body = String(trimmed[close.upperBound...]).trimmingCharacters(in: .whitespaces)
+            } else {
+                body += (body.isEmpty ? "" : "\n") + line
+            }
+        }
+        flush()
+
+        var sections: [(title: String, text: String)] = []
+        for section in ordered {
+            for piece in splitByLines(section.1, limit: limit) {
+                sections.append((section.0, piece))
             }
         }
         return sections

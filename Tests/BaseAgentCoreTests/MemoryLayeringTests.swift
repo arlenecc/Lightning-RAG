@@ -401,6 +401,40 @@ final class MemoryLayeringTests: XCTestCase {
         XCTAssertTrue((dir.read(dir.tidyProposalFile) ?? "").contains("未自动执行"))
     }
 
+    /// 历史提炼输入必须按辅助模型上下文预算分片：
+    /// 旧实现最多塞 10 万字符，8192 上下文的辅助模型每轮都超预算失败。
+    func testHistoryInsightInputStaysWithinBudgetAndDrainsPartially() async {
+        guard let dir else { return }
+        final class Capture: @unchecked Sendable {
+            var texts: [String] = []
+        }
+        let capture = Capture()
+        let big = String(repeating: "用户讨论了项目细节。", count: 500)
+        let ids = ["s1", "s2", "s3"]
+        var history = ""
+        for id in ids {
+            history += "@@SESSION \(id)\n@@USER \(big)\n@@AGENT 收到。\n@@SESSION-END\n\n"
+        }
+        XCTAssertTrue(dir.write(history, to: dir.allHistoryFile))
+        dir.enqueuePendingInsights(ids)
+
+        let maintenance = MemoryMaintenance(
+            directory: dir,
+            log: { _ in },
+            collect: { msgs, _ in
+                capture.texts = msgs.map(\.content)
+                return "持续活动\n已消失事项\n情绪事件\n<!-- LAST_SESSION: s1 -->"
+            })
+        await maintenance.mineHistoryInsights()
+
+        let input = capture.texts.joined(separator: "\n")
+        XCTAssertLessThan(TokenEstimator.estimate(input), 6_000,
+                          "输入必须控制在小模型上下文内")
+        let remaining = dir.pendingInsightIds()
+        XCTAssertFalse(remaining.isEmpty, "超预算时应保留未处理的 session")
+        XCTAssertLessThan(remaining.count, ids.count)
+    }
+
     /// tracker 用归一化路径去重，且 reset 后重新视为首次。
     func testSOPTrackerCanonicalKeyAndReset() {
         let tracker = SOPReadTracker()

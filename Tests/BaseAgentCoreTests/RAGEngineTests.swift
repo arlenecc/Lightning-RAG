@@ -1256,6 +1256,28 @@ final class RAGEngineTests: XCTestCase {
         XCTAssertEqual(hardCut.joined(), longLine)
     }
 
+    /// 知识图谱输出按 `【标题】` 分节，超长节再按行切。
+    func testCondenseSectionsFromHeadings() {
+        let text = """
+        从知识图谱检索到 3 个实体、2 条关系
+        【实体】
+        居鲁士
+        大流士
+        【关系】
+        居鲁士 --建立--> 阿契美尼德
+        【原文片段】
+        \(String(repeating: "片段内容", count: 2000))
+        """
+        let sections = RAGEngine.sectionsFromHeadings(text, limit: 800)
+        let titles = Set(sections.map(\.title))
+        XCTAssertTrue(titles.contains("实体"))
+        XCTAssertTrue(titles.contains("关系"))
+        XCTAssertTrue(titles.contains("原文片段"))
+        XCTAssertGreaterThan(sections.filter { $0.title == "原文片段" }.count, 1,
+                             "超长节必须切成多片")
+        XCTAssertTrue(sections.allSatisfy { $0.text.count <= 800 })
+    }
+
     /// 章节聚合：同一文档同一 heading 归为一章，不同文档/heading 分开。
     func testCondenseSectionsGroupsByDocumentAndHeading() {
         let hits = [

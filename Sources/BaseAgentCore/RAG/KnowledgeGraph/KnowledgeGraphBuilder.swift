@@ -295,8 +295,12 @@ public final class KnowledgeGraphBuilder {
     /// 查询 → 高层/低层关键词（供检索使用）。
     func extractKeywords(query: String) async throws -> KGKeywords {
         let prompt = KnowledgeGraphPrompts.keywordExtractionPrompt(query: query)
-        let output = try await complete(system: "", user: prompt,
-                                        temperature: Self.extractionTemperature).text
+        // system 必须非空且稳定：本地后端的 isolated 前缀副本池只在
+        // systemPrompt 非空时生效，否则每次检索都全量 prefill（约 1.5s）。
+        let output = try await complete(
+            system: "你是知识图谱检索的关键词提取器。严格按用户给出的格式输出，不要解释。",
+            user: prompt,
+            temperature: Self.extractionTemperature).text
         return Self.parseKeywords(output)
     }
 

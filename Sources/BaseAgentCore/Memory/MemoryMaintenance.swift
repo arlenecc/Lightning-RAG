@@ -43,13 +43,22 @@ public final class MemoryMaintenance: @unchecked Sendable {
         let previous = dir.read(dir.historyInsightFile, limit: 200_000) ?? ""
         let lastMark = Self.lastSessionMarker(in: previous)
         // 只截取队列中尚未处理的骨架，按 session 边界对齐，不拆分同一 session。
-        // 增量由「持久化队列」判定（allowed 集合），不依赖 id 字符串大小比较：
-        // `MMdd_HHmmss_NNN` 跨年时字典序不可靠，且 lastMark 只作为给模型的提示。
-        let increment = Self.skeletonAfter(nil, in: fullHistory, allowed: Set(pending))
-        guard !increment.isEmpty else {
+        // 单次最多 `insightIncrementTokenBudget`，剩余 session 留到下一轮：
+        // 辅助模型上下文通常 8192，旧实现把最多 10 万字符一次性塞进去，
+        // 每轮都超预算失败、永远写不出产物。
+        let batch = Self.skeletonBatches(in: fullHistory, allowed: Set(pending),
+                                         maxTokens: Self.insightIncrementTokenBudget)
+        guard !batch.text.isEmpty else {
             // 队列里的 id 在 all_history 找不到（异常）：出队避免永久卡住。
             dir.clearPendingInsights(pending)
             return
+        }
+        // 旧产物只保留尾部：LAST_SESSION 与情绪事件追加在末尾，覆盖写回时
+        // 至少保证增量标记不丢；完整产物过大本身说明该人工整理。
+        let priorTail = Self.clipTail(previous, maxTokens: Self.insightPreviousTokenBudget)
+        if priorTail.count < previous.count {
+            log("[memory] 历史提炼：旧产物 \(previous.count) 字符，仅保留尾部 "
+                + "\(priorTail.count) 字符以适配辅助模型上下文")
         }
 
         let prompt = """
@@ -59,10 +68,10 @@ public final class MemoryMaintenance: @unchecked Sendable {
         \(lastMark.isEmpty ? "(无，首次运行)" : lastMark)
 
         --- 已有产物（活动知识层 / 情绪事件 / 增量标记，需读取并更新写回） ---
-        \(String(previous.prefix(40_000)))
+        \(priorTail.isEmpty ? "(无)" : priorTail)
 
         --- 本次新增的历史 USER/Agent 骨架（含 session 标识） ---
-        \(String(increment.prefix(60_000)))
+        \(batch.text)
 
         --- 输出要求 ---
         直接输出更新后的 `history_insight.md` 全文（纯文本，不要 markdown 代码围栏）：
@@ -86,8 +95,11 @@ public final class MemoryMaintenance: @unchecked Sendable {
             return
         }
         // 只在产物落盘成功后出队；失败/取消都保留，下一轮重试。
-        dir.clearPendingInsights(pending)
-        log("[memory] 历史提炼完成：处理 \(pending.count) 个 session，队列已出队")
+        dir.clearPendingInsights(batch.ids)
+        log("[memory] 历史提炼完成：本次处理 \(batch.ids.count)/\(pending.count) 个 session")
+        if batch.ids.count < pending.count {
+            log("[memory] 历史提炼：剩余 \(pending.count - batch.ids.count) 个 session 下轮继续")
+        }
     }
 
     // MARK: 改进8 —— 辅助引擎执行「记忆整理 SOP」
@@ -200,16 +212,24 @@ public final class MemoryMaintenance: @unchecked Sendable {
         return last
     }
 
-    /// 截取增量标记之后的 session 骨架，且只保留本次归档的 session，保证不拆分同一 session。
-    private static func skeletonAfter(_ marker: String?, in history: String,
-                                      allowed: Set<String>) -> String {
-        var kept = ""
+    // MARK: - 历史提炼输入预算
+
+    /// 单次提炼新增骨架的 token 预算。辅助模型上下文常见为 8192，
+    /// system（SOP）+ 旧产物 + 生成输出都要留余量，这里取 2600。
+    private static let insightIncrementTokenBudget = 2_600
+    /// 旧产物保留尾部的 token 预算（LAST_SESSION 与情绪事件都在末尾）。
+    private static let insightPreviousTokenBudget = 1_200
+
+    /// 按 session 边界收集待提炼骨架，累计到 `maxTokens` 即停。
+    /// 返回实际纳入的文本与 session id（调用方据此精确出队）。
+    private static func skeletonBatches(in history: String, allowed: Set<String>,
+                                        maxTokens: Int) -> (text: String, ids: [String]) {
+        var blocks: [(id: String, text: String)] = []
         var currentId: String?
         var current = ""
-        var include = false
         func flush() {
-            if include, let id = currentId, allowed.contains(id) {
-                kept += "@@SESSION \(id)\n\(current)@@SESSION-END\n\n"
+            if let id = currentId, allowed.contains(id), !current.isEmpty {
+                blocks.append((id, current))
             }
             current = ""
         }
@@ -219,19 +239,71 @@ public final class MemoryMaintenance: @unchecked Sendable {
                 flush()
                 currentId = String(s.dropFirst("@@SESSION ".count))
                     .trimmingCharacters(in: .whitespacesAndNewlines)
-                include = true
                 continue
             }
             if s.hasPrefix("@@SESSION-END") {
                 flush()
                 currentId = nil
-                include = false
                 continue
             }
-            if include { current += s + "\n" }
+            if currentId != nil { current += s + "\n" }
         }
         flush()
-        return kept
+
+        var kept = ""
+        var ids: [String] = []
+        var used = 0
+        for block in blocks {
+            let tokens = TokenEstimator.estimate(block.text)
+            let remaining = maxTokens - used
+            if tokens > remaining {
+                // 至少处理一个 session：整块超预算时截断后仍纳入，
+                // 否则超长 session 会让队列永久卡住、每轮重复失败。
+                if ids.isEmpty {
+                    kept += "@@SESSION \(block.id)\n"
+                        + clipHead(block.text, maxTokens: maxTokens)
+                        + "@@SESSION-END\n\n"
+                    ids.append(block.id)
+                }
+                break
+            }
+            kept += "@@SESSION \(block.id)\n\(block.text)@@SESSION-END\n\n"
+            ids.append(block.id)
+            used += tokens
+        }
+        return (kept, ids)
+    }
+
+    /// 按 token 预算保留开头（二分字符长度，近似无损边界）。
+    private static func clipHead(_ text: String, maxTokens: Int) -> String {
+        guard TokenEstimator.estimate(text) > maxTokens else { return text }
+        var lo = 0
+        var hi = text.count
+        while lo < hi {
+            let mid = (lo + hi + 1) / 2
+            if TokenEstimator.estimate(String(text.prefix(mid))) <= maxTokens {
+                lo = mid
+            } else {
+                hi = mid - 1
+            }
+        }
+        return String(text.prefix(lo)) + "\n…[超出预算已截断]\n"
+    }
+
+    /// 按 token 预算保留结尾。
+    private static func clipTail(_ text: String, maxTokens: Int) -> String {
+        guard TokenEstimator.estimate(text) > maxTokens else { return text }
+        var lo = 0
+        var hi = text.count
+        while lo < hi {
+            let mid = (lo + hi + 1) / 2
+            if TokenEstimator.estimate(String(text.suffix(mid))) <= maxTokens {
+                lo = mid
+            } else {
+                hi = mid - 1
+            }
+        }
+        return "…[前部已省略]\n" + String(text.suffix(lo))
     }
 
     private static func stripFence(_ raw: String) -> String {
