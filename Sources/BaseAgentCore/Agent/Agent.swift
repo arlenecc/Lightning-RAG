@@ -1352,10 +1352,17 @@ public final class Agent: @unchecked Sendable {
                 + "原文片段按价值取舍，宁少勿超（超出部分会被硬截断）。"
                 + "输出格式：先 `摘要:` 一段，再 `原文片段:` 若干段。"
         }
+        // 输出侧断流上限：目标长度 + 余量。断流立即取消底层生成，
+        // 是「模型不守约」时的硬止损；截断到目标长度由调用方负责。
+        let maxOutputChars: Int?
+        switch stage {
+        case .chapter: maxOutputChars = 700      // 目标 300 字 + 1 条原句 + 余量
+        case .merge: maxOutputChars = 2_000      // 目标 1800 字 + 余量
+        }
         let output = await collectChat([
             ChatMessage(role: .system, content: system),
             ChatMessage(role: .user, content: text),
-        ], temperature: 0.2)
+        ], temperature: 0.2, maxOutputChars: maxOutputChars)
         let trimmed = output.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return nil }
         log("[rag] 辅助模型整理（\(stage == .chapter ? "章节" : "整合")）："
@@ -1400,7 +1407,9 @@ public final class Agent: @unchecked Sendable {
     /// 兜底**：辅助不可用时走主模型 isolated 副本（关闭 thinking、不碰主
     /// 会话 KV）；主模型连 isolated 都不支持时任务跳过。章节目录摘要不属
     /// 于此类——它是锦上添花，只用辅助模型（见 BookSummaryCoordinator）。
-    private func collectChat(_ messages: [ChatMessage], temperature: Double) async -> String {
+    private func collectChat(_ messages: [ChatMessage],
+                             temperature: Double,
+                             maxOutputChars: Int? = nil) async -> String {
         let service = auxLLM ?? llm
         guard let options = Self.backgroundRequestOptions(for: service,
                                                           isMain: service === llm) else {
@@ -1415,7 +1424,16 @@ public final class Agent: @unchecked Sendable {
                 // AsyncThrowingStream 的迭代不会自动感知 Task 取消；主动退出后
                 // 流销毁会触发 onTermination，进而取消底层 MLX 生成。
                 if Task.isCancelled { break }
-                if event.kind == .content { output += event.content }
+                if event.kind == .content {
+                    output += event.content
+                    // 2B 模型偶尔无视 prompt 的长度约束把输入整段复述回来；
+                    // 摘要类任务靠输出侧提前断流止损（断流即取消底层生成），
+                    // 而不是等它把几千字生成完再截断。
+                    if let maxOutputChars, output.count >= maxOutputChars {
+                        log("[llm] 后台输出超过 \(maxOutputChars) 字符，提前终止生成")
+                        break
+                    }
+                }
                 if event.kind == .done { break }
             }
         } catch is CancellationError {

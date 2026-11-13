@@ -3178,6 +3178,11 @@ public final class RAGEngine {
         parts.reserveCapacity(chunks.count)
         for chunk in chunks {
             let input = "【\(chunk.title)】\n\(chunk.text)"
+            // 过短碎片摘要没有压缩价值，还多付一次模型调用，直接保留原文。
+            if chunk.text.count < 200 {
+                parts.append(input)
+                continue
+            }
             if let condensed = await condenser(input, .chapter), !condensed.isEmpty {
                 let clipped = condensed.count > 600
                     ? String(condensed.prefix(600)) + "…" : condensed

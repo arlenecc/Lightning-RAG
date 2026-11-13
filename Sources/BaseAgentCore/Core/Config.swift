@@ -386,18 +386,18 @@ public struct AgentConfig: Sendable {
     public var ragKGRelationTopK: Int = 40
     /// 实体/关系反查原文时每条最多带回的相关切片数（默认 5）。
     public var ragKGMaxChunksPerHit: Int = 5
-    /// 实体上下文 token 预算上限（默认 600）。
-    public var ragKGEntityTokenBudget: Int = 600
-    /// 关系上下文 token 预算上限（默认 800）。
-    public var ragKGRelationTokenBudget: Int = 800
-    /// 原文片段上下文 token 预算上限（默认 3000）。
-    /// 实体 + 关系 + 原文默认合计 4400，加上标题行仍在总预算 5000 内，
-    /// 保证图谱输出能完整交给下游摘要，不因中间截断丢信息。
-    public var ragKGChunkTokenBudget: Int = 3_000
-    /// 图谱输出的总 token 预算（默认 5000）：实体 + 关系 + 原文的硬上限。
-    /// 上游摘要（map-reduce）按 4000 字符分片，5000 token 输出只需 2~3 片
+    /// 实体上下文 token 预算上限（默认 400）。
+    public var ragKGEntityTokenBudget: Int = 400
+    /// 关系上下文 token 预算上限（默认 600）。
+    public var ragKGRelationTokenBudget: Int = 600
+    /// 原文片段上下文 token 预算上限（默认 2000）。
+    /// 实体 + 关系 + 原文默认合计 3000，正好压在总预算 3000 内，
+    /// 图谱输出 1~2 片即可完成 map-reduce 摘要。
+    public var ragKGChunkTokenBudget: Int = 2_000
+    /// 图谱输出的总 token 预算（默认 3000）：实体 + 关系 + 原文的硬上限。
+    /// 上游摘要（map-reduce）按 4000 字符分片，3000 token 输出只需 1~2 片
     /// 即可完成压缩，检索链路端到端延迟显著低于大预算。
-    public var ragKGTotalTokenBudget: Int = 5_000
+    public var ragKGTotalTokenBudget: Int = 3_000
     /// 单个切片最多保留的实体数（默认 20）。
     public var ragKGMaxEntitiesPerChunk: Int = 20
     /// 单个切片最多保留的关系数（默认 50）。
@@ -984,10 +984,10 @@ public struct AgentConfig: Sendable {
         ragKGEntityTopK = max(1, min(200, ragKGEntityTopK))
         ragKGRelationTopK = max(1, min(200, ragKGRelationTopK))
         ragKGMaxChunksPerHit = max(1, min(20, ragKGMaxChunksPerHit))
-        ragKGEntityTokenBudget = max(500, min(20_000, ragKGEntityTokenBudget))
-        ragKGRelationTokenBudget = max(500, min(20_000, ragKGRelationTokenBudget))
+        ragKGEntityTokenBudget = max(200, min(20_000, ragKGEntityTokenBudget))
+        ragKGRelationTokenBudget = max(200, min(20_000, ragKGRelationTokenBudget))
         ragKGChunkTokenBudget = max(500, min(40_000, ragKGChunkTokenBudget))
-        ragKGTotalTokenBudget = max(4_096, min(60_000, ragKGTotalTokenBudget))
+        ragKGTotalTokenBudget = max(1_500, min(60_000, ragKGTotalTokenBudget))
         // 抽取限额收口：实体/关系按行数上限，描述按字符数上限。
         ragKGMaxEntitiesPerChunk = max(1, min(200, ragKGMaxEntitiesPerChunk))
         ragKGMaxRelationsPerChunk = max(1, min(500, ragKGMaxRelationsPerChunk))
