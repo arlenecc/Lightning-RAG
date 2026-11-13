@@ -1003,8 +1003,8 @@ final class ParserTests: XCTestCase {
         XCTAssertEqual(config.ragChunkSize, 800)
         XCTAssertEqual(config.ragChunkOverlap, 80)
         XCTAssertEqual(config.ragSearchMaxTotalChars, 12_000)
-        XCTAssertEqual(config.ragAuxSummarizeMinChars, 8_000)
-        XCTAssertEqual(config.ragAuxSummarizeMaxChars, 12_000)
+        XCTAssertEqual(config.ragAuxSummarizeMinChars, 5_000)
+        XCTAssertEqual(config.ragAuxSummarizeMaxChars, 20_000)
         XCTAssertEqual(config.ragVectorOverfetch, 2,
                        "混合检索先融合 rowid/分数，内层只需 1-2 倍召回")
         let options = ChunkingOptions(config: config)

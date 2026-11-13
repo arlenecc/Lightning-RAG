@@ -526,6 +526,14 @@ public struct EnrichedDocumentOutline: Sendable, Equatable {
     }
 }
 
+/// 辅助模型精简的阶段：map 阶段处理单个章节分片，reduce 阶段整合多段摘要。
+public enum RAGCondenseStage: Sendable, Equatable {
+    /// map：单章节 / 单分片的局部摘要。
+    case chapter
+    /// reduce：多段章节摘要的合并去重。
+    case merge
+}
+
 /// 知识库引擎：解析 → 清洗 → 切片 → embedding → SQLite 写入；
 /// 检索走 FTS5 + 向量 RRF，再按配置做 rerank。
 public final class RAGEngine {
@@ -3098,7 +3106,14 @@ public final class RAGEngine {
 
     /// 可选的辅助模型精简器（由 Agent 注入，动态读取当前 auxLLM）。
     /// 返回 nil 表示不精简（未配置辅助模型、精简失败或结果为空）。
-    public var auxCondenser: ((String) async -> String?)?
+    public var auxCondenser: ((String, RAGCondenseStage) async -> String?)?
+
+    /// map-reduce 分片上限：单个分片进入辅助模型的最大字符数。
+    /// 4000 中文字符约 2500~4000 token，加上提示词后仍远小于常见
+    /// 辅助模型（2B 级）的 8k 上下文，避免超长输入被静默截断或质量劣化。
+    static let condenseChapterChars = 4_000
+    /// reduce 最多递归轮数：防止「摘要不比原文短」时无限分批。
+    static let condenseMaxRounds = 3
 
     /// 精简触发条件：
     /// - 总字数落在 [min, max] 区间；
@@ -3115,16 +3130,132 @@ public final class RAGEngine {
     }
 
     /// 精简失败或输出为空时回退原文，绝不让检索结果变空。
+    ///
+    /// 采用 map-reduce（章节摘要）：
+    /// 1. map：按「文档 / 章节标题」分组，超长章节再按行切成 ≤4000 字符的分片，
+    ///    逐片交给辅助模型做局部摘要 —— 每片都短，prefill 稳定、质量聚焦；
+    /// 2. reduce：把各分片摘要合并；合并后仍超 4000 字符则继续分批整合，
+    ///    最多 3 轮，保证任何一次辅助模型调用的输入都不超上下文。
+    ///
+    /// 分片按顺序串行调用：本地辅助模型（尤其 MLX）并发推理曾出现
+    /// 断言崩溃，串行 + 稳定前缀复用比并发更稳，整体 prefill 也更短。
     private func condenseIfNeeded(_ output: String, hits: [SearchHit]) async -> String {
         let documentCount = Set(hits.map(\.source)).count
         guard Self.shouldCondense(outputChars: output.count,
                                   documentCount: documentCount,
                                   config: config),
               let condenser = auxCondenser else { return output }
-        if let condensed = await condenser(output), !condensed.isEmpty {
-            return condensed
+
+        let chunks = Self.condenseSections(hits: hits,
+                                           limit: Self.condenseChapterChars,
+                                           maxTotal: config.ragAuxSummarizeMaxChars)
+        // 单块（单文档单章节且未超分片上限）：一次整理即可，不必多一轮。
+        guard chunks.count > 1 else {
+            if let condensed = await condenser(output, .merge), !condensed.isEmpty {
+                return condensed
+            }
+            return output
         }
-        return output
+
+        // map：逐章节分片摘要；单片失败时保留该片原文，不让结果凭空缺失。
+        var parts: [String] = []
+        parts.reserveCapacity(chunks.count)
+        for chunk in chunks {
+            let input = "【\(chunk.title)】\n\(chunk.text)"
+            if let condensed = await condenser(input, .chapter), !condensed.isEmpty {
+                parts.append("【\(chunk.title)】\n\(condensed)")
+            } else {
+                parts.append(input)
+            }
+        }
+
+        // reduce：合并去重，必要时多轮分批压缩。
+        var current = parts
+        guard current.count > 1 else { return current[0] }
+        for _ in 0..<Self.condenseMaxRounds {
+            let joined = current.joined(separator: "\n\n")
+            if joined.count <= Self.condenseChapterChars {
+                if let merged = await condenser(joined, .merge), !merged.isEmpty {
+                    return merged
+                }
+                return joined
+            }
+            var next: [String] = []
+            for batch in Self.splitByLines(joined, limit: Self.condenseChapterChars) {
+                if let merged = await condenser(batch, .merge), !merged.isEmpty {
+                    next.append(merged)
+                } else {
+                    next.append(batch)
+                }
+            }
+            // 没有变得更短就停止，避免无效轮次。
+            guard next.count < current.count else { return joined }
+            current = next
+            if current.count == 1 {
+                if let merged = await condenser(current[0], .merge), !merged.isEmpty {
+                    return merged
+                }
+                return current[0]
+            }
+        }
+        return current.joined(separator: "\n\n")
+    }
+
+    /// 把命中结果按「文档 / 章节标题」聚成章节，超长章节按行切成 ≤limit 的片。
+    /// 保持命中顺序（相关度从高到低），让最重要的内容先进入摘要；
+    /// 累计字符数达到 `maxTotal` 后停止，保证总处理量与配置上限一致。
+    static func condenseSections(hits: [SearchHit], limit: Int,
+                                 maxTotal: Int = .max)
+        -> [(title: String, text: String)] {
+        var order: [String] = []
+        var grouped: [String: [String]] = [:]
+        for hit in hits {
+            let doc = (hit.source as NSString).lastPathComponent
+            let title = hit.heading.isEmpty ? doc : "\(doc) / \(hit.heading)"
+            if grouped[title] == nil {
+                order.append(title)
+                grouped[title] = []
+            }
+            grouped[title]?.append(hit.text)
+        }
+        var sections: [(title: String, text: String)] = []
+        var used = 0
+        for title in order {
+            guard used < maxTotal else { break }
+            let body = (grouped[title] ?? []).joined(separator: "\n")
+            for piece in splitByLines(body, limit: limit) {
+                guard used < maxTotal else { break }
+                let remaining = maxTotal - used
+                let text = piece.count > remaining ? String(piece.prefix(remaining)) : piece
+                sections.append((title, text))
+                used += text.count
+            }
+        }
+        return sections
+    }
+
+    /// 按行切分到不超过 limit 字符；单行本身超限时按字符硬切。
+    static func splitByLines(_ text: String, limit: Int) -> [String] {
+        guard limit > 0 else { return [text] }
+        guard text.count > limit else { return [text] }
+        var chunks: [String] = []
+        var current = ""
+        for rawLine in text.components(separatedBy: "\n") {
+            var line = rawLine
+            while line.count > limit {
+                if !current.isEmpty { chunks.append(current); current = "" }
+                let cut = line.index(line.startIndex, offsetBy: limit)
+                chunks.append(String(line[line.startIndex..<cut]))
+                line = String(line[cut...])
+            }
+            if current.count + line.count + 1 > limit, !current.isEmpty {
+                chunks.append(current)
+                current = ""
+            }
+            current += (current.isEmpty ? "" : "\n") + line
+        }
+        if !current.isEmpty { chunks.append(current) }
+        return chunks
     }
 
     // MARK: Meta

@@ -260,12 +260,12 @@ public struct AgentConfig: Sendable {
     public var ragQueryTimeoutSeconds: Double = 5
     /// 辅助模型精简触发下限：检索结果总字数低于该值时原样返回，
     /// 不调用辅助模型（内容不多时总结只会丢细节、平白增加延迟）。
-    /// 默认 8000：5 条 × 1500 字上限的常见结果不会触发，只有多文档/
-    /// 超长结果才交给辅助模型。
-    public var ragAuxSummarizeMinChars: Int = 8_000
-    /// 辅助模型精简触发上限：超过该值的结果不做精简
-    ///（内容过大时一次性摘要不可靠）。
-    public var ragAuxSummarizeMaxChars: Int = 12_000
+    /// 默认 5000：常见单文档结果不会触发，多文档 / 超长结果才交给辅助模型。
+    public var ragAuxSummarizeMinChars: Int = 5_000
+    /// 辅助模型精简触发上限：超过该值的结果不做精简。
+    /// 默认 20000：精简内部按 4000 字符分片做 map-reduce 章节摘要，
+    /// 因此上限不再受「一次性摘要不可靠」约束。
+    public var ragAuxSummarizeMaxChars: Int = 20_000
     /// 启动时自动同步知识库。默认关闭：首次全量同步会长时间占用
     /// embedding 模型与磁盘 IO，容易与对话争抢资源；需要时手动触发。
     public var ragAutoIngest: Bool = false

@@ -363,10 +363,11 @@ public final class Agent: @unchecked Sendable {
             self.rawSessionSnapshotLock.unlock()
         }
         // RAG 检索结果的辅助模型精简：动态读取当前 auxLLM（AppModel 可在
-        // 运行中替换辅助模型），阈值判断在 RAGEngine.condenseIfNeeded 内。
-        self.ragEngine.auxCondenser = { [weak self] text in
+        // 运行中替换辅助模型），触发阈值在 RAGEngine.condenseIfNeeded 内，
+        // 分片与整合由 RAGEngine 编排（map-reduce 章节摘要）。
+        self.ragEngine.auxCondenser = { [weak self] text, stage in
             guard let self, self.auxLLM != nil else { return nil }
-            return await self.condenseRAGResult(text)
+            return await self.condenseRAGResult(text, stage: stage)
         }
     }
 
@@ -1330,22 +1331,36 @@ public final class Agent: @unchecked Sendable {
     /// 用辅助模型整理 RAG 检索结果：先写一段简短的全局摘要，再原样保留
     /// Top 片段的原文。只压缩重复，不重写原文，避免主模型拿到的细节失真。
     /// 输出为空或失败由调用方回退原文。
-    private func condenseRAGResult(_ text: String) async -> String? {
+    private func condenseRAGResult(_ text: String,
+                                   stage: RAGCondenseStage) async -> String? {
         guard beginBackgroundIfIdle() else { return nil }
         defer { endBackground() }
+        let system: String
+        switch stage {
+        case .chapter:
+            system = "你是检索结果整理器。输入是单个章节或文档片段的检索结果。"
+                + "请提取关键事实、数值、名称、结论与因果，写一段简短摘要（标注来源）；"
+                + "然后原样保留该章节最重要的 1~3 条原文片段，用 `原文片段:` 开头、"
+                + "以 `---` 分隔各片段，不要改写、不要省略、不要合并句子。"
+                + "不要编造或添加原文没有的信息，不要发表评论。"
+                + "输出格式：先 `摘要:` 一段，再 `原文片段:` 若干段。"
+        case .merge:
+            system = "你是检索结果整合器。输入是同一问题下多个章节/文档的检索摘要。"
+                + "请合并去重，输出一段总摘要：关键事实、数值、名称、结论与因果，"
+                + "并保留来源标注；随后用 `原文片段:` 开头、以 `---` 分隔，"
+                + "原样保留最有价值的原文片段，不要改写、不要编造、不要评论。"
+                + "总输出必须严格控制在 1800 字以内：优先保证摘要完整，"
+                + "原文片段按价值取舍，宁少勿超（超出部分会被硬截断）。"
+                + "输出格式：先 `摘要:` 一段，再 `原文片段:` 若干段。"
+        }
         let output = await collectChat([
-            ChatMessage(role: .system,
-                        content: "你是检索结果整理器。输入是若干条带来源标注的检索片段。"
-                            + "请先写一段简短摘要（关键事实、数值、名称、结论与因果，"
-                            + "并标注来源），然后**原样保留最重要的前 3 条片段全文**，"
-                            + "用 `原文片段:` 开头、以 `---` 分隔各片段，不要改写、不要省略、"
-                            + "不要合并句子。不要编造或添加原文没有的信息，不要发表评论。"
-                            + "输出格式：先 `摘要:` 一段，再 `原文片段:` 若干段。"),
+            ChatMessage(role: .system, content: system),
             ChatMessage(role: .user, content: text),
         ], temperature: 0.2)
         let trimmed = output.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return nil }
-        log("[rag] 辅助模型整理：\(text.count) 字 -> \(trimmed.count) 字")
+        log("[rag] 辅助模型整理（\(stage == .chapter ? "章节" : "整合")）："
+            + "\(text.count) 字 -> \(trimmed.count) 字")
         return trimmed
     }
 

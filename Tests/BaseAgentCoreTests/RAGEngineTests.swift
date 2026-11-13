@@ -1217,24 +1217,61 @@ final class RAGEngineTests: XCTestCase {
     /// 单文档中等长度结果原样返回，避免每次 rag_search 都多一次模型调用。
     func testAuxCondenseOnlyTriggersForMultiDocumentOrVeryLongResults() {
         var config = AgentConfig()
-        config.ragAuxSummarizeMinChars = 8_000
-        config.ragAuxSummarizeMaxChars = 12_000
+        config.ragAuxSummarizeMinChars = 5_000
+        config.ragAuxSummarizeMaxChars = 20_000
 
-        XCTAssertFalse(RAGEngine.shouldCondense(outputChars: 7_999, documentCount: 3,
+        XCTAssertFalse(RAGEngine.shouldCondense(outputChars: 4_999, documentCount: 3,
                                                 config: config))
-        XCTAssertFalse(RAGEngine.shouldCondense(outputChars: 8_000, documentCount: 1,
+        XCTAssertFalse(RAGEngine.shouldCondense(outputChars: 5_000, documentCount: 1,
                                                 config: config),
                        "单文档中等长度结果不调用辅助模型")
-        XCTAssertTrue(RAGEngine.shouldCondense(outputChars: 8_000, documentCount: 2,
+        XCTAssertTrue(RAGEngine.shouldCondense(outputChars: 5_000, documentCount: 2,
                                                config: config))
-        XCTAssertFalse(RAGEngine.shouldCondense(outputChars: 11_999, documentCount: 1,
+        XCTAssertFalse(RAGEngine.shouldCondense(outputChars: 7_499, documentCount: 1,
                                                 config: config))
-        XCTAssertTrue(RAGEngine.shouldCondense(outputChars: 12_000, documentCount: 1,
+        XCTAssertTrue(RAGEngine.shouldCondense(outputChars: 7_500, documentCount: 1,
                                                config: config),
                       "接近上限的超长结果即使单文档也摘要")
-        XCTAssertFalse(RAGEngine.shouldCondense(outputChars: 12_001, documentCount: 2,
+        XCTAssertTrue(RAGEngine.shouldCondense(outputChars: 20_000, documentCount: 1,
+                                               config: config))
+        XCTAssertFalse(RAGEngine.shouldCondense(outputChars: 20_001, documentCount: 2,
                                                 config: config),
-                       "超过上限不做一次性摘要")
+                       "超过上限不做精简")
+    }
+
+    /// 分片必须严格不超过上限，且保持原有换行语义；单行超限时硬切。
+    func testCondenseSplitByLinesRespectsLimit() {
+        let text = (0..<40).map { "第\($0)行内容" }.joined(separator: "\n")
+        let chunks = RAGEngine.splitByLines(text, limit: 50)
+        XCTAssertGreaterThan(chunks.count, 1)
+        for chunk in chunks {
+            XCTAssertLessThanOrEqual(chunk.count, 50)
+        }
+        XCTAssertEqual(chunks.joined(separator: "\n"), text, "切分不丢内容")
+
+        let longLine = String(repeating: "字", count: 120)
+        let hardCut = RAGEngine.splitByLines(longLine, limit: 50)
+        XCTAssertEqual(hardCut.count, 3)
+        XCTAssertTrue(hardCut.allSatisfy { $0.count <= 50 })
+        XCTAssertEqual(hardCut.joined(), longLine)
+    }
+
+    /// 章节聚合：同一文档同一 heading 归为一章，不同文档/heading 分开。
+    func testCondenseSectionsGroupsByDocumentAndHeading() {
+        let hits = [
+            SearchHit(rowID: 1, text: "A1", source: "/kb/a.md", chunkIndex: 0,
+                      heading: "第一章"),
+            SearchHit(rowID: 2, text: "A2", source: "/kb/a.md", chunkIndex: 1,
+                      heading: "第一章"),
+            SearchHit(rowID: 3, text: "B1", source: "/kb/b.md", chunkIndex: 0),
+            SearchHit(rowID: 4, text: "A3", source: "/kb/a.md", chunkIndex: 2,
+                      heading: "第二章"),
+        ]
+        let sections = RAGEngine.condenseSections(hits: hits, limit: 4_000)
+        XCTAssertEqual(sections.map(\.title),
+                       ["a.md / 第一章", "b.md", "a.md / 第二章"])
+        XCTAssertEqual(sections[0].text, "A1\nA2")
+        XCTAssertEqual(sections[1].text, "B1")
     }
 
     /// 命中多文档且长度达阈值时，`searchFormatted` 必须把输出交给注入的整理器。
@@ -1245,11 +1282,11 @@ final class RAGEngineTests: XCTestCase {
         try FileManager.default.createDirectory(at: kb, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: root) }
 
-        let body = String(repeating: "apple banana ", count: 40)
-        for name in ["a.md", "b.md"] {
-            try body.write(to: kb.appendingPathComponent(name),
-                           atomically: true, encoding: .utf8)
-        }
+        // 两份文档正文必须不同：ingest 会按内容哈希去重，完全相同的副本只入库一份。
+        try String(repeating: "apple banana ", count: 40)
+            .write(to: kb.appendingPathComponent("a.md"), atomically: true, encoding: .utf8)
+        try String(repeating: "apple cherry ", count: 40)
+            .write(to: kb.appendingPathComponent("b.md"), atomically: true, encoding: .utf8)
 
         var config = AgentConfig()
         config.workspace = root.path
@@ -1267,12 +1304,17 @@ final class RAGEngineTests: XCTestCase {
                                embedding: RagFakeEmbedding(), reranker: nil)
         _ = await engine.ingest()
         var calls = 0
-        engine.auxCondenser = { input in
+        var stages: [RAGCondenseStage] = []
+        engine.auxCondenser = { input, stage in
             calls += 1
+            stages.append(stage)
             return "摘要:\n\(input.prefix(20))\n原文片段:\n---"
         }
         let output = try await engine.searchFormatted(query: "apple", topK: 2)
-        XCTAssertEqual(calls, 1)
+        // 两个文档 → 2 次章节摘要（map）+ 1 次整合（reduce）。
+        XCTAssertEqual(calls, 3)
+        XCTAssertEqual(stages.filter { $0 == .chapter }.count, 2)
+        XCTAssertEqual(stages.filter { $0 == .merge }.count, 1)
         XCTAssertTrue(output.hasPrefix("摘要:"))
         engine.close()
     }
