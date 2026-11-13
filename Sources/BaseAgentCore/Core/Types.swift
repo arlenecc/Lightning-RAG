@@ -390,6 +390,9 @@ public protocol AgentCallbacks: AnyObject {
     func onError(_ message: String)
     func onContextShrunk(_ summary: String, _ reason: String)
     func onSkillSuggested(_ skill: SkillSuggestion)
+    /// 检索即展示：rag_search 召回的全部切片（含进上下文的 top-1）推给 UI
+    /// 作气泡展示；headless / 无 UI 调用方默认空实现即可。
+    func onRetrievedChunks(_ chunks: [RAGCitation])
     func confirm(_ message: String) -> Bool
     func askUser(_ prompt: String) -> String?
     func onFinished()
@@ -408,6 +411,7 @@ public extension AgentCallbacks {
     func onError(_ message: String) {}
     func onContextShrunk(_ summary: String, _ reason: String) {}
     func onSkillSuggested(_ skill: SkillSuggestion) {}
+    func onRetrievedChunks(_ chunks: [RAGCitation]) {}
     /// 默认拒绝：没有实现人工确认通道的调用方（headless / 测试 / CLI）不得
     /// 静默放行高风险工具。需要放行的场景必须显式使用 `AutoConfirmCallbacks`。
     func confirm(_ message: String) -> Bool { false }

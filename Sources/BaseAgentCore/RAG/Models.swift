@@ -77,6 +77,51 @@ public struct SearchHit: Sendable, Identifiable {
     }
 }
 
+// MARK: - 检索即展示（Retrieval-as-Presentation）
+
+/// 一条召回切片的展示卡片。全部召回切片作为气泡附在回复后供用户点开；
+/// 只有排名最高的一片进模型上下文（`isPrimary`）。
+public struct RAGCitation: Sendable, Identifiable, Equatable {
+    /// 切片唯一标识（naive 路径为 chunks 表 rowID；KG 路径为图谱 chunk id）。
+    public var id: String
+    /// 1-based 展示排名（跨多次检索去重合并后按到达顺序编号）。
+    public var rank: Int
+    /// 来源文件名（不含目录）。
+    public var source: String
+    /// 章节/标题路径，可能为空。
+    public var heading: String
+    /// 切片原文（气泡弹窗展示，不截断）。
+    public var text: String
+    /// 最终分数（RRF 融合值或 rerank 语义分）。
+    public var score: Double
+    /// 是否为进模型上下文、供模型参考总结的 top-1 切片。
+    public var isPrimary: Bool
+
+    public init(id: String, rank: Int, source: String, heading: String = "",
+                text: String, score: Double = 0, isPrimary: Bool = false) {
+        self.id = id
+        self.rank = rank
+        self.source = source
+        self.heading = heading
+        self.text = text
+        self.score = score
+        self.isPrimary = isPrimary
+    }
+}
+
+/// 检索即展示的检索产出：`context` 只含进模型上下文的内容
+/// （top-1 切片 + 图谱实体/关系），`citations` 是全部召回切片
+/// （含 top-1），供 UI 气泡展示。
+public struct RAGRetrievalOutcome: Sendable {
+    public var context: String
+    public var citations: [RAGCitation]
+
+    public init(context: String, citations: [RAGCitation]) {
+        self.context = context
+        self.citations = citations
+    }
+}
+
 public struct DocumentRecord: Sendable, Equatable {
     public var docID: String
     public var docName: String

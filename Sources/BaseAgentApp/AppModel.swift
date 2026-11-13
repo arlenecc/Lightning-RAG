@@ -11,6 +11,9 @@ struct ChatItem: Identifiable, Equatable {
     var content: String
     /// 用户消息携带的图像附件（JPEG/PNG 字节），仅用于 UI 缩略图展示。
     var images: [Data]?
+    /// 检索即展示：附在本回复后的全部召回切片（含模型参考的 top-1），
+    /// 不进模型上下文，仅供用户点击查看原文。
+    var citations: [RAGCitation]?
 }
 
 struct ToolEvent: Identifiable {
@@ -26,6 +29,12 @@ struct LogLine: Identifiable {
     let id = UUID()
     var text: String
     var timestamp = Date()
+}
+
+/// 引用切片查看窗口的状态：正在查看哪条回复的第几个切片（0-based）。
+struct CitationViewerState: Hashable {
+    let messageID: UUID
+    var index: Int
 }
 
 /// 协作式取消标志：Agent 回调在后台线程读取，UI 在主线程写入。
@@ -114,6 +123,12 @@ final class UICallbacks: AgentCallbacks, @unchecked Sendable {
         }
     }
 
+    func onRetrievedChunks(_ chunks: [RAGCitation]) {
+        DispatchQueue.main.async { [weak self] in
+            self?.model?.attachCitations(chunks)
+        }
+    }
+
     func confirm(_ message: String) -> Bool {
         runOnMain {
             let alert = NSAlert()
@@ -183,6 +198,8 @@ final class AppViewModel: ObservableObject {
     /// 仅作为解析参数快照，不写回 config.json，也不重建 Agent。
     @Published var converterConfig: AgentConfig?
     @Published var chatItems: [ChatItem] = []
+    /// 引用切片查看窗口当前展示的位置；nil 表示窗口显示占位内容。
+    @Published var citationViewer: CitationViewerState?
     @Published var reasoning = ""
     @Published var logs: [LogLine] = []
     @Published var toolEvents: [ToolEvent] = []
@@ -1069,6 +1086,7 @@ final class AppViewModel: ObservableObject {
             await MainActor.run {
                 guard let self else { return }
                 self.chatItems.removeAll()
+                self.citationViewer = nil
                 self.reasoning = ""
                 self.toolEvents.removeAll()
                 self.pendingToolIndices.removeAll()
@@ -1589,6 +1607,26 @@ final class AppViewModel: ObservableObject {
             indices.removeFirst()
             pendingToolIndices[name] = indices.isEmpty ? nil : indices
         }
+    }
+
+    // MARK: 检索即展示
+
+    /// 把本轮 rag_search 召回的全部切片挂到当前流式回复上（不进模型上下文）。
+    /// 一轮里模型可能多次检索：按到达顺序合并、按切片 id 去重。
+    func attachCitations(_ chunks: [RAGCitation]) {
+        guard !chunks.isEmpty, let id = streamingID,
+              let index = chatItems.firstIndex(where: { $0.id == id }) else { return }
+        var list = chatItems[index].citations ?? []
+        var seen = Set(list.map(\.id))
+        for chunk in chunks where seen.insert(chunk.id).inserted {
+            list.append(chunk)
+        }
+        chatItems[index].citations = list
+    }
+
+    /// 点击切片气泡：更新查看窗口状态（由调用方再 openWindow 聚焦窗口）。
+    func openCitation(messageID: UUID, index: Int) {
+        citationViewer = CitationViewerState(messageID: messageID, index: index)
     }
 
     func finishRun() {

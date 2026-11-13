@@ -92,6 +92,11 @@ struct BaseAgentDesktopApp: App {
         }
         .defaultSize(width: 900, height: 620)
 
+        Window("引用切片", id: "citation-viewer") {
+            ChunkViewerWindowView(model: model)
+        }
+        .defaultSize(width: 780, height: 680)
+
         Window("OCR 识别测试", id: "ocr-lab") {
             OCRLabView(model: model)
                 .frame(minWidth: 900, minHeight: 640)
@@ -748,6 +753,15 @@ struct MainView: View {
                 }
                 Text(item.content.isEmpty && item.role == .assistant ? "…" : item.content)
                     .textSelection(.enabled)
+                // 检索即展示：全部召回切片（含模型参考的 top-1）以气泡跟在答案后，
+                // 点击在独立窗口查看原文，可前后切换相邻切片。
+                if item.role == .assistant, let citations = item.citations,
+                   !citations.isEmpty {
+                    CitationChipsRow(citations: citations, messageID: item.id,
+                                     model: model) {
+                        openWindow(id: "citation-viewer")
+                    }
+                }
             }
             .padding(10)
             .background(background(for: item.role))
@@ -904,6 +918,175 @@ struct LogsWindowView: View {
 
     private func timeText(_ date: Date) -> String {
         Self.timeFormatter.string(from: date)
+    }
+}
+
+// MARK: - 检索即展示
+
+/// 回复下方的召回切片气泡行：每个 chip 一条切片，点击在独立窗口查看原文。
+struct CitationChipsRow: View {
+    let citations: [RAGCitation]
+    let messageID: UUID
+    @ObservedObject var model: AppViewModel
+    let onOpen: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text("召回切片 \(citations.count) 条（点击查看原文）")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 6) {
+                    ForEach(Array(citations.enumerated()), id: \.element.id) { index, citation in
+                        chip(index, citation)
+                    }
+                }
+                .padding(.vertical, 1)
+            }
+        }
+    }
+
+    private func chip(_ index: Int, _ citation: RAGCitation) -> some View {
+        HStack(spacing: 5) {
+            Image(systemName: citation.isPrimary ? "star.fill" : "doc.text")
+                .font(.caption2)
+                .foregroundStyle(citation.isPrimary ? Color.accentColor : Color.secondary)
+                .help(citation.isPrimary ? "模型参考本切片总结回复" : "召回切片，仅供用户查看")
+            Text("#\(index + 1) \(citation.source)")
+                .font(.caption)
+                .lineLimit(1)
+                .truncationMode(.middle)
+                .frame(maxWidth: 220, alignment: .leading)
+            if !citation.heading.isEmpty {
+                Text(citation.heading)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .frame(maxWidth: 160, alignment: .leading)
+            }
+            Text(String(format: "%.2f", citation.score))
+                .font(.caption2.monospacedDigit())
+                .foregroundStyle(.tertiary)
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 4)
+        .background(
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .fill(Color(nsColor: .controlBackgroundColor)))
+        .overlay(
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .strokeBorder(citation.isPrimary
+                              ? Color.accentColor.opacity(0.55)
+                              : Color.secondary.opacity(0.35),
+                              lineWidth: citation.isPrimary ? 1.2 : 1))
+        .contentShape(Rectangle())
+        .onTapGesture {
+            model.openCitation(messageID: messageID, index: index)
+            onOpen()
+        }
+        .help("查看切片原文（⌘[ / ⌘] 切换相邻切片）")
+    }
+}
+
+/// 引用切片查看窗口：显示当前切片原文，可切换同一回复内的前/后切片，
+/// 避免切片截断带来的阅读困扰。
+struct ChunkViewerWindowView: View {
+    @ObservedObject var model: AppViewModel
+
+    var body: some View {
+        Group {
+            if let state = model.citationViewer,
+               let item = model.chatItems.first(where: { $0.id == state.messageID }),
+               let citations = item.citations, !citations.isEmpty {
+                viewer(state: state, citations: citations)
+            } else {
+                Text("没有正在查看的引用切片。\n点击对话中回复下方的切片气泡即可在此查看原文。")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            }
+        }
+    }
+
+    private func viewer(state: CitationViewerState,
+                        citations: [RAGCitation]) -> some View {
+        let index = min(max(state.index, 0), citations.count - 1)
+        let citation = citations[index]
+        return VStack(spacing: 0) {
+            header(citation, index: index, total: citations.count, state: state)
+            Divider()
+            // 切片原文：入库切片本身有长度上限，整段直出，不二次截断。
+            ScrollView {
+                Text(citation.text)
+                    .font(.system(size: 13))
+                    .textSelection(.enabled)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(16)
+            }
+        }
+        .id(state)
+    }
+
+    private func header(_ citation: RAGCitation, index: Int, total: Int,
+                        state: CitationViewerState) -> some View {
+        VStack(spacing: 4) {
+            HStack(spacing: 8) {
+                Button {
+                    model.openCitation(messageID: state.messageID, index: index - 1)
+                } label: {
+                    Image(systemName: "chevron.left")
+                }
+                .disabled(index == 0)
+                // 用 ⌘[ / ⌘] 而不是 ⌘← / ⌘→：后者是输入框的行首/行尾快捷键，
+                // 避免快捷键串窗时抢走主窗口输入框的编辑行为。
+                .keyboardShortcut("[", modifiers: .command)
+                .help("上一个切片（⌘[）")
+
+                Text("切片 \(index + 1) / \(total)")
+                    .font(.callout.monospacedDigit())
+
+                Button {
+                    model.openCitation(messageID: state.messageID, index: index + 1)
+                } label: {
+                    Image(systemName: "chevron.right")
+                }
+                .disabled(index >= total - 1)
+                .keyboardShortcut("]", modifiers: .command)
+                .help("下一个切片（⌘]）")
+
+                if citation.isPrimary {
+                    Label("模型参考", systemImage: "star.fill")
+                        .font(.caption2)
+                        .foregroundStyle(Color.accentColor)
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 2)
+                        .background(Color.accentColor.opacity(0.14))
+                        .cornerRadius(6)
+                }
+                Spacer(minLength: 8)
+                Text("相关度 \(String(format: "%.4f", citation.score))")
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(.secondary)
+            }
+            HStack(spacing: 4) {
+                Text(citation.source)
+                    .font(.caption).bold()
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                if !citation.heading.isEmpty {
+                    Text("· \(citation.heading)")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+        .background(Color(nsColor: .controlBackgroundColor))
     }
 }
 

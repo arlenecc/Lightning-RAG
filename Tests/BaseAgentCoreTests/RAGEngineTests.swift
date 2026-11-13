@@ -1340,4 +1340,97 @@ final class RAGEngineTests: XCTestCase {
         XCTAssertTrue(output.hasPrefix("摘要:"))
         engine.close()
     }
+
+    /// 检索即展示：全部召回切片进 citations（top-1 标记 isPrimary），
+    /// 但上下文只含 1 条切片正文；空结果不产 citations。
+    func testSearchWithCitationsKeepsTopOneInContext() async throws {
+        let root = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("base-agent-rag-citations-\(UUID().uuidString)")
+        let kb = root.appendingPathComponent("kb")
+        try FileManager.default.createDirectory(at: kb, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        // 两份文档正文必须不同：ingest 会按内容哈希去重。
+        try String(repeating: "apple banana ", count: 40)
+            .write(to: kb.appendingPathComponent("a.md"), atomically: true, encoding: .utf8)
+        try String(repeating: "apple cherry ", count: 40)
+            .write(to: kb.appendingPathComponent("b.md"), atomically: true, encoding: .utf8)
+
+        var config = AgentConfig()
+        config.workspace = root.path
+        config.knowledgeBase = kb.path
+        config.ragRerankEnabled = false
+        config.ragSemanticChunking = false
+        config.ragChunkSize = 40
+        config.ragChunkOverlap = 5
+
+        let engine = RAGEngine(config: config, knowledgeBase: kb.path,
+                               embedding: RagFakeEmbedding(), reranker: nil)
+        _ = await engine.ingest()
+        let outcome = try await engine.searchWithCitations(query: "apple", topK: 5)
+        // 全部召回切片都作为气泡卡片返回，只有第一个标记 isPrimary。
+        XCTAssertGreaterThan(outcome.citations.count, 1)
+        XCTAssertEqual(outcome.citations.filter(\.isPrimary).count, 1)
+        XCTAssertTrue(outcome.citations[0].isPrimary)
+        for (index, citation) in outcome.citations.enumerated() {
+            XCTAssertEqual(citation.rank, index + 1)
+            if index > 0 { XCTAssertFalse(citation.isPrimary) }
+        }
+        // 上下文只有一条切片正文：不出现第二个 "### 来源:"。
+        XCTAssertEqual(outcome.context.components(separatedBy: "### 来源:").count - 1, 1)
+        XCTAssertTrue(outcome.context.contains("检索即展示"))
+        XCTAssertTrue(outcome.context.contains(outcome.citations[0].text.prefix(10)))
+
+        // 指定来源无匹配（明确返回空，不退化成全局检索）：兜底文案，无气泡。
+        let empty = try await engine.searchWithCitations(query: "apple",
+                                                         source: "not-exist.md")
+        XCTAssertEqual(empty.context, "（知识库中未找到相关内容）")
+        XCTAssertTrue(empty.citations.isEmpty)
+        engine.close()
+    }
+
+    /// rag_search 工具：召回切片通过 onRetrievedChunks 推给 UI，
+    /// 工具输出（进上下文）只含 top-1 一条切片正文。
+    func testRagSearchToolEmitsCitationsAndSingleChunkContext() async throws {
+        let root = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("base-agent-rag-tool-\(UUID().uuidString)")
+        let kb = root.appendingPathComponent("kb")
+        try FileManager.default.createDirectory(at: kb, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        try String(repeating: "apple banana ", count: 40)
+            .write(to: kb.appendingPathComponent("a.md"), atomically: true, encoding: .utf8)
+        try String(repeating: "apple cherry ", count: 40)
+            .write(to: kb.appendingPathComponent("b.md"), atomically: true, encoding: .utf8)
+
+        var config = AgentConfig()
+        config.workspace = root.path
+        config.knowledgeBase = kb.path
+        config.ragRerankEnabled = false
+        config.ragSemanticChunking = false
+        config.ragChunkSize = 40
+        config.ragChunkOverlap = 5
+
+        let engine = RAGEngine(config: config, knowledgeBase: kb.path,
+                               embedding: RagFakeEmbedding(), reranker: nil)
+        _ = await engine.ingest()
+
+        final class CitationRecorder: AgentCallbacks {
+            var received: [[RAGCitation]] = []
+            func onRetrievedChunks(_ chunks: [RAGCitation]) { received.append(chunks) }
+        }
+        let recorder = CitationRecorder()
+        let tool = RagSearchTool(config: config, callbacks: recorder, registry: nil,
+                                 engine: engine)
+        let result = try await tool.run(["query": .string("apple"), "top_k": .int(5)])
+        XCTAssertTrue(result.success)
+        // 一批切片回调给 UI，含 top-1。
+        XCTAssertEqual(recorder.received.count, 1)
+        XCTAssertGreaterThan(recorder.received[0].count, 1)
+        XCTAssertTrue(recorder.received[0][0].isPrimary)
+        // 进上下文的输出只有一条切片正文（不含其余切片）。
+        let body = result.toMessage()
+        XCTAssertEqual(body.components(separatedBy: "### 来源:").count - 1, 1)
+        engine.close()
+    }
 }

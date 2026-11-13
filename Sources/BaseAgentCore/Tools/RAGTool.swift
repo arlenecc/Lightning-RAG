@@ -39,9 +39,14 @@ func ragToolOK(_ text: String) -> ToolResult {
 // MARK: - rag_search
 
 /// 知识库检索工具：等价于 Python `RagSearchTool`。
+///
+/// 检索即展示（Retrieval-as-Presentation）：召回切片不再全量进模型上下文。
+/// 只有相关度最高的 1 条切片进上下文供模型参考总结；全部召回切片
+/// （含 top-1）通过 `AgentCallbacks.onRetrievedChunks` 推给 UI，
+/// 作为气泡附在回复后供用户点开查看。
 public final class RagSearchTool: AgentTool {
     public let name = "rag_search"
-    public let description = "从本地知识库（RAG）检索与 query 相关的内容，可限定来源文件。query 请使用用户原始措辞，不要翻译或音译。返回带来源的 Markdown 片段，片段即正文、请直接据此作答；来源/章节只是索引标识、不是磁盘文件路径，无需再找原文件。此说明只针对知识库文档，不影响 web_scan / file_tools / shell_run 等其它工具。"
+    public let description = "从本地知识库（RAG）检索与 query 相关的内容，可限定来源文件。query 请使用用户原始措辞，不要翻译或音译。只返回相关度最高的 1 条切片全文进上下文，其余召回切片不进上下文、而是作为引用气泡直接展示给用户（用户可自行点开查看）；如最高分切片不足以回答，请换措辞再次检索。来源/章节只是索引标识、不是磁盘文件路径，无需再找原文件。此说明只针对知识库文档，不影响 web_scan / file_tools / shell_run 等其它工具。"
     public let parameters: JSONValue = .object([
         "type": .string("object"),
         "properties": .object([
@@ -55,20 +60,23 @@ public final class RagSearchTool: AgentTool {
             ]),
             "top_k": .object([
                 "type": .string("integer"),
-                "description": .string("候选片段数，默认 3，范围 1-10；开启重排序时"
-                    + "最终条数由设置里的 TopN 决定"),
+                "description": .string("召回候选切片数（决定展示给用户的气泡数量），"
+                    + "默认 3，范围 1-10；开启重排序时由设置里的 TopN 决定"),
             ]),
         ]),
         "required": .array([.string("query")]),
     ])
 
     private let engine: RAGEngine
+    /// 检索即展示：召回切片通过回调推给 UI 气泡；无 UI 调用方为 nil。
+    private weak var callbacks: AgentCallbacks?
 
     public init(config: AgentConfig,
                 callbacks: AgentCallbacks? = nil,
                 registry: ToolRegistry? = nil,
                 engine: RAGEngine) {
         self.engine = engine
+        self.callbacks = callbacks
     }
 
     public func run(_ args: [String: JSONValue]) async throws -> ToolResult {
@@ -77,11 +85,14 @@ public final class RagSearchTool: AgentTool {
         let topK = args.boundedInt("top_k", default: 3, range: 1...10)
         let source = args.trimmedString("source")
         do {
-            let output = try await engine.searchFormatted(
+            let outcome = try await engine.searchWithCitations(
                 query: query,
                 topK: topK,
                 source: source.isEmpty ? nil : source)
-            return ragToolOK(output)
+            if !outcome.citations.isEmpty {
+                callbacks?.onRetrievedChunks(outcome.citations)
+            }
+            return ragToolOK(outcome.context)
         } catch {
             return .fail("知识库检索失败: \(error.localizedDescription)")
         }

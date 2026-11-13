@@ -112,7 +112,10 @@ public enum AgentToolFactory {
             description:
                 "Local knowledge-base (RAG). Choose via `op`:\n"
                 + "- op=\"search\": retrieve relevant chunks (query, source, top_k); "
-                + "use the user's original wording for query.\n"
+                + "use the user's original wording for query. Only the single top-ranked "
+                + "chunk is returned in the tool result; all retrieved chunks are shown "
+                + "to the user as citation bubbles (not in your context). If the top "
+                + "chunk is insufficient, re-search with different wording.\n"
                 + "- op=\"outline\": view a document's chapter outline/summaries, or list all "
                 + "documents (book_name).\n"
                 + "- op=\"status\": knowledge-base indexing status.\n"

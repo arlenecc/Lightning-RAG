@@ -2947,11 +2947,80 @@ public final class RAGEngine {
         return Array(hits.prefix(resultLimit))
     }
 
-    // MARK: 知识图谱检索
+    // MARK: 检索即展示（Retrieval-as-Presentation）/ 知识图谱检索
+
+    /// 检索即展示入口：召回切片不再全量进模型上下文。
+    ///
+    /// - naive 策略：只有相关度最高的 1 条切片格式化进 `context`；
+    /// - 图谱策略：实体/关系照常进 `context`，原文片段同样只留 1 条；
+    /// - 全部召回切片（含 top-1）放进 `citations` 供 UI 气泡展示。
+    public func searchWithCitations(query: String, topK: Int = 3,
+                                    source: String? = nil) async throws -> RAGRetrievalOutcome {
+        // 图谱策略：非 naive 且图谱已就绪时走知识图谱检索，否则回退原始实现。
+        if config.ragRetrievalStrategy.usesKnowledgeGraph {
+            if let outcome = try await knowledgeGraphSearchWithCitations(query: query,
+                                                                         source: source) {
+                let condensed = await condenseIfNeeded(outcome.context)
+                return RAGRetrievalOutcome(context: condensed, citations: outcome.citations)
+            }
+        }
+        let hits = try await search(query: query, topK: topK, source: source)
+        guard !hits.isEmpty else {
+            return RAGRetrievalOutcome(context: "（知识库中未找到相关内容）", citations: [])
+        }
+        let citations = hits.enumerated().map { index, hit in
+            RAGCitation(id: String(hit.rowID), rank: index + 1,
+                        source: (hit.source as NSString).lastPathComponent,
+                        heading: hit.heading, text: hit.text, score: hit.score,
+                        isPrimary: index == 0)
+        }
+        return RAGRetrievalOutcome(context: Self.formatPrimaryContext(hits: hits),
+                                   citations: citations)
+    }
+
+    /// 单条 top-1 切片的上下文格式：告诉模型其余切片去了哪里、不够时怎么办。
+    static func formatPrimaryContext(hits: [SearchHit]) -> String {
+        let hit = hits[0]
+        let name = (hit.source as NSString).lastPathComponent
+        let heading = hit.heading.isEmpty ? "" : "\n章节: \(hit.heading)"
+        // RRF 分数（≈1/61）与 rerank/余弦不可比，展示时标明口径。
+        let isRRF = hit.rrfScore != nil && abs((hit.rrfScore ?? 0) - hit.score) < 1e-9
+        let scoreLabel = isRRF ? "RRF" : "相关度"
+        let header = hits.count == 1
+            ? "本次召回 1 条相关切片，已全部进入上下文："
+            : "本次共召回 \(hits.count) 条相关切片。按检索即展示架构，只有相关度最高的"
+                + " 1 条进入上下文，其余 \(hits.count - 1) 条已直接作为引用气泡展示给用户"
+                + "（用户可自行点开查看，模型无需也无法转述）："
+        let body = "### 来源: \(name) (\(scoreLabel): "
+            + String(format: "%.4f", hit.score) + ")\(heading)\n\(hit.text)"
+        return header + "\n" + body
+    }
+
+    /// 图谱策略的检索即展示：返回上下文文本与全部原文切片候选。nil 表示回退 naive。
+    private func knowledgeGraphSearchWithCitations(query: String,
+                                                   source: String?)
+        async throws -> (context: String, citations: [RAGCitation])? {
+        guard let (context, chunks) = try await knowledgeGraphSearch(query: query, source: source,
+                                                                     chunksInContext: true) else {
+            return nil
+        }
+        let citations = chunks.enumerated().map { index, passage in
+            RAGCitation(id: passage.sourceChunkIDs.first ?? "kg:\(index + 1)",
+                        rank: index + 1,
+                        source: passage.label,
+                        text: passage.text, score: passage.score,
+                        isPrimary: index == 0)
+        }
+        return (context, citations)
+    }
 
     /// 知识图谱检索 + 统一 reranker 精排 + 格式化。返回 nil 表示回退原始实现。
-    private func knowledgeGraphSearchFormatted(query: String,
-                                               source: String?) async throws -> String? {
+    /// `chunks` 是按最终分数排序的全部原文切片候选（chunksInContext 时 [0] 已进上下文）。
+    /// `chunksInContext=false` 供无 UI 的消费方（MCP）沿用旧全量切片进上下文行为。
+    private func knowledgeGraphSearch(query: String,
+                                      source: String?,
+                                      chunksInContext: Bool) async throws
+        -> (context: String, chunks: [KGPassage])? {
         guard config.ragRetrievalStrategy.usesKnowledgeGraph else { return nil }
         guard let embedding else { return nil }
         let (kgStore, kgGraph) = try ensureKnowledgeGraph()
@@ -2979,12 +3048,16 @@ public final class RAGEngine {
                                                 config: config, chunkStore: store)
         let candidates = try await retriever.retrieve(query: query, source: source)
         guard !candidates.isEmpty else { return nil }
-        return await formatKnowledgeGraph(query: query, candidates: candidates)
+        return await formatKnowledgeGraph(query: query, candidates: candidates,
+                                          chunksInContext: chunksInContext)
     }
 
-    /// 三路候选统一走同一个 reranker 精排，按实体/关系/原文分组并做 token 预算截断。
-    private func formatKnowledgeGraph(query: String,
-                                      candidates: KGRetrievalCandidates) async -> String {
+    /// 三路候选统一走同一个 reranker 精排，实体/关系全量进上下文；
+    /// 原文片段在 chunksInContext 时只留 top-1 进上下文（其余供 UI 气泡），
+    /// false 时沿用旧全量行为（预算内尽量多放）。
+    private func formatKnowledgeGraph(query: String, candidates: KGRetrievalCandidates,
+                                      chunksInContext: Bool)
+        async -> (context: String, chunks: [KGPassage]) {
         var passages = candidates.allPassages
         // 1) 统一 reranker 精排（失败/超时则保留图谱自身排序）。
         if config.ragRerankEnabled, let reranker, !passages.isEmpty {
@@ -3009,7 +3082,7 @@ public final class RAGEngine {
             }
             .map(\.element)
 
-        // 3) 预算截断：实体 3000、关系 4000、原文 12000，总输出 ≤20000 token。
+        // 3) 预算截断：实体 400、关系 600，原文片段只留 top-1（检索即展示），
         //    原文预算再被「总预算 − 实体实际 − 关系实际」收口，三者之和不会越顶。
         let entitySection = assembleSection("实体", passages: entities,
                                             budgetTokens: config.ragKGEntityTokenBudget)
@@ -3020,20 +3093,26 @@ public final class RAGEngine {
         let chunkBudget = max(0, min(config.ragKGChunkTokenBudget,
                                      config.ragKGTotalTokenBudget
                                         - entityTokens - relationTokens))
-        let chunkSection = assembleSection("原文片段", passages: chunks,
+        let contextChunks = chunksInContext ? Array(chunks.prefix(1)) : chunks
+        let chunkSection = assembleSection("原文片段", passages: contextChunks,
                                            budgetTokens: chunkBudget)
 
         var lines: [String] = []
         let header = "从知识图谱检索到 \(entities.count) 个实体、\(relations.count) 条关系"
-            + (chunks.isEmpty ? "" : "、\(chunks.count) 个原文片段")
+            + (chunks.isEmpty ? "" : chunksInContext
+                ? "、\(chunks.count) 个原文片段（仅相关度最高的 1 条进上下文，"
+                    + "其余已作为引用气泡展示给用户）"
+                : "、\(chunks.count) 个原文片段")
             + "（\(config.ragRetrievalStrategy.rawValue) 策略"
             + (config.ragRerankEnabled ? " + 重排序" : "") + "）："
         lines.append(header)
         if !entitySection.isEmpty { lines.append(""); lines.append(entitySection) }
         if !relationSection.isEmpty { lines.append(""); lines.append(relationSection) }
         if !chunkSection.isEmpty { lines.append(""); lines.append(chunkSection) }
-        if lines.count <= 1 { return "（知识库中未找到相关内容）" }
-        return lines.joined(separator: "\n")
+        if lines.count <= 1 {
+            return ("（知识库中未找到相关内容）", [])
+        }
+        return (lines.joined(separator: "\n"), chunks)
     }
 
     /// 组装一个分组，按 token 预算截断。
@@ -3058,9 +3137,11 @@ public final class RAGEngine {
                                 maxCharsPerResult: Int? = nil,
                                 maxTotalChars: Int? = nil) async throws -> String {
         // 图谱策略：非 naive 且图谱已就绪时走知识图谱检索，否则回退原始实现。
+        // 无 UI 消费方（MCP）沿用旧全量切片进上下文行为。
         if config.ragRetrievalStrategy.usesKnowledgeGraph {
-            if let kgOutput = try await knowledgeGraphSearchFormatted(query: query, source: source) {
-                return await condenseIfNeeded(kgOutput)
+            if let kg = try await knowledgeGraphSearch(query: query, source: source,
+                                                       chunksInContext: false) {
+                return await condenseIfNeeded(kg.context)
             }
         }
         let hits = try await search(query: query, topK: topK, source: source)
