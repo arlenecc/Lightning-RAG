@@ -185,6 +185,22 @@ public func hasSummaryTag(_ content: String) -> Bool {
                                            options: [.dotMatchesLineSeparators, .caseInsensitive])
 }
 
+/// 模型跳过 `<think>` 起始标签、直接输出思考并以 `</think>` 收尾时，
+/// 把标签之前的内容归入 reasoning，正文只保留标签之后的部分。
+///
+/// 正常路径由本地 LLM 的 think 流式切分处理；这里兜底模板未给出
+/// `<think>` 前缀、但模型自行补了关闭标签的情况，避免思考过程进入
+/// 正文、入库和下一轮上下文。
+public func splitStrayThinking(_ content: String) -> (content: String, reasoning: String) {
+    guard !content.contains("<think>"), let range = content.range(of: "</think>") else {
+        return (content, "")
+    }
+    let reasoning = String(content[..<range.lowerBound])
+    let visible = String(content[range.upperBound...])
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+    return (visible, reasoning)
+}
+
 /// 流式过滤 `<summary>…</summary>`：把摘要从正文中分离，供 UI 放进思考区。
 ///
 /// 模型可能把标签拆到多个 chunk 里，因此保留跨 chunk 缓冲；正文仍按原样

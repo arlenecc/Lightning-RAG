@@ -53,6 +53,7 @@ public final class AgentToolDispatcher {
 
         for (index, call) in calls.enumerated() {
             agent.log("[tool] \(call.name) \(call.compact)")
+            AgentLog.info("[tool] 开始 \(call.name) \(call.compact)")
 
             if call.arguments["__parse_error__"] != nil {
                 let raw = call.arguments["__raw__"]?.stringValue ?? ""
@@ -1505,8 +1506,12 @@ public final class Agent: @unchecked Sendable {
     }
 
     func logToolResult(_ name: String, _ result: ToolResult) {
-        log("[tool] \(name) -> success=\(result.success) out_len=\(result.output.count) "
-            + "err=\(String(result.error.prefix(120)))")
+        let line = "[tool] \(name) -> success=\(result.success) out_len=\(result.output.count) "
+            + "err=\(String(result.error.prefix(120)))"
+        log(line)
+        // 工具执行结果同时落日志文件：UI 日志面板不持久化，事后无法定位
+        // 「模型说调用了工具但没执行」这类问题。
+        AgentLog.info(line)
     }
 
     private static func dayString() -> String {

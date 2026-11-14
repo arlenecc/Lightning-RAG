@@ -316,6 +316,22 @@ final class RegressionTests: XCTestCase {
         XCTAssertEqual(summary.split(separator: "\n").count, 30)
     }
 
+    /// 回归：模型漏掉 `<think>` 起始标签、直接以 `</think>` 收尾时，
+    /// 关闭标签前的内容必须归入思考，不能留在正文或入库。
+    func testSplitStrayThinkingWithoutOpenTag() {
+        let raw = "先确认知识库状态，再回答。</think>知识库中有 422 个切片。"
+        let split = splitStrayThinking(raw)
+        XCTAssertEqual(split.content, "知识库中有 422 个切片。")
+        XCTAssertEqual(split.reasoning, "先确认知识库状态，再回答。")
+
+        // 完整思考块交给 LLM 层切分，这里不重复处理。
+        let paired = "<think>思考</think>答案"
+        XCTAssertEqual(splitStrayThinking(paired).content, paired)
+
+        // 没有关闭标签时保持原样。
+        XCTAssertEqual(splitStrayThinking("普通回答").content, "普通回答")
+    }
+
     func testSkillRequestClassificationSkipsGreetingsAndSimpleQueries() {
         XCTAssertTrue(SkillManager.isTrivialRequest("你好"))
         XCTAssertTrue(SkillManager.isTrivialRequest("今天天气怎么样？"))

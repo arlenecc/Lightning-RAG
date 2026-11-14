@@ -1482,8 +1482,12 @@ public final class KernelLoop {
 
         // 看门狗可能已因取消而结束流（此时循环正常退出），统一在这里判定。
         if cancelled || self.cancelled() || Task.isCancelled { return nil }
-        let reasoningText = reasoningBuf.joined()
-        if !seenDone && (!contentBuf.joined().isEmpty || !reasoningText.isEmpty) {
+        // 模型可能跳过 <think> 起始标签、直接输出思考再以 </think> 收尾：
+        // 这段内容不能进正文，否则会写入 transcript 并污染下一轮上下文。
+        let stray = splitStrayThinking(contentBuf.joined())
+        let text = stray.content
+        let reasoningText = reasoningBuf.joined() + stray.reasoning
+        if !seenDone && (!text.isEmpty || !reasoningText.isEmpty) {
             log("[agent] warning: LLM stream ended without 'done' event")
         }
 
@@ -1504,7 +1508,6 @@ public final class KernelLoop {
         callbacks.onTokenSpeed(totalTokens,
                                completion > 0 ? Double(completion) / generated : 0.0)
 
-        let text = contentBuf.joined()
         let toolCalls = calls.map(toolCallWithID)
         return LLMResponse(
             content: text,

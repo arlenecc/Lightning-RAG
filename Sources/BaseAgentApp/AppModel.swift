@@ -345,6 +345,8 @@ final class AppViewModel: ObservableObject {
     /// 本轮是否已把第一个 chunk 刷到 UI。首字节延迟是用户最敏感的指标，
     /// 不该为了 50ms 批处理再等一轮。
     private var didFirstFlush = false
+    /// 本轮是否已把游离 `</think>` 之前的思考从正文搬到思考区。
+    private var didReclassifyStrayThink = false
     private var ragStatusRefreshing = false
     private var configGeneration = 0
     /// `applyConfig { sync }` 路径：记住应用配置前已加载的模型，同步结束后再恢复。
@@ -668,6 +670,7 @@ final class AppViewModel: ObservableObject {
         streamingID = nil
         flushScheduled = false
         didFirstFlush = false
+        didReclassifyStrayThink = false
         summaryFilter.reset()
     }
 
@@ -1773,10 +1776,40 @@ final class AppViewModel: ObservableObject {
         let parts = summaryFilter.feed(text)
         if !parts.content.isEmpty { contentBuffer += parts.content }
         if !parts.summary.isEmpty { reasoningBuffer += parts.summary }
+        reclassifyStrayThinking()
         if !parts.content.isEmpty || !parts.summary.isEmpty {
             scheduleFlush()
         }
         statusText = "生成中…"
+    }
+
+    /// 模型跳过 `<think>` 起始标签、直接输出思考并以 `</think>` 收尾时，
+    /// 把标签之前的正文改判为思考，避免思考过程停留在对话气泡里。
+    private func reclassifyStrayThinking() {
+        guard let id = streamingID,
+              let index = chatItems.firstIndex(where: { $0.id == id }) else { return }
+        let combined = chatItems[index].content + contentBuffer
+        guard let range = combined.range(of: "</think>") else { return }
+        let prefix = String(combined[..<range.lowerBound])
+        // 正常 `<think>…</think>` 由 LLM 层切分，不会进正文；出现开标签
+        // 说明是完整思考块，交给内核统一处理，这里不重复搬运。
+        guard !prefix.contains("<think>") else { return }
+        let tail = String(combined[range.upperBound...]).drop(while: \.isWhitespace)
+        if didReclassifyStrayThink {
+            // 后续游离标签只删除，避免把已经展示的回答再次搬进思考区。
+            chatItems[index].content = prefix + tail
+        } else {
+            didReclassifyStrayThink = true
+            let thinking = prefix.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !thinking.isEmpty {
+                if !reasoningBuffer.isEmpty, !reasoningBuffer.hasSuffix("\n") {
+                    reasoningBuffer += "\n"
+                }
+                reasoningBuffer += thinking
+            }
+            chatItems[index].content = String(tail)
+        }
+        contentBuffer = ""
     }
 
     func appendReasoning(_ text: String) {
