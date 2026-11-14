@@ -1104,7 +1104,8 @@ public final class RAGEngine {
 
     /// 新切片入库后，仅对未进入图谱的切片做增量抽取，并合并进现有图谱与快照。
     private func updateKnowledgeGraphIncrementally() async {
-        guard let llm = auxLLM else { return }
+        // 先判定切片是否被改写/删除；这一步不依赖辅助模型，否则无 auxLLM
+        // 时会直接 return，旧图谱保持 complete，后续会用失效的 chunk 引用。
         guard let store = try? ensureKnowledgeGraphStore(),
               store.buildState() == .complete else { return }
         // 已有切片被改写/删除时，增量无法撤回旧证据，只能整体重建。
@@ -1117,6 +1118,7 @@ public final class RAGEngine {
             invalidateKnowledgeGraph(reason: "已有切片被修改或删除")
             return
         }
+        guard let llm = auxLLM else { return }
         guard let (_, graph) = try? ensureKnowledgeGraph() else { return }
         let builder = KnowledgeGraphBuilder(store: store, graph: graph, llm: llm,
                                             limits: kgExtractionLimits,
