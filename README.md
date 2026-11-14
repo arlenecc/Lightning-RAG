@@ -243,7 +243,8 @@ OvisOCR2 的 MLX 权重使用 `model_type=qwen3_5`（Qwen3.5-0.8B 后训练）�
 1. 结构切片：按 Markdown / 中文章节 / 编号标题切分章节；
 2. 语义切片：内置 `potion-multilingual-128M`（int4 ONNX，纯 CPU，无 512 token 位置上限）计算相邻句余弦，在相似度低谷处断开；模型不可用时退化为词重叠；
 3. 递归回退：段落 → 换行 → 句号 → 空格 → token 窗口，严格遵守 token 预算；
-4. 块间按 token 数添加 overlap（计入总预算）。
+4. 同章节短片段合并：低于 `chunk_size × 7/8` 的相邻片段顺序合并（不超预算、不跨「第X章 / Chapter / Part」），避免语义低谷或 PDF 页尾各自成为一两百字的小片；
+5. 块间按 token 数添加 overlap（计入总预算）。
 
 默认 `chunk_size=800 token`、`overlap=80 token`（10%，含在 800 内）。同步时优先用模型自带 `tokenizer.json` 做精确计数（不含特殊 token），分词器不可用时退回标定过的保守估算器（`EmbeddingTokenEstimator`）：纯中文约 1 字 ≈ 1 token，中英混排约 1.8 字符/token，英文约 3.5 字符/token；因此 800 token 大致对应 800 字中文或 1000–1400 字混排。默认 jina-embeddings-v5（与 jina-v3 一样）声明窗口为 8192 token，但 embedding 推理前会统一压到 1024 token，默认 800 token 的切片完整计算、不会被截断；若把切片大小调到超过推理输入上限（1024 token，或改用 bge 等更小的 512 窗口模型），同步时会自动压到该上限，overlap 同步压到上限的 10%，设置面板会显示「实际生效：N token」。所有切分路径都在句子结束处断开；旧配置里的默认 500/50 会在加载时自动迁移到 800/80，自定义组合保持不变。
 

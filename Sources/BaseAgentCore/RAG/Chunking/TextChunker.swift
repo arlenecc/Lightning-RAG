@@ -46,7 +46,10 @@ public final class TextChunker: TextChunkingStrategy {
         }
 
         guard !raw.isEmpty else { return [] }
-        let withOverlap = applyOverlap(raw, overlapTokens: options.overlapTokens)
+        // 先把同一章节内的短片段合并到接近 chunk_size，再加重叠：
+        // PDF 的页尾、引文、短小节如果各自成片，召回结果会只有一两百字。
+        let coalesced = coalesceShortPieces(raw, source: document.source)
+        let withOverlap = applyOverlap(coalesced, overlapTokens: options.overlapTokens)
         var chunks: [Chunk] = []
         for item in withOverlap {
             let trimmed = item.text.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -117,6 +120,61 @@ public final class TextChunker: TextChunkingStrategy {
             }
         }
         return output
+    }
+
+    // MARK: 合并短片段
+
+    /// 把同一章节内的相邻片段合并到接近 `chunk_size`。
+    ///
+    /// 语义切片按主题低谷断开、短章节整章成片，都会产生 100-200 字的小片；
+    /// 这类片段单独召回时上下文不足。这里在不跨章节、不超预算的前提下
+    /// 顺序合并，让大多数切片落在 `chunk_size` 的 7/8 以上。
+    private func coalesceShortPieces(
+        _ pieces: [(text: String, heading: String,
+                    sectionIndex: Int, mergeable: Bool)],
+        source: String
+    ) -> [(text: String, heading: String, sectionIndex: Int, mergeable: Bool)] {
+        guard pieces.count > 1 else { return pieces }
+        let target = max(options.minChunkTokens, options.chunkSizeTokens * 7 / 8)
+        let strictHeadings = DocumentOutline.usesExplicitHeadings(source)
+
+        // 结构化文档以顶层标题为章节边界；PDF/纯文本只信任
+        // 「第X章 / Chapter / Part」这类显式章节标记，避免把正文里的
+        // 数字编号误当成新章节而阻断合并。
+        func chapterKey(_ heading: String) -> String {
+            let top = heading.components(separatedBy: " > ").first ?? heading
+            if strictHeadings { return top }
+            return Self.isChapterMarker(top) ? top : ""
+        }
+
+        var output: [(text: String, heading: String,
+                      sectionIndex: Int, mergeable: Bool)] = []
+        for piece in pieces {
+            guard var last = output.last else {
+                output.append(piece)
+                continue
+            }
+            let combined = last.text + "\n" + piece.text
+            if chapterKey(last.heading) == chapterKey(piece.heading),
+               options.tokenCounter(last.text) < target,
+               options.tokenCounter(combined) <= options.chunkSizeTokens {
+                last.text = combined
+                output[output.count - 1] = last
+            } else {
+                output.append(piece)
+            }
+        }
+        return output
+    }
+
+    /// 显式章节标记：第X章/节/篇/部/卷，或英文 Chapter / Part / Section。
+    private static func isChapterMarker(_ heading: String) -> Bool {
+        let trimmed = heading.trimmingCharacters(in: .whitespaces)
+        guard !trimmed.isEmpty else { return false }
+        let pattern = #"^第[一二三四五六七八九十百千零〇0-9]+[章节篇部卷]"#
+        if trimmed.range(of: pattern, options: .regularExpression) != nil { return true }
+        let lower = trimmed.lowercased()
+        return lower.hasPrefix("chapter ") || lower.hasPrefix("part ")
     }
 
     // MARK: Overlap

@@ -120,17 +120,18 @@ final class ChunkingTests: XCTestCase {
         XCTAssertEqual(nodes.map(\.title), ["第一章 绪论"])
     }
 
-    /// 长章节必须走语义切片；语义片即使短于 minChunkTokens 也不能被合并。
+    /// 语义主题边界在两侧片段都足够大时保留；短片段则由 chunk 级合并补足。
     func testSemanticBoundariesSurviveMinChunkChars() async {
-        let text = """
-        苹果是一种常见的水果，富含维生素和膳食纤维。香蕉也是一种常见的水果，口感香甜且价格实惠。今天天气晴朗，阳光明媚，适合外出散步。天空没有云朵，微风轻拂，让人心情愉快。
-        """
+        let text = String(repeating: "苹果是一种常见的水果，富含维生素和膳食纤维。", count: 3)
+            + "香蕉口感香甜。"
+            + String(repeating: "今天天气晴朗，阳光明媚，适合外出散步。", count: 3)
+            + "天空没有云朵，微风轻拂。"
         let options = ChunkingOptions(chunkSizeTokens: 80, overlapTokens: 0,
                                       minChunkTokens: 80,
                                       semanticThreshold: 0.55, enableSemantic: true,
                                       tokenCounter: { $0.count })
         let document = ParsedDocument(text: text, source: "fruit.md")
-        // 前两句水果、后两句天气：主题之间相似度为 0，主题内部为 1。
+        // 前四句水果、后四句天气：主题之间相似度为 0，主题内部为 1。
         let similarity: SemanticChunker.AdjacentSimilarity = { sentences in
             (0..<(sentences.count - 1)).map { index in
                 let a = sentences[index]
@@ -145,6 +146,38 @@ final class ChunkingTests: XCTestCase {
         XCTAssertEqual(chunks.count, 2, chunks.map(\.text).joined(separator: " | "))
         XCTAssertTrue(chunks[0].text.contains("苹果"))
         XCTAssertTrue(chunks[1].text.contains("天空"))
+    }
+
+    /// 同一章节内的短小节应合并到接近 chunk_size，不能各自成为小片。
+    func testShortSubsectionsCoalesceWithinChapter() async {
+        let text = """
+        # 第一章 总述
+
+        ## 背景
+
+        短内容一，只有一句话。
+
+        ## 现状
+
+        短内容二，也只有一句话。
+
+        # 第二章 方法
+
+        ## 步骤
+
+        第二章的短内容，不应与第一章合并。
+        """
+        let options = ChunkingOptions(chunkSizeTokens: 200, overlapTokens: 0,
+                                      minChunkTokens: 10,
+                                      enableSemantic: false,
+                                      tokenCounter: { $0.count })
+        let document = ParsedDocument(text: text, source: "report.docx")
+        let chunks = await TextChunker(options: options).chunk(document: document)
+        XCTAssertEqual(chunks.count, 2, chunks.map { $0.heading + ":" + $0.text }.joined(separator: " | "))
+        XCTAssertTrue(chunks[0].text.contains("短内容一"))
+        XCTAssertTrue(chunks[0].text.contains("短内容二"), "同章短小节应合并")
+        XCTAssertFalse(chunks[0].text.contains("第二章"), "不应跨章合并")
+        XCTAssertTrue(chunks[1].text.contains("第二章"))
     }
 
     /// 不超过切片大小设置的短章节整章作为一个切片，不做二次切分。

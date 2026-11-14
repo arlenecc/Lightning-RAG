@@ -56,11 +56,16 @@ public enum DocumentOutline {
             let number = s.substring(with: match.range(at: 1))
             let title = s.substring(with: match.range(at: 2))
                 .trimmingCharacters(in: .whitespaces)
-            guard title.count <= 60, !title.contains("|"),
+            guard title.count <= 40, !title.contains("|"),
                   !title.hasPrefix("/"), !title.hasPrefix("／"),
                   !title.contains("，"), !title.contains(","),
+                  !title.hasPrefix("年"), !title.hasPrefix("月"),
+                  !title.hasPrefix("日"), !title.hasPrefix("时"),
                   !Self.looksLikeDateProse("\(number) \(title)"),
                   !Self.hasSentencePunctuation(title) else { return nil }
+            // 纯 3 位以上数字（年份/页码/正文编号）不是章节号；
+            // 带点号的层级编号（1.2.3）仍保留。
+            if !number.contains("."), number.count >= 3 { return nil }
             // 表格/统计数据行（「23 大土地所有者 385 000 19 250 000」）
             // 带多个独立数字组，不是标题。
             let digitGroups = title.components(
