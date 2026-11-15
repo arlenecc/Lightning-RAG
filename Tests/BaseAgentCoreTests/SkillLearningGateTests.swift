@@ -46,10 +46,43 @@ final class SkillLearningGateTests: XCTestCase {
 
         XCTAssertTrue(SkillManager.isSupplementalFeedback("补充一下，输出使用 Excel"))
         XCTAssertTrue(SkillManager.isSupplementalFeedback("记得把日期格式改成 ISO"))
+        XCTAssertTrue(SkillManager.isSupplementalFeedback("能不能改成 Excel 输出？"))
         XCTAssertFalse(SkillManager.isSupplementalFeedback("继续"))
+        XCTAssertFalse(SkillManager.isSupplementalFeedback("继续做"))
+        XCTAssertFalse(SkillManager.isSupplementalFeedback("继续完成剩下的步骤"))
+        XCTAssertFalse(SkillManager.isSupplementalFeedback("接着处理"))
         XCTAssertFalse(SkillManager.isSupplementalFeedback("好的，下一步"))
         XCTAssertFalse(SkillManager.isSupplementalFeedback("ok"))
         XCTAssertFalse(SkillManager.isSupplementalFeedback("谢谢"))
+        XCTAssertFalse(SkillManager.isSupplementalFeedback("很好，谢谢"))
+        XCTAssertFalse(SkillManager.isSupplementalFeedback("可以了"))
+        XCTAssertFalse(SkillManager.isSupplementalFeedback("为什么失败了？"))
+    }
+
+    func testFrontmatterBlockListTagsParsed() {
+        let root = NSTemporaryDirectory() + "/skill-tags-\(UUID().uuidString)"
+        defer { try? FileManager.default.removeItem(atPath: root) }
+        let manager = SkillManager(workspace: root)
+        let text = """
+        ---
+        name: 简历优化
+        description: 优化简历结构与措辞
+        tags:
+          - cv
+          - "resume"
+        keywords:
+          - 简历
+          - 求职
+        ---
+        # 简历优化
+        ## When to use
+        用户需要修改简历时。
+        """
+        let skill = manager.parseSkillMarkdown(
+            text, directory: "简历优化", absolutePath: root + "/简历优化",
+            entry: "SKILL.md", fingerprint: "x")
+        XCTAssertEqual(skill?.tags, ["cv", "resume"])
+        XCTAssertEqual(skill?.keywords, ["简历", "求职"])
     }
 
     func testSaveToolRejectsNewSkillWithoutEligibility() async throws {

@@ -42,7 +42,7 @@ private func rounded(_ value: Double) -> Double {
 /// 这里只做关键词检索。
 public final class SkillSearchTool: AgentTool {
     public let name = "skill_search"
-    public let description = "关键词搜索 .agent/skills 下已保存的技能；按 query 打分（名称 > 关键词/tags > 描述）。"
+    public let description = "关键词搜索全部技能（已保存 + 下载/内置）；按 query 打分（名称 > 关键词/tags > 描述）。"
     public let parameters: JSONValue = .object([
         "type": .string("object"),
         "properties": .object([
@@ -105,7 +105,7 @@ public final class SkillSearchTool: AgentTool {
 /// 避免任何子工具再声明与组合工具 `op` 同名的参数。
 public final class SkillListTool: AgentTool {
     public let name = "skill_list"
-    public let description = "列出全部已保存技能（名称、路径、描述）。"
+    public let description = "列出全部技能（含下载/内置，最多展示 50 个；名称、路径、描述）。"
     public let parameters: JSONValue = .object([
         "type": .string("object"),
         "properties": .object([:]),

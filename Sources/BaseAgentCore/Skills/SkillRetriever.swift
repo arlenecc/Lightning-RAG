@@ -77,6 +77,11 @@ public final class SkillRetriever {
 
     private let k1 = 1.5
     private let b = 0.75
+    /// 向量同步串行化：`skill_tools` 的 semantic_search 可并行执行，首次
+    /// （或缓存失效后）并发检索若各自重算同一批 2000+ 技能向量，会把
+    /// embedding 开销翻倍。这里用单许可信号量让后来者等待，并在获得许可后
+    /// 重新计算缺失集合，直接复用前一次的结果。
+    private let syncGate = AsyncSemaphore(value: 1)
 
     public init(manager: SkillManager, embedding: EmbeddingProvider? = nil,
                 reranker: RerankProvider? = nil) {
@@ -133,7 +138,17 @@ public final class SkillRetriever {
 
         var queryVector: [Float]?
         if let embedding {
-            queryVector = try? await embedding.embedQuery(q)
+            do {
+                let vector = try await embedding.embedQuery(q)
+                if vector.isEmpty {
+                    AgentLog.warning("[skill] 查询向量为空，回退 BM25")
+                } else {
+                    queryVector = vector
+                }
+            } catch {
+                AgentLog.warning("[skill] 查询向量生成失败，回退 BM25: "
+                    + error.localizedDescription)
+            }
         }
 
         var candidates: [String: RetrievedSkill] = [:]
@@ -418,6 +433,8 @@ public final class SkillRetriever {
     }
 
     private func syncVectors(_ skills: [Skill], embedding: EmbeddingProvider) async {
+        guard await syncGate.acquire() else { return }
+        defer { syncGate.release() }
         let dimension = embedding.dimension
         var missing: [Skill] = []
         lock.lock()

@@ -316,7 +316,7 @@ public final class Agent: @unchecked Sendable {
         let builtin = (config.workspace as NSString).appendingPathComponent("skills")
         self.skills = skills ?? SkillManager(skillsDirectory: skillsDirectory,
                                              builtinDirectories: [builtin])
-        self.skillIndex = SkillIndex(skillsDirectory: skillsDirectory)
+        self.skillIndex = SkillIndex(manager: self.skills)
         let embedding = LocalModelFactory.shared.makeEmbedding(config: config)
         let reranker = LocalModelFactory.shared.makeReranker(config: config)
         self.skillRetriever = SkillRetriever(manager: self.skills, embedding: embedding,
@@ -1005,9 +1005,11 @@ public final class Agent: @unchecked Sendable {
         }
 
         // 命中技能：截断并提示用 skill_tools(op="load") 读全文。
-        // 至少 2 分才注入，单个常见词命中不足以代表任务与技能相关。
+        // 至少 3 分才注入：名称命中(3) 或关键词/tags 命中(2)+描述，
+        // 单个常见词或两个描述词命中不足以代表任务与技能相关，
+        // 误注入错误技能会污染上下文（正确技能可由 semantic_search 召回）。
         if !lastUserText.isEmpty, let matched = skills.matchScored(lastUserText),
-           matched.score >= 2 {
+           matched.score >= 3 {
             let skill = matched.skill
             var prompt = skill.body
             if prompt.count > SystemPromptLimits.maxSkillPromptChars {

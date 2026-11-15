@@ -84,7 +84,7 @@ public enum AgentToolFactory {
             name: "skill_tools",
             description:
                 "Reusable skills. Choose via `op`:\n"
-                + "- op=\"search\": keyword search of saved skills (query, top_k).\n"
+                + "- op=\"search\": keyword search of all skills (saved + downloaded) (query, top_k).\n"
                 + "- op=\"semantic_search\": semantic/BM25 hybrid search of SKILL.md (query, top_k); "
                 + "use the user's original wording for query.\n"
                 + "- op=\"load\": load a skill's full instructions by directory (path, entry).\n"

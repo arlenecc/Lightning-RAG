@@ -47,6 +47,20 @@ public final class SkillManager {
     private var lastMTime: TimeInterval = 0
     private let scanInterval: TimeInterval = 300
 
+    /// 词面匹配用的预分词缓存。
+    ///
+    /// `matchScored` 每轮用户请求至少调用一次；2000+ 技能逐个跑
+    /// `NLTokenizer` 实测要 300-460ms。按「技能路径 + 内容指纹」缓存后，
+    /// 技能文件不变时只做集合交集，匹配开销降到毫秒级。
+    private struct MatchProfile {
+        var fingerprint: String
+        var name: [String]
+        var keywords: [String]
+        var tags: [String]
+        var description: [String]
+    }
+    private var matchProfiles: [String: MatchProfile] = [:]
+
     /// 递归扫描时跳过的目录名（同 Python 版）。
     /// `need-deps` 存放依赖外部服务/工具的技能：不参与自动扫描与语义召回，
     /// 但仍可通过 `skill_tools(op="load", path="need-deps/...")` 手动加载。
@@ -95,16 +109,20 @@ public final class SkillManager {
         var best: Skill?
         var bestScore = 0
         for skill in list() {
+            let profile = matchProfile(for: skill)
             var score = 0
-            let nameWords = Set(TextAnalyzer.words(skill.name))
+            let nameWords = Set(profile.name)
             score += nameWords.intersection(query).count * 3
-            let keywordWords = Set(skill.keywords.flatMap { TextAnalyzer.words($0) })
+            let keywordWords = Set(profile.keywords)
             score += keywordWords.intersection(query).count * 2
-            let tagWords = Set(skill.tags.flatMap { TextAnalyzer.words($0) })
+            let tagWords = Set(profile.tags)
             score += tagWords.intersection(query).count * 2
-            let descriptionWords = Set(TextAnalyzer.words(skill.description))
+            let descriptionWords = Set(profile.description)
                 .subtracting(Self.matchStopwords)
-            score += descriptionWords.intersection(query).count
+            // 描述是弱信号：中文分词常把「帮我」「这份」拆成单字（帮/份/这），
+            // 长英文描述里出现两个常见单字就会误命中。只统计长度 ≥2 的 token。
+            score += descriptionWords.intersection(query)
+                .filter { $0.count >= 2 }.count
             if skill.description.localizedCaseInsensitiveContains(text) ||
                 text.localizedCaseInsensitiveContains(skill.description) {
                 score += 1
@@ -116,6 +134,28 @@ public final class SkillManager {
         }
         guard let best else { return nil }
         return (best, bestScore)
+    }
+
+    /// 读取（或按需计算）技能的预分词匹配档案。
+    private func matchProfile(for skill: Skill) -> MatchProfile {
+        lock.lock()
+        if let profile = matchProfiles[skill.absolutePath],
+           profile.fingerprint == skill.fingerprint {
+            lock.unlock()
+            return profile
+        }
+        lock.unlock()
+
+        let profile = MatchProfile(
+            fingerprint: skill.fingerprint,
+            name: TextAnalyzer.words(skill.name),
+            keywords: skill.keywords.flatMap { TextAnalyzer.words($0) },
+            tags: skill.tags.flatMap { TextAnalyzer.words($0) },
+            description: TextAnalyzer.words(skill.description))
+        lock.lock()
+        matchProfiles[skill.absolutePath] = profile
+        lock.unlock()
+        return profile
     }
 
     private static let suggestThreshold = 2
@@ -163,11 +203,25 @@ public final class SkillManager {
             of: "[，,。.!！?？、\\s]+", with: "", options: .regularExpression)
         let fillers = ["继续", "下一步", "接着", "好的", "可以", "是的", "谢谢", "多谢",
                        "continue", "goon", "next", "okay", "thanks", "yes", "ok",
-                       "按计划", "往下走", "往下", "执行", "开始", "行", "好", "嗯", "哦", "对"]
+                       "按计划", "往下走", "往下", "执行", "开始", "没问题",
+                       "继续做", "接着做", "往下做", "剩下的", "剩余的", "其余的",
+                       "其他", "其它", "后续", "步骤", "流程", "任务",
+                       "处理", "完成", "运行", "生成", "做", "跑", "干", "弄", "搞", "走", "来",
+                       "做得很好", "做得不错", "很好", "不错", "厉害", "完美", "漂亮",
+                       "great", "perfect", "nice", "awesome", "excellent",
+                       "行", "好", "嗯", "哦", "对", "了", "吧", "呢", "啊", "呀"]
         for filler in fillers.sorted(by: { $0.count > $1.count }) {
             remainder = remainder.replacingOccurrences(of: filler, with: "")
         }
-        return !remainder.isEmpty
+        guard !remainder.isEmpty else { return false }
+
+        // 纯提问（「为什么失败了？」）不算补充；带明确调整指令的提问仍算。
+        let hasQuestion = ["为什么", "怎么", "如何", "是否", "能不能", "可不可以",
+                           "吗", "？", "?"].contains { lower.contains($0) }
+        let hasInstruction = ["改成", "改为", "换成", "补充", "记得", "需要", "应该",
+                              "必须", "输出", "不要", "别", "加", "删", "调整", "用"]
+            .contains { lower.contains($0) }
+        return !(hasQuestion && !hasInstruction)
     }
 
     /// 能力/身份问询：「你能做什么」「有哪些工具/能力」「介绍一下自己」等。
@@ -309,6 +363,8 @@ public final class SkillManager {
             }
             return $0.directory < $1.directory
         }
+        let alive = Set(cached.map(\.absolutePath))
+        matchProfiles = matchProfiles.filter { alive.contains($0.key) }
         lastScanAt = now
         lastMTime = mtime
         return cached
@@ -519,20 +575,22 @@ public final class SkillManager {
             let nameSet = Set(names)
             let markdownPath = (current as NSString).appendingPathComponent("SKILL.md")
 
+            var parsed: Skill?
             if nameSet.contains("SKILL.md") {
-                if let text = Self.readLimited(markdownPath),
-                   let skill = parseSkillMarkdown(text,
-                                                  directory: Self.relativeDirectory(current, root: root),
-                                                  absolutePath: current,
-                                                  entry: "SKILL.md",
-                                                  fingerprint: Self.fingerprint(text)) {
-                    results.append(skill)
-                }
-            } else if nameSet.contains("skill.json") {
-                if let skill = parseLegacySkill(directory: current, root: root) {
-                    results.append(skill)
+                if let text = Self.readLimited(markdownPath) {
+                    parsed = parseSkillMarkdown(text,
+                                                directory: Self.relativeDirectory(current, root: root),
+                                                absolutePath: current,
+                                                entry: "SKILL.md",
+                                                fingerprint: Self.fingerprint(text))
                 }
             }
+            // `SKILL.md` 可能只是普通说明（无 frontmatter），此时回退到同目录的
+            // `skill.json`，否则同时存在两种元数据的技能会被整条漏掉。
+            if parsed == nil, nameSet.contains("skill.json") {
+                parsed = parseLegacySkill(directory: current, root: root)
+            }
+            if let parsed { results.append(parsed) }
 
             for name in names {
                 if name.hasPrefix(".") || skippedDirectories.contains(name) { continue }
@@ -563,6 +621,9 @@ public final class SkillManager {
         var blockLines: [String] = []
         var inBlock = false
         var blockFolded = false
+        var listKey: String?
+        var listItems: [String] = []
+        var inList = false
 
         func flushBlock() {
             guard let currentKey = key else { return }
@@ -578,15 +639,36 @@ public final class SkillManager {
             blockFolded = false
         }
 
+        /// YAML 块列表（`tags:` 后跟若干 `  - item`）此前只取到空值，
+        /// 导致下载技能的 tags 全部丢失；这里单独收集为换行列表。
+        func flushList() {
+            guard let currentKey = listKey else { return }
+            meta[currentKey] = listItems.joined(separator: "\n")
+            listKey = nil
+            listItems = []
+            inList = false
+        }
+
         while index < lines.count {
             let raw = lines[index]
             let line = raw.trimmingCharacters(in: .whitespaces)
             if line == "---" || line == "..." {
                 flushBlock()
+                flushList()
                 index += 1
                 break
             }
             if raw.hasPrefix(" ") || raw.hasPrefix("\t") {
+                if inList {
+                    let item = line.hasPrefix("-")
+                        ? String(line.dropFirst()).trimmingCharacters(in: .whitespaces)
+                        : ""
+                    if !item.isEmpty {
+                        listItems.append(Self.unquote(item))
+                    }
+                    index += 1
+                    continue
+                }
                 if inBlock {
                     blockLines.append(raw.trimmingCharacters(in: .whitespaces))
                 }
@@ -594,6 +676,7 @@ public final class SkillManager {
                 continue
             }
             flushBlock()
+            flushList()
 
             guard let colon = raw.firstIndex(of: ":") else {
                 index += 1
@@ -613,8 +696,15 @@ public final class SkillManager {
                 continue
             }
             meta[name] = Self.unquote(value)
+            if value.isEmpty {
+                inList = true
+                listKey = name
+                listItems = []
+            }
             index += 1
         }
+        flushBlock()
+        flushList()
 
         let name = Self.unquote(meta["name"] ?? "")
             .trimmingCharacters(in: .whitespacesAndNewlines)
@@ -656,14 +746,27 @@ public final class SkillManager {
         guard !name.isEmpty else { return nil }
         let description = object["description"]?.stringValue ?? ""
         let keywords = (object["keywords"]?.arrayValue ?? []).compactMap(\.stringValue)
+        let tags = (object["tags"]?.arrayValue ?? []).compactMap(\.stringValue)
         let entry = object["entry"]?.stringValue?
             .trimmingCharacters(in: .whitespacesAndNewlines) ?? "prompt.md"
-        let entryName = entry.isEmpty ? "prompt.md" : entry
-        let entryPath = (directory as NSString).appendingPathComponent(entryName)
+        var entryName = entry.isEmpty ? "prompt.md" : entry
+        let fm = FileManager.default
+        var entryPath = (directory as NSString).appendingPathComponent(entryName)
+        if !fm.fileExists(atPath: entryPath) {
+            // 声明的入口缺失时回退到实际存在的约定文件，避免 skill.json 与
+            // SKILL.md 同时存在、但 entry 指向旧文件时读到空正文。
+            if fm.fileExists(atPath: (directory as NSString).appendingPathComponent("SKILL.md")) {
+                entryName = "SKILL.md"
+            } else if fm.fileExists(atPath: (directory as NSString)
+                .appendingPathComponent("prompt.md")) {
+                entryName = "prompt.md"
+            }
+            entryPath = (directory as NSString).appendingPathComponent(entryName)
+        }
         let body = Self.readLimited(entryPath) ?? ""
         return Skill(name: name,
                      description: description,
-                     tags: [],
+                     tags: tags,
                      keywords: keywords,
                      directory: Self.relativeDirectory(directory, root: root),
                      absolutePath: directory,
@@ -671,7 +774,8 @@ public final class SkillManager {
                      whenToUse: "",
                      whenNotToUse: "",
                      examples: "",
-                     fingerprint: Self.fingerprint(body + "|" + description + "|" + keywords.joined(separator: ",")),
+                     fingerprint: Self.fingerprint(body + "|" + description + "|"
+                        + keywords.joined(separator: ",") + "|" + tags.joined(separator: ",")),
                      body: body)
     }
 
