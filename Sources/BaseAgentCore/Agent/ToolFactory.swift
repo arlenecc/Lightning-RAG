@@ -140,6 +140,7 @@ public enum AgentToolFactory {
 
         // 未合并的独立工具。
         let standaloneTools: [AgentTool] = [
+            WebSearchTool(config: config, callbacks: callbacks, registry: registry),
             CodeRunTool(config: config, callbacks: callbacks, registry: registry),
             ShellRunTool(config: config, callbacks: callbacks, registry: registry),
             AskUserTool(config: config, callbacks: callbacks, registry: registry),
