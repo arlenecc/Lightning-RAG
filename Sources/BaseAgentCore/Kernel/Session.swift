@@ -273,6 +273,66 @@ public final class Session: @unchecked Sendable {
         return plan.steps.filter { planOpenStatuses.contains($0.status) }
     }
 
+    // MARK: - 技能学习门控
+
+    /// 当前计划下用户中途纠正/补充的累计状态。
+    public struct SkillLearningSignal: Sendable {
+        public var goal: String = ""
+        public var guidanceTurns: Int = 0
+        public var corrected: Bool = false
+        public var supplemented: Bool = false
+        public init() {}
+    }
+
+    private static let skillLearningKey = "__skill_learning"
+
+    public func skillLearningSignal() -> SkillLearningSignal {
+        guard let object = working[Self.skillLearningKey]?.objectValue else {
+            return SkillLearningSignal()
+        }
+        var signal = SkillLearningSignal()
+        signal.goal = object["goal"]?.stringValue ?? ""
+        signal.guidanceTurns = object["turns"]?.intValue ?? 0
+        signal.corrected = object["corrected"]?.boolValue ?? false
+        signal.supplemented = object["supplemented"]?.boolValue ?? false
+        return signal
+    }
+
+    /// 计划仍在进行时，用户又发来一条消息：记为一次介入；
+    /// 命中纠正词或提供新的补充要求时分别标记。
+    public func noteSkillGuidance(planGoal: String, corrective: Bool,
+                                  supplemental: Bool = false) {
+        var signal = skillLearningSignal()
+        if signal.goal != planGoal {
+            signal = SkillLearningSignal()
+            signal.goal = planGoal
+        }
+        signal.guidanceTurns += 1
+        signal.corrected = signal.corrected || corrective
+        signal.supplemented = signal.supplemented || supplemental
+        working[Self.skillLearningKey] = .object([
+            "goal": .string(signal.goal),
+            "turns": .int(signal.guidanceTurns),
+            "corrected": .bool(signal.corrected),
+            "supplemented": .bool(signal.supplemented),
+        ])
+    }
+
+    public func resetSkillLearningSignal() {
+        working.removeValue(forKey: Self.skillLearningKey)
+    }
+
+    /// 新技能落盘门控：计划至少 3 步、全部完成，且同一计划下用户中途
+    /// 纠正或补充过要求。模型一轮直接做完的任务不学习；更新已有技能不走这里。
+    public func isSkillLearningEligible(minimumSteps: Int = 3) -> Bool {
+        guard let plan = getPlan(),
+              plan.steps.count >= minimumSteps,
+              plan.steps.allSatisfy({ $0.status == "done" }) else { return false }
+        let signal = skillLearningSignal()
+        guard signal.goal == plan.goal else { return false }
+        return signal.corrected || signal.supplemented
+    }
+
     /// 把计划渲染成紧凑的多行文本（每轮回注 + UI 面板共用）。
     public func renderPlan() -> String {
         renderPlanDict(getPlan())
@@ -339,7 +399,8 @@ public final class Session: @unchecked Sendable {
         // 不应反复诱导模型询问「是否保存为技能」。
         if n % max(1, everyN * 2) == 0, getPlan() != nil {
             parts.append(
-                "[TIPS] 长任务：如已有可复用流程，用 skill_tools(op=\"save\") 固化；"
+                "[TIPS] 长任务：计划至少 3 步、用户中途纠正或补充并全部完成后，"
+                    + "才用 skill_tools(op=\"save\") 固化；"
                 + "阶段性成果用 start_long_term_update 蒸馏进长期记忆。"
             )
         }

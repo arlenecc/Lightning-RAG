@@ -142,6 +142,34 @@ public final class SkillManager {
                              options: [.regularExpression, .caseInsensitive]) != nil
     }
 
+    /// 用户是否在纠正上一轮的做法（仅用于技能学习信号，不影响对话路由）。
+    public static func isCorrectiveFeedback(_ text: String) -> Bool {
+        let lower = text.lowercased()
+        let markers = [
+            "不对", "错了", "搞错", "理解错", "不是这样", "不是这个", "改成", "改为",
+            "重新", "纠正", "我说的是", "换一种", "调整一下", "修正", "漏了", "遗漏",
+            "should be", "that's wrong", "not right", "instead", "redo", "correct that",
+            "don't do", "do not use",
+        ]
+        return markers.contains { lower.contains($0) }
+    }
+
+    /// 用户是否在补充/调整要求（不是单纯「继续」「好的」这类推进语）。
+    public static func isSupplementalFeedback(_ text: String) -> Bool {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.count >= 4 else { return false }
+        let lower = trimmed.lowercased()
+        var remainder = lower.replacingOccurrences(
+            of: "[，,。.!！?？、\\s]+", with: "", options: .regularExpression)
+        let fillers = ["继续", "下一步", "接着", "好的", "可以", "是的", "谢谢", "多谢",
+                       "continue", "goon", "next", "okay", "thanks", "yes", "ok",
+                       "按计划", "往下走", "往下", "执行", "开始", "行", "好", "嗯", "哦", "对"]
+        for filler in fillers.sorted(by: { $0.count > $1.count }) {
+            remainder = remainder.replacingOccurrences(of: filler, with: "")
+        }
+        return !remainder.isEmpty
+    }
+
     /// 能力/身份问询：「你能做什么」「有哪些工具/能力」「介绍一下自己」等。
     ///
     /// 答案由内核按真实注册的 tool schema 本地生成，不调用任何工具、也不问模型
@@ -446,6 +474,19 @@ public final class SkillManager {
                      keywords: cleanTags, directory: slug, absolutePath: directory,
                      entry: "SKILL.md", whenToUse: cleanWhen, whenNotToUse: "",
                      examples: "", fingerprint: Self.fingerprint(body), body: body)
+    }
+
+    /// 是否已有同名技能（按 slug 判断目录）。用于区分「新建技能」与「更新技能」：
+    /// 学习门控只限制新建，已有技能的修订不受计划/引导条件约束。
+    public func hasSkill(named name: String) -> Bool {
+        let slug = Self.slugify(name)
+        guard !slug.isEmpty else { return false }
+        return rootsLocked().contains { root in
+            var isDirectory: ObjCBool = false
+            let path = (root as NSString).appendingPathComponent(slug)
+            return FileManager.default.fileExists(atPath: path, isDirectory: &isDirectory)
+                && isDirectory.boolValue
+        }
     }
 
     // MARK: - 扫描实现

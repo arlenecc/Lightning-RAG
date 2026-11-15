@@ -77,6 +77,9 @@ public final class SkillSearchTool: AgentTool {
         guard !query.isEmpty else { return .fail("缺少参数: query") }
         let topK = args.boundedInt("top_k", default: 3, range: 1...5)
         let results = index.search(query: query, topK: topK)
+        let names = results.map(\.name).joined(separator: ",")
+        AgentLog.info("[skill] 关键词检索 query=\(String(query.prefix(80))) top=\(topK) "
+            + "hits=\(results.count) names=\(names)")
         if results.isEmpty {
             return .ok("找不到匹配的技能。")
         }
@@ -127,6 +130,7 @@ public final class SkillListTool: AgentTool {
 private func listAllSkills(_ index: SkillIndex) -> ToolResult {
     index.scan(force: true)
     let entries = index.listAll()
+    AgentLog.info("[skill] 列出技能 total=\(entries.count)")
     if entries.isEmpty {
         return .ok("暂无已保存的技能。")
     }
@@ -181,6 +185,11 @@ public final class SkillSemanticSearchTool: AgentTool {
         guard !query.isEmpty else { return .fail("缺少参数: query") }
         let topK = args.boundedInt("top_k", default: 3, range: 1...5)
         let skills = await retriever.retrieve(query: query, topK: topK)
+        let hitText = skills.map {
+            "\($0.name)(\(String(format: "%.3f", $0.score)))"
+        }.joined(separator: ",")
+        AgentLog.info("[skill] 语义检索 query=\(String(query.prefix(80))) top=\(topK) "
+            + "hits=\(skills.count) \(hitText)")
         guard !skills.isEmpty else {
             return .ok("找不到匹配的技能。")
         }
@@ -253,17 +262,22 @@ public final class SkillLoadTool: AgentTool {
                     let base = URL(fileURLWithPath: retriever.skillsDirectory)
                         .resolvingSymlinksInPath().path
                     let external = !(directory == base || directory.hasPrefix(base + "/"))
+                    AgentLog.info("[skill] 加载 path=\(rawPath) entry=\(name) "
+                        + "chars=\(content.count) external=\(external)")
                     return .ok(external ? "[external skill: \(directory)]\n\n\(content)" : content)
                 }
             }
         }
 
         if let content = index.readSkillContent(path: rawPath, entry: entry) {
+            AgentLog.info("[skill] 加载(索引) path=\(rawPath) entry=\(entry) chars=\(content.count)")
             return .ok(content)
         }
         if entry != "SKILL.md", let content = index.readSkillContent(path: rawPath, entry: "SKILL.md") {
+            AgentLog.info("[skill] 加载(索引回退) path=\(rawPath) entry=SKILL.md chars=\(content.count)")
             return .ok(content)
         }
+        AgentLog.info("[skill] 加载失败 path=\(rawPath) entry=\(entry)")
         return .fail("技能不存在或入口文件缺失: \(rawPath)")
     }
 }
@@ -273,7 +287,10 @@ public final class SkillLoadTool: AgentTool {
 /// 技能保存工具：等价于 Python `SkillSaveTool`。
 public final class SkillSaveTool: AgentTool {
     public let name = "skill_save"
-    public let description = "把可复用的操作流程保存为技能（写入 workspace/skills/<slug>/SKILL.md，并同步到 .agent/skills 索引目录）。"
+    public let description = "把可复用流程保存为技能（写入 .agent/skills/<slug>/SKILL.md；"
+        + "主技能目录为 workspace/skills 时同时镜像）。仅当计划至少 3 步、"
+        + "用户中途纠正或补充要求并全部完成时允许新建；更新已有技能不受限；"
+        + "定时任务/无人值守任务不允许新建。"
     public let parameters: JSONValue = .object([
         "type": .string("object"),
         "properties": .object([
@@ -308,6 +325,7 @@ public final class SkillSaveTool: AgentTool {
     private let manager: SkillManager
     private let retriever: SkillRetriever
     private let index: SkillIndex
+    private weak var registry: ToolRegistry?
     private let legacySkillsDirectory: String
 
     public init(config: AgentConfig,
@@ -318,6 +336,7 @@ public final class SkillSaveTool: AgentTool {
                 index: SkillIndex? = nil) {
         let resolvedManager = manager ?? SkillManager(workspace: config.workspace)
         self.manager = resolvedManager
+        self.registry = registry
         self.legacySkillsDirectory = URL(fileURLWithPath: config.workspace)
             .appendingPathComponent(".agent")
             .appendingPathComponent("skills")
@@ -340,6 +359,24 @@ public final class SkillSaveTool: AgentTool {
         let tags = args.stringList("tags")
         guard !steps.isEmpty else { return .fail("steps is required") }
 
+        // 学习门控只限制「新建」：计划至少 3 步、用户中途纠正/补充过，
+        // 且全部完成，才允许沉淀新技能；修订已有技能不受限。
+        let isUpdate = manager.hasSkill(named: name)
+        AgentLog.info("[skill] 保存请求 name=\(name) update=\(isUpdate)")
+        if !isUpdate {
+            if registry?.isUnattended == true {
+                AgentLog.info("[skill] 保存被拒绝 name=\(name) 原因=无人值守")
+                return .fail("定时任务/无人值守任务不允许新建技能。")
+            }
+            guard let session = registry?.session,
+                  session.isSkillLearningEligible() else {
+                AgentLog.info("[skill] 保存被拒绝 name=\(name) 原因=计划/介入条件不满足")
+                return .fail("技能保存被拒绝：只有计划至少 3 步、用户中途纠正或补充要求、"
+                    + "并且所有步骤都已完成的任务，才允许固化新技能。"
+                    + "模型一轮直接完成的简单任务无需保存。")
+            }
+        }
+
         do {
             let skill = try manager.save(name: name,
                                          description: description,
@@ -357,8 +394,11 @@ public final class SkillSaveTool: AgentTool {
             if FileManager.default.fileExists(atPath: mirrored) {
                 note += "；已镜像到 \(mirrored) 以便关键词检索命中"
             }
+            AgentLog.info("[skill] 已保存 name=\(skill.name) update=\(isUpdate) "
+                + "path=\(skill.absolutePath) chars=\(skill.body.count)")
             return .ok("skill saved: \(skill.absolutePath)\n\(note)。")
         } catch {
+            AgentLog.warning("[skill] 保存失败 name=\(name): \(error.localizedDescription)")
             return .fail("技能保存失败: \(error.localizedDescription)")
         }
     }

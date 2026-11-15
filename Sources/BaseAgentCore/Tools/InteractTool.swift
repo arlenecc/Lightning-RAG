@@ -14,6 +14,7 @@ public final class AskUserTool: AgentTool {
 
     private let config: AgentConfig
     private let callbacks: AgentCallbacks?
+    private weak var registry: ToolRegistry?
 
     public var parameters: JSONValue {
         ToolSupport.objectSchema(
@@ -26,7 +27,7 @@ public final class AskUserTool: AgentTool {
     public init(config: AgentConfig, callbacks: AgentCallbacks?, registry: ToolRegistry? = nil) {
         self.config = config
         self.callbacks = callbacks
-        _ = registry
+        self.registry = registry
     }
 
     public func run(_ args: [String: JSONValue]) async throws -> ToolResult {
@@ -38,6 +39,15 @@ public final class AskUserTool: AgentTool {
             }
             guard let answer = callbacks.askUser(prompt) else {
                 return .fail("User dismissed the question.")
+            }
+            // 用户回答澄清问题本身就是引导；计入技能学习信号（计划需仍在进行）。
+            if let session = registry?.session,
+               let plan = session.getPlan(),
+               !session.planOpenSteps().isEmpty {
+                session.noteSkillGuidance(
+                    planGoal: plan.goal,
+                    corrective: SkillManager.isCorrectiveFeedback(answer),
+                    supplemental: true)
             }
             return ToolResult(success: true, output: answer)
         } catch {

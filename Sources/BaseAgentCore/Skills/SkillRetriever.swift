@@ -212,16 +212,23 @@ public final class SkillRetriever {
         if let reranker {
             let shortlist = Array(ranked.prefix(recall))
             let documents = shortlist.map { "\($0.name). \($0.description)" }
-            if let scores = try? await reranker.rerank(query: q, documents: documents),
-               scores.count == shortlist.count {
-                var reranked = shortlist
-                for index in reranked.indices {
-                    reranked[index].score = scores[index]
+            do {
+                let scores = try await reranker.rerank(query: q, documents: documents)
+                if scores.count == shortlist.count {
+                    var reranked = shortlist
+                    for index in reranked.indices {
+                        reranked[index].score = scores[index]
+                    }
+                    ranked = reranked.sorted {
+                        if $0.score != $1.score { return $0.score > $1.score }
+                        return $0.name.localizedStandardCompare($1.name) == .orderedAscending
+                    }
+                } else {
+                    AgentLog.warning("[skill] reranker 返回数量不一致，回退向量排序")
                 }
-                ranked = reranked.sorted {
-                    if $0.score != $1.score { return $0.score > $1.score }
-                    return $0.name.localizedStandardCompare($1.name) == .orderedAscending
-                }
+            } catch {
+                AgentLog.warning("[skill] reranker 精排失败，回退向量排序: "
+                    + error.localizedDescription)
             }
         }
         return Array(ranked.prefix(limit))
@@ -305,6 +312,11 @@ public final class SkillRetriever {
             if invalid { cacheDirty = true }
         }
         lock.unlock()
+        if invalid {
+            AgentLog.warning("[skill] 向量缓存失效（版本/模型/维度变化），将重建")
+        } else if !loaded.isEmpty {
+            AgentLog.info("[skill] 向量缓存已加载 n=\(loaded.count)")
+        }
     }
 
     /// 把最新向量快照原子写回磁盘。无变化时不写，避免每次检索都重写文件。
@@ -467,6 +479,8 @@ public final class SkillRetriever {
             }
             cacheDirty = true
             lock.unlock()
+            lock.lock(); let total = vectors.count; lock.unlock()
+            AgentLog.info("[skill] 向量同步完成 added=\(missing.count) total=\(total)")
         } catch {
             AgentLog.warning("skill_retriever: 语义索引不可用，回退 BM25: \(error.localizedDescription)")
         }

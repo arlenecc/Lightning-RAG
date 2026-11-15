@@ -699,6 +699,7 @@ public final class Agent: @unchecked Sendable {
         if session.getPlan() == nil, let stored = PlanStore.load(config) {
             session.setPlan(stored)
         }
+        noteSkillLearningSignal(userInput, lightweight: lightweightTurn)
         if session.getPlan() != nil, !lightweightTurn {
             if session.planOpenSteps().isEmpty {
                 session.clearPlan()
@@ -832,10 +833,18 @@ public final class Agent: @unchecked Sendable {
         // 寒暄、简单查询、未完成的任务即使重复出现，也不会再提示保存技能。
         let planTouched = session.planRevision != planRevisionBefore
         let plan = session.getPlan()
-        let planComplete = (plan?.steps.count ?? 0) >= 2
+        let planDone = (plan?.steps.count ?? 0) >= 2
             && (plan?.steps.allSatisfy { $0.status == "done" } ?? false)
-        let substantive = distillRequested || (planTouched && planComplete)
-        if substantive, let skillCandidate, skills.match(userInput) == nil {
+        let substantive = distillRequested || (planTouched && planDone)
+        // 只有「计划至少 3 步 + 用户中途纠正/补充 + 全部完成」才建议固化；
+        // 一轮内直接做完的任务、定时任务都不进入学习。
+        if !tools.isUnattended,
+           session.isSkillLearningEligible(),
+           let skillCandidate, skills.match(userInput) == nil {
+            let signal = session.skillLearningSignal()
+            AgentLog.info("[skill] 建议固化 name=\(skillCandidate.name) "
+                + "steps=\(plan?.steps.count ?? 0) interventions=\(signal.guidanceTurns) "
+                + "corrected=\(signal.corrected) supplemented=\(signal.supplemented)")
             callbacks.onSkillSuggested(SkillSuggestion(
                 name: skillCandidate.name,
                 description: skillCandidate.description,
@@ -1006,6 +1015,8 @@ public final class Agent: @unchecked Sendable {
                     + "\n…（已截断，用 skill_tools(op=\"load\") 读取完整技能内容）"
             }
             sections.append("# Active skill: \(skill.name)\n\(prompt)")
+            AgentLog.info("[skill] 自动注入 name=\(skill.name) score=\(matched.score) "
+                + "chars=\(prompt.count) dir=\(skill.directory)")
         }
 
         // 知识库状态只读 RAGEngine 的快照：绝不在这里同步打开/扫描向量库。
@@ -1106,6 +1117,25 @@ public final class Agent: @unchecked Sendable {
     }
 
     // MARK: 结束后：后台事实抽取 + L4 蒸馏
+
+    /// 只有计划仍在进行时用户追加的消息才算「引导」；计划已完成则重置，
+    /// 避免下一轮寒暄或新任务继承旧信号。
+    private func noteSkillLearningSignal(_ input: String, lightweight: Bool) {
+        guard !lightweight else { return }
+        guard let plan = session.getPlan(), !session.planOpenSteps().isEmpty else {
+            session.resetSkillLearningSignal()
+            return
+        }
+        let corrective = SkillManager.isCorrectiveFeedback(input)
+        let supplemental = !corrective && SkillManager.isSupplementalFeedback(input)
+        session.noteSkillGuidance(planGoal: plan.goal,
+                                  corrective: corrective,
+                                  supplemental: supplemental)
+        let signal = session.skillLearningSignal()
+        AgentLog.info("[skill] 记录介入 plan=\(String(plan.goal.prefix(60))) "
+            + "turns=\(signal.guidanceTurns) corrected=\(signal.corrected) "
+            + "supplemented=\(signal.supplemented)")
+    }
 
     /// 事实抽取是**文件驱动的后台任务**：每 4 小时最多一次，增量读取当天
     /// `raw_session/<date>.txt` 里新增的完整 SESSION 块，只用辅助模型、只写
