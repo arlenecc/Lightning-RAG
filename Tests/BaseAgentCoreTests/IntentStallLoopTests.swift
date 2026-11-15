@@ -233,6 +233,63 @@ final class IntentStallLoopTests: XCTestCase {
 
     // MARK: - 结果性答复 / 上下文膨胀 / 跨段预算
 
+    /// 长期记忆问询空转：模型连续只说「需要调用 long_memory 工具获取」却不发
+    /// 调用时，内核应在意图空转耗尽后代发一次 long_memory(op="search")，
+    /// 把真实记忆交给模型收尾，而不是直接返回失败说明。
+    func testMemoryQuestionIntentStallFallsBackToLongMemorySearch() async {
+        let state = State()
+        let meta = "用户询问的是长期记忆内容，需要调用 long_memory 工具获取"
+        let runtime = KernelRuntime(
+            stream: { messages, _, _ in
+                let prompt = messages.last(where: { $0.role == .user })?.content ?? ""
+                _ = state.nextCall(prompt)
+                return prompt.contains("内核已代你执行 long_memory")
+                    ? self.textStream("你之前说过：项目使用 Swift。")
+                    : self.textStream(meta)
+            },
+            execute: { calls in
+                state.record(calls.map(\.name))
+                return calls.map { _ in
+                    ToolResult.ok("{\"hits\":[{\"text\":\"项目使用 Swift\"}]}")
+                }
+            },
+            schemas: { ["update_plan", "long_memory", "web_scan"].map(self.schema) },
+            log: { _ in }
+        )
+        let loop = KernelLoop(runtime: runtime, config: AgentConfig(), callbacks: nil,
+                              systemPrompt: { BASE_SYSTEM_PROMPT }, maxTurns: 8)
+        let result = await loop.run("你还记得我们项目用什么语言吗？", toolsEnabled: true)
+
+        XCTAssertTrue(state.executed.contains("long_memory"),
+            "意图空转耗尽后应代发长期记忆检索：\(state.executed)")
+        XCTAssertTrue(result.text.contains("Swift"),
+            "应基于真实记忆收尾，而不是返回失败说明：\(result.text)")
+        XCTAssertFalse(result.text.contains("没有发出任何工具调用"),
+            "兜底成功后不应再返回空转失败说明：\(result.text)")
+    }
+
+    func testIntentOnlyDetectsMentionedToolWithoutCall() {
+        XCTAssertTrue(KernelLoop.looksLikeIntentOnly("需要调用 long_memory 工具获取"),
+            "点名工具 + 动作词应判为空转")
+        XCTAssertTrue(KernelLoop.looksLikeIntentOnly("我将使用 skill_tools 查询技能"))
+        XCTAssertTrue(KernelLoop.looksLikeIntentOnly("需要先 file_tools 读取文件"),
+            "工具名 + 读取动作应判为空转")
+        XCTAssertTrue(KernelLoop.looksLikeIntentOnly("我需要先查看文件内容"),
+            "第一人称意图句 + 查看动作应判为空转")
+        XCTAssertFalse(KernelLoop.looksLikeIntentOnly("我检查了一下结果，没有问题。"),
+            "已完成的陈述不应判为空转")
+        XCTAssertFalse(KernelLoop.looksLikeIntentOnly("这是一段正常的最终答复。"))
+    }
+
+    func testIntentExamplesForSkillAndLocalFile() {
+        XCTAssertTrue(KernelLoop.looksLikeSkillQuestion("有没有处理 PDF 的技能"))
+        XCTAssertTrue(KernelLoop.looksLikeSkillQuestion("skill 里有什么"))
+        XCTAssertEqual(KernelLoop.firstLocalPath(in: "读一下 /tmp/a.md"), "/tmp/a.md")
+        XCTAssertEqual(KernelLoop.firstLocalPath(in: "打开 report.xlsx"), "report.xlsx")
+        XCTAssertNil(KernelLoop.firstLocalPath(in: "访问 https://a.com/x.md"))
+        XCTAssertEqual(KernelLoop.jsonExampleString("a\"b\\c"), "a\\\"b\\\\c")
+    }
+
     func testLooksLikeResult() {
         XCTAssertTrue(KernelLoop.looksLikeResult(
             "已完成：CNN 今日要闻共 3 条，分别是 A、B、C。"))

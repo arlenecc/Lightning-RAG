@@ -242,6 +242,7 @@ public final class SkillManager {
             "查一下", "查下", "查查", "搜一下", "搜下", "读一下", "读下", "打开",
             "写一下", "写下", "改一下", "改下", "分析", "总结", "生成", "下载",
             "执行", "运行", "编译", "翻译", "整理", "读取", "写入", "列出文件",
+            "处理", "找一个", "找个", "推荐", "适合", "用哪个", "用来",
             "fix", "debug", "write", "read", "open", "search for", "look up",
         ]
         if taskVerbs.contains(where: { lower.contains($0) }) { return false }

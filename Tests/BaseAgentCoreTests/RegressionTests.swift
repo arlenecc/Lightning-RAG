@@ -350,6 +350,15 @@ final class RegressionTests: XCTestCase {
             XCTAssertFalse(SkillManager.isGreeting(text), "不应视为寒暄: \(text)")
         }
     }
+
+    func testCapabilityQueryDoesNotSwallowConcreteSkillTask() {
+        XCTAssertTrue(SkillManager.isCapabilityQuery("你能做什么"))
+        XCTAssertTrue(SkillManager.isCapabilityQuery("你有哪些功能"))
+        XCTAssertFalse(SkillManager.isCapabilityQuery("你有哪些技能可以处理 PDF"),
+            "带具体任务的技能问询不能走无工具轻量通道")
+        XCTAssertFalse(SkillManager.isCapabilityQuery("帮我找一个处理简历的技能"),
+            "带任务动作的问询不能走无工具轻量通道")
+    }
 }
 
 private final class CountingVLM: VLMService {

@@ -223,6 +223,8 @@ public final class KernelLoop {
     private var hasToolSuccess = false
     /// 意图空转耗尽后由内核代发过一次 web_scan（一段只兜底一次）。
     private var didFallbackFetch = false
+    /// 意图空转耗尽后由内核代发过一次 long_memory(op="search")。
+    private var didFallbackMemorySearch = false
     /// 兜底抓取拿到的真实内容：模型若仍不给正文，失败说明里也要交付它。
     private var fallbackToolText = ""
     private var planNudged = 0
@@ -441,6 +443,7 @@ public final class KernelLoop {
         didWork = false
         hasToolSuccess = false
         didFallbackFetch = false
+        didFallbackMemorySearch = false
         fallbackToolText = ""
         planNudged = 0
         planFinishNudge = 0
@@ -768,9 +771,12 @@ public final class KernelLoop {
                 // 跳过计划门、直接点名真实工具、只要求输出工具调用。
                 // resume（自动续跑）段同样保留意图检测：旧实现用 !resume
                 // 把所有门控一并关掉，续跑段第一句元陈述就被当最终答复。
-                if toolsEnabled,
-                   event == "intent"
-                    || (!didWork && Self.looksLikeIntentOnly(resp.content)) {
+                // 可见正文里的元陈述（event=done）也归入同一门；长期记忆兜底
+                // 同样依据这个判定，web_scan 兜底仍只在正文为空的 event=intent
+                // 时触发（避免改变既有 cnn.com 事故的收敛行为）。
+                let intentOnly = event == "intent"
+                    || (!didWork && Self.looksLikeIntentOnly(resp.content))
+                if toolsEnabled, intentOnly {
                     intentStall += 1
                     // 空转场景也要保证计划面板有内容：多步任务模型零工具调用、
                     // 只描述计划，面板会一直空着，用户只看到「直接失败」。这里
@@ -801,7 +807,7 @@ public final class KernelLoop {
                         }
                         let toolList = names.isEmpty
                             ? "web_scan / shell_run / file_tools(op=\"read\") / code_run"
-                            : names.prefix(8).joined(separator: " / ")
+                            : names.joined(separator: " / ")
                         // 用户明确给了网址时，给出可直接照抄的调用参数：小模型
                         // 看到精确示例比抽象指令更容易真的发出 tool_call。
                         let urlExample = Self.firstWebURL(in: userInput).map { url in
@@ -811,7 +817,24 @@ public final class KernelLoop {
                         // 问「知识库里有什么」时同样给出可照抄的调用：
                         // 实测 4B 模型会连轮只输出 <summary> 而不发 tool_call。
                         let kbExample = Self.looksLikeKnowledgeBaseQuestion(userInput)
-                            ? "\n可直接照抄这一条：rag_tools({\"op\": \"status\"})。"
+                            ? "\n可直接照抄：rag_tools({\"op\": \"status\"})；"
+                                + "查内容用 rag_tools({\"op\": \"search\", "
+                                + "\"query\": \"\(Self.jsonExampleString(userInput))\"})。"
+                            : ""
+                        // 问技能库时给语义检索示例；问本地文件时给读取示例。
+                        let skillExample = Self.looksLikeSkillQuestion(userInput)
+                            ? "\n可直接照抄：skill_tools({\"op\": \"semantic_search\", "
+                                + "\"query\": \"\(Self.jsonExampleString(userInput))\"})。"
+                            : ""
+                        let fileExample = Self.firstLocalPath(in: userInput).map { path in
+                            "\n可直接照抄：file_tools({\"op\": \"read\", "
+                                + "\"path\": \"\(Self.jsonExampleString(path))\"})。"
+                        } ?? ""
+                        // 问「你还记得…」时同样给出可照抄的调用：小模型会反复
+                        // 说「需要调用 long_memory」但不知道复合工具的 op 参数。
+                        let memoryExample = Self.looksLikeMemoryQuestion(userInput)
+                            ? "\n可直接照抄这一条：long_memory({\"op\": \"search\", "
+                                + "\"query\": \"\(Self.jsonExampleString(userInput))\"})。"
                             : ""
                         pending = """
                         [System] 上一条回复只是描述了你打算做什么，没有发出任何工具调用，任务没有任何进展。
@@ -819,13 +842,46 @@ public final class KernelLoop {
                         注意：<summary>…</summary> 只是内部摘要，既不是给用户的答复，也不能代替工具调用。
                         本轮**禁止输出 `<summary>` 标签**，也不要输出任何正文。
                         现在**跳过 update_plan**，不要再创建计划、不要复述任务、不要输出「我需要」「让我」「现在开始」这类文字。
-                        直接发出一个真实工具调用去获取所需信息，然后基于工具返回结果作答。\(urlExample)\(kbExample)
+                        直接发出一个真实工具调用去获取所需信息，然后基于工具返回结果作答。\(urlExample)\(kbExample)\(skillExample)\(fileExample)\(memoryExample)
                         可用工具：\(toolList)。
                         本轮只输出工具调用本身，不要输出其它解释文字。
                         """
                         log("[kernel] 意图空转 \(intentStall)/\(maxIntentStall)："
                             + "跳过计划门，强制直接调用工具")
                         continue
+                    }
+                    // 三次强制之后模型仍不发工具调用，而用户在问长期记忆：
+                    // 内核代发一次 long_memory(op="search")，把真实记忆交给
+                    // 模型总结（只读操作；结果只进下一轮 user 提示，不伪造
+                    // tool_calls 写入 Session）。
+                    if !didFallbackMemorySearch, intentOnly,
+                       Self.looksLikeMemoryQuestion(userInput) {
+                        didFallbackMemorySearch = true
+                        let call = ToolCall(id: "", name: "long_memory",
+                                            arguments: ["op": .string("search"),
+                                                        "query": .string(userInput)])
+                        var recalled: [ToolResult] = []
+                        do {
+                            recalled = try await runtime.execute([call])
+                        } catch {
+                            log("[kernel] 长期记忆兜底检索失败：\(describe(error))")
+                        }
+                        if let first = recalled.first, first.success {
+                            didWork = true
+                            fallbackToolText = first.output
+                            let head = String(first.output.prefix(8_000))
+                            pending = """
+                            [System] 内核已代你执行 long_memory(op="search")，结果如下。
+                            **不要再调用任何工具，也不要只输出 <summary> 元标签**：
+                            直接基于下面的长期记忆结果用中文回答；没有命中就明确说
+                            「没有找到相关记忆」，不要编造。
+
+                            \(head)
+                            """
+                            log("[kernel] 意图空转耗尽：内核代发 long_memory 检索"
+                                + "（\(first.output.count) 字符）")
+                            continue
+                        }
                     }
                     // 三次强制之后模型仍不发工具调用，而用户明确给了网址：
                     // 内核代发一次 web_scan，把真实数据交给模型总结。工具结果
@@ -1710,7 +1766,34 @@ public final class KernelLoop {
     /// 用户是否在问「知识库里有什么」：这类问题应走 `rag_tools(op="status")`。
     static func looksLikeKnowledgeBaseQuestion(_ userInput: String) -> Bool {
         let text = userInput.lowercased()
-        return text.contains("知识库") || text.contains("knowledge base")
+        let markers = ["知识库", "knowledge base", "文档库", "向量库", "知识图谱", "rag_tools"]
+        return markers.contains { text.contains($0) }
+    }
+
+    /// 用户是否在问长期记忆（「你还记得…」「我之前说过…」「我的偏好」）。
+    /// 弱工具调用模型会反复说「需要调用 long_memory」却发不出调用；
+    /// 意图空转门据此给出可照抄参数，并在耗尽时由内核代查一次。
+    static func looksLikeMemoryQuestion(_ userInput: String) -> Bool {
+        let text = userInput.lowercased()
+        let markers = [
+            "长期记忆", "记忆", "记得", "还记得", "之前说", "以前说", "说过",
+            "我的偏好", "我喜欢", "我的习惯", "我常用", "我们项目",
+            "memory", "remember", "what did i", "my preference",
+        ]
+        return markers.contains { text.contains($0) }
+    }
+
+    /// 用户是否在问技能库（「有没有处理 PDF 的技能」「skill 里有什么」）。
+    static func looksLikeSkillQuestion(_ userInput: String) -> Bool {
+        let text = userInput.lowercased()
+        return text.contains("技能") || text.contains("skill")
+    }
+
+    /// 把用户原话转成可安全嵌入示例 JSON 的字符串（转义反斜杠与引号）。
+    static func jsonExampleString(_ value: String, limit: Int = 200) -> String {
+        String(value.prefix(limit))
+            .replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "\"", with: "\\\"")
     }
 
     /// 回复是否只是「声明要做什么」的元陈述，而不是任务结果。
@@ -1733,11 +1816,40 @@ public final class KernelLoop {
             "执行计划", "可验证的步骤", "创建 2~7", "开始执行计划",
             "获取", "并总结", "抓取", "并总结", "查询", "并总结",
             "我将", "我打算", "计划如下", "同步执行", "重新执行工具",
+            // 只说明「需要调用某工具获取」但仍不发 tool_call 的元陈述。
+            "需要调用", "工具获取", "调用工具获取",
             // 虚假进度声明：模型没调工具却声称「已拿到 / 本步完成 / 可继续」，
             // 这类空转若不拦，会被当正常正文收下、反复刷屏到轮次耗尽。
             "已拿到", "已获取", "已读取", "本步完成", "证实", "推翻",
             "可继续提取", "可继续下一步", "下一步是", "我将获取", "我将抓取",
         ]
+        // 通用兜底：明确点名了工具、又用了「调用/查询/读取…」这类动作词，
+        // 但整段没有任何 tool_call —— 无论具体措辞如何都应算意图空转。
+        let toolNames = [
+            "file_tools", "web_scan", "rag_tools", "skill_tools", "long_memory",
+            "memory", "shell_run", "code_run", "update_plan", "ask_user", "mcp",
+        ]
+        let actionVerbs = [
+            "调用", "使用", "执行", "查询", "检索", "读取", "获取", "搜索",
+            "扫描", "抓取", "运行",
+        ]
+        let mentionsTool = toolNames.contains { text.contains($0) }
+        let mentionsAction = actionVerbs.contains { text.contains($0) }
+        if mentionsTool && mentionsAction { return true }
+
+        // 没有点名工具、但用「我需要先查看/让我检查」这类第一人称意图句
+        // 描述下一步，同样不应作为最终答复。
+        let firstPersonIntent = [
+            "我需要", "我先", "让我", "我将", "接下来我", "待我", "稍后我", "正在",
+        ]
+        let inspectVerbs = [
+            "查看", "检查", "看一下", "先看", "搜索", "检索", "查询", "读取",
+            "获取", "确认", "分析", "扫描",
+        ]
+        if firstPersonIntent.contains(where: { text.contains($0) }),
+           inspectVerbs.contains(where: { text.contains($0) }) {
+            return true
+        }
         return markers.filter { text.contains($0) }.count >= 2
     }
 
@@ -1802,6 +1914,31 @@ public final class KernelLoop {
             if let url = WebURLPolicy.normalizedURLString(candidate) {
                 return url
             }
+        }
+        return nil
+    }
+
+    /// 从用户输入里抽出第一个本地路径（绝对路径或常见扩展名文件），
+    /// 用于意图空转提示给出可照抄的 `file_tools(op="read")` 参数。
+    static func firstLocalPath(in text: String) -> String? {
+        let extensions: Set<String> = [
+            "md", "txt", "pdf", "csv", "tsv", "json", "jsonl", "yaml", "yml",
+            "toml", "ini", "conf", "env", "xml", "log", "sqlite", "db",
+            "swift", "py", "js", "ts", "html", "css", "sh", "sql",
+            "xlsx", "xls", "docx", "pptx", "png", "jpg", "jpeg",
+        ]
+        let separators = CharacterSet(charactersIn:
+            " \n\t\r，。；、,;:\"'“”‘’（）()[]{}<>")
+        let cleaned = KernelRegex.replace("https?://[^\\s]+", in: text, with: " ",
+                                          options: [.caseInsensitive])
+        for raw in cleaned.components(separatedBy: separators) {
+            let token = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !token.isEmpty, !token.contains("://"),
+                  !token.hasPrefix("//") else { continue }
+            if token.hasPrefix("/"), token.count > 1 { return token }
+            guard let dot = token.lastIndex(of: ".") else { continue }
+            let ext = String(token[token.index(after: dot)...]).lowercased()
+            if extensions.contains(ext) { return token }
         }
         return nil
     }
@@ -2048,6 +2185,7 @@ public final class KernelLoop {
         didWork = false
         hasToolSuccess = false
         didFallbackFetch = false
+        didFallbackMemorySearch = false
         fallbackToolText = ""
         planNudged = 0
         planFinishNudge = 0
