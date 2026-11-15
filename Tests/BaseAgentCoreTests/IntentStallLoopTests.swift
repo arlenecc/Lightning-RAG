@@ -268,6 +268,40 @@ final class IntentStallLoopTests: XCTestCase {
             "兜底成功后不应再返回空转失败说明：\(result.text)")
     }
 
+    /// 搜索类任务空转：模型连续只说「需要先建计划再搜索」却不发调用，
+    /// 内核应在意图空转耗尽后代发一次 web_search，把真实搜索结果交给模型收尾。
+    func testSearchQuestionIntentStallFallsBackToWebSearch() async {
+        let state = State()
+        let meta = "我需要先创建计划，然后搜索今天最新的 AI 新闻。"
+        let runtime = KernelRuntime(
+            stream: { messages, _, _ in
+                let prompt = messages.last(where: { $0.role == .user })?.content ?? ""
+                _ = state.nextCall(prompt)
+                return prompt.contains("内核已代你执行 web_search")
+                    ? self.textStream("AI 新闻：A、B。")
+                    : self.textStream(meta)
+            },
+            execute: { calls in
+                state.record(calls.map(\.name))
+                return calls.map { _ in
+                    ToolResult.ok("1. AI 新闻 A\n2. AI 新闻 B\nhttps://example.com/a")
+                }
+            },
+            schemas: { ["update_plan", "web_search", "web_scan"].map(self.schema) },
+            log: { _ in }
+        )
+        let loop = KernelLoop(runtime: runtime, config: AgentConfig(), callbacks: nil,
+                              systemPrompt: { BASE_SYSTEM_PROMPT }, maxTurns: 8)
+        let result = await loop.run("搜索今天最新的 AI 新闻", toolsEnabled: true)
+
+        XCTAssertTrue(state.executed.contains("web_search"),
+            "搜索类空转应代发 web_search：\(state.executed)")
+        XCTAssertTrue(result.text.contains("AI 新闻"),
+            "应基于真实搜索结果收尾：\(result.text)")
+        XCTAssertFalse(result.text.contains("没有发出任何工具调用"),
+            "兜底成功后不应返回空转失败说明：\(result.text)")
+    }
+
     func testIntentOnlyDetectsMentionedToolWithoutCall() {
         XCTAssertTrue(KernelLoop.looksLikeIntentOnly("需要调用 long_memory 工具获取"),
             "点名工具 + 动作词应判为空转")

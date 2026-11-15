@@ -223,6 +223,8 @@ public final class KernelLoop {
     private var hasToolSuccess = false
     /// 意图空转耗尽后由内核代发过一次 web_scan（一段只兜底一次）。
     private var didFallbackFetch = false
+    /// 意图空转耗尽后由内核代发过一次 web_search（一段只兜底一次）。
+    private var didFallbackSearch = false
     /// 意图空转耗尽后由内核代发过一次 long_memory(op="search")。
     private var didFallbackMemorySearch = false
     /// 兜底抓取拿到的真实内容：模型若仍不给正文，失败说明里也要交付它。
@@ -443,6 +445,7 @@ public final class KernelLoop {
         didWork = false
         hasToolSuccess = false
         didFallbackFetch = false
+        didFallbackSearch = false
         didFallbackMemorySearch = false
         fallbackToolText = ""
         planNudged = 0
@@ -763,6 +766,26 @@ public final class KernelLoop {
                 // 识别「获取/查询/搜索」类任务，统一走本门的 3 次推进预算。）
                 let openSteps = session.planOpenSteps()
 
+                // 计划状态被 update_plan 全部标成 done/skipped，但本段从未调用
+                // 任何实际工具：这不是完成，而是绕过执行。必须逼它先拿到真实
+                // 工具结果；提醒预算耗尽后，结尾会把虚假 done 降级为 skipped。
+                let planClosedWithoutWork = toolsEnabled && !didWork
+                    && isMultistep(userInput)
+                    && session.getPlan() != nil && openSteps.isEmpty
+                if planClosedWithoutWork, finishNudge < finishNudgePlanMax {
+                    finishNudge += 1
+                    session.finishTurn(rec, assistantText: resp.content,
+                                       summary: l2Summary(resp.content),
+                                       rawContent: resp.rawContent)
+                    pending = """
+                    [System] 计划里的步骤已经被 update_plan 标成完成/跳过，但本段从未调用任何实际工具——update_plan 只改计划状态，不能替代文件读取 / 检索 / 执行，也不能用 create 时直接写 status="done" 绕过执行。
+                    若任务需要外部或文件信息，现在必须发出一个真实工具调用（如 web_search / web_scan / rag_tools(op="search") / file_tools / shell_run），拿到结果后再收尾。
+                    若确实完全不需要工具，请在正文中说明依据；内核还会再提醒 \(finishNudgePlanMax - finishNudge) 次。
+                    """
+                    log("[kernel] 计划已闭合但零实际工具调用，提醒 \(finishNudge)/\(finishNudgePlanMax)")
+                    continue
+                }
+
                 // 「我要先创建计划 / 现在开始执行第一步」这类纯意图声明：
                 // 既没有工具调用也没有任何实质结果，绝不能当最终答复收下。
                 // 旧路径会由 noToolEvent 判 done → reason=done、plan 仍为空
@@ -912,6 +935,44 @@ public final class KernelLoop {
                             \(head)
                             """
                             log("[kernel] 意图空转耗尽：内核代发 web_scan 兜底抓取"
+                                + "（\(first.output.count) 字符）")
+                            continue
+                        }
+                    }
+                    // 三次强制之后模型仍不发调用，且任务不是给网址 / 本地文件 /
+                    // 知识库 / 技能 / 长期记忆：代发一次 web_search，把真实搜索结果
+                    // 交给模型收尾。搜索类任务不再因小模型只会描述计划而空转失败。
+                    if !didFallbackSearch, !resume, intentOnly,
+                       Self.firstWebURL(in: userInput) == nil,
+                       Self.firstLocalPath(in: userInput) == nil,
+                       !Self.looksLikeKnowledgeBaseQuestion(userInput),
+                       !Self.looksLikeSkillQuestion(userInput),
+                       !Self.looksLikeMemoryQuestion(userInput) {
+                        didFallbackSearch = true
+                        let call = ToolCall(
+                            id: "", name: "web_search",
+                            arguments: ["query": .string(userInput),
+                                        "count": .int(8)])
+                        var searched: [ToolResult] = []
+                        do {
+                            searched = try await runtime.execute([call])
+                        } catch {
+                            log("[kernel] 兜底搜索失败：\(describe(error))")
+                        }
+                        if let first = searched.first, first.success,
+                           !first.output.isEmpty {
+                            fallbackToolText = first.output
+                            didWork = true
+                            let head = String(first.output.prefix(8_000))
+                            pending = """
+                            [System] 内核已代你执行 web_search，搜索结果如下。
+                            **不要再调用任何工具，也不要只输出 <summary> 元标签**：
+                            直接基于下面的搜索结果用中文回答；需要正文时从结果中取真实 URL 再 web_scan。
+                            没有命中就明确说「没有找到相关信息」，不要编造。
+
+                            \(head)
+                            """
+                            log("[kernel] 意图空转耗尽：内核代发 web_search"
                                 + "（\(first.output.count) 字符）")
                             continue
                         }
@@ -1193,14 +1254,19 @@ public final class KernelLoop {
                     successSigs.insert(callSig(tc))
                 }
             }
-            // 建计划（create）不算开工；但 patch 实际改变了步骤状态（尤其标 done）
-            // 算「做过事」——避免「只调了 update_plan 却被判定为一次工具都没调用」的
-            // 误导，也让纯文字收尾时把已 patch 完成的计划正确视为已完成。
-            if hasActual || batch.planPatched { didWork = true }
-            // 只有真正成功返回过内容的工具结果才让成果核验门开启：
+            // 只有真正发出非 update_plan 的工具调用才算开工。
+            // `update_plan` 只改计划状态，绝不能算作「已经做过事」，否则
+            // 模型可以 create 时直接写 status="done"、再输出一段文字就收尾，
+            // 计划面板显示完成但实际一个工具都没执行（真实空转漏洞）。
+            if hasActual { didWork = true }
+            // 只有真正非 update_plan 的工具成功返回过内容才让成果核验门开启：
             // preset 预置失败 / dispatcher 异常都会让 hasActual 为真，
-            // 但那时「核验」审视的只是幻觉结论。
-            if rawResults.contains(where: { $0.success && !$0.output.isEmpty }) {
+            // update_plan 的成功也不能当作「有工具结果」。
+            for (index, call) in toolCalls.enumerated()
+            where call.name != "update_plan" {
+                guard index < rawResults.count,
+                      rawResults[index].success,
+                      !rawResults[index].output.isEmpty else { continue }
                 hasToolSuccess = true
             }
 
@@ -1347,6 +1413,34 @@ public final class KernelLoop {
                 if autoDone > 0 {
                     finalText += "\n\n---\n（计划已自动标记 \(autoDone) 个步骤为完成）"
                 }
+            }
+        }
+
+        // 计划被模型用 update_plan 标完成，但整段没有任何实际工具调用：
+        // 不能把虚假 done 留在计划面板里，也不能让最终答复看起来已验证完成。
+        if exitReason == .done && !didWork, isMultistep(userInput),
+           let plan = session.getPlan() {
+            var adjusted = plan
+            var downgraded = 0
+            for index in adjusted.steps.indices
+            where adjusted.steps[index].status == "done" {
+                adjusted.steps[index].status = "skipped"
+                if adjusted.steps[index].note.isEmpty {
+                    adjusted.steps[index].note = "无实际工具验证（文字收尾），已降级为 skipped"
+                }
+                downgraded += 1
+            }
+            if downgraded > 0 {
+                session.setPlan(adjusted)
+                do {
+                    try PlanStore.save(adjusted, config: config)
+                } catch {
+                    AgentLog.warning("[kernel] 计划降级落盘失败: \(error.localizedDescription)")
+                }
+                callbacks.onPlanUpdated(adjusted)
+                finalText += "\n\n---\n⚠ 计划中 \(downgraded) 个“完成”步骤没有实际工具验证，"
+                    + "已降级为 skipped，不能视为已完成。"
+                log("[kernel] 零实际工具调用，计划中 \(downgraded) 个 done 降级为 skipped")
             }
         }
 
@@ -1641,9 +1735,6 @@ public final class KernelLoop {
         var failed: [(name: String, error: String)] = []
         var repeats: [(name: String, error: String)] = []
         var planMutated = false
-        /// 仅 `update_plan(op="patch")` 成功改变步骤状态时为真；`create` 不算，
-        /// 因为「只建计划」仍视为未开工。
-        var planPatched = false
     }
 
     private func resultOK(_ res: ToolResult) -> (Bool, String) {
@@ -1663,11 +1754,7 @@ public final class KernelLoop {
         for (tc, res) in zip(toolCalls, rawResults) {
             let (ok, err) = resultOK(res)
             if tc.name == "update_plan" {
-                if ok {
-                    batch.planMutated = true
-                    let op = (tc.arguments["op"]?.stringValue ?? "").lowercased()
-                    if op == "patch" { batch.planPatched = true }
-                }
+                if ok { batch.planMutated = true }
                 continue
             }
             if ok { continue }
@@ -2185,6 +2272,7 @@ public final class KernelLoop {
         didWork = false
         hasToolSuccess = false
         didFallbackFetch = false
+        didFallbackSearch = false
         didFallbackMemorySearch = false
         fallbackToolText = ""
         planNudged = 0
