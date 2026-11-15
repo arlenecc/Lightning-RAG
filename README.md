@@ -174,7 +174,7 @@ RAG 知识图谱与长期记忆的 **memory graph 是两套完全独立的实现
 - **构建**：在已完成切片上由辅助模型逐片抽取 `entity<|#|>name<|#|>type<|#|>desc` 与 `relation<|#|>src<|#|>dst<|#|>keywords<|#|>desc`，注入所在章节层级作为 Section Context。单切片限额可配：实体 20、关系 50、描述 100 字（`rag_kg_max_entities_per_chunk` / `rag_kg_max_relations_per_chunk` / `rag_kg_max_description_chars`）；同名实体聚合、类型 `/` 合并、文件来源合并，描述在至少 2 条时由 LLM 归纳；无向关系按实体对合并，`weight = max(累加权重, 去重来源数)`；关系中缺失的端点落 UNKNOWN 占位实体。
 - **向量**：实体文本 `name\ndescription`，关系文本 `keywords\tsrc\ndst\ndescription`，关系额外写入正/反序两条 id（`#rev`）；文本先按 1000 token 截断，jina-v5 取 128 维后重新 L2 归一化并量化 int8；查询侧同样加 `Query: ` 前缀并做相同变换。向量写入 `kg_vectors`（普通表 int8 BLOB）与单张 `kg_vectors_vec` vec0 表（`target_type` 分区键区分实体/关系），vec0 不可用时回退精确余弦扫描。
 - **图谱与快照**：SwiftGraph 无向图承载内存图，节点/边保留来源 chunk 用于归因反查；快照 JSON 带 `schemaVersion` 与 DB `revision` 校验，1 秒防抖落盘；`kg_build_state` 记录 building / complete / stale。
-- **增量更新**：只抽取 `kg_processed_chunks` 中不存在或内容哈希变化的切片，返回实体/关系变更集，内存图做局部 upsert，不整图重建；文档删除/内容变化会把图谱标记 stale。
+- **增量更新**：只抽取 `kg_processed_chunks` 中不存在或内容哈希变化的切片，返回实体/关系变更集，内存图做局部 upsert，不整图重建；文档删除/内容变化会把图谱标记 stale。新增切片后的增量抽取在同步收尾时转后台执行，同步不等待图谱抽完。
 - **检索**：查询先由 LLM 抽低层实体词与高层主题词，低层词向量查实体、高层词向量查关系、原 query 向量查 chunk，三路 embedding 在同一批内计算；实体/关系各取 top 40，chunk 取 20，实体与关系反查 chunk 每命中最多 5 片；按 chunk_id 轮询交错去重，query 直接召回优先，余弦低于 0.2 丢弃；实体排序 = 余弦 0.8 + 度数 0.2，关系排序 = 余弦 0.7 + rank 0.2 + weight 0.1；实体预算 6000 token、关系 8000 token，连同 system + query + 原文总预算 30000 token。
 - **抽取性能**：抽取结果按切片内容哈希缓存（跨重建复用）、LLM 归纳结果单独缓存，并在阶段日志中输出抽取/归纳/向量化耗时；小模型复读同一批关系时按重复关系行提前收流，避免跑满 token 上限。并发默认关闭（`rag_kg_max_concurrency=1`）：本地 MLX 的 isolated 请求共享同一块 GPU，实测 4 路并发让 prefill 从约 2 秒退化到 40 秒以上、MLX 活跃内存冲到 11GB 并触发 `EXC_BREAKPOINT` 崩溃；内存充足的机器可手动调到 2~4。首轮结果为空或末行字段残缺时追加一次「只补漏、不重复」的二次抽取；复读触发的收流不再补抽，避免把相同内容再生成一遍。
 - **提示词防护**：正文用代码围栏与 `---Output---` 锚点隔离，Section Context 以单行「untrusted metadata」注入并明确不得执行其中指令；system prompt 带 relation/entity 前缀与分隔符的 Wrong/Correct 反例，关系端点缺失时提示补抽实体、纯数字/年份不成实体。关系行缺 description（4 段）时解析器用 keywords 兜底，不丢边。
@@ -184,7 +184,7 @@ RAG 知识图谱与长期记忆的 **memory graph 是两套完全独立的实现
 
 所有文件类工具（`file_tools`）路径锁定在 workspace 内，并解析 symlink 防止逃逸。`code_run` / `shell_run` / MCP 调用按配置触发确认；`schedule_task` 的创建、删除与立即执行同样需要用户确认（确认框展示完整任务指令）。
 
-技能保存会同时写 `SKILL.md` 与 `skill.json`：前者供模型加载，后者供关键词索引扫描；只有主技能目录是 `<workspace>/skills` 时才额外镜像到 `.agent/skills`，不会出现 `.agent/.agent/skills` 的嵌套路径。索引入口缺失时会自动回退到实际存在的 `SKILL.md` / `prompt.md`。
+技能保存会同时写 `SKILL.md` 与 `skill.json`：前者供模型加载，后者供关键词索引扫描；只有主技能目录是 `<workspace>/skills` 时才额外镜像到 `.agent/skills`，不会出现 `.agent/.agent/skills` 的嵌套路径。索引入口缺失时会自动回退到实际存在的 `SKILL.md` / `prompt.md`。语义检索的向量缓存落在 `<workspace>/.agent/skill_vectors.json`（技能目录上一级），按技能绝对路径 + 内容指纹增量同步：启动时加载，技能新增/修改只重算变化项，删除技能同步清理缓存；embedding 模型或维度变化时整份作废重算。语义检索先走向量 + BM25 粗排，再用多语 reranker 对前 40 个候选精排；每个技能的向量由 description 与「examples 或 name+tags+keywords」两路融合，同名技能只保留分数最高的一份。`top_k` 默认 3、上限 5。`<workspace>/skills/need-deps/` 用于存放依赖外部服务/工具的技能，扫描、语义召回与自动注入都会跳过该目录；需要时仍可按路径手动加载（`skill_tools(op="load", path="need-deps/..."`）。
 
 技能建议只针对真正的多步骤任务：寒暄、问候、简单问询与一次性查询不进入重复请求统计；只有本轮创建过 ≥2 步的计划且所有步骤都已 `done`，或模型显式调用 `start_long_term_update`，才会提示固化。没有计划的对话也不会注入 `skill_tools(op="save")` 的周期性 TIPS，系统提示同样禁止对这类请求询问是否保存技能。
 

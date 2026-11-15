@@ -52,7 +52,7 @@ public final class SkillSearchTool: AgentTool {
             ]),
             "top_k": .object([
                 "type": .string("integer"),
-                "description": .string("返回条数，默认 5，范围 1-20"),
+                "description": .string("返回条数，默认 3，范围 1-5"),
             ]),
         ]),
         "required": .array([.string("query")]),
@@ -75,7 +75,7 @@ public final class SkillSearchTool: AgentTool {
 
         let query = args.trimmedString("query")
         guard !query.isEmpty else { return .fail("缺少参数: query") }
-        let topK = args.boundedInt("top_k", default: 5, range: 1...20)
+        let topK = args.boundedInt("top_k", default: 3, range: 1...5)
         let results = index.search(query: query, topK: topK)
         if results.isEmpty {
             return .ok("找不到匹配的技能。")
@@ -159,7 +159,7 @@ public final class SkillSemanticSearchTool: AgentTool {
             ]),
             "top_k": .object([
                 "type": .string("integer"),
-                "description": .string("返回条数，默认 5，范围 1-20"),
+                "description": .string("返回条数，默认 3，范围 1-5"),
             ]),
         ]),
         "required": .array([.string("query")]),
@@ -179,7 +179,7 @@ public final class SkillSemanticSearchTool: AgentTool {
     public func run(_ args: [String: JSONValue]) async throws -> ToolResult {
         let query = args.trimmedString("query")
         guard !query.isEmpty else { return .fail("缺少参数: query") }
-        let topK = args.boundedInt("top_k", default: 5, range: 1...20)
+        let topK = args.boundedInt("top_k", default: 3, range: 1...5)
         let skills = await retriever.retrieve(query: query, topK: topK)
         guard !skills.isEmpty else {
             return .ok("找不到匹配的技能。")

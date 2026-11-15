@@ -131,7 +131,7 @@ public final class SkillIndex {
     }
 
     /// 与 Python 版一致：名称匹配权重最高，其次关键词 / tags，描述子串兜底。
-    public func search(query: String, topK: Int = 5) -> [SkillIndexEntry] {
+    public func search(query: String, topK: Int = 3) -> [SkillIndexEntry] {
         let q = query.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !q.isEmpty else { return [] }
         scan()
@@ -139,7 +139,7 @@ public final class SkillIndex {
 
         let queryTokens = Set(SkillTextTokenizer.tokens(q))
         let lowered = q.lowercased()
-        let limit = max(1, topK)
+        let limit = max(1, min(topK, 5))
 
         var scored: [(entry: SkillIndexEntry, score: Int)] = []
         for entry in snapshot {

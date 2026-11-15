@@ -318,8 +318,10 @@ public final class Agent: @unchecked Sendable {
                                              builtinDirectories: [builtin])
         self.skillIndex = SkillIndex(skillsDirectory: skillsDirectory)
         let embedding = LocalModelFactory.shared.makeEmbedding(config: config)
-        self.skillRetriever = SkillRetriever(manager: self.skills, embedding: embedding)
-        self.ragEngine = RAGEngine(config: config, embedding: embedding)
+        let reranker = LocalModelFactory.shared.makeReranker(config: config)
+        self.skillRetriever = SkillRetriever(manager: self.skills, embedding: embedding,
+                                             reranker: reranker)
+        self.ragEngine = RAGEngine(config: config, embedding: embedding, reranker: reranker)
         let memoryDir = MemoryDirectory(workspace: config.workspace)
         memoryDir.ensureLayout()
         self.memoryDirectory = memoryDir
@@ -994,13 +996,16 @@ public final class Agent: @unchecked Sendable {
         }
 
         // 命中技能：截断并提示用 skill_tools(op="load") 读全文。
-        if !lastUserText.isEmpty, let matched = skills.match(lastUserText) {
-            var prompt = matched.body
+        // 至少 2 分才注入，单个常见词命中不足以代表任务与技能相关。
+        if !lastUserText.isEmpty, let matched = skills.matchScored(lastUserText),
+           matched.score >= 2 {
+            let skill = matched.skill
+            var prompt = skill.body
             if prompt.count > SystemPromptLimits.maxSkillPromptChars {
                 prompt = String(prompt.prefix(SystemPromptLimits.maxSkillPromptChars))
                     + "\n…（已截断，用 skill_tools(op=\"load\") 读取完整技能内容）"
             }
-            sections.append("# Active skill: \(matched.name)\n\(prompt)")
+            sections.append("# Active skill: \(skill.name)\n\(prompt)")
         }
 
         // 知识库状态只读 RAGEngine 的快照：绝不在这里同步打开/扫描向量库。

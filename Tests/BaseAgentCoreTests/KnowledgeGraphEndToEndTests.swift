@@ -200,6 +200,8 @@ final class KnowledgeGraphEndToEndTests: XCTestCase {
         XCTAssertGreaterThan(ingest.processed, 0,
                              "processed=\(ingest.processed) skipped=\(ingest.skipped) "
                              + "discarded=\(ingest.discarded) errors=\(ingest.errors)")
+        // 增量图谱抽取已改为同步收尾后的后台任务，等待其完成再断言。
+        await engine.waitForIncrementalKnowledgeGraphUpdate()
         XCTAssertNotNil(engine.graphEntity(named: "Dana"), "增量更新应把新实体并入内存图")
         XCTAssertGreaterThanOrEqual(engine.knowledgeGraphStatus().entities, 9)
         let danaRelations = engine.graphIncidentRelationships(name: "Dana")

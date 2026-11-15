@@ -35,11 +35,20 @@ public final class SkillRetriever {
     private let embedding: EmbeddingProvider?
     private let lock = NSRecursiveLock()
 
-    private struct SkillVector {
+    private struct SkillVector: Codable {
         var fingerprint: String
         var description: [Float]
         var examples: [Float]
         var examplesEmpty: Bool
+    }
+
+    /// 技能向量磁盘缓存。按技能绝对路径 + 内容指纹校验，技能文件变化时
+    /// 只重算变化项；embedding 模型或维度改变时整份作废。
+    private struct VectorCacheFile: Codable {
+        var version: Int
+        var embedding: String
+        var dimension: Int
+        var skills: [String: SkillVector]
     }
 
     private struct BM25Doc {
@@ -55,12 +64,27 @@ public final class SkillRetriever {
     private var bm25Signature = ""
     private var forceScan = false
 
+    /// 向量缓存文件放在技能目录的上一级（App 下即 `.agent/skill_vectors.json`），
+    /// 避免被技能扫描当成技能目录。
+    private let cachePath: String
+    private let cachePathLock = NSLock()
+    private var cacheLoaded = false
+    private var cacheDirty = false
+    private static let cacheVersion = 3
+    /// 可选精排器：向量+BM25 先取短名单，再用多语 reranker 按名称/描述精排，
+    /// 显著改善中文任务 ↔ 英文技能名/描述的跨语言召回。
+    private let reranker: RerankProvider?
+
     private let k1 = 1.5
     private let b = 0.75
 
-    public init(manager: SkillManager, embedding: EmbeddingProvider? = nil) {
+    public init(manager: SkillManager, embedding: EmbeddingProvider? = nil,
+                reranker: RerankProvider? = nil) {
         self.manager = manager
         self.embedding = embedding
+        self.reranker = reranker
+        let parent = (manager.skillsDirectory as NSString).deletingLastPathComponent
+        self.cachePath = (parent as NSString).appendingPathComponent("skill_vectors.json")
     }
 
     public convenience init(skillsDirectory: String,
@@ -91,19 +115,20 @@ public final class SkillRetriever {
     }
 
     /// 混合检索，返回带目录的候选。
-    public func retrieve(query: String, topK: Int = 5) async -> [RetrievedSkill] {
+    public func retrieve(query: String, topK: Int = 3) async -> [RetrievedSkill] {
         let q = query.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !q.isEmpty else { return [] }
-        let limit = max(1, min(topK, 20))
+        let limit = max(1, min(topK, 5))
         let skills = await refreshIndex()
 
         let queryTokens = SkillTextTokenizer.tokens(q)
         let rawBM25 = bm25Score(for: queryTokens)
-        // 与 Python 版一致：BM25 通道只取前 3 个候选。
+        // 有 reranker 时扩大召回窗口，先粗排再精排；没有时沿用前 3。
+        let recall = reranker == nil ? limit : max(limit * 10, 40)
         let bm25Top = rawBM25.sorted {
             if $0.value != $1.value { return $0.value > $1.value }
             return $0.key < $1.key
-        }.prefix(3)
+        }.prefix(recall)
         let bm25Scores = Dictionary(uniqueKeysWithValues: bm25Top.map { ($0.key, $0.value) })
 
         var queryVector: [Float]?
@@ -155,9 +180,11 @@ public final class SkillRetriever {
                 }
                 return $0.path < $1.path
             }
-            for item in ranked.prefix(limit) {
+            // 有 reranker 时放宽阈值，让它对更大的短名单做精排。
+            let vectorThreshold = reranker == nil ? 0.5 : 0
+            for item in ranked.prefix(recall) {
                 let keywordScore = bm25Scores[item.path] ?? 0
-                guard item.candidate.score >= 0.5 || keywordScore > 0 else { continue }
+                guard item.candidate.score >= vectorThreshold || keywordScore > 0 else { continue }
                 let existing = candidates[item.path]
                 candidates[item.path] = RetrievedSkill(
                     dir: item.candidate.dir, name: item.candidate.name,
@@ -167,15 +194,41 @@ public final class SkillRetriever {
             }
         }
 
-        return candidates.values.sorted {
+        // 同名技能可能来自不同目录（如 writing-skills 与 skills-codex 的同名副本），
+        // 只保留分数最高的一份，避免重复项占满备选名额。
+        var seenNames = Set<String>()
+        let unique = candidates.values.sorted {
             if $0.score != $1.score { return $0.score > $1.score }
             if $0.bm25Score != $1.bm25Score { return $0.bm25Score > $1.bm25Score }
             return $0.name.localizedStandardCompare($1.name) == .orderedAscending
-        }.prefix(limit).map { $0 }
+        }.filter { seenNames.insert($0.name.lowercased()).inserted }
+        // 有关键词命中但没有进入向量 topK 的候选分数为 0：有正向语义分时
+        // 不再展示它们，避免出现 0.000 的干扰项；全部为 0 时仍回退展示。
+        let positive = unique.filter { $0.score > 0 }
+        var ranked = positive.isEmpty ? unique : positive
+
+        // 向量模型很小，跨语言（中文任务 ↔ 英文技能名/描述）时排序容易接近。
+        // 用多语 reranker 对前 12 个候选按「名称 + 描述」精排，只影响排序。
+        if let reranker {
+            let shortlist = Array(ranked.prefix(recall))
+            let documents = shortlist.map { "\($0.name). \($0.description)" }
+            if let scores = try? await reranker.rerank(query: q, documents: documents),
+               scores.count == shortlist.count {
+                var reranked = shortlist
+                for index in reranked.indices {
+                    reranked[index].score = scores[index]
+                }
+                ranked = reranked.sorted {
+                    if $0.score != $1.score { return $0.score > $1.score }
+                    return $0.name.localizedStandardCompare($1.name) == .orderedAscending
+                }
+            }
+        }
+        return Array(ranked.prefix(limit))
     }
 
     /// 转换成共享契约中的 `SkillSuggestion`。
-    public func suggestions(query: String, topK: Int = 5) async -> [SkillSuggestion] {
+    public func suggestions(query: String, topK: Int = 3) async -> [SkillSuggestion] {
         await retrieve(query: query, topK: topK).map {
             SkillSuggestion(name: $0.name,
                             description: $0.description,
@@ -184,12 +237,15 @@ public final class SkillRetriever {
     }
 
     /// 释放内存索引（检索器仍可继续使用，下次会重建）。
+    /// 向量已持久化到磁盘，这里只清内存，下次检索直接重新加载缓存。
     public func close() {
         lock.lock()
         vectors = [:]
         bm25Docs = []
         idf = [:]
         bm25Signature = ""
+        cacheLoaded = false
+        cacheDirty = false
         lock.unlock()
     }
 
@@ -201,13 +257,79 @@ public final class SkillRetriever {
         forceScan = false
         lock.unlock()
 
+        ensureVectorCacheLoaded()
         let skills = manager.scan(force: force)
         rebuildBM25(skills, force: force)
 
         if let embedding {
             await syncVectors(skills, embedding: embedding)
         }
+        persistVectorsIfNeeded()
         return skills
+    }
+
+    // MARK: - 向量缓存
+
+    /// 启动/首次检索时把磁盘向量加载进内存；模型或维度不匹配则整份丢弃。
+    private func ensureVectorCacheLoaded() {
+        guard let embedding else { return }
+        cachePathLock.lock()
+        let alreadyLoaded = cacheLoaded
+        cachePathLock.unlock()
+        guard !alreadyLoaded else { return }
+
+        let dimension = embedding.dimension
+        var loaded: [String: SkillVector] = [:]
+        var invalid = false
+        if let data = FileManager.default.contents(atPath: cachePath),
+           let file = try? JSONDecoder().decode(VectorCacheFile.self, from: data) {
+            if file.version == Self.cacheVersion,
+               file.embedding == embedding.identifier,
+               file.dimension == dimension {
+                loaded = file.skills.filter {
+                    $0.value.description.count == dimension
+                        && $0.value.examples.count == dimension
+                }
+            } else {
+                invalid = true
+            }
+        }
+
+        lock.lock()
+        if !cacheLoaded {
+            // 只补内存里还没有的路径：并发首次检索已经算出的结果优先。
+            for (path, vector) in loaded where vectors[path] == nil {
+                vectors[path] = vector
+            }
+            cacheLoaded = true
+            if invalid { cacheDirty = true }
+        }
+        lock.unlock()
+    }
+
+    /// 把最新向量快照原子写回磁盘。无变化时不写，避免每次检索都重写文件。
+    private func persistVectorsIfNeeded() {
+        guard let embedding else { return }
+        lock.lock()
+        guard cacheDirty else { lock.unlock(); return }
+        let snapshot = vectors
+        cacheDirty = false
+        lock.unlock()
+
+        let payload = VectorCacheFile(version: Self.cacheVersion,
+                                      embedding: embedding.identifier,
+                                      dimension: embedding.dimension,
+                                      skills: snapshot)
+        guard let data = try? JSONEncoder().encode(payload) else { return }
+        let directory = (cachePath as NSString).deletingLastPathComponent
+        try? FileManager.default.createDirectory(atPath: directory,
+                                                 withIntermediateDirectories: true)
+        do {
+            try AtomicFile.write(data, to: cachePath)
+        } catch {
+            AgentLog.warning("skill_retriever: 向量缓存写入失败: "
+                + error.localizedDescription)
+        }
     }
 
     private func rebuildBM25(_ skills: [Skill], force: Bool) {
@@ -252,9 +374,11 @@ public final class SkillRetriever {
         idf = computedIDF
         averageLength = docs.isEmpty ? 0 : Double(totalLength) / Double(docs.count)
         bm25Signature = signature
-        // 清理已删除技能的向量，避免内存无界增长。
+        // 清理已删除技能的向量，避免内存无界增长；有删除时标记缓存待落盘。
         let alive = Set(skills.map(\.absolutePath))
+        let before = vectors.count
         vectors = vectors.filter { alive.contains($0.key) }
+        if vectors.count != before { cacheDirty = true }
         lock.unlock()
     }
 
@@ -282,12 +406,15 @@ public final class SkillRetriever {
     }
 
     private func syncVectors(_ skills: [Skill], embedding: EmbeddingProvider) async {
+        let dimension = embedding.dimension
         var missing: [Skill] = []
         lock.lock()
         for skill in skills {
-            if vectors[skill.absolutePath]?.fingerprint != skill.fingerprint {
-                missing.append(skill)
-            }
+            let cached = vectors[skill.absolutePath]
+            let valid = cached?.fingerprint == skill.fingerprint
+                && cached?.description.count == dimension
+                && cached?.examples.count == dimension
+            if !valid { missing.append(skill) }
         }
         lock.unlock()
         guard !missing.isEmpty else { return }
@@ -295,9 +422,17 @@ public final class SkillRetriever {
         let descriptionTexts = missing.map { skill in
             String((skill.description.isEmpty ? skill.name : skill.description).prefix(2_000))
         }
-        let exampleTexts = missing.map { skill in
-            let source = skill.examples.isEmpty ? skill.description : skill.examples
-            return String((source.isEmpty ? skill.name : source).prefix(3_000))
+        let exampleTexts = missing.enumerated().map { index, skill -> String in
+            // 没有 examples 时用「名称 + tags + keywords」作为第二路向量：
+            // 名称往往就是任务名（test-driven-development / meeting-insights-analyzer），
+            // 只嵌入长描述会把这些强信号稀释掉。
+            guard skill.examples.isEmpty else {
+                return String(skill.examples.prefix(3_000))
+            }
+            let header = ([skill.name] + skill.tags + skill.keywords)
+                .filter { !$0.isEmpty }
+                .joined(separator: " ")
+            return String((header.isEmpty ? skill.name : header).prefix(2_000))
         }
 
         do {
@@ -328,8 +463,9 @@ public final class SkillRetriever {
                     fingerprint: skill.fingerprint,
                     description: descriptionVector,
                     examples: exampleVector,
-                    examplesEmpty: skill.examples.isEmpty)
+                    examplesEmpty: false)
             }
+            cacheDirty = true
             lock.unlock()
         } catch {
             AgentLog.warning("skill_retriever: 语义索引不可用，回退 BM25: \(error.localizedDescription)")

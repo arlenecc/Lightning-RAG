@@ -563,6 +563,11 @@ public final class RAGEngine {
     private var kgStore: KnowledgeGraphStore?
     private var kgGraph: KnowledgeGraph?
     private let kgLock = NSLock()
+    /// 同步收尾的增量图谱更新任务：后台执行，不阻塞同步返回。
+    /// `pending` 用于运行期间又被同步触发的补跑，避免连续同步漏抽新切片。
+    private let kgIncrementalLock = NSLock()
+    private var kgIncrementalScheduled = false
+    private var kgIncrementalPending = false
     /// 知识图谱抽取/关键词提取用的辅助模型（由 AppModel 注入，与 Agent.auxLLM 同实例）。
     public var auxLLM: LLMService?
     /// 保护「使用 store」的整段读操作；close/reload 必须等读操作结束。
@@ -1146,6 +1151,43 @@ public final class RAGEngine {
         }
     }
 
+    /// 同步收尾后的增量图谱更新转到后台：同步先返回，图谱稍后补齐。
+    /// 同一时刻只跑一个；运行期间再次触发只记 pending，结束后补跑一轮。
+    private func scheduleIncrementalKnowledgeGraphUpdate() {
+        kgIncrementalLock.lock()
+        if kgIncrementalScheduled {
+            kgIncrementalPending = true
+            kgIncrementalLock.unlock()
+            AgentLog.info("[kg] 增量更新仍在后台执行，本次同步结束后补跑")
+            return
+        }
+        kgIncrementalScheduled = true
+        kgIncrementalLock.unlock()
+        Task.detached(priority: .utility) { [weak self] in
+            guard let self else { return }
+            await self.updateKnowledgeGraphIncrementally()
+            self.kgIncrementalLock.lock()
+            self.kgIncrementalScheduled = false
+            let rerun = self.kgIncrementalPending
+            self.kgIncrementalPending = false
+            self.kgIncrementalLock.unlock()
+            if rerun {
+                self.scheduleIncrementalKnowledgeGraphUpdate()
+            }
+        }
+    }
+
+    /// 等待后台增量图谱更新结束（测试用；生产路径不需要等待）。
+    func waitForIncrementalKnowledgeGraphUpdate() async {
+        while true {
+            kgIncrementalLock.lock()
+            let running = kgIncrementalScheduled
+            kgIncrementalLock.unlock()
+            guard running else { return }
+            try? await Task.sleep(nanoseconds: 20_000_000)
+        }
+    }
+
     /// 手动触发图谱实体消歧：用向量语义相似度对同指实体做进一步合并。
     ///
     /// 「构建知识图谱」阶段仅做字符全匹配（快速、不依赖向量），本方法用于事后
@@ -1464,8 +1506,8 @@ public final class RAGEngine {
 
     /// 增量同步知识库。返回统计；同一实例并发调用会被拒绝。
     ///
-    /// ANN 索引的自动构建在同步收尾、释放独占标志后转到后台任务执行，
-    /// 因此同步一返回，检索与状态查询即可继续（构建不持有 `searchLock`）。
+    /// ANN 索引的自动构建与知识图谱的增量抽取都在同步收尾后转到后台任务执行，
+    /// 因此同步一返回，检索与状态查询即可继续（两者都不持有 `searchLock`）。
     public func ingest(force: Bool = false,
                        progress: ((Int, Int, String) -> Void)? = nil,
                        log: ((String) -> Void)? = nil) async -> IngestStats {
@@ -1779,10 +1821,11 @@ public final class RAGEngine {
         // 之后，保证 manifest.json 对诊断/外部读取仍是最新完整快照。
         manifestStore.compact()
         // 新切片/去重完成后：去重改变了 chunk 标识，只能重建；纯新增则增量更新图谱。
+        // 增量抽取转到后台，同步立即返回，不再等图谱抽完。
         if stats.deduplicated > 0 {
             invalidateKnowledgeGraph(reason: "切片去重改变了 chunk 标识")
         } else if stats.processed > 0 {
-            await updateKnowledgeGraphIncrementally()
+            scheduleIncrementalKnowledgeGraphUpdate()
         }
         return stats
     }
@@ -3054,7 +3097,7 @@ public final class RAGEngine {
                                           chunksInContext: chunksInContext)
     }
 
-    /// 三路候选统一走同一个 reranker 精排，实体/关系全量进上下文；
+    /// 三路候选统一走同一个 reranker 精排，并对实体/关系/原文统一做阈值过滤；
     /// 原文片段在 chunksInContext 时只留 top-1 进上下文（其余供 UI 气泡），
     /// false 时沿用旧全量行为（预算内尽量多放）。
     private func formatKnowledgeGraph(query: String, candidates: KGRetrievalCandidates,
@@ -3068,7 +3111,13 @@ public final class RAGEngine {
                 try await reranker.rerank(query: query, documents: texts)
             }) ?? []
             if scores.count == texts.count {
+                let kgRanked = passages
                 for i in passages.indices { passages[i].score = scores[i] }
+                // 与 naive 检索一致：丢弃阈值以下的实体/关系/原文，避免低相关
+                // 候选挤占上下文与引用气泡；全部低于阈值时回退图谱自身排序，
+                // 避免三路候选被一次性清空。
+                let filtered = passages.filter { $0.score >= config.ragRerankThreshold }
+                passages = filtered.isEmpty ? kgRanked : filtered
             }
         }
         // 2) 分组排序：实体/关系按余弦 + 度数/权重合成，原文按相似度稳定排序。

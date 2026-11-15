@@ -48,9 +48,11 @@ public final class SkillManager {
     private let scanInterval: TimeInterval = 300
 
     /// 递归扫描时跳过的目录名（同 Python 版）。
+    /// `need-deps` 存放依赖外部服务/工具的技能：不参与自动扫描与语义召回，
+    /// 但仍可通过 `skill_tools(op="load", path="need-deps/...")` 手动加载。
     private let skippedDirectories: Set<String> = [
         "tests", "test", ".git", ".svn", ".hg", "node_modules", "__pycache__",
-        "build", "dist",
+        "build", "dist", "need-deps",
     ]
 
     public init(skillsDirectory: String, builtinDirectories: [String] = []) {
@@ -77,9 +79,18 @@ public final class SkillManager {
         (skillsDirectory as NSString).deletingLastPathComponent + "/skill_requests.json"
     }
 
-    /// 按关键词命中度挑选最相关技能（名称 ×3、关键词 ×2、tags ×2、描述 ×1）。
+    /// 按关键词命中度挑选最相关技能（名称 ×3、关键词 ×2、tags ×2、描述词 ×1）。
     public func match(_ text: String) -> Skill? {
-        let query = Set(TextAnalyzer.words(text))
+        matchScored(text)?.skill
+    }
+
+    /// 带分数的技能匹配。
+    ///
+    /// 描述按逐词交集计分：中文改写查询几乎不会与整段描述做子串相等，
+    /// 只判整段包含会让「帮我提取 PDF 表格」这类请求完全匹配不到技能。
+    /// 调用方可按分数阈值决定是否注入，避免单个常见词造成误命中。
+    public func matchScored(_ text: String) -> (skill: Skill, score: Int)? {
+        let query = Set(TextAnalyzer.words(text)).subtracting(Self.matchStopwords)
         guard !query.isEmpty else { return nil }
         var best: Skill?
         var bestScore = 0
@@ -91,6 +102,9 @@ public final class SkillManager {
             score += keywordWords.intersection(query).count * 2
             let tagWords = Set(skill.tags.flatMap { TextAnalyzer.words($0) })
             score += tagWords.intersection(query).count * 2
+            let descriptionWords = Set(TextAnalyzer.words(skill.description))
+                .subtracting(Self.matchStopwords)
+            score += descriptionWords.intersection(query).count
             if skill.description.localizedCaseInsensitiveContains(text) ||
                 text.localizedCaseInsensitiveContains(skill.description) {
                 score += 1
@@ -100,7 +114,8 @@ public final class SkillManager {
                 best = skill
             }
         }
-        return best
+        guard let best else { return nil }
+        return (best, bestScore)
     }
 
     private static let suggestThreshold = 2
@@ -108,6 +123,11 @@ public final class SkillManager {
         "the", "a", "an", "to", "of", "and", "or", "for", "in", "on", "with",
         "please", "帮我", "一下", "这个", "那个", "然后", "怎么", "如何",
     ]
+    /// 匹配时忽略的功能词：这些词在中文请求与描述里出现频率高，计分会放大误命中。
+    private static let matchStopwords: Set<String> = stopwords.union([
+        "的", "了", "在", "把", "对", "是", "有", "和", "与", "及", "中",
+        "这", "那", "我", "你", "请", "先", "再", "做", "用", "要", "能",
+    ])
 
     /// 纯寒暄/感谢/告别：连工具都不需要，直接文本回复。
     public static func isGreeting(_ text: String) -> Bool {
@@ -358,7 +378,7 @@ public final class SkillManager {
                      tags: [String] = []) throws -> Skill {
         let slug = Self.slugify(name)
         guard !slug.isEmpty else {
-            throw AgentError.invalidArguments("invalid skill name (need [a-z0-9-])")
+            throw AgentError.invalidArguments("invalid skill name (需要字母、数字或中文)")
         }
 
         let fm = FileManager.default
@@ -724,7 +744,12 @@ public final class SkillManager {
         for scalar in lowered.unicodeScalars {
             let isASCIIAlnum = (scalar.value >= 97 && scalar.value <= 122)
                 || (scalar.value >= 48 && scalar.value <= 57)
-            if isASCIIAlnum || scalar == "." {
+            // 中文技能名很常见：早期只保留 ASCII 会把整段名字清空，save
+            // 直接失败（invalid skill name）。CJK 统一保留为目录名。
+            let isCJK = (0x3400...0x4DBF).contains(scalar.value)
+                || (0x4E00...0x9FFF).contains(scalar.value)
+                || (0xF900...0xFAFF).contains(scalar.value)
+            if isASCIIAlnum || scalar == "." || isCJK {
                 out.unicodeScalars.append(scalar)
                 lastDash = false
             } else if !lastDash {
