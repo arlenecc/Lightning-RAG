@@ -156,6 +156,23 @@ public final class MLXLLMService: LLMService, PreloadableLLMService,
         tools: [JSONValue],
         temperature: Double
     ) -> AsyncThrowingStream<LLMStreamEvent, Error> {
+        makeChatStream(messages: messages, tools: tools,
+                       temperature: temperature, completion: nil)
+    }
+
+    /// 带「生成任务真正结束」信号的内部实现。
+    ///
+    /// 隔离池在归还副本前会调用 `resetSessionForPool()`；如果只等
+    /// `continuation.finish()`（消费者恢复）就重置，底层 MLX 生成可能仍在
+    /// 另一个线程收尾，`rawCache` 的释放会与生成并发，实测触发
+    /// `resetSessionForPool` 内 SIGSEGV。`completion` 在生成 Task 完全退出后
+    /// 才 signal，隔离池据此实现「先停稳，再重置」。
+    func makeChatStream(
+        messages: [ChatMessage],
+        tools: [JSONValue],
+        temperature: Double,
+        completion: StreamCompletion?
+    ) -> AsyncThrowingStream<LLMStreamEvent, Error> {
         AsyncThrowingStream { continuation in
             let directory = self.directory
             let enableThinking = self.enableThinking
@@ -178,6 +195,7 @@ public final class MLXLLMService: LLMService, PreloadableLLMService,
             // 取消时直接终止底层 MLX 生成，避免用户点「终止」后还要等下一个 token。
             let innerTask = InnerTaskBox()
             let task = Task {
+                defer { completion?.signal() }
                 // 生成中断抢救记账：截断/取消发生时，prompt 段的 KV 仍然
                 // 有效（内核重试只在历史末尾追加纠错提示）。可裁剪缓存
                 // 裁掉已生成部分保留 prompt，重试的 prefill 只剩增量；
@@ -649,7 +667,13 @@ public final class MLXLLMService: LLMService, PreloadableLLMService,
                     ))
                     continuation.finish()
                 } catch {
+                    // 取消/失败也要先等生成 Task 真正退出，再裁剪/丢弃缓存；
+                    // 否则可能与仍在收尾的 MLX 生成并发释放 KV cache
+                    //（SIGSEGV 于 objc_destructInstance / resetSessionForPool）。
+                    let pendingGeneration = innerTask.task
                     innerTask.cancel()
+                    _ = await pendingGeneration?.value
+                    innerTask.task = nil
                     // 取消/失败时缓存已部分推进。prompt 段 KV 仍然有效：
                     // 可裁剪缓存裁掉已生成的部分保留 prompt（内核重试/下一轮
                     // 消息 = 原历史 + 新输入，token 级前缀命中 prompt，只补
@@ -756,10 +780,17 @@ public final class MLXLLMService: LLMService, PreloadableLLMService,
                     let copy = try await borrowIsolatedCopy(
                         key: key, systemPrompt: systemPrompt,
                         tools: tools, thinking: thinking)
-                    for try await event in copy.chatStream(
-                        messages: messages, tools: tools, temperature: temperature) {
+                    let completion = StreamCompletion()
+                    for try await event in copy.makeChatStream(
+                        messages: messages, tools: tools, temperature: temperature,
+                        completion: completion) {
                         continuation.yield(event)
                     }
+                    // 必须等底层生成 Task 完全退出后再重置：消费者在
+                    // `continuation.finish()` 后可能先于生成 Task 收尾恢复，
+                    // 此时复位 rawCache 会与 MLX 生成线程并发释放缓存
+                    //（1.3.20 实测 SIGSEGV 于 resetSessionForPool）。
+                    await completion.wait()
                     // 只清本轮生成段与轨迹，预热快照仍在，下个切片直接复用。
                     copy.resetSessionForPool()
                     returnIsolatedCopy(copy, key: key)
@@ -1455,6 +1486,36 @@ final class UncheckedSendableBox<T>: @unchecked Sendable {
     init(_ value: T) { self.value = value }
 }
 
+/// 生成 Task 完成信号：隔离池归还副本前必须等底层 MLX 生成真正退出，
+/// 否则 `resetSessionForPool()` 会与仍在运行的生成并发释放 KV cache。
+final class StreamCompletion: @unchecked Sendable {
+    private let lock = NSLock()
+    private var finished = false
+    private var waiter: CheckedContinuation<Void, Never>?
+
+    func signal() {
+        lock.lock()
+        finished = true
+        let pending = waiter
+        waiter = nil
+        lock.unlock()
+        pending?.resume()
+    }
+
+    func wait() async {
+        await withCheckedContinuation { continuation in
+            lock.lock()
+            if finished {
+                lock.unlock()
+                continuation.resume()
+                return
+            }
+            waiter = continuation
+            lock.unlock()
+        }
+    }
+}
+
 /// 让 `onTermination`（@Sendable、同步）能够取消底层 MLX 生成任务。
 private final class InnerTaskBox: @unchecked Sendable {
     private let lock = NSLock()
@@ -1476,7 +1537,6 @@ private final class InnerTaskBox: @unchecked Sendable {
     func cancel() {
         lock.lock()
         let current = storage
-        storage = nil
         lock.unlock()
         current?.cancel()
     }
