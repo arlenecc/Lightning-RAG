@@ -126,6 +126,8 @@ HTML 与 Office 解析另有专项覆盖：HTML 保存页的本地 iframe / fram
 
 **自定义 system prompt**：首次启动会在 `<workspace>/assets/system_prompt.txt` 写出内置的 `BASE_SYSTEM_PROMPT`；之后每次启动读取该文件并替换内置提示词，可直接用文本编辑器调整模型行为规则，**重启（或重新应用配置）后生效**（会话期间保持不变，以免 system 前缀抖动使 KV cache 反复重建）。文件内容空白或不可读时本次回退内置提示词，且不会覆盖文件。它替换的是协议主体，L0 META-SOP 与 L1 全局索引仍按多级记忆机制追加在其后；轻量轮（纯寒暄/能力问询）使用内核的极简提示，不受该文件影响。内置提示词中的 `<summary>` 标签、`rag_tools(op="outline")` 起手式、工具状态词等是内核回注与测试的硬依赖，建议在原文基础上调整，不要整段删除。
 
+**v1.3.24（当前）**：新增 `web_search` 多引擎聚合搜索与 50 个备用检索源。主引擎（Google / Bing / DuckDuckGo / Brave / 百度 / 搜狗 / 360）并发查询，结果不足时按查询意图自动补位备用源；结果统一去重、过滤、排序，模型再从结果取真实 URL 交给 `web_scan` 读正文。系统提示要求本地知识库缺失信息主动搜索。内核同步收紧计划空转保护：`update_plan` 不再计为实际工作，计划闭合但零工具调用时强制真实工具，收尾时把无验证的 `done` 降级为 `skipped`；搜索类意图空转耗尽时内核代发一次 `web_search`。
+
 **v1.3.9**：知识图谱抽取默认切到 JSON 格式并加固提示词。**格式可切**：`rag_kg_extraction_format` 默认 `json`（`entities` / `relationships` 数组），可改 `delimited` 兼容 0.8B 等小模型；两种格式缓存键隔离，配置文件中带 `_comment_*` 说明。**提示词加固**：正文代码围栏隔离、Section Context 标注不可信元数据、新增 relation/entity 与分隔符的 Wrong/Correct 反例、纯数字/年份不成实体、端点缺失提示补抽。**解析兜底**：4 段关系用 keywords 补描述，JSON 支持代码围栏与数组 keywords。**二次补抽**：首轮为空或末行残缺时追加一次只补漏请求。**崩溃修复**：图谱抽取并发默认改为 1（`rag_kg_max_concurrency`），修复 2B 四路并发导致 MLX 活跃内存 11GB、`mlx_async_eval` 触发 `EXC_BREAKPOINT` 的构建崩溃。**实测**：2B JSON 模式 19.5 秒抽到 7/7 实体、5 条有效关系；0.8B 仍不建议用于图谱构建。
 
 **v1.3.8**：知识图谱抽取质量与性能收口。**限额可配**：单切片实体 20 / 关系 50 / 描述 100 字（`rag_kg_max_entities_per_chunk` / `rag_kg_max_relations_per_chunk` / `rag_kg_max_description_chars`），提示词、解析与落库三处同时生效；关系描述在归纳后再次截断。**收流保护**：模型输出 `<|COMPLETE|>` 后立即停止消费；同一实体对重复关系行累计达 12 条时提前取消生成（实测 2B 从复读到 6k+ 字符/123 秒缩到约 2.5k 字符/50 秒）。**抽取提速**：按切片内容哈希跨重建复用抽取结果、LLM 归纳结果缓存、支持独立会话的后端最多 4 路并发，阶段日志输出抽取/归纳/向量化耗时。**真机验证**：2B 抽取 4/4 核心实体与 5~6 条无向关系，0.8B 关系行字段残缺、有效关系为 0，不建议用于图谱构建。长期记忆侧同步补强事实抽取校验与邻域检索。
@@ -151,6 +153,7 @@ HTML 与 Office 解析另有专项覆盖：HTML 保存页的本地 iframe / fram
 | 工具 | 形式 | 子操作 |
 | --- | --- | --- |
 | `file_tools` | 组合 | `read` / `write` / `modify`（别名 `patch`）/ `list` / `search` |
+| `web_search` | 独立 | 多引擎聚合搜索：7 个主引擎并发 + 50 个备用源按意图/延迟补位（自动取最快的 8 个）；返回去重排序的标题/URL/摘要 |
 | `web_scan` | 组合 | `scan`（抓取并提取正文，JS 页面自动渲染）/ `render`（WebKit 渲染、等待选择器、执行 JS、截图） |
 | `long_memory` | 组合 | `graph`（实体 / 关系 / 观察）/ `search`（语义召回） |
 | `skill_tools` | 组合 | `search` / `semantic_search` / `load` / `save` / `list` |
@@ -161,6 +164,8 @@ HTML 与 Office 解析另有专项覆盖：HTML 保存页的本地 iframe / fram
 | `update_plan` / `update_working_checkpoint` / `start_long_term_update` | 独立 | 计划、工作便签、长期记忆蒸馏 |
 | `schedule_task` | 独立 | `create` / `list` / `delete` / `enable` / `disable` / `run_now` |
 | MCP 工具 | 动态 | `mcp_<server>_<tool>`（随服务端工具清单变化热更新） |
+
+**Web 搜索（web_search）**：默认并发查询 Google / Bing / DuckDuckGo / Brave / 百度 / 搜狗 / 360 七个主引擎，每次请求随机桌面浏览器 UA，并分别适配各引擎的请求参数、跳转包装（Bing `ck/a`、Google `/url?q=`、DDG `uddg`、百度/搜狗 `/link`）与 DOM 结构。主引擎去重后不足 4 条、或成功引擎少于 2 个时，自动按查询意图从 50 个实测可用、按延迟排序的备用源（Wikipedia、StackExchange、npm/crates/RubyGems/Packagist/NuGet/Docker Hub/Hex/pub.dev、arXiv/OpenAlex/Crossref/Europe PMC/DOAJ、Google News/Bing News、Openverse/Open Library/Internet Archive/iTunes/Deezer/TVmaze/MusicBrainz、Yahoo! JAPAN/Wiby 等）中选最快的 8 个补位；也支持 `engines="backup"` 查询全部备用源或 `engines="all"` 查询主 + 备用。结果统一做 URL 归一化、跟踪参数清理、广告/检索页过滤、跨引擎去重和「引擎权重 × 位置 + 多引擎一致性 + 查询词命中」排序，输出受 7600 字符上限约束。需要正文时，模型从结果中取真实 URL 交给 `web_scan`。实现见 `Tools/WebSearchTool.swift` 与 `Tools/WebSearchBackupEngines.swift`。
 
 **RAG 检索策略（少而精）**：用户问书/文档内容时，先 `rag_tools(op="outline")` 获取全书/章节摘要与结构树；若大纲摘要已覆盖问题则直接引用、**不再检索**；整体性问题（全书大意/主题）只搜前言/引言/导论，针对性问题只搜目标章节（检索词带上章节标题，`source=书名`）。内核在每次 `rag_tools(op="outline")`（或每次 `run()`）之后对 `rag_tools(op="search")` 设**硬上限（默认 3 次）**：超出部分不再真正调用，直接预置失败并提示「基于已检索内容与大纲摘要直接综合作答」，彻底杜绝同一问题反复换关键词 scatter 检索。
 
@@ -194,6 +199,7 @@ RAG 知识图谱与长期记忆的 **memory graph 是两套完全独立的实现
 - 子进程超时/取消时递归终止进程树（`pgrep -P`），避免 `npx`/shell 留下孤儿；失败时把 stdout/stderr 尾部并入错误，模型能看到真实报错。
 - 风险判定覆盖裸 `~`、`/`、`..`、`$HOME`/`${HOME}` 等目标，且不会把 `rm -rf ./` 误判为工作区外操作。
 - `web_scan` 首请求与每次重定向都拒绝 loopback/私网/link-local/云元数据地址（SSRF）；响应体上限 8MB、重定向 5 次，任务取消时立即中止下载。
+- `web_search` 只请求固定引擎/API 域名，结果跳转的二次解析同样经过私网/非 http(s) 拦截；查询值严格百分号编码，避免用户输入被注入成额外请求参数；单引擎验证码/超时/空包只影响自身，状态行按引擎标注成功、失败或 0 结果。
 - MCP stdio 客户端（官方 SDK `Client` + `StdioTransport`）：启动串行化；`shutdown()` 后不会被 `callTool` 复活；进程退出立即断开并使挂起请求失败；服务端 `tools/list_changed` 会同步更新工具注册表与 schema 缓存。
 - `AtomicFile` 使用同目录临时文件 + 原子替换，不再「先删旧再 move」。
 - 所有 `URLSession`（OpenAI/Web/MCP 之外的 HTTP 工具）在 Agent 关闭或配置切换时 `invalidateAndCancel`。
@@ -410,7 +416,8 @@ Sources/
       KnowledgeGraph/          # 实体/关系抽取、vec0 向量、SwiftGraph、五策略检索
       RAGEngine.swift          # 同步、Manifest、检索、rerank
     Tools/                     # 组合工具（file_tools/web_scan/long_memory/skill_tools/rag_tools）
-                               # + 独立工具（code_run/shell_run/ask_user/plan/schedule_task/MCP）
+                               # + 独立工具（web_search/code_run/shell_run/ask_user/plan/schedule_task/MCP）
+                               # + Web 搜索适配器与 50 源备用目录（WebSearchTool/WebSearchBackupEngines）
     Scheduling/                # 定时任务模型、schedules.json 存储、DispatchSourceTimer 调度器
     Memory/                    # 工作记忆、长期记忆、memory graph（与 RAG 知识图谱独立）
     Skills/                    # 技能发现、索引、语义检索
@@ -432,6 +439,7 @@ docs/软件设计文档.md
 - 主/辅 LLM 支持 MLX-LM / MLX-VLM / GGUF / ONNX；OCR VLM 支持 MLX / GGUF+mmproj（ONNX VLM 暂无通用图适配）；Embedding / Reranker 支持 ONNX / FastEmbed / MLX / GGUF。FastEmbed 复用 ONNX 运行时及其缓存目录。GGUF 与 ONNX 均在进程内运行，不需要外部 server 或 Python。
 - ONNX LLM 的空 KV 按 float32 + `config.json` 的层数/KV 头数/head_dim 初始化；fp16 past 或非标准 KV 布局的导出会给出明确错误，需要针对性适配。
 - 本机已实测：GGUF LLM（Qwen3.5-9B，CPU 与 Metal GPU，工具调用正常）、GGUF VLM（Qwythos-9B + mmproj，OCR 输出正确）、GGUF Embedding（nomic-embed-text-v1.5，768 维）、GGUF system 前缀预热复用、MLX-VLM 主模型（Qwen3.5-2B）。ONNX LLM、ONNX VLM 与 GGUF Reranker 的代码路径已接入，但当前机器没有对应模型，未做推理实测；缺少模型或运行时会给出明确错误。
+- `web_search` 的通用网页引擎受目标站反爬影响：Google 常返回 JS 验证页，Bing 不支持无 JS 翻页，搜狗/百度/DuckDuckGo 高频调用可能触发验证码；失败按引擎隔离并在状态行标注。`engines="backup"` 全量查询 50 个备用源约 9 秒，自动补位只取最快的 8 个（约 3 秒）。
 - 配置窗口覆盖主要参数；MCP 服务器列表等高级配置仍可直接编辑 `~/.base-agent/config.json`。
 
 
