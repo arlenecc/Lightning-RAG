@@ -42,6 +42,27 @@ public final class KnowledgeGraphRetriever {
         guard !trimmed.isEmpty else {
             return KGRetrievalCandidates()
         }
+        let totalStarted = Date()
+        var keywordSeconds = 0.0
+        var embedSeconds = 0.0
+        var vectorSearchSeconds = 0.0
+        var expandSeconds = 0.0
+        var directSeconds = 0.0
+        var entityCount = 0
+        var relationCount = 0
+        var chunkCount = 0
+        let ms: (Double) -> String = { String(format: "%.0fms", $0 * 1000) }
+        defer {
+            AgentLog.info("[kg] retriever 阶段耗时: "
+                + "关键词=\(ms(keywordSeconds)), "
+                + "查询向量=\(ms(embedSeconds)), "
+                + "实体/关系向量检索=\(ms(vectorSearchSeconds)), "
+                + "图谱扩展/排序=\(ms(expandSeconds)), "
+                + "原文向量检索=\(ms(directSeconds)), "
+                + "总计=\(ms(Date().timeIntervalSince(totalStarted)))；"
+                + "strategy=\(config.ragRetrievalStrategy.rawValue), "
+                + "实体=\(entityCount), 关系=\(relationCount), 原文=\(chunkCount)")
+        }
         let strategy = config.ragRetrievalStrategy
         let floor = config.ragKGSimilarityFloor
         let entityTopK = config.ragKGEntityTopK
@@ -51,6 +72,7 @@ public final class KnowledgeGraphRetriever {
         let hasSourceFilter = !sourceNeedle.isEmpty
 
         // 1) 关键词抽取（失败回退：直接用原 query）。
+        let keywordStarted = Date()
         let keywords: KGKeywords
         if strategy.usesKnowledgeGraph {
             keywords = (try? await builder.extractKeywords(query: trimmed))
@@ -58,11 +80,14 @@ public final class KnowledgeGraphRetriever {
         } else {
             keywords = KGKeywords(highLevel: [trimmed], lowLevel: [trimmed])
         }
+        keywordSeconds = Date().timeIntervalSince(keywordStarted)
 
         // 2) 三路向量（ll→实体、hl→关系、原 query→原文）一次批量计算。
         let lowTexts = normalizedKeywords(keywords.lowLevel, fallback: trimmed)
         let highTexts = normalizedKeywords(keywords.highLevel, fallback: trimmed)
+        let embedStarted = Date()
         let vectors = try await embedQueries(lowTexts + highTexts + [trimmed])
+        embedSeconds = Date().timeIntervalSince(embedStarted)
         guard vectors.count == lowTexts.count + highTexts.count + 1 else {
             throw AgentError.storage("批量查询向量数量不一致")
         }
@@ -72,11 +97,14 @@ public final class KnowledgeGraphRetriever {
         let chunkVector = vectors[vectors.count - 1]
 
         // 3) 三路召回。
+        let vectorStarted = Date()
         async let entityHits = kgStore.searchEntities(vector: entityVector, topK: entityTopK,
                                                       similarityFloor: floor)
         async let relationHits = kgStore.searchRelationships(vector: relationVector, topK: relationTopK,
                                                              similarityFloor: floor)
         let (entities, relations) = try await (entityHits, relationHits)
+        vectorSearchSeconds = Date().timeIntervalSince(vectorStarted)
+        let expandStarted = Date()
 
         // 4) 按策略组装实体/关系候选 + 图谱扩展。
         var entityPassages: [KGPassage] = []
@@ -149,8 +177,10 @@ public final class KnowledgeGraphRetriever {
                                               limit: perHitChunkLimit)
         let relationChunkStreams = chunkStreams(relationPassages, refMap: refMap,
                                                 limit: perHitChunkLimit)
+        expandSeconds = Date().timeIntervalSince(expandStarted)
 
         // 8) 原文直接召回（mix；相似度低于下限直接丢弃）。
+        let directStarted = Date()
         var directChunks: [KGPassage] = []
         if strategy == .mix {
             let hits = try chunkStore.search(
@@ -163,6 +193,7 @@ public final class KnowledgeGraphRetriever {
                                  score: hit.score, sourceChunkIDs: [chunkID])
             }
         }
+        directSeconds = Date().timeIntervalSince(directStarted)
 
         // 9) chunk 合并：直接召回在前，实体/关系反查按轮询交错去重（chunk id）。
         var chunkPassages: [KGPassage] = []
@@ -176,6 +207,9 @@ public final class KnowledgeGraphRetriever {
         roundRobin(entityChunkStreams.flatMap { $0 },
                    relationChunkStreams.flatMap { $0 }).forEach(append)
 
+        entityCount = entityPassages.count
+        relationCount = relationPassages.count
+        chunkCount = chunkPassages.count
         return KGRetrievalCandidates(entities: entityPassages,
                                      relations: relationPassages,
                                      chunks: chunkPassages)

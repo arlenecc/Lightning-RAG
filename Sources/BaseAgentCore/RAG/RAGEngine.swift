@@ -1335,7 +1335,28 @@ public final class RAGEngine {
     /// mix 模式额外叠加原文 chunk 兜底。
     public func graphSearch(query: String, mode: GraphSearchMode,
                             topK: Int = 20) async throws -> GraphSearchResult {
+        let totalStarted = Date()
+        let graphStarted = Date()
         let (_, graph) = try ensureKnowledgeGraph()
+        let graphSeconds = Date().timeIntervalSince(graphStarted)
+        var matchSeconds = 0.0
+        var expandSeconds = 0.0
+        var mixSearchSeconds = 0.0
+        var entityCount = 0
+        var relationshipCount = 0
+        var chunkCount = 0
+        let ms: (Double) -> String = { String(format: "%.0fms", $0 * 1000) }
+        defer {
+            AgentLog.info("[kg][direct] graphSearch 耗时: "
+                + "图谱加载=\(ms(graphSeconds)), "
+                + "关键词匹配=\(ms(matchSeconds)), "
+                + "子图扩展/排序=\(ms(expandSeconds)), "
+                + "mix原文检索=\(ms(mixSearchSeconds)), "
+                + "总计=\(ms(Date().timeIntervalSince(totalStarted)))；"
+                + "mode=\(mode.rawValue), 实体=\(entityCount), "
+                + "关系=\(relationshipCount), 原文=\(chunkCount)")
+        }
+        let matchStarted = Date()
         let tokens = query.lowercased()
             .components(separatedBy: CharacterSet.alphanumerics.inverted)
             .filter { $0.count >= 2 }
@@ -1350,6 +1371,8 @@ public final class RAGEngine {
                 .lowercased()
             return tokens.contains { hay.contains($0) }
         }
+        matchSeconds = Date().timeIntervalSince(matchStarted)
+        let expandStarted = Date()
 
         var entities: [KGEntity] = []
         var relationships: [KGRelationship] = []
@@ -1407,15 +1430,21 @@ public final class RAGEngine {
             relationships = hybrid.relationships
         }
 
+        expandSeconds = Date().timeIntervalSince(expandStarted)
         if entities.count > topK { entities = Array(entities.prefix(topK)) }
         if relationships.count > topK { relationships = Array(relationships.prefix(topK)) }
 
+        let mixStarted = Date()
         var chunks: [String] = []
         if mode == .mix {
             if let hits = try? await search(query: query, topK: min(topK, 10), source: nil) {
                 chunks = hits.map { $0.text }
             }
         }
+        mixSearchSeconds = Date().timeIntervalSince(mixStarted)
+        entityCount = entities.count
+        relationshipCount = relationships.count
+        chunkCount = chunks.count
         return GraphSearchResult(mode: mode.rawValue, entities: entities,
                                  relationships: relationships, chunks: chunks)
     }
@@ -2842,6 +2871,25 @@ public final class RAGEngine {
     private func searchBody(query: String, topK: Int, source: String?,
                             timeout: Double?) async throws -> [SearchHit] {
         guard let embedding else { throw AgentError.storage("embedding 模型不可用") }
+        let searchStarted = Date()
+        var embedSeconds = 0.0
+        var retrievalSeconds = 0.0
+        var rerankSeconds = 0.0
+        var rerankStatus = "off"
+        var rerankCandidates = 0
+        var rerankKept = 0
+        var finalCount = 0
+        let ms: (Double) -> String = { String(format: "%.0fms", $0 * 1000) }
+        defer {
+            AgentLog.info("[rag] search 阶段耗时: "
+                + "query_embed=\(ms(embedSeconds)), "
+                + "向量+FTS+RRF=\(ms(retrievalSeconds)), "
+                + "rerank=\(ms(rerankSeconds))(\(rerankStatus)), "
+                + "总计=\(ms(Date().timeIntervalSince(searchStarted)))；"
+                + "候选=\(rerankCandidates), 返回=\(finalCount), "
+                + "strategy=\(config.ragRetrievalStrategy.rawValue), "
+                + "rerank=\(config.ragRerankEnabled && reranker != nil ? "on" : "off")")
+        }
         let limit = resolvedTimeout(timeout)
         // topK 来自模型参数：硬性封顶，避免一次检索把 reranker 批量推到很高。
         let requested = max(1, min(topK, 20))
@@ -2853,6 +2901,7 @@ public final class RAGEngine {
         // 后台摘要同抢 GPU 时可能被拖慢数秒；给足余量避免「慢」被误判成「超时」，
         // 同时保底防止 MLX 卡死导致静默挂起。
         let embedBudget = max(20, limit)
+        let embedStarted = Date()
         if config.ragBinaryCoarseEnabled,
            effectiveVectorElementType != .bin,
            let signing = embedding as? EmbeddingBinarySigning,
@@ -2875,6 +2924,7 @@ public final class RAGEngine {
             }
             binaryOptions = nil
         }
+        embedSeconds = Date().timeIntervalSince(embedStarted)
         let rerankEnabled = config.ragRerankEnabled && reranker != nil
         // 开启重排序时，最终条数由设置里的 TopN 决定（候选池按它放大）；
         // 未开启时仍按调用方 top_k。两者都封顶 20。
@@ -2887,6 +2937,7 @@ public final class RAGEngine {
         let candidateCount = max(requested, resultCount)
             * (rerankEnabled ? candidateMultiplier : 1)
 
+        let retrievalStarted = Date()
         let fetched: [SearchHit]? = try withSnapshotStoreBounded(timeout: limit) {
             store, deadline in
             func run(sourceFilter: String? = nil,
@@ -2939,16 +2990,20 @@ public final class RAGEngine {
                 return try run(sourceContains: needle)
             }
         }
+        retrievalSeconds = Date().timeIntervalSince(retrievalStarted)
         guard var hits = fetched else {
             AgentLog.info("RAG: 向量库为空，未检索")
             return []
         }
+        rerankCandidates = hits.count
 
         // 正常返回 TopN；reranker 失败/超时降级时收紧到 3 条。
         var resultLimit = resultCount
+        let rerankStarted = Date()
         if rerankEnabled, let reranker, !hits.isEmpty {
             // 先抽出纯文本：闭包要跨任务边界，避免捕获整个 SearchHit 数组。
             let documents = hits.map(\.text)
+            rerankCandidates = documents.count
             do {
                 let scores = try await Self.withTimeout(config.ragRerankTimeoutSeconds) {
                     try await reranker.rerank(query: query, documents: documents)
@@ -2966,6 +3021,8 @@ public final class RAGEngine {
                     hits = filtered.isEmpty
                         ? Array(hits.sorted { $0.score > $1.score }.prefix(resultCount))
                         : filtered
+                    rerankStatus = "ok"
+                    rerankKept = hits.count
                 } else {
                     throw RerankCountMismatch(got: scores.count, expected: hits.count)
                 }
@@ -2977,19 +3034,31 @@ public final class RAGEngine {
                 // 只给会话前 3 条，避免 TopN 调大后把上下文塞爆。
                 resultLimit = min(resultLimit, Self.rerankFallbackLimit)
                 if error is RerankTimeout {
+                    rerankStatus = "timeout"
                     AgentLog.warning("RAG rerank 超时（\(config.ragRerankTimeoutSeconds)s），"
                         + "已回退 RRF 排序（最多 3 条）")
                 } else if let mismatch = error as? RerankCountMismatch {
+                    rerankStatus = "count-mismatch"
                     AgentLog.warning("RAG rerank 返回分数数量不符"
                         + "（\(mismatch.got)/\(mismatch.expected)），"
                         + "使用 RRF 排序（最多 3 条）")
                 } else {
+                    rerankStatus = "failed"
                     AgentLog.warning("RAG rerank 失败，使用 RRF 排序（最多 3 条）: "
                         + error.localizedDescription)
                 }
             }
+        } else {
+            rerankStatus = hits.isEmpty ? "no-candidates" : "off"
         }
-        return Array(hits.prefix(resultLimit))
+        rerankSeconds = Date().timeIntervalSince(rerankStarted)
+        let output = Array(hits.prefix(resultLimit))
+        finalCount = output.count
+        rerankKept = output.count
+        AgentLog.info("[rag][rerank] provider=\(reranker?.identifier ?? "none"), "
+            + "候选=\(rerankCandidates), 保留=\(rerankKept), "
+            + "耗时=\(ms(rerankSeconds)), 状态=\(rerankStatus)")
+        return output
     }
 
     // MARK: 检索即展示（Retrieval-as-Presentation）/ 知识图谱检索
@@ -3103,13 +3172,44 @@ public final class RAGEngine {
     private func formatKnowledgeGraph(query: String, candidates: KGRetrievalCandidates,
                                       chunksInContext: Bool)
         async -> (context: String, chunks: [KGPassage]) {
+        let totalStarted = Date()
+        var rerankSeconds = 0.0
+        var rerankStatus = "off"
+        var rerankCandidates = 0
+        var rerankKept = 0
+        var entityCount = 0
+        var relationCount = 0
+        var chunkCount = 0
+        let ms: (Double) -> String = { String(format: "%.0fms", $0 * 1000) }
+        defer {
+            AgentLog.info("[kg][rerank] provider=\(reranker?.identifier ?? "none"), "
+                + "候选=\(rerankCandidates), 保留=\(rerankKept), "
+                + "rerank=\(ms(rerankSeconds))(\(rerankStatus)), "
+                + "格式化总计=\(ms(Date().timeIntervalSince(totalStarted)))；"
+                + "实体=\(entityCount), 关系=\(relationCount), 原文=\(chunkCount)")
+        }
         var passages = candidates.allPassages
+        rerankCandidates = passages.count
         // 1) 统一 reranker 精排（失败/超时则保留图谱自身排序）。
+        let rerankStarted = Date()
         if config.ragRerankEnabled, let reranker, !passages.isEmpty {
             let texts = passages.map(\.text)
-            let scores = (try? await Self.withTimeout(config.ragRerankTimeoutSeconds) {
-                try await reranker.rerank(query: query, documents: texts)
-            }) ?? []
+            var scores: [Double] = []
+            do {
+                scores = try await Self.withTimeout(config.ragRerankTimeoutSeconds) {
+                    try await reranker.rerank(query: query, documents: texts)
+                }
+            } catch {
+                if error is RerankTimeout {
+                    rerankStatus = "timeout"
+                    AgentLog.warning("[kg] rerank 超时（\(config.ragRerankTimeoutSeconds)s），"
+                        + "保留图谱自身排序")
+                } else {
+                    rerankStatus = "failed"
+                    AgentLog.warning("[kg] rerank 失败，保留图谱自身排序: "
+                        + error.localizedDescription)
+                }
+            }
             if scores.count == texts.count {
                 let kgRanked = passages
                 for i in passages.indices { passages[i].score = scores[i] }
@@ -3118,8 +3218,17 @@ public final class RAGEngine {
                 // 避免三路候选被一次性清空。
                 let filtered = passages.filter { $0.score >= config.ragRerankThreshold }
                 passages = filtered.isEmpty ? kgRanked : filtered
+                rerankStatus = "ok"
+            } else if rerankStatus == "off" {
+                rerankStatus = "count-mismatch"
+                AgentLog.warning("[kg] rerank 返回分数数量不符"
+                    + "（\(scores.count)/\(texts.count)），保留图谱自身排序")
             }
+        } else {
+            rerankStatus = passages.isEmpty ? "no-candidates" : "off"
         }
+        rerankSeconds = Date().timeIntervalSince(rerankStarted)
+        rerankKept = passages.count
         // 2) 分组排序：实体/关系按余弦 + 度数/权重合成，原文按相似度稳定排序。
         let entities = KGCandidateRanking.entities(passages.filter { $0.kind == .entity })
         let relations = KGCandidateRanking.relations(passages.filter { $0.kind == .relation })
@@ -3132,6 +3241,9 @@ public final class RAGEngine {
                 return lhs.offset < rhs.offset
             }
             .map(\.element)
+        entityCount = entities.count
+        relationCount = relations.count
+        chunkCount = chunks.count
 
         // 3) 预算截断：实体 400、关系 600，原文片段只留 top-1（检索即展示），
         //    原文预算再被「总预算 − 实体实际 − 关系实际」收口，三者之和不会越顶。
@@ -3294,6 +3406,12 @@ public final class RAGEngine {
     private func runCondense(_ output: String,
                              chunks: [(title: String, text: String)]) async -> String {
         guard let condenser = auxCondenser else { return output }
+        let condenseStarted = Date()
+        defer {
+            AgentLog.info("[rag] condense 耗时="
+                + String(format: "%.0fms", Date().timeIntervalSince(condenseStarted) * 1000)
+                + "；分片=\(chunks.count), 输入=\(output.count) 字符")
+        }
         guard chunks.count > 1 else {
             let single = output.count <= Self.condenseChapterChars
                 ? output : (chunks.first?.text ?? output)

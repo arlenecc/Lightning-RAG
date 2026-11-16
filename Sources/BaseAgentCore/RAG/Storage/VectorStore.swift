@@ -1491,6 +1491,14 @@ public final class VectorStore: @unchecked Sendable {
         guard vector.count == dimension else {
             throw AgentError.storage("查询向量维度 \(vector.count) != \(dimension)")
         }
+        let totalStarted = Date()
+        var vectorSeconds = 0.0
+        var ftsSeconds = 0.0
+        var fusionSeconds = 0.0
+        var vectorCandidateCount = 0
+        var ftsResultCount = 0
+        var vectorMode = "disabled"
+        let ms: (Double) -> String = { String(format: "%.0fms", $0 * 1000) }
         // 向量候选必须与写入/删除串行；有期限时不能无限期等待正在提交的
         // 大批量写入，超时由调用方跳过本次检索。
         if let deadline {
@@ -1506,6 +1514,9 @@ public final class VectorStore: @unchecked Sendable {
 
         // 待重建时向量通道暂停，但全文通道仍然可用（与 status 的提示一致）。
         let vectorUsable = rebuildReason == nil
+        vectorMode = vectorUsable
+            ? (binary != nil ? "binary+ann/exact" : (ann != nil ? "ann/exact" : "exact"))
+            : "disabled"
         if !vectorUsable {
             AgentLog.info("向量库待重建（\(rebuildReason ?? "")），本次只用全文检索")
         }
@@ -1520,6 +1531,7 @@ public final class VectorStore: @unchecked Sendable {
         let ftsCandidateCount = targeted ? max(ftsInner * 4, 20) : ftsInner
         var binaryScores: [Int64: Double] = [:]
         var vectorCandidates: [(Int64, Double)] = []
+        let vectorStarted = Date()
         if vectorUsable {
             if let binary, sourceFilter == nil, !targeted {
                 switch try binaryCoarseCandidatesLocked(
@@ -1541,6 +1553,8 @@ public final class VectorStore: @unchecked Sendable {
                     sourceFilter: sourceFilter, ann: ann, targeted: targeted)
             }
         }
+        vectorSeconds = Date().timeIntervalSince(vectorStarted)
+        vectorCandidateCount = vectorCandidates.count
 
         // 仍持有写入锁时开启读快照：确保 FTS 候选与 hydrate 落在同一个
         // 数据库版本；建立快照后即可解锁，让写入/删除并发提交。
@@ -1560,6 +1574,7 @@ public final class VectorStore: @unchecked Sendable {
                 lock.unlock()
                 unlocked = true
 
+                let ftsStarted = Date()
                 var ftsCandidates = try self.ftsCandidates(
                     reader, query: query, limit: ftsCandidateCount,
                     sourceFilter: sourceFilter)
@@ -1570,8 +1585,11 @@ public final class VectorStore: @unchecked Sendable {
                     ftsCandidates = try self.filterCandidates(reader, ftsCandidates,
                                                               contains: needle)
                 }
+                ftsSeconds = Date().timeIntervalSince(ftsStarted)
+                ftsResultCount = ftsCandidates.count
                 guard !vectorPool.isEmpty || !ftsCandidates.isEmpty else { return [] }
 
+                let fusionStarted = Date()
                 var rrfScores: [Int64: Double] = [:]
                 var vectorScores: [Int64: Double] = [:]
                 var ftsScores: [Int64: Double] = [:]
@@ -1594,6 +1612,7 @@ public final class VectorStore: @unchecked Sendable {
                     sourceFilter: sourceFilter,
                     sourceContains: sourceContains,
                     limit: topK)
+                fusionSeconds = Date().timeIntervalSince(fusionStarted)
                 return hydrated.map { hit in
                     var copy = hit
                     copy.rrfScore = hit.score
@@ -1604,8 +1623,19 @@ public final class VectorStore: @unchecked Sendable {
                 }
             }
         }
-        guard let seconds else { return try run() }
-        return try reader.withDeadline(seconds: seconds, run)
+        let results: [SearchHit]
+        if let seconds {
+            results = try reader.withDeadline(seconds: seconds, run)
+        } else {
+            results = try run()
+        }
+        AgentLog.info("[rag][vector] 混合检索耗时: "
+            + "向量=\(ms(vectorSeconds))（候选 \(vectorCandidateCount), \(vectorMode)）, "
+            + "FTS=\(ms(ftsSeconds))（候选 \(ftsResultCount)）, "
+            + "RRF+hydrate=\(ms(fusionSeconds)), "
+            + "总计=\(ms(Date().timeIntervalSince(totalStarted)))；"
+            + "topK=\(topK), 返回=\(results.count)")
+        return results
     }
 
     // MARK: - Documents
