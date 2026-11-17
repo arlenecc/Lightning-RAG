@@ -102,8 +102,25 @@ public final class ColBERTReaderService: @unchecked Sendable {
         let files = try await downloader.listNeededFiles(repo: model.repo)
         let scoped = RequiredModelCatalog.scopedFiles(for: model, in: files)
         for file in scoped {
+            let label = file.path
+            let started = Date()
+            var lastLogAt = Date.distantPast
+            AgentLog.info("[colbert] 开始下载 \(file.path)（\(file.size / 1_048_576)MB）")
             try await downloader.download(repo: model.repo, file: file,
-                                          into: model.directory) { _, _ in }
+                                          into: model.directory) { received, total in
+                // 大文件下载可达数十分钟，每 10% 或 30 秒输出一次，避免用户以为同步卡死。
+                let now = Date()
+                let ratio = total > 0 ? Double(received) / Double(total) : 0
+                let enoughTime = now.timeIntervalSince(lastLogAt) >= 30
+                if enoughTime || (total > 0 && received >= total) {
+                    lastLogAt = now
+                    let percent = Int(ratio * 100)
+                    AgentLog.info("[colbert] 下载 \(label) \(received / 1_048_576)MB"
+                        + "/\(total / 1_048_576)MB（\(percent)%）")
+                }
+            }
+            AgentLog.info("[colbert] 下载完成 \(file.path)，耗时 "
+                + String(format: "%.1f", Date().timeIntervalSince(started)) + "s")
         }
         guard RequiredModelCatalog.isComplete(model) else {
             throw HFModelDownloader.HFError.badResponse("检索阅读模型下载后仍不完整")
@@ -118,8 +135,20 @@ public final class ColBERTReaderService: @unchecked Sendable {
         let engine = try await ensureEngine()
         opLock.lock()
         defer { opLock.unlock() }
-        return try engine.ingest(markdown: markdown, source: source, title: title,
-                                 sourceKey: sourceKey(source), options: options)
+        // 长文档切片编码可能持续数十秒：按 30 秒节流输出进度，避免看起来「卡住」。
+        let encoded = markdown.count
+        let started = Date()
+        var lastLogAt = Date.distantPast
+        return try engine.ingest(
+            markdown: markdown, source: source, title: title,
+            sourceKey: sourceKey(source), options: options,
+            progress: { done, total in
+                let now = Date()
+                guard now.timeIntervalSince(lastLogAt) >= 30 || done == total else { return }
+                lastLogAt = now
+                AgentLog.info("[colbert] 编码 \(done)/\(total) 分片（\(encoded) 字符，已用 "
+                    + String(format: "%.0f", now.timeIntervalSince(started)) + "s）")
+            })
     }
 
     /// 删除指定来源的全部切片（不加载模型）。

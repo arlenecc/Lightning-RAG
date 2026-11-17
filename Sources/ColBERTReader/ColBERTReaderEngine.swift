@@ -79,9 +79,11 @@ public final class ColBERTReaderEngine {
     @discardableResult
     public func ingest(markdown: String, source: String, title: String? = nil,
                        sourceKey: String? = nil,
-                       options: ColBERTReaderOptions) throws -> Int {
+                       options: ColBERTReaderOptions,
+                       progress: ((Int, Int) -> Void)? = nil) throws -> Int {
         try engine().addMarkdown(markdown, source: source, title: title,
-                                 bits: options.quantBits, sourceKey: sourceKey)
+                                 bits: options.quantBits, sourceKey: sourceKey,
+                                 progress: progress)
     }
 
     /// 删除指定来源的全部切片（不依赖模型加载）。

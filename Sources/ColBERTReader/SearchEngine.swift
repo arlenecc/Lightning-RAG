@@ -141,12 +141,15 @@ final class SearchEngine {
         let sourceID = sourceKey ?? (base + "-" + hash8(text))
         let docTitle = title ?? base
         let addStarted = Date()
-        let chunks = try Chunker.split(text, sourceName: docTitle, model: colbert, options: options)
+        // 大分片不依赖模型做语义切分：每个 8000 字符片段的边界由结构与词法相似度决定。
+        // 之前把 ColBERT 传入切片器，需要在整本书的每个句子上跑一次模型前向
+        // （一本书数千句 × 24 层），是同步卡住的主因之一。
+        let chunks = try Chunker.split(text, sourceName: docTitle, model: nil, options: options)
         let chunkingTime = Date().timeIntervalSince(addStarted)
         timing?("chunking", chunkingTime)
         guard !chunks.isEmpty else { throw DocSearchError.chunking("没有产生任何切片") }
 
-        var pruneTotal = 0.0, encodeTotal = 0.0, quantTotal = 0.0, dbTotal = 0.0
+        var encodeTotal = 0.0, quantTotal = 0.0, dbTotal = 0.0
         var termTotal = 0, tokenTotal = 0
         return try db.transaction {
             // 同一文件重复入库时先清理旧切片（前缀是确定性的 sourceID）。
@@ -157,15 +160,13 @@ final class SearchEngine {
             for (i, chunk) in chunks.enumerated() {
                 let id = String(format: "%@#%04d", sourceID, i)
                 var stage = Date()
-                var terms = TokenPruner.shared.prune(chunk.content)
-                if terms.isEmpty { terms = TextAnalysis.words(chunk.content).filter { !TokenPruner.shared.isStopword($0) } }
-                pruneTotal += Date().timeIntervalSince(stage)
-                guard !terms.isEmpty else { continue }
-                termTotal += terms.count
-
-                stage = Date()
-                let vectors = try colbert.encodeTerms(terms)
+                // 整段编码：一次前向得到切片内每个内容 token 的向量。
+                // 旧实现逐词编码，每个词都要重复一次完整 24 层前向（一本书数小时），
+                // 且丢失词序；整段编码与标准 ColBERT 一致，入库降到秒级。
+                let vectors = try colbert.encodeDocument(chunk.content)
                 encodeTotal += Date().timeIntervalSince(stage)
+                guard !vectors.isEmpty else { continue }
+                termTotal += vectors.count
                 tokenTotal += vectors.count
 
                 stage = Date()
@@ -198,7 +199,6 @@ final class SearchEngine {
             Self.setMeta(db, "doc_count", String(previous + added))
             Self.setMeta(db, "doc_rowid_seq", String(rowSeq))
             let total = Date().timeIntervalSince(addStarted)
-            timing?("prune_total", pruneTotal)
             timing?("encode_total", encodeTotal)
             timing?("quantize_total", quantTotal)
             timing?("db_write_total", dbTotal)

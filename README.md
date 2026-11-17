@@ -53,8 +53,8 @@ VARIANT=lite  scripts/package-app.sh release && VARIANT=lite  scripts/package-dm
 
 | VARIANT | 内置模型 | DMG |
 |---|---|---|
-| `clean`（默认） | 无；potion 语义切片 / jina embedding / jina reranker 均在首次启动时从 hf-mirror 自动下载 | `dist/Lightning-RAG-1.3.26-clean.dmg` |
-| `lite` | potion-multilingual-128M int4（语义切片）+ jina-embeddings-v5-text-nano-mlx-int4 + jina-reranker-v2-base-multilingual-onnx | `dist/Lightning-RAG-1.3.26-lite.dmg` |
+| `clean`（默认） | 无；potion 语义切片 / jina embedding / jina reranker 均在首次启动时从 hf-mirror 自动下载 | `dist/Lightning-RAG-1.3.27-clean.dmg` |
+| `lite` | potion-multilingual-128M int4（语义切片）+ jina-embeddings-v5-text-nano-mlx-int4 + jina-reranker-v2-base-multilingual-onnx | `dist/Lightning-RAG-1.3.27-lite.dmg` |
 
 两个版本共用 `dist/Lightning-RAG.app`（应用本体与显示名不变，只有内置模型不同），
 因此需按「打包 App → 打包 DMG」的顺序逐个构建。两个版本都不含主模型、辅助模型
@@ -127,7 +127,9 @@ HTML 与 Office 解析另有专项覆盖：HTML 保存页的本地 iframe / fram
 
 **自定义 system prompt**：首次启动会在 `<workspace>/assets/system_prompt.txt` 写出内置的 `BASE_SYSTEM_PROMPT`；之后每次启动读取该文件并替换内置提示词，可直接用文本编辑器调整模型行为规则，**重启（或重新应用配置）后生效**（会话期间保持不变，以免 system 前缀抖动使 KV cache 反复重建）。文件内容空白或不可读时本次回退内置提示词，且不会覆盖文件。它替换的是协议主体，L0 META-SOP 与 L1 全局索引仍按多级记忆机制追加在其后；轻量轮（纯寒暄/能力问询）使用内核的极简提示，不受该文件影响。内置提示词中的 `<summary>` 标签、`rag_tools(op="outline")` 起手式、工具状态词等是内核回注与测试的硬依赖，建议在原文基础上调整，不要整段删除。
 
-**v1.3.26（当前）**：新增**检索阅读模式**（`colbert_reader_enabled`）。解析之后的切片、embedding、入库、检索、精排由 ColBERT 多向量检索旁路接管：jina-colbert-v2 ONNX int8 + 残差量化写入独立 `colbert.db`，簇心粗筛 + MaxSim 精排 + 可选 ANN，分片不进入模型上下文、全部作为引用气泡供用户点开阅读。该模式与普通 embedding / 向量库**完全解耦**：embedding 不可用时同步与检索照常工作，普通 embedding 配置变化不再触发 ColBERT 重建，预加载、ANN 自动构建与知识图谱调度均按模式分流。同步修正引用来源：`document.source` 记录文件相对路径，气泡「来源」为文件名、「章节」为切片标题。新增 `RAGBenchmark` CLI 对比两种链路的 hit@1 / hit@k / MRR 与耗时（支持 `--no-embedding` 验证解耦）；三文档冒烟语料两链路均 6/6 命中，检索阅读平均耗时约 123ms，普通 RAG（含 reranker）约 456ms。
+**v1.3.27（当前）**：修复检索阅读模式知识同步长时间无进展。**编码实现**：ColBERT 入库由「逐词编码」（每个词重复一次 24 层 XLM-R-large 前向，一本书数小时）改为「按 300 token 分段 + batch=8 整段编码」，一本 26.5 万字符书籍实测入库约 9.3 分钟；切片器不再把 ColBERT 当语义相似度模型逐句调用，改用结构与词法边界。**截断修复**：模型 `tokenizer.json` 写死 `truncation=300`，旧实现整段编码时会静默丢弃切片尾部 95% 正文，现按 300 token 分段后再编码。**可观测性**：模型下载（约 560MB）与切片编码每 30 秒输出 `[colbert]` 进度日志，不再出现长时间静默；ONNX 推理线程数改为物理核数（上限 8）。三文档冒烟语料两链路仍 6/6 命中，真实书籍查询 hit@1 2/2。
+
+**v1.3.26**：新增**检索阅读模式**（`colbert_reader_enabled`）。解析之后的切片、embedding、入库、检索、精排由 ColBERT 多向量检索旁路接管：jina-colbert-v2 ONNX int8 + 残差量化写入独立 `colbert.db`，簇心粗筛 + MaxSim 精排 + 可选 ANN，分片不进入模型上下文、全部作为引用气泡供用户点开阅读。该模式与普通 embedding / 向量库**完全解耦**：embedding 不可用时同步与检索照常工作，普通 embedding 配置变化不再触发 ColBERT 重建，预加载、ANN 自动构建与知识图谱调度均按模式分流。同步修正引用来源：`document.source` 记录文件相对路径，气泡「来源」为文件名、「章节」为切片标题。新增 `RAGBenchmark` CLI 对比两种链路的 hit@1 / hit@k / MRR 与耗时（支持 `--no-embedding` 验证解耦）；三文档冒烟语料两链路均 6/6 命中，检索阅读平均耗时约 123ms，普通 RAG（含 reranker）约 456ms。
 
 **v1.3.24**：新增 `web_search` 多引擎聚合搜索与 50 个备用检索源。主引擎（Google / Bing / DuckDuckGo / Brave / 百度 / 搜狗 / 360）并发查询，结果不足时按查询意图自动补位备用源；结果统一去重、过滤、排序，模型再从结果取真实 URL 交给 `web_scan` 读正文。系统提示要求本地知识库缺失信息主动搜索。内核同步收紧计划空转保护：`update_plan` 不再计为实际工作，计划闭合但零工具调用时强制真实工具，收尾时把无验证的 `done` 降级为 `skipped`；搜索类意图空转耗尽时内核代发一次 `web_search`。
 
@@ -312,6 +314,8 @@ swift run RAGBenchmark --corpus <语料目录> --no-embedding
 ```
 
 三文档冒烟语料实测：两种链路均 6/6 命中（hit@1 100%、MRR 1.0），普通 RAG 平均约 456ms（含 reranker），检索阅读约 123ms；`--no-embedding` 下普通 RAG 明确报错且不崩溃，检索阅读仍 6/6 命中。
+
+**性能与进度**：ColBERT 模型（`model_int8.onnx` 约 560MB）只在启用该模式后首次同步时下载，网络慢时可能需要数十分钟，日志会按 30 秒输出下载进度。入库按 300 token 分段批量编码（tokenizer 自带 300 token 截断，必须先分段，否则切片尾部正文不会参与检索）；一本约 26 万字的书在 8 核 Apple Silicon 上实测约 9 分钟（约 300 GFLOPS 有效算力），日志每 30 秒输出 `[colbert] 编码 x/y 分片`。首次全量同步大知识库请预留相应时间，后续增量同步只处理变化文件。
 
 ### 6. 本地模型
 

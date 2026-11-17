@@ -28,7 +28,8 @@ final class ColBERT {
         self.outputName = outputName
     }
 
-    static func load(modelDir: String, threads: Int = 4) async throws -> ColBERT {
+    static func load(modelDir: String,
+                     threads: Int = min(8, ProcessInfo.processInfo.activeProcessorCount)) async throws -> ColBERT {
         let dir = URL(fileURLWithPath: modelDir, isDirectory: true)
         guard FileManager.default.fileExists(atPath: dir.appendingPathComponent("tokenizer.json").path) else {
             throw DocSearchError.model("缺少 tokenizer.json: \(modelDir)")
@@ -39,6 +40,9 @@ final class ColBERT {
         }
 
         let tokenizer = try await Tokenizers.AutoTokenizer.from(modelFolder: dir, strict: false)
+        // tokenizer.json 自带 truncation=max_length 300（模型作者的短文训练设置）。
+        // 不能整段直接编码，否则 8000 字符的切片只会保留前 300 token，其余正文
+        // 完全不参与检索；encodeDocument 按 300 token 切成多段后批量编码。
         let env: ORTEnv
         envLock.lock()
         if sharedEnv == nil { sharedEnv = try ORTEnv(loggingLevel: .warning) }
@@ -180,6 +184,82 @@ final class ColBERT {
             offset = end
         }
         return output
+    }
+
+    /// 整段编码：把切片正文切成若干 ≤300 token 的小段，批量前向后拼接各段内
+    /// 容 token 的向量（标准 ColBERT 的 token 级表示）。
+    ///
+    /// 两个关键点：
+    /// 1. tokenizer.json 写死了 truncation=300，超过 300 token 的部分会被静默丢弃，
+    ///    所以必须先按 300 token 分段，否则一本书只有开头几百字参与检索；
+    /// 2. 逐词编码（`encodeTerms`）每个词都要重复一次完整 24 层前向，一本书要数
+    ///    小时；分段批量编码按 batch=8 分摊权重读取，入库耗时降到分钟级。
+    func encodeDocument(_ text: String, maxTokens: Int = 300,
+                        batchSize: Int = 8) throws -> [[Float]] {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return [] }
+        let segments = Self.segment(trimmed, maxTokens: maxTokens,
+                                    encodeIDs: { self.encodeIDs($0, kind: .document) })
+        guard !segments.isEmpty else { return [] }
+        let encoded = try encode(segments, kind: .document, batchSize: batchSize)
+        var vectors: [[Float]] = []
+        vectors.reserveCapacity(segments.count * 128)
+        for (i, segment) in segments.enumerated() {
+            guard i < encoded.count else { break }
+            let seq = encoded[i]
+            let ids = encodeIDs(segment, kind: .document)
+            let positions = contentIndices(ids, kind: .document)
+            if positions.isEmpty {
+                vectors.append(contentsOf: seq)
+            } else {
+                for p in positions where p < seq.count { vectors.append(seq[p]) }
+            }
+        }
+        return vectors
+    }
+
+    /// 按 token 预算切段：优先在句子边界断开，单句超长时按字符二分收缩。
+    private static func segment(_ text: String, maxTokens: Int,
+                                encodeIDs: (String) -> [Int]) -> [String] {
+        var sentences = TextAnalysis.sentences(text)
+        if sentences.isEmpty { sentences = [text] }
+        var segments: [String] = []
+        var current = ""
+        func flush() {
+            let trimmed = current.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !trimmed.isEmpty { segments.append(trimmed) }
+            current = ""
+        }
+        for sentence in sentences {
+            let candidate = current.isEmpty ? sentence : TextAnalysis.join(current, sentence)
+            if encodeIDs(candidate).count <= maxTokens {
+                current = candidate
+                continue
+            }
+            flush()
+            if encodeIDs(sentence).count <= maxTokens {
+                current = sentence
+                continue
+            }
+            // 单句超过预算：按字符二分找到最大可容纳前缀，剩余部分继续处理。
+            var rest = Substring(sentence)
+            while !rest.isEmpty {
+                var lo = 1, hi = rest.count
+                while lo < hi {
+                    let mid = (lo + hi + 1) / 2
+                    if encodeIDs(String(rest.prefix(mid))).count <= maxTokens {
+                        lo = mid
+                    } else {
+                        hi = mid - 1
+                    }
+                }
+                guard lo > 0 else { break }
+                segments.append(String(rest.prefix(lo)))
+                rest = rest.dropFirst(lo)
+            }
+        }
+        flush()
+        return segments
     }
 
     /// 查询中心向量：取 query 增强后所有「内容 token」（含 <mask>，排除 <s>/</s>/标记）的均值。
