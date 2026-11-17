@@ -19,6 +19,7 @@ macOS 原生自主 Agent。控制流是**三态自动机 + 五级上下文压缩
   - 默认 Embedding 为 lite 版内置（clean 版首次启动自动下载）的 `jina-embeddings-v5-text-nano-mlx-int4`（EuroBERT-210M，int4），未配置时开箱可用；`jina-embeddings-v5-text-nano-onnx-int8` 为可选后端
   - 默认 Reranker 为 lite 版内置（clean 版首次启动自动下载）的 `jina-reranker-v2-base-multilingual-onnx`（XLM-R base，ONNX int8，`model_quantized.onnx` 约 267MB），配置留空时开箱可用；RAG 全链路（切片 / 向量 / 召回 / 重排）无需配置任何本地模型，只需配置主模型与辅助模型
   - 默认主模型 `models/qwen3.5-4b-agentic-coder-v4-4bit-mlx`；辅助模型默认 `models/Qwen3.5-2B-MLX-4bit`，但默认**不启用**，需要在配置窗口显式勾选「启用」
+  - 检索阅读模式（可选）：`arlenecc/jina-colbert-v2-64-onnx-int8`（ONNX int8 约 560MB），启用该模式后首次同步时从 hf-mirror 断点续传下载到 `<workspace>/models`；不启用则不下载、不加载
 - 运行时已随包内置：
   - GGUF：llama.cpp 官方 XCFramework，进程内直接加载模型，不再启动 `llama-server`
   - ONNX：onnxruntime-swift，不再依赖 Python / `onnxruntime-genai`
@@ -52,8 +53,8 @@ VARIANT=lite  scripts/package-app.sh release && VARIANT=lite  scripts/package-dm
 
 | VARIANT | 内置模型 | DMG |
 |---|---|---|
-| `clean`（默认） | 无；potion 语义切片 / jina embedding / jina reranker 均在首次启动时从 hf-mirror 自动下载 | `dist/Lightning-RAG-1.3.9-clean.dmg` |
-| `lite` | potion-multilingual-128M int4（语义切片）+ jina-embeddings-v5-text-nano-mlx-int4 + jina-reranker-v2-base-multilingual-onnx | `dist/Lightning-RAG-1.3.9-lite.dmg` |
+| `clean`（默认） | 无；potion 语义切片 / jina embedding / jina reranker 均在首次启动时从 hf-mirror 自动下载 | `dist/Lightning-RAG-1.3.26-clean.dmg` |
+| `lite` | potion-multilingual-128M int4（语义切片）+ jina-embeddings-v5-text-nano-mlx-int4 + jina-reranker-v2-base-multilingual-onnx | `dist/Lightning-RAG-1.3.26-lite.dmg` |
 
 两个版本共用 `dist/Lightning-RAG.app`（应用本体与显示名不变，只有内置模型不同），
 因此需按「打包 App → 打包 DMG」的顺序逐个构建。两个版本都不含主模型、辅助模型
@@ -117,7 +118,7 @@ HTML 与 Office 解析另有专项覆盖：HTML 保存页的本地 iframe / fram
   - 辅助模型：标题后带「启用」复选框（对应 `aux_enabled`，默认关闭）。本地模式同主模型布局（含独立的「KV复用」「KV量化」开关），默认 `models/Qwen3.5-2B-MLX-4bit`；未启用时「加载模型 / 重新加载」按钮禁用。
   - 启动时按 `auto_preload_main`（默认开启）预加载主模型；辅助模型仅在 `aux_enabled=true` 时加载。关闭主模型启动预加载后，需在配置窗口手动点「加载模型」；同步结束后的模型恢复不受影响。未指定模型时使用默认主模型 `models/qwen3.5-4b-agentic-coder-v4-4bit-mlx`。加载会真正把参数应用到新创建的模型实例。
   - Agent 区底部「运行参数」行：「最大迭代」（`max_iterations`，默认 15，1...50），修改后点该行「应用配置」保存。
-- **配置窗口（知识同步）**：`工作目录` 单独一行；`源目录`（原「知识库目录」）行内紧跟四个操作按钮：应用配置 / 同步知识 / 停止同步 / 向量去重（排查并清理向量库内重复的切片，保留入库时间最早的一份），按钮与目录选择在同一行排列（窗口较窄时不拆分）。同一区域提供 RAG 检索策略下拉（local / global / hybrid / mix / naive）与「构建知识图谱 / 停止构建 / 实体消歧」；图谱未构建完成时四种图谱策略不可选。Embedding 行 = 类型（FastEmbed / ONNX / MLX / GGUF）+ 本地路径 + 选择… +「语义切片」开关 /「切片大小」/「overlap」；Reranker 行 = 同布局 +「启用重排序」开关 /「TopN」/「候选池」/「阈值」。「启用重排序」对应 `rag_rerank_enabled`（默认开启），「TopN」对应 `rag_rerank_top_n`（默认 3，1...20），「候选池」对应 `rag_rerank_candidate_multiplier`（默认 3，1...5：候选池 = `max(调用方 top_k, TopN) × 倍数`），「阈值」对应 `rag_rerank_threshold`（默认 0.45，0...1），表示 reranker 之后保留的结果数量、候选池放大倍数与分数过滤下限；`rag_rerank_timeout_seconds`（默认 5s，0 = 不限制）控制 rerank 墙钟超时，超时回退 RRF 并只返回前 3 条。Reranker 行之后依次是「二值粗筛」开关与候选数 Stepper、`ANN设置` 分组标签、向量库与 ANN 索引合并行：向量元素类型（默认 int8；可选 int8 / fp32 / fp16 / bin）/ Matryoshka 模式与截断维（jina-v5 六档 32 / 64 / 128 / 256 / 512 / 768，其它模型保留 128 / 256 / 512） /「ANN 检索」与「自动构建」开关 / ANN 索引摘要与「构建 ANN 索引 / 停止构建 / 删除索引」，「重建向量库」按钮固定在该组行末。「ANN 检索」对应 `rag_ann_enabled`，「自动构建」对应 `rag_ann_auto_build`。「二值粗筛」开关对应 `rag_binary_coarse_enabled`（默认开启），候选数对应 `rag_binary_coarse_candidates`（默认 200，50...1000，步进 50，关闭时禁用）。二值可用时全局检索由它取代 ANN，不可用或定向检索时自动回退原流程；主存储为 BIN 时该功能停用，旧库需重新同步后才会生效。高级区保留 PDF/EPUB OCR 引擎、OCR 模型（MLX / GGUF / ONNX）、mmproj、归一化/二值化，以及「RAG 参数设置」中的「查询超时」（`rag_query_timeout_seconds`，默认 5s，0 = 关闭）和「同步参数设置」中的「启动时自动同步」（`rag_auto_ingest`，默认关闭；开启后每次启动会自动增量扫描知识库，首次全量同步可能长时间占用 embedding 模型与磁盘 IO）、「同步并发」（`rag_ingest_concurrency`）、「OCR 并发」（`rag_vision_concurrency`）、「MLX 缓存」（`mlx_cache_limit_mb`）与「MLX 上限」（`mlx_memory_limit_mb`，0 = 自动）。向量库待重建时，红色提示显示在该合并行下方。
+- **配置窗口（知识同步）**：`工作目录` 单独一行；`源目录`（原「知识库目录」）行内紧跟四个操作按钮：应用配置 / 同步知识 / 停止同步 / 向量去重（排查并清理向量库内重复的切片，保留入库时间最早的一份），按钮与目录选择在同一行排列（窗口较窄时不拆分）。同一区域提供 RAG 检索策略下拉（local / global / hybrid / mix / naive）与「构建知识图谱 / 停止构建 / 实体消歧」；图谱未构建完成时四种图谱策略不可选。Embedding 行 = 类型（FastEmbed / ONNX / MLX / GGUF）+ 本地路径 + 选择… +「语义切片」开关 /「切片大小」/「overlap」；Reranker 行 = 同布局 +「启用重排序」开关 /「TopN」/「候选池」/「阈值」。「启用重排序」对应 `rag_rerank_enabled`（默认开启），「TopN」对应 `rag_rerank_top_n`（默认 3，1...20），「候选池」对应 `rag_rerank_candidate_multiplier`（默认 3，1...5：候选池 = `max(调用方 top_k, TopN) × 倍数`），「阈值」对应 `rag_rerank_threshold`（默认 0.45，0...1），表示 reranker 之后保留的结果数量、候选池放大倍数与分数过滤下限；`rag_rerank_timeout_seconds`（默认 5s，0 = 不限制）控制 rerank 墙钟超时，超时回退 RRF 并只返回前 3 条。Reranker 行之后依次是「二值粗筛」开关与候选数 Stepper、`ANN设置` 分组标签、向量库与 ANN 索引合并行：向量元素类型（默认 int8；可选 int8 / fp32 / fp16 / bin）/ Matryoshka 模式与截断维（jina-v5 六档 32 / 64 / 128 / 256 / 512 / 768，其它模型保留 128 / 256 / 512） /「ANN 检索」与「自动构建」开关 / ANN 索引摘要与「构建 ANN 索引 / 停止构建 / 删除索引」，「重建向量库」按钮固定在该组行末。「ANN 检索」对应 `rag_ann_enabled`，「自动构建」对应 `rag_ann_auto_build`。「二值粗筛」开关对应 `rag_binary_coarse_enabled`（默认开启），候选数对应 `rag_binary_coarse_candidates`（默认 200，50...1000，步进 50，关闭时禁用）。二值可用时全局检索由它取代 ANN，不可用或定向检索时自动回退原流程；主存储为 BIN 时该功能停用，旧库需重新同步后才会生效。高级区保留 PDF/EPUB OCR 引擎、OCR 模型（MLX / GGUF / ONNX）、mmproj、归一化/二值化，以及「RAG 参数设置」中的「查询超时」（`rag_query_timeout_seconds`，默认 5s，0 = 关闭）和「同步参数设置」中的「启动时自动同步」（`rag_auto_ingest`，默认关闭；开启后每次启动会自动增量扫描知识库，首次全量同步可能长时间占用 embedding 模型与磁盘 IO）、「同步并发」（`rag_ingest_concurrency`）、「OCR 并发」（`rag_vision_concurrency`）、「MLX 缓存」（`mlx_cache_limit_mb`）与「MLX 上限」（`mlx_memory_limit_mb`，0 = 自动）。向量库待重建时，红色提示显示在该合并行下方。同区域还有「检索阅读模式」行：启用复选框（`colbert_reader_enabled`）、量化残差（2bit / 4bit，`colbert_quant_bits`）、粗筛候选（10/20/50/100，`colbert_coarse_candidates`）、精选 topN（1/3/5，`colbert_top_n`）与「使用ANN」（`colbert_use_ann`）；启用后该行提示解析后的切片/向量/检索整体切到 ColBERT 链路，普通 embedding 与向量库不再参与，需重新同步一次知识库。
   - 高级区的「PDF OCR 设置」行末提供「转换工具」按钮，打开独立窗口，把单个文件或整个目录批量转换为 Markdown。复用知识同步的解析器（PDF / EPUB / HTML / TXT / 图片，Office 支持现代格式 `.docx` / `.xlsx` / `.pptx` 与旧版 `.doc` / `.xls` / `.ppt`），沿用打开窗口时面板上的 OCR / PDF / 归一化设置快照；不写回 `config.json`，也不重建 Agent。目录递归时保留相对子目录结构，输出目录位于输入目录内会自动跳过；同批同名（如 `a.txt` 与 `a.html`）依次生成 `a-2.md`、`a-3.md`；单个文件失败不会中断整批。进度区显示当前文件、当前环节（解析 / 图片归一化 / 图片识别 / 清洗与 Markdown 转换）与总体进度，关闭窗口会取消仍在进行的转换。转换按文件体积分批并发：达到 32MB 的文件单独成批串行，其余文件按同步并发（最多 6）并行；PDF 解析按体积收紧页级 worker / 在途页并分批产图，内嵌大图先按目标尺寸降采样，超过 200MP 回退有界栅格化。转换只到写出 Markdown，不做切片、embedding 与入库。
 - 确认弹窗默认按钮为「拒绝」；`ask_user` 的回答作为工具结果继续同一轮推理。
 - RAG 状态在后台线程查询，不在主线程建库/COUNT；状态只读取来源总数与前 256 个来源名，大知识库不会把全部路径读入内存。连续应用配置只生效最后一次，旧同步完成后只重载它自己的引擎，不会影响新 Agent。
@@ -126,7 +127,9 @@ HTML 与 Office 解析另有专项覆盖：HTML 保存页的本地 iframe / fram
 
 **自定义 system prompt**：首次启动会在 `<workspace>/assets/system_prompt.txt` 写出内置的 `BASE_SYSTEM_PROMPT`；之后每次启动读取该文件并替换内置提示词，可直接用文本编辑器调整模型行为规则，**重启（或重新应用配置）后生效**（会话期间保持不变，以免 system 前缀抖动使 KV cache 反复重建）。文件内容空白或不可读时本次回退内置提示词，且不会覆盖文件。它替换的是协议主体，L0 META-SOP 与 L1 全局索引仍按多级记忆机制追加在其后；轻量轮（纯寒暄/能力问询）使用内核的极简提示，不受该文件影响。内置提示词中的 `<summary>` 标签、`rag_tools(op="outline")` 起手式、工具状态词等是内核回注与测试的硬依赖，建议在原文基础上调整，不要整段删除。
 
-**v1.3.24（当前）**：新增 `web_search` 多引擎聚合搜索与 50 个备用检索源。主引擎（Google / Bing / DuckDuckGo / Brave / 百度 / 搜狗 / 360）并发查询，结果不足时按查询意图自动补位备用源；结果统一去重、过滤、排序，模型再从结果取真实 URL 交给 `web_scan` 读正文。系统提示要求本地知识库缺失信息主动搜索。内核同步收紧计划空转保护：`update_plan` 不再计为实际工作，计划闭合但零工具调用时强制真实工具，收尾时把无验证的 `done` 降级为 `skipped`；搜索类意图空转耗尽时内核代发一次 `web_search`。
+**v1.3.26（当前）**：新增**检索阅读模式**（`colbert_reader_enabled`）。解析之后的切片、embedding、入库、检索、精排由 ColBERT 多向量检索旁路接管：jina-colbert-v2 ONNX int8 + 残差量化写入独立 `colbert.db`，簇心粗筛 + MaxSim 精排 + 可选 ANN，分片不进入模型上下文、全部作为引用气泡供用户点开阅读。该模式与普通 embedding / 向量库**完全解耦**：embedding 不可用时同步与检索照常工作，普通 embedding 配置变化不再触发 ColBERT 重建，预加载、ANN 自动构建与知识图谱调度均按模式分流。同步修正引用来源：`document.source` 记录文件相对路径，气泡「来源」为文件名、「章节」为切片标题。新增 `RAGBenchmark` CLI 对比两种链路的 hit@1 / hit@k / MRR 与耗时（支持 `--no-embedding` 验证解耦）；三文档冒烟语料两链路均 6/6 命中，检索阅读平均耗时约 123ms，普通 RAG（含 reranker）约 456ms。
+
+**v1.3.24**：新增 `web_search` 多引擎聚合搜索与 50 个备用检索源。主引擎（Google / Bing / DuckDuckGo / Brave / 百度 / 搜狗 / 360）并发查询，结果不足时按查询意图自动补位备用源；结果统一去重、过滤、排序，模型再从结果取真实 URL 交给 `web_scan` 读正文。系统提示要求本地知识库缺失信息主动搜索。内核同步收紧计划空转保护：`update_plan` 不再计为实际工作，计划闭合但零工具调用时强制真实工具，收尾时把无验证的 `done` 降级为 `skipped`；搜索类意图空转耗尽时内核代发一次 `web_search`。
 
 **v1.3.9**：知识图谱抽取默认切到 JSON 格式并加固提示词。**格式可切**：`rag_kg_extraction_format` 默认 `json`（`entities` / `relationships` 数组），可改 `delimited` 兼容 0.8B 等小模型；两种格式缓存键隔离，配置文件中带 `_comment_*` 说明。**提示词加固**：正文代码围栏隔离、Section Context 标注不可信元数据、新增 relation/entity 与分隔符的 Wrong/Correct 反例、纯数字/年份不成实体、端点缺失提示补抽。**解析兜底**：4 段关系用 keywords 补描述，JSON 支持代码围栏与数组 keywords。**二次补抽**：首轮为空或末行残缺时追加一次只补漏请求。**崩溃修复**：图谱抽取并发默认改为 1（`rag_kg_max_concurrency`），修复 2B 四路并发导致 MLX 活跃内存 11GB、`mlx_async_eval` 触发 `EXC_BREAKPOINT` 的构建崩溃。**实测**：2B JSON 模式 19.5 秒抽到 7/7 实体、5 条有效关系；0.8B 仍不建议用于图谱构建。
 
@@ -285,6 +288,31 @@ manifest 条目同时记录 `chunkCount` 与 `complete`：增量跳过前会校�
 
 知识同步配置区的「向量去重」可随时手动排查向量库：按切片正文 SHA256 分组，每组只保留入库时间最早的一份，单事务删除重复的 `chunks` / `chunks_fts` / `chunk_vectors`；整篇被清空的来源写 `duplicateOf` tombstone 并删除 documents/Markdown 缓存，后续增量同步直接跳过，避免重复向量继续制造检索噪声。去重期间与同步、模型加载/卸载、对话发送互斥，结束后自动刷新 RAG 统计。
 
+### 5.1 检索阅读模式（ColBERT 多向量大分片）
+
+`rag` 配置中的 `colbert_reader_enabled`（设置窗口「启用检索阅读模式」）打开后，解析之后的**切片、embedding、入库、检索、精排**整条链路被 ColBERT 多向量检索旁路接管，与普通 embedding / 向量库**完全解耦**：
+
+| 环节 | 普通 RAG | 检索阅读模式（ColBERT） |
+| --- | --- | --- |
+| 切片 | `TextChunker` 800/80 token 结构 + 语义切片 | ColBERT 大分片（按章节聚合，模型内 token 化） |
+| 编码 | jina-v5 单向量 + Matryoshka 128 维 int8 | jina-colbert-v2 多向量（每 token 一个向量）+ 残差量化 |
+| 存储 | `rag_data/<kb>/index.sqlite` | 独立 `rag_data/<kb>/colbert.db`（与普通库互不干扰） |
+| 召回 | 向量 + FTS + RRF → reranker | 簇心粗筛（vec0）→ 残差 MaxSim 精排，可叠加 ANN 索引 |
+| 上下文 | top-1 切片进模型上下文 | 分片**不进入上下文**，全部作为引用气泡，由用户点开阅读 |
+
+- 模型默认 `arlenecc/jina-colbert-v2-64-onnx-int8`（`colbert_model`），clean 版首次使用时经 hf-mirror 断点续传下载到 `<workspace>/models`，之后常驻复用；`colbert_quant_bits`（2/4，默认 4）、`colbert_coarse_candidates`（默认 20）、`colbert_top_n`（默认 3）、`colbert_use_ann`（默认开）可调。
+- **与普通 embedding 解耦**：该模式下 `RAGEngine.ingest` 不要求 embedding 模型可用，普通向量库打不开也只记日志、不中断同步；不创建 embedding 调度器、不校验向量库重建闸门、不按 embedding 窗口收口切片。`makeIngestSignature` 只记录 ColBERT 模型与量化配置，因此调整普通 embedding 后端、元素类型、Matryoshka 维度、切片大小都不会触发 ColBERT 库重建。预加载只加载 ColBERT 模型；ANN 自动构建改走 ColBERT 索引；知识图谱增量抽取得以跳过。
+- **引用来源**：`colbert.db` 的 `document.source` 记录入库时的文件相对路径，气泡上的「来源」是文件名，「章节」是切片所在标题；旧库缺少该列时会自动补列并回退到标题。
+- **验证工具** `RAGBenchmark`：对同一语料分别用两种链路入库并逐条检索，输出 hit@1 / hit@k / MRR 与平均、中位查询耗时，报告写入 `<workspace>/benchmark_report.json`：
+
+```bash
+swift run RAGBenchmark --corpus <语料目录> --topk 3
+# 验证解耦：把普通 embedding 配置成不可用，检索阅读模式仍应正常入库与检索
+swift run RAGBenchmark --corpus <语料目录> --no-embedding
+```
+
+三文档冒烟语料实测：两种链路均 6/6 命中（hit@1 100%、MRR 1.0），普通 RAG 平均约 456ms（含 reranker），检索阅读约 123ms；`--no-embedding` 下普通 RAG 明确报错且不崩溃，检索阅读仍 6/6 命中。
+
 ### 6. 本地模型
 
 - LLM / VLM：**mlx-swift-lm**（`MLXLLM` / `MLXLMCommon` / `MLXVLM`）、**llama.cpp C API**（GGUF）与 **onnxruntime-swift**（ONNX）。
@@ -404,6 +432,8 @@ PDF Ovis 引擎按 `rag_ocr_model_path` / `rag_ocr_model_name` 加载，不受 `
 Package.swift
 Sources/
   CSQLiteVec/                  # sqlite-vec v0.1.9 amalgamation（静态编入）
+  ColBERTReader/               # 检索阅读模式：ColBERT 多向量入库/粗筛/MaxSim/ANN
+  RAGBenchmark/                # 检索准确率与耗时对比 CLI（普通 RAG vs 检索阅读）
   BaseAgentCore/
     Core/                      # JSONValue / ChatMessage / Tool 协议 / Config
     Kernel/                    # 三态自动机、Session、预算、L0-L4 压缩
@@ -414,7 +444,8 @@ Sources/
       Chunking/                # NaturalLanguage 切片与大纲
       Storage/                 # SQLite、sqlite-vec、FTS5、VectorStore
       KnowledgeGraph/          # 实体/关系抽取、vec0 向量、SwiftGraph、五策略检索
-      RAGEngine.swift          # 同步、Manifest、检索、rerank
+      ColBERTReaderService.swift  # 检索阅读模式封装（下载/入库/检索/ANN/清理）
+      RAGEngine.swift          # 同步、Manifest、检索、rerank、按模式分流
     Tools/                     # 组合工具（file_tools/web_scan/long_memory/skill_tools/rag_tools）
                                # + 独立工具（web_search/code_run/shell_run/ask_user/plan/schedule_task/MCP）
                                # + Web 搜索适配器与 50 源备用目录（WebSearchTool/WebSearchBackupEngines）

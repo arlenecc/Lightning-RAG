@@ -7,6 +7,7 @@ let package = Package(
     products: [
         .library(name: "BaseAgentCore", targets: ["BaseAgentCore"]),
         .executable(name: "Lightning-RAG", targets: ["BaseAgentApp"]),
+        .executable(name: "RAGBenchmark", targets: ["RAGBenchmark"]),
     ],
     dependencies: [
         // Tokenizer：swift-transformers 的 Tokenizers 模块
@@ -52,11 +53,27 @@ let package = Package(
             name: "CPDFShim",
             path: "Sources/CPDFShim"
         ),
+        // 检索阅读模式：ColBERT 多向量大分片检索（相对独立组件，接管解析后全流程）
+        .target(
+            name: "ColBERTReader",
+            dependencies: [
+                "CSQLiteVec",
+                .product(name: "Tokenizers", package: "swift-transformers"),
+                .product(name: "onnxruntime", package: "onnxruntime-swift-package-manager"),
+            ],
+            path: "Sources/ColBERTReader",
+            resources: [
+                .copy("Resources/stopwords_full.txt"),
+            ],
+            swiftSettings: [.swiftLanguageMode(.v5)],
+            linkerSettings: [.linkedLibrary("sqlite3")]
+        ),
         .target(
             name: "BaseAgentCore",
             dependencies: [
                 "CSQLiteVec",
                 "CPDFShim",
+                "ColBERTReader",
                 "llama",
                 .product(name: "Jinja", package: "swift-jinja"),
                 .product(name: "Tokenizers", package: "swift-transformers"),
@@ -88,6 +105,12 @@ let package = Package(
             dependencies: ["BaseAgentCore"],
             path: "Sources/BaseAgentApp",
             resources: [.process("Resources")],
+            swiftSettings: [.swiftLanguageMode(.v5)]
+        ),
+        .executableTarget(
+            name: "RAGBenchmark",
+            dependencies: ["BaseAgentCore"],
+            path: "Sources/RAGBenchmark",
             swiftSettings: [.swiftLanguageMode(.v5)]
         ),
         .testTarget(

@@ -340,6 +340,22 @@ public struct AgentConfig: Sendable {
     /// 开启后即使 mtime/size 相同也会比对采样指纹（能发现保留时间戳的改动）。
     public var ragVerifyFingerprint: Bool = false
 
+    // 检索阅读模式（ColBERT 多向量大分片检索）
+    /// 启用后旁路接管文档解析→markdown 之后的切片、embedding、入库、检索、
+    /// reranker 全流程，改用 ColBERT 大分片多向量检索。分片不再进入模型
+    /// 上下文，只作为召回切片气泡附在回复后供用户点击阅读，并可切换前后切片。
+    public var colbertReaderEnabled: Bool = false
+    /// 残差量化位数：2 或 4。2bit 更省空间但精度略低。
+    public var colbertQuantBits: Int = 4
+    /// 粗筛候选数（10/20/50/100，默认 20）：先粗筛出候选再做 MaxSim 精排。
+    public var colbertCoarseCandidates: Int = 20
+    /// 精选返回条数（1/3/5，默认 3）。
+    public var colbertTopN: Int = 3
+    /// 是否使用 ANN 向量索引加速检索。
+    public var colbertUseANN: Bool = true
+    /// 检索阅读模式使用的模型仓库名（自动从 hf-mirror.com 下载）。
+    public var colbertModel: String = "arlenecc/jina-colbert-v2-64-onnx-int8"
+
     // SQLite + sqlite-vec 存储
     /// 预留（当前固定 sqlite）：migrate() 会把非 "sqlite" 的配置强制归一，
     /// 生产检索只由 ragSQLiteVecEnabled / elementType 决定存储形态。
@@ -639,6 +655,18 @@ public struct AgentConfig: Sendable {
             ragIngestConcurrency = min(max(1, v), 10)
         }
         if let v = bool("rag_verify_fingerprint") { ragVerifyFingerprint = v }
+        if let v = bool("colbert_reader_enabled") { colbertReaderEnabled = v }
+        if let v = int("colbert_quant_bits") {
+            colbertQuantBits = (v == 2) ? 2 : 4
+        }
+        if let v = int("colbert_coarse_candidates") {
+            colbertCoarseCandidates = [10, 20, 50, 100].contains(v) ? v : 20
+        }
+        if let v = int("colbert_top_n") {
+            colbertTopN = [1, 3, 5].contains(v) ? v : 3
+        }
+        if let v = bool("colbert_use_ann") { colbertUseANN = v }
+        if let v = string("colbert_model"), !v.isEmpty { colbertModel = v }
         if let v = int("rag_vision_concurrency") { ragVisionConcurrency = max(0, v) }
         if let v = int("rag_ovis_instances") { ragOvisInstances = min(max(1, v), 2) }
         if let v = int("rag_embedding_min_batch") { ragEmbeddingMinBatch = v }
@@ -1057,6 +1085,12 @@ public struct AgentConfig: Sendable {
             "rag_semantic_chunking": ragSemanticChunking,
             "rag_ingest_concurrency": ragIngestConcurrency,
             "rag_verify_fingerprint": ragVerifyFingerprint,
+            "colbert_reader_enabled": colbertReaderEnabled,
+            "colbert_quant_bits": colbertQuantBits,
+            "colbert_coarse_candidates": colbertCoarseCandidates,
+            "colbert_top_n": colbertTopN,
+            "colbert_use_ann": colbertUseANN,
+            "colbert_model": colbertModel,
             "rag_vision_concurrency": ragVisionConcurrency,
             "rag_ovis_instances": ragOvisInstances,
             "rag_embedding_min_batch": ragEmbeddingMinBatch,

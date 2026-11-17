@@ -535,7 +535,23 @@ public enum RequiredModelCatalog {
                 directory: dir,
                 subpath: "int4"))
         }
+        if config.colbertReaderEnabled {
+            // 检索阅读模式：ColBERT 多向量模型，运行时只加载 model_int8.onnx。
+            out.append(RequiredModel(
+                kind: "检索阅读",
+                repo: config.colbertModel,
+                directory: colbertModelDirectory(for: config),
+                allowedWeightNames: ["model_int8.onnx"],
+                requiresTokenizer: true))
+        }
         return out
+    }
+
+    /// 检索阅读模式模型的下载/加载目录（与运行时加载目录同源）。
+    public static func colbertModelDirectory(for config: AgentConfig) -> URL {
+        let name = (config.colbertModel as NSString).lastPathComponent
+        return URL(fileURLWithPath: config.modelsDirectory, isDirectory: true)
+            .appendingPathComponent(name, isDirectory: true)
     }
 
     /// 下载清单过滤：按仓库子目录剥前缀 + 按运行时可加载权重白名单筛选。

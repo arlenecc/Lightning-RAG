@@ -132,6 +132,12 @@ struct SettingsView: View {
     /// RAG MCP 服务（Streamable HTTP）：监听范围 / 端口（运行中时锁定）。
     @State private var ragMCPScope = false
     @State private var ragMCPPortText = "8080"
+    /// 检索阅读模式（ColBERT 大分片多向量检索）。
+    @State private var colbertReaderEnabled = false
+    @State private var colbertQuantBits = 4
+    @State private var colbertCoarseCandidates = 20
+    @State private var colbertTopN = 3
+    @State private var colbertUseANN = true
 
     @State private var statusMessage = ""
 
@@ -706,6 +712,58 @@ struct SettingsView: View {
                         }
                         .help("把知识库 RAG 能力以 MCP 服务（Streamable HTTP）提供给其它大模型应用；"
                               + "修改监听范围或端口后需停止再启动才生效。默认仅本机 127.0.0.1:8080")
+                        Divider()
+                        HStack(spacing: 8) {
+                            Text("检索阅读模式").font(.caption).bold()
+                            Toggle("启用检索阅读模式", isOn: $colbertReaderEnabled)
+                                .toggleStyle(.checkbox)
+                            Text("量化残差").font(.caption2).foregroundStyle(.secondary)
+                            Picker("", selection: $colbertQuantBits) {
+                                Text("2bit").tag(2)
+                                Text("4bit").tag(4)
+                            }
+                            .labelsHidden()
+                            .frame(width: 70)
+                            Text("粗筛候选").font(.caption2).foregroundStyle(.secondary)
+                            Picker("", selection: $colbertCoarseCandidates) {
+                                Text("10").tag(10)
+                                Text("20").tag(20)
+                                Text("50").tag(50)
+                                Text("100").tag(100)
+                            }
+                            .labelsHidden()
+                            .frame(width: 64)
+                            Text("精选topN").font(.caption2).foregroundStyle(.secondary)
+                            Picker("", selection: $colbertTopN) {
+                                Text("1").tag(1)
+                                Text("3").tag(3)
+                                Text("5").tag(5)
+                            }
+                            .labelsHidden()
+                            .frame(width: 56)
+                            Toggle("使用ANN", isOn: $colbertUseANN)
+                                .toggleStyle(.checkbox)
+                            Button(model.isBuildingColbertANN ? "索引构建中…" : "构建/续建向量索引") {
+                                model.requestColbertANNBuild()
+                            }
+                            .disabled(model.isBuildingColbertANN || model.isSyncing)
+                            Spacer(minLength: 8)
+                        }
+                        .help("启用后旁路接管文档解析→markdown 之后的切片/embedding/入库/检索/精排全流程，"
+                              + "改用 ColBERT 大分片多向量检索。分片不再进入模型上下文，只作为召回切片气泡"
+                              + "附在回复后供点击阅读，并可切换前后切片；模型只回复引导性信息。"
+                              + "所需模型自动从 hf-mirror.com 下载。")
+                        HStack(spacing: 8) {
+                            Text("模型").font(.caption2).foregroundStyle(.secondary)
+                            Text("arlenecc/jina-colbert-v2-64-onnx-int8")
+                                .font(.caption2).foregroundStyle(.secondary)
+                                .textSelection(.enabled)
+                            if !model.colbertIndexSummary.isEmpty {
+                                Text(model.colbertIndexSummary)
+                                    .font(.caption2).foregroundStyle(.secondary)
+                            }
+                            Spacer(minLength: 8)
+                        }
                         HStack(spacing: 8) {
                             Text("自定义OCR模型").font(.caption)
                             Picker("", selection: $vlmBackend) {
@@ -1437,6 +1495,11 @@ struct SettingsView: View {
         embeddingTokenBudgetInitial = config.ragEmbeddingTokenBudgetInitial
         embeddingTokenBudgetStep = config.ragEmbeddingTokenBudgetStep
         verifyFingerprint = config.ragVerifyFingerprint
+        colbertReaderEnabled = config.colbertReaderEnabled
+        colbertQuantBits = config.colbertQuantBits
+        colbertCoarseCandidates = config.colbertCoarseCandidates
+        colbertTopN = config.colbertTopN
+        colbertUseANN = config.colbertUseANN
         retrievalStrategy = config.ragRetrievalStrategy
         refreshEmbeddingLimit()
     }
@@ -1777,6 +1840,12 @@ struct SettingsView: View {
                                                     config.ragEmbeddingTokenBudgetMax)
         config.ragEmbeddingTokenBudgetStep = min(max(128, embeddingTokenBudgetStep), 8_192)
         config.ragVerifyFingerprint = verifyFingerprint
+        config.colbertReaderEnabled = colbertReaderEnabled
+        config.colbertQuantBits = colbertQuantBits == 2 ? 2 : 4
+        config.colbertCoarseCandidates = [10, 20, 50, 100].contains(colbertCoarseCandidates)
+            ? colbertCoarseCandidates : 20
+        config.colbertTopN = [1, 3, 5].contains(colbertTopN) ? colbertTopN : 3
+        config.colbertUseANN = colbertUseANN
         // 图谱未建成（或已失效）时只允许 naive，避免保存一个不可用的策略。
         config.ragRetrievalStrategy = model.knowledgeGraphBuilt ? retrievalStrategy : .naive
 

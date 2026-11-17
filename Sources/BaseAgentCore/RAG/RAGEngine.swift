@@ -551,6 +551,10 @@ public final class RAGEngine {
     public var indexDBPath: String {
         (ragDir as NSString).appendingPathComponent("index.sqlite")
     }
+    /// 检索阅读模式的独立向量库路径（ragDir/colbert.db，与 index.sqlite 隔离）。
+    public var colbertDBPath: String {
+        (ragDir as NSString).appendingPathComponent("colbert.db")
+    }
     private let manifestStore: ManifestStore
     public private(set) var knowledgeBase: String
 
@@ -559,6 +563,9 @@ public final class RAGEngine {
     private var reranker: RerankProvider?
     private var store: VectorStore?
     private let storeLock = NSLock()
+    /// 检索阅读模式（ColBERT 大分片多向量检索）的服务实例（惰性）。
+    private var colbertReader: ColBERTReaderService?
+    private let colbertLock = NSLock()
     /// 知识图谱子系统的惰性实例。
     private var kgStore: KnowledgeGraphStore?
     private var kgGraph: KnowledgeGraph?
@@ -757,6 +764,31 @@ public final class RAGEngine {
         guard binarySignatureDimension > 0, let embedding else { return "" }
         return (embedding as? EmbeddingBinarySigning)?.binarySourceIdentifier
             ?? embedding.identifier
+    }
+
+    /// 检索阅读模式服务（惰性创建；未启用时返回 nil）。
+    func colbertService() -> ColBERTReaderService? {
+        guard config.colbertReaderEnabled else { return nil }
+        colbertLock.lock()
+        defer { colbertLock.unlock() }
+        if let existing = colbertReader { return existing }
+        let service = ColBERTReaderService(config: config, dbPath: colbertDBPath)
+        colbertReader = service
+        return service
+    }
+
+    /// 构建 / 续建检索阅读模式的 ANN 向量索引，返回摘要。
+    @discardableResult
+    public func buildColbertANN() async throws -> String {
+        guard let colbert = colbertService() else {
+            throw AgentError.storage("检索阅读模式未启用")
+        }
+        return try await colbert.buildANN()
+    }
+
+    /// 检索阅读模式 ANN 索引的当前状态摘要。
+    public func colbertANNStatus() -> String {
+        colbertService()?.annStatus() ?? "未启用"
     }
 
     /// 索引指纹：向量语义 + 落盘布局（`embedding.identifier | dimension |
@@ -1457,6 +1489,24 @@ public final class RAGEngine {
     public func preloadAuxiliaryModels() async -> RAGPreloadOutcome {
         var loaded: [String] = []
         var failures: [String] = []
+        // 检索阅读模式与普通 embedding / reranker 完全解耦：只预加载 ColBERT，
+        // 不把无关模型拉进内存（也不会因它们缺失而报错）。
+        if let colbert = colbertService() {
+            do {
+                try await colbert.preload()
+                loaded.append("ColBERT(\(config.colbertModel))")
+            } catch {
+                failures.append("ColBERT(\(config.colbertModel)): "
+                    + error.localizedDescription)
+            }
+            if !loaded.isEmpty {
+                AgentLog.info("[rag] 预加载完成并常驻：\(loaded.joined(separator: "、"))")
+            }
+            for failure in failures {
+                AgentLog.warning("[rag] 预加载失败：\(failure)")
+            }
+            return RAGPreloadOutcome(loaded: loaded, failures: failures)
+        }
         if let embedding {
             do {
                 try await embedding.preload()
@@ -1568,9 +1618,12 @@ public final class RAGEngine {
             stats.errors.append("知识库目录不存在: \(knowledgeBase)")
             return stats
         }
-        guard embedding != nil else {
-            stats.errors.append("embedding 模型不可用")
-            return stats
+        let colbertMode = config.colbertReaderEnabled
+        if !colbertMode {
+            guard embedding != nil else {
+                stats.errors.append("embedding 模型不可用")
+                return stats
+            }
         }
 
         // 解析引擎 / 切片参数 / embedding 模型变化会让旧切片失效。
@@ -1579,32 +1632,54 @@ public final class RAGEngine {
         let configSignature = makeIngestSignature()
         let signatureHash = Self.contentHash(configSignature)
         let effectiveForce = force
-        // 每次同步都打印一次生效的切片参数：用户可据此核对「面板设置 →
-        // 实际切片 → 检索呈现」是否一致，而不是只看面板数字。
-        let effectiveChunking = Self.resolvedChunkingOptions(config: config,
-                                                             embedding: embedding)
-        logFn("RAG: 切片参数 \(effectiveChunking.options.chunkSizeTokens) token"
-            + "（含 overlap \(effectiveChunking.options.overlapTokens)），"
-            + "语义切片 \(config.ragSemanticChunking ? "开" : "关")"
-            + (effectiveChunking.clampedFrom.map {
-                "，面板设置的 \($0) 已按 embedding 模型输入上限收口"
-            } ?? ""))
+        if colbertMode {
+            // 检索阅读模式与普通 embedding / 切片参数完全解耦：只报告
+            // ColBERT 侧参数，不再依赖 embedding 模型窗口收口切片。
+            logFn("RAG: 检索阅读模式（ColBERT 大分片），"
+                + "模型 \(config.colbertModel)，量化 \(config.colbertQuantBits)bit，"
+                + "粗筛 \(config.colbertCoarseCandidates)，精选 \(config.colbertTopN)")
+        } else {
+            // 每次同步都打印一次生效的切片参数：用户可据此核对「面板设置 →
+            // 实际切片 → 检索呈现」是否一致，而不是只看面板数字。
+            let effectiveChunking = Self.resolvedChunkingOptions(config: config,
+                                                                 embedding: embedding)
+            logFn("RAG: 切片参数 \(effectiveChunking.options.chunkSizeTokens) token"
+                + "（含 overlap \(effectiveChunking.options.overlapTokens)），"
+                + "语义切片 \(config.ragSemanticChunking ? "开" : "关")"
+                + (effectiveChunking.clampedFrom.map {
+                    "，面板设置的 \($0) 已按 embedding 模型输入上限收口"
+                } ?? ""))
+        }
 
         let files = scanFiles()
         logFn("RAG: 开始同步，共 \(files.count) 个文件（force=\(effectiveForce)）")
-        logFn("RAG: 初始化索引库…")
-        let store: VectorStore
-        do {
-            store = try ensureStore()
-        } catch {
-            stats.errors.append(error.localizedDescription)
-            logFn("RAG: 索引库初始化失败：\(error.localizedDescription)")
-            return stats
+        // 检索阅读模式旁路普通向量库；该库仅用于文档元数据/大纲，打开失败
+        // （embedding 模型缺失/未就绪）不阻塞 ColBERT 同步与检索。
+        let store: VectorStore?
+        if colbertMode {
+            store = try? ensureStore()
+            if store == nil {
+                logFn("RAG: 普通向量库未打开（embedding 未就绪）；"
+                    + "检索阅读模式不受影响")
+            }
+        } else {
+            do {
+                store = try ensureStore()
+            } catch {
+                stats.errors.append(error.localizedDescription)
+                logFn("RAG: 索引库初始化失败：\(error.localizedDescription)")
+                return stats
+            }
         }
-        let existingChunkCount = store.count
+        // 检索阅读模式旁路接管索引库；删除清理也要同步到 colbert 库。
+        let colbertRef = colbertService()
+        let existingChunkCount = colbertMode
+            ? (colbertRef?.totalChunkCount() ?? 0)
+            : (store?.count ?? 0)
         // B 方案闸门：配置与索引指纹不符时不静默删数据，但也不能继续写入
         // （新向量与旧向量语义/类型不同，混在一个库里检索结果不可信）。
-        if let reason = store.rebuildReason {
+        // 检索阅读模式不使用普通向量通道，该闸门不适用。
+        if !colbertMode, let reason = store?.rebuildReason {
             stats.errors.append("向量库需要重建（\(reason)）；"
                 + "请先在设置中执行「重建向量库」再同步")
             logFn("RAG: 向量库待重建（\(reason)），已拒绝本次同步；全文检索仍可用")
@@ -1615,7 +1690,7 @@ public final class RAGEngine {
             // force 会先删后插全部来源；旧索引的 rowid 全部失效，续建没有意义。
             // 同步开始前直接重置，结束后由后台任务按需全量重建。
             do {
-                try store.dropANNIndex()
+                try store?.dropANNIndex()
                 logFn("RAG: 强制同步前已重置 ANN 索引，结束后将按需重建")
             } catch {
                 logFn("RAG: 重置 ANN 索引失败（不影响本次同步）：\(error.localizedDescription)")
@@ -1626,8 +1701,12 @@ public final class RAGEngine {
         logFn("RAG: manifest 载入 \(manifest.count) 条")
         // 数据库被删除/重建但 manifest 还在时，增量逻辑会把所有文件当成
         // 「未变化」而跳过，知识库永久为空；此时必须全量重建。
-        if !store.hasChunks, !manifest.isEmpty {
-            logFn("RAG: 向量库为空但 manifest 仍存在，执行全量重建")
+        // 检索阅读模式用 colbert 库判断「索引是否为空」。
+        let indexHasChunks = colbertMode
+            ? (colbertRef?.totalChunkCount() ?? 0) > 0
+            : (store?.hasChunks ?? false)
+        if !indexHasChunks, !manifest.isEmpty {
+            logFn("RAG: 索引库为空但 manifest 仍存在，执行全量重建")
             manifest.removeAll()
             manifestStore.clear()
         }
@@ -1666,10 +1745,14 @@ public final class RAGEngine {
         // 1) 清理已删除文件的向量与缓存。
         for (source, entry) in manifest where !currentSources.contains(source) {
             do {
-                _ = try store.deleteBySource(source)
+                if let colbertRef {
+                    try colbertRef.delete(source: source)
+                } else {
+                    _ = try store?.deleteBySource(source)
+                }
                 // 文档摘要/大纲记录也要删除，否则 rag_outline 会一直列出已删文件。
-                try? store.deleteDocumentByMdPath(entry.mdPath)
-                try? store.deleteDocument(docName: entry.docName)
+                try? store?.deleteDocumentByMdPath(entry.mdPath)
+                try? store?.deleteDocument(docName: entry.docName)
                 try? FileManager.default.removeItem(atPath: entry.mdPath)
                 removedKeys.insert(source)
                 stats.removed += 1
@@ -1683,27 +1766,33 @@ public final class RAGEngine {
         //    上限 6）；每个文件内部
         //    「解析 → 切片 → embedding → 入库」形成流水线。
         //    embedding 由共享调度器串行进入模型，并按吞吐/内存自动调整子批。
-        guard let baseEmbedding = embedding else {
+        //    检索阅读模式完全旁路该调度器（nil），不依赖 embedding 模型。
+        let scheduler: AdaptiveEmbeddingScheduler?
+        if colbertMode {
+            scheduler = nil
+        } else if let baseEmbedding = embedding {
+            scheduler = AdaptiveEmbeddingScheduler(
+                base: baseEmbedding,
+                options: .init(minBatchSize: config.ragEmbeddingMinBatch,
+                               maxBatchSize: config.ragEmbeddingMaxBatch,
+                               initialBatchSize: config.ragEmbeddingInitialBatch,
+                               step: config.ragEmbeddingBatchStep,
+                               memoryLimitMB: Double(config.ragEmbeddingMemoryLimitMB),
+                               throughputTolerance: config.ragEmbeddingThroughputTolerance,
+                               probeBatches: config.ragEmbeddingProbeBatches,
+                               probeSeconds: config.ragEmbeddingProbeSeconds,
+                               tokenBudgetMin: config.ragEmbeddingTokenBudgetMin,
+                               tokenBudgetMax: config.ragEmbeddingTokenBudgetMax,
+                               initialTokenBudget: config.ragEmbeddingTokenBudgetInitial,
+                               tokenBudgetStep: config.ragEmbeddingTokenBudgetStep),
+                log: logFn)
+        } else {
             stats.errors.append("embedding 模型不可用")
             return stats
         }
-        let scheduler = AdaptiveEmbeddingScheduler(
-            base: baseEmbedding,
-            options: .init(minBatchSize: config.ragEmbeddingMinBatch,
-                           maxBatchSize: config.ragEmbeddingMaxBatch,
-                           initialBatchSize: config.ragEmbeddingInitialBatch,
-                           step: config.ragEmbeddingBatchStep,
-                           memoryLimitMB: Double(config.ragEmbeddingMemoryLimitMB),
-                           throughputTolerance: config.ragEmbeddingThroughputTolerance,
-                           probeBatches: config.ragEmbeddingProbeBatches,
-                           probeSeconds: config.ragEmbeddingProbeSeconds,
-                           tokenBudgetMin: config.ragEmbeddingTokenBudgetMin,
-                           tokenBudgetMax: config.ragEmbeddingTokenBudgetMax,
-                           initialTokenBudget: config.ragEmbeddingTokenBudgetInitial,
-                           tokenBudgetStep: config.ragEmbeddingTokenBudgetStep),
-            log: logFn)
-        let binarySignaturesEnabled = effectiveVectorElementType != .bin
-            && scheduler.binaryDimension != nil
+        let binarySignaturesEnabled = !colbertMode
+            && effectiveVectorElementType != .bin
+            && scheduler?.binaryDimension != nil
         let jobs = uniqueFiles.enumerated().map { index, file in
             IngestJob(index: index, total: total, file: file,
                       label: "[\(index + 1)/\(total)] \(file.relativePath)")
@@ -1737,7 +1826,9 @@ public final class RAGEngine {
         let contentRegistry = ContentDedupRegistry(
             manifest: snapshot,
             sources: currentSources,
-            isUsable: { source in storeRef.chunkCount(source: source) > 0 })
+            isUsable: { source in
+                Self.chunkCount(source: source, store: storeRef, colbert: colbertRef) > 0
+            })
         let markdownDirRef = markdownDir
         let knowledgeBaseRef = knowledgeBase
         let signature = signatureHash
@@ -1768,6 +1859,7 @@ public final class RAGEngine {
                                 contentRegistry: contentRegistry,
                                 store: storeRef,
                                 embedding: scheduler,
+                                colbertReader: colbertRef,
                                 manifestStore: manifestStoreRef,
                                 manifestSnapshot: manifestSnapshot,
                                 signatureHash: signature,
@@ -1814,6 +1906,7 @@ public final class RAGEngine {
                 existingSources: Set(manifest.keys),
                 signatureHash: signatureHash,
                 store: store,
+                colbertReader: colbertRef,
                 markdownDir: markdownDir,
                 knowledgeBase: knowledgeBase,
                 log: logFn)
@@ -1832,8 +1925,7 @@ public final class RAGEngine {
             logFn("RAG: 已完成文件已保留，下次同步将从剩余未完成文件继续")
         } else {
             progress?(total, total, "")
-            let metrics = scheduler.metricsSnapshot()
-            if metrics.texts > 0 {
+            if let metrics = scheduler?.metricsSnapshot(), metrics.texts > 0 {
                 logFn(String(format: "RAG: embedding 实测 %ld token，%.0f token/秒，"
                              + "峰值内存 %.0f MB，当前预算 %ld token / 最多 %ld 条",
                              metrics.tokens, metrics.tokensPerSecond,
@@ -1851,7 +1943,10 @@ public final class RAGEngine {
         manifestStore.compact()
         // 新切片/去重完成后：去重改变了 chunk 标识，只能重建；纯新增则增量更新图谱。
         // 增量抽取转到后台，同步立即返回，不再等图谱抽完。
-        if stats.deduplicated > 0 {
+        // 检索阅读模式没有普通切片，知识图谱不参与，跳过图谱调度。
+        if colbertMode {
+            // no-op
+        } else if stats.deduplicated > 0 {
             invalidateKnowledgeGraph(reason: "切片去重改变了 chunk 标识")
         } else if stats.processed > 0 {
             scheduleIncrementalKnowledgeGraphUpdate()
@@ -1860,16 +1955,18 @@ public final class RAGEngine {
     }
 
     /// 影响切片内容的配置签名。
+    ///
+    /// 检索阅读模式与普通 embedding / 切片参数完全解耦：该模式下只记录
+    /// ColBERT 相关的模型与量化配置，普通 embedding 后端、向量元素类型、
+    /// Matryoshka 维度、切片大小等变化都不会触发 ColBERT 库重建。
     private func makeIngestSignature() -> String {
-        let embeddingModel = config.localEmbeddingModel.isEmpty
-            ? config.ragEmbeddingModel : config.localEmbeddingModel
-        let fields: [(String, String)] = [
-            // 渲染/清洗逻辑变化时递增，强制旧缓存文件重建。
-            // 8：结构化清洗档（HTML/Office/EPUB 保真）+ HTML 本地框架接力 +
-            //    Office 备注/列表/脚注/日期格式完善。
-            // 9：语义切片改为 CJK 无空格拼接 + 弱边界短片合并。
-            // 10：语义切片相似度改用内置 ONNX 模型（CPU）。
-            // 11：语义切片模型更换为 potion-multilingual-128M int4（无 512 token 上限）。
+        // 渲染/清洗逻辑变化时递增，强制旧缓存文件重建。
+        // 8：结构化清洗档（HTML/Office/EPUB 保真）+ HTML 本地框架接力 +
+        //    Office 备注/列表/脚注/日期格式完善。
+        // 9：语义切片改为 CJK 无空格拼接 + 弱边界短片合并。
+        // 10：语义切片相似度改用内置 ONNX 模型（CPU）。
+        // 11：语义切片模型更换为 potion-multilingual-128M int4（无 512 token 上限）。
+        var fields: [(String, String)] = [
             ("pipeline_version", "11"),
             ("pdf_engine", config.ragPDFEngine.rawValue),
             ("epub_ocr_engine", config.ragEPUBOCREngine.rawValue),
@@ -1878,6 +1975,21 @@ public final class RAGEngine {
             ("ocr_path", config.ragOCRModelPath),
             ("ocr_preprocess", String(config.ragOCRPreprocess)),
             ("ocr_binarize", String(config.ragOCRBinarize)),
+        ]
+        if config.colbertReaderEnabled {
+            // 开关本身必须进签名：切换模式要触发全量重建，否则旧模式切片的
+            // manifest 命中会让新模式无数据。
+            fields.append(contentsOf: [
+                ("colbert_reader", "1"),
+                // 模型仓库与量化位数决定多向量语义与落盘格式，变化必须重建。
+                ("colbert_model", config.colbertModel),
+                ("colbert_quant_bits", String(config.colbertQuantBits)),
+            ])
+            return fields.map { "\($0.0)=\($0.1)" }.joined(separator: "\n")
+        }
+        let embeddingModel = config.localEmbeddingModel.isEmpty
+            ? config.ragEmbeddingModel : config.localEmbeddingModel
+        fields.append(contentsOf: [
             ("chunk_size", String(config.ragChunkSize)),
             ("chunk_overlap", String(config.ragChunkOverlap)),
             // 语义切片开关会改变切片边界：不进签名的话，切换后旧切片会被
@@ -1893,7 +2005,8 @@ public final class RAGEngine {
             // 旧切片必须按新配置重算；未实际截断时记 0，避免无谓重建。
             ("vector_element_type", effectiveVectorElementType.rawValue),
             ("matryoshka_dim", String(effectiveMatryoshkaDimension)),
-        ]
+            ("colbert_reader", "0"),
+        ])
         return fields.map { "\($0.0)=\($0.1)" }.joined(separator: "\n")
     }
 
@@ -1938,6 +2051,9 @@ public final class RAGEngine {
     /// 一个文件的完整处理：解析 → 清洗 → 切片 → embedding → 入库 → manifest。
     /// 多文件由 `ingest` 的 worker 池并发调用；共享的 store/manifest/scheduler
     /// 内部都有锁或串行队列。
+    ///
+    /// 检索阅读模式下 `store` / `embedding` 可为 nil：普通向量库与 embedding
+    /// 完全不参与该模式的解析后流程。
     private static func process(
         job: IngestJob,
         force: Bool,
@@ -1945,8 +2061,9 @@ public final class RAGEngine {
         binarySignaturesEnabled: Bool,
         registry: DocumentParserRegistry,
         contentRegistry: ContentDedupRegistry,
-        store: VectorStore,
-        embedding: AdaptiveEmbeddingScheduler,
+        store: VectorStore?,
+        embedding: AdaptiveEmbeddingScheduler?,
+        colbertReader: ColBERTReaderService?,
         manifestStore: ManifestStore,
         manifestSnapshot: [String: RAGManifestEntry],
         signatureHash: String,
@@ -2037,7 +2154,8 @@ public final class RAGEngine {
                         || !FileManager.default.fileExists(atPath: entry.mdPath) {
                 redoReason = "Markdown 缓存缺失"
             } else {
-                let actualChunks = store.chunkCount(source: source)
+                let actualChunks = Self.chunkCount(source: source, store: store,
+                                                   colbert: colbertReader)
                 if actualChunks != entry.chunkCount {
                     // manifest 说完成，但库里没有对应切片（被删除/上次写入中断/外部改动）。
                     redoReason = "索引切片不完整（\(actualChunks)/\(entry.chunkCount ?? 0)）"
@@ -2101,6 +2219,7 @@ public final class RAGEngine {
                 // 该来源此前可能已入库（例如文件被改短）：旧切片、缓存 Markdown
                 // 与文档记录/摘要必须一起清掉，避免继续命中旧内容。
                 removeIndexedSource(source: source, entry: previous, store: store,
+                                    colbertReader: colbertReader,
                                     markdownDir: markdownDir, knowledgeBase: knowledgeBase)
                 outcome.discarded = true
                 log("RAG: \(job.label) 丢弃（正文仅 \(bodyCharacters) 字，视为无效碎片）")
@@ -2133,6 +2252,7 @@ public final class RAGEngine {
                 // 该来源之前可能以独立文档入过库：清掉旧向量与 Markdown/摘要，
                 // 避免检索同时命中两份正文。
                 removeIndexedSource(source: source, entry: previous, store: store,
+                                    colbertReader: colbertReader,
                                     markdownDir: markdownDir, knowledgeBase: knowledgeBase)
                 outcome.skipped = true
                 outcome.deduplicated = true
@@ -2144,6 +2264,56 @@ public final class RAGEngine {
                 contentDigest = textDigest
             }
             if isCancelled() || Task.isCancelled { throw AgentError.cancelled }
+
+            if let colbertReader {
+                // 检索阅读模式：旁路接管切片/embedding/入库/检索/精排全流程，
+                // 改用 ColBERT 大分片多向量检索。分片不进入模型上下文，只作为
+                // 召回切片气泡附在回复后供用户点击阅读。
+                let colbertStarted = Date()
+                do {
+                    let count = try await colbertReader.ingest(
+                        markdown: text, source: source, title: file.relativePath)
+                    let mdPath = Self.cacheMarkdownPath(for: source,
+                                                        markdownDir: markdownDir,
+                                                        knowledgeBase: knowledgeBase)
+                    try AtomicFile.write(text, to: mdPath)
+                    let failedPages = parsed.metadata["failed_pages"].flatMap { Int($0) } ?? 0
+                    let entry = RAGManifestEntry(
+                        mtime: signature?.mtime ?? 0,
+                        size: signature?.size ?? 0,
+                        fingerprint: Self.sourceFingerprint(source, size: signature?.size),
+                        digest: Self.contentHash(text),
+                        docName: file.relativePath,
+                        mdPath: mdPath,
+                        ingestSignature: signatureHash,
+                        chunkCount: count,
+                        complete: failedPages == 0)
+                    manifestStore.merge(updated: [source: entry], removed: [])
+                    outcome.processed = true
+                    outcome.chunks = count
+                    let pages = parsed.pageCount > 0 ? " / \(parsed.pageCount) 页" : ""
+                    let failedPart = failedPages > 0
+                        ? "，失败 \(failedPages) 页（下次同步将重试）" : ""
+                    log("RAG: ✓ \(job.label) 检索阅读完成：\(text.count) 字符\(pages)，"
+                        + "\(count) 分片\(failedPart)；"
+                        + "ColBERT 入库 \(Self.elapsedText(colbertStarted))"
+                        + "，总 \(Self.elapsedText(fileStarted))")
+                    return outcome
+                } catch AgentError.cancelled {
+                    outcome.cancelled = true
+                    return outcome
+                } catch {
+                    outcome.error = "\(file.relativePath): \(error.localizedDescription)"
+                    log("RAG: ✗ \(file.relativePath) 检索阅读失败：\(error.localizedDescription)")
+                    manifestStore.merge(updated: [:], removed: [source])
+                    return outcome
+                }
+            }
+
+            // 非检索阅读模式：普通向量库与 embedding 调度器必须可用。
+            guard let store, let embedding else {
+                throw AgentError.storage("embedding 模型不可用")
+            }
 
             let chunkStarted = Date()
             var chunkDocument = parsed
@@ -2281,9 +2451,9 @@ public final class RAGEngine {
             // 文件已变更但处理失败：清掉旧索引，避免继续命中过期内容；
             // 同时移除 manifest 条目，让下次同步重试。
             if let old = manifestSnapshot[source] {
-                _ = try? store.deleteBySource(source)
-                try? store.deleteDocumentByMdPath(old.mdPath)
-                try? store.deleteDocument(docName: old.docName)
+                _ = try? store?.deleteBySource(source)
+                try? store?.deleteDocumentByMdPath(old.mdPath)
+                try? store?.deleteDocument(docName: old.docName)
                 try? FileManager.default.removeItem(atPath: old.mdPath)
             }
             manifestStore.merge(updated: [:], removed: [source])
@@ -2423,7 +2593,10 @@ public final class RAGEngine {
             guard var entry = manifest[source] else { continue }
             let remaining = store.chunkCount(source: source)
             if remaining == 0 {
+                // 这里清理的是普通向量库的重复切片，与 colbert 库无关；
+                // 不能传 colbertService()，否则会误删检索阅读模式的数据。
                 Self.removeIndexedSource(source: source, entry: entry, store: store,
+                                         colbertReader: nil,
                                          markdownDir: markdownDir,
                                          knowledgeBase: knowledgeBase)
                 stats.emptiedSources += 1
@@ -2704,6 +2877,11 @@ public final class RAGEngine {
     /// 同步收尾后调度后台构建。真正的「是否值得建」判断放在后台任务里，
     /// 避免把状态查询重新塞回同步返回路径。
     private func scheduleANNAutoBuild(log logFn: @escaping (String) -> Void) {
+        // 检索阅读模式不使用普通向量库/ANN 索引，改为续建 ColBERT 向量索引。
+        if config.colbertReaderEnabled {
+            scheduleColbertANNAutoBuild(log: logFn)
+            return
+        }
         guard config.ragANNAutoBuild,
               config.ragANNEnabled || config.ragBinaryCoarseEnabled else { return }
         annBuildLock.lock()
@@ -2730,6 +2908,44 @@ public final class RAGEngine {
         }
         annBuildLock.lock()
         // 任务可能已经完成并清掉了 scheduled：此时不再回填已结束的句柄。
+        if annBuildScheduled, annBuildGeneration == generation {
+            annBuildTask = task
+        }
+        annBuildLock.unlock()
+    }
+
+    /// 检索阅读模式的 ANN 自动续建：与普通索引共用同一个后台任务槽，
+    /// 避免两套构建同时抢占模型/库连接。
+    private func scheduleColbertANNAutoBuild(log logFn: @escaping (String) -> Void) {
+        guard config.colbertUseANN else { return }
+        annBuildLock.lock()
+        guard annBuildTask == nil else {
+            annBuildLock.unlock()
+            return
+        }
+        annBuildScheduled = true
+        annBuildGeneration &+= 1
+        let generation = annBuildGeneration
+        annBuildLock.unlock()
+
+        let task = Task.detached(priority: .utility) { [weak self] in
+            guard let self else { return }
+            do {
+                let summary = try await self.buildColbertANN()
+                logFn("RAG: ColBERT 向量索引构建完成：\(summary)")
+            } catch {
+                logFn("RAG: ColBERT 向量索引构建失败：\(error.localizedDescription)")
+            }
+            self.annBuildLock.lock()
+            if self.annBuildGeneration == generation {
+                self.annBuildScheduled = false
+                self.annBuildTask = nil
+                self.annBuildActive = false
+                self.annBuildProgress = nil
+            }
+            self.annBuildLock.unlock()
+        }
+        annBuildLock.lock()
         if annBuildScheduled, annBuildGeneration == generation {
             annBuildTask = task
         }
@@ -3070,6 +3286,21 @@ public final class RAGEngine {
     /// - 全部召回切片（含 top-1）放进 `citations` 供 UI 气泡展示。
     public func searchWithCitations(query: String, topK: Int = 3,
                                     source: String? = nil) async throws -> RAGRetrievalOutcome {
+        // 检索阅读模式：旁路接管检索召回 + 精排，改用 ColBERT 大分片多向量检索。
+        // 分片不进入模型上下文，只作为召回切片气泡附在回复后。
+        if let colbert = colbertService() {
+            do {
+                let outcome = try await colbert.search(query: query)
+                if outcome.citations.isEmpty {
+                    return RAGRetrievalOutcome(context: "（知识库中未找到相关内容）",
+                                               citations: [])
+                }
+                return outcome
+            } catch {
+                AgentLog.error("[colbert] 检索阅读检索失败：\(error.localizedDescription)")
+                throw error
+            }
+        }
         // 图谱策略：非 naive 且图谱已就绪时走知识图谱检索，否则回退原始实现。
         if config.ragRetrievalStrategy.usesKnowledgeGraph {
             if let outcome = try await knowledgeGraphSearchWithCitations(query: query,
@@ -3691,6 +3922,7 @@ public final class RAGEngine {
                 let chunks = try store.deleteBySource(source)
                 Self.removeIndexedSource(
                     source: source, entry: entry?.value, store: store,
+                    colbertReader: colbertService(),
                     markdownDir: markdownDir, knowledgeBase: knowledgeBase)
                 return chunks
             }
@@ -4223,7 +4455,8 @@ public final class RAGEngine {
         duplicateGroups: [DuplicateFileGroup],
         existingSources: Set<String>,
         signatureHash: String,
-        store: VectorStore,
+        store: VectorStore?,
+        colbertReader: ColBERTReaderService?,
         markdownDir: String,
         knowledgeBase: String,
         log: @escaping (String) -> Void
@@ -4238,7 +4471,8 @@ public final class RAGEngine {
                   representative.complete == true,
                   (representative.chunkCount ?? 0) > 0 else { continue }
             for file in group.duplicates
-            where finalManifest[file.path] != nil || store.chunkCount(source: file.path) > 0 {
+            where finalManifest[file.path] != nil
+                || Self.chunkCount(source: file.path, store: store, colbert: colbertReader) > 0 {
                 removeSet.insert(file.path)
             }
         }
@@ -4271,6 +4505,7 @@ public final class RAGEngine {
         for source in removeSet.sorted() {
             let entry = finalManifest[source]
             removeIndexedSource(source: source, entry: entry, store: store,
+                                colbertReader: colbertReader,
                                 markdownDir: markdownDir, knowledgeBase: knowledgeBase)
             let name = entry?.docName
                 ?? relativeSourcePath(source, knowledgeBase: knowledgeBase)
@@ -4281,6 +4516,7 @@ public final class RAGEngine {
         for (source, canonical) in tombstoneCanonical {
             guard let entry = finalManifest[source] else { continue }
             removeIndexedSource(source: source, entry: entry, store: store,
+                                colbertReader: colbertReader,
                                 markdownDir: markdownDir, knowledgeBase: knowledgeBase)
             var marker = entry
             marker.duplicateOf = canonical
@@ -4299,21 +4535,33 @@ public final class RAGEngine {
     private static func removeIndexedSource(
         source: String,
         entry: RAGManifestEntry?,
-        store: VectorStore,
+        store: VectorStore?,
+        colbertReader: ColBERTReaderService?,
         markdownDir: String,
         knowledgeBase: String
     ) {
-        _ = try? store.deleteBySource(source)
+        if let colbertReader {
+            _ = try? colbertReader.delete(source: source)
+        } else {
+            _ = try? store?.deleteBySource(source)
+        }
         let mdPath = entry?.mdPath
             ?? cacheMarkdownPath(for: source, markdownDir: markdownDir,
                                 knowledgeBase: knowledgeBase)
         let docName = entry?.docName
             ?? relativeSourcePath(source, knowledgeBase: knowledgeBase)
-        try? store.deleteDocumentByMdPath(mdPath)
-        try? store.deleteDocument(docName: docName)
+        try? store?.deleteDocumentByMdPath(mdPath)
+        try? store?.deleteDocument(docName: docName)
         if !mdPath.isEmpty {
             try? FileManager.default.removeItem(atPath: mdPath)
         }
+    }
+
+    /// 检索阅读模式用 colbert 库计数，普通模式用向量库计数。
+    private static func chunkCount(source: String, store: VectorStore?,
+                                   colbert: ColBERTReaderService?) -> Int {
+        if let colbert { return colbert.chunkCount(source: source) }
+        return store?.chunkCount(source: source) ?? 0
     }
 
     private static func relativeSourcePath(_ source: String,

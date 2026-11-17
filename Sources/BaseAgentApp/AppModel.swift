@@ -277,6 +277,10 @@ final class AppViewModel: ObservableObject {
     @Published var isResolvingEntities = false {
         didSet { if !isResolvingEntities { flushQueuedSends() } }
     }
+    /// 正在构建/续建检索阅读模式的 ANN 向量索引。
+    @Published var isBuildingColbertANN = false
+    /// 检索阅读模式向量索引构建结果摘要。
+    @Published var colbertIndexSummary = ""
     /// 知识图谱是否已构建（决定 4 种图谱检索策略是否可选）。
     @Published var knowledgeGraphBuilt = false
     @Published var knowledgeGraphEntityCount = 0
@@ -2294,6 +2298,44 @@ final class AppViewModel: ObservableObject {
         appendLog("用户请求停止 ANN 索引构建")
         // 引擎在每个块之间检查取消标志，块内不中断，保证已落盘数据一致。
         agent?.ragEngine.cancel()
+    }
+
+    // MARK: 检索阅读模式（ColBERT）
+
+    /// 点击「构建/续建向量索引」：为检索阅读模式的 ColBERT 大分片库构建 ANN 索引。
+    func requestColbertANNBuild() {
+        guard let agent else {
+            showInfoAlert(title: "检索阅读模式", message: "RAG 尚未就绪，请先应用配置。")
+            return
+        }
+        if isSyncing || isBuildingANN || isBuildingKG || isBuildingColbertANN {
+            showInfoAlert(title: "暂不能构建向量索引",
+                          message: "知识同步或其它索引任务正在进行，请稍后再试。")
+            return
+        }
+        isBuildingColbertANN = true
+        colbertIndexSummary = "构建中…"
+        let target = ObjectIdentifier(agent)
+        Task.detached(priority: .utility) { [weak self] in
+            let result: Result<String, Error>
+            do {
+                let summary = try await agent.ragEngine.buildColbertANN()
+                result = .success(summary)
+            } catch {
+                result = .failure(error)
+            }
+            await MainActor.run { [weak self] in
+                guard let self else { return }
+                guard let current = self.agent, ObjectIdentifier(current) == target else { return }
+                switch result {
+                case .success(let summary):
+                    self.colbertIndexSummary = summary
+                case .failure(let error):
+                    self.colbertIndexSummary = "失败：\(error.localizedDescription)"
+                }
+                self.isBuildingColbertANN = false
+            }
+        }
     }
 
     // MARK: 知识图谱
