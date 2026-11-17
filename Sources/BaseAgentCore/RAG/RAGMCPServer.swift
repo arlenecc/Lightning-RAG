@@ -233,6 +233,28 @@ public final class RAGMCPToolset: @unchecked Sendable {
         }
         let topK = max(1, min(20, args["top_k"]?.intValue ?? 5))
         let source = args["source"]?.stringValue
+        // 检索阅读模式：普通 embedding 通道不可用，改走 ColBERT 召回并把
+        // 切片原文直接返回给外部 MCP 客户端（MCP 没有 App 内的引用气泡 UI）。
+        if engine.config.colbertReaderEnabled {
+            do {
+                let outcome = try await engine.searchWithCitations(
+                    query: query, topK: topK, source: source)
+                guard !outcome.citations.isEmpty else {
+                    return .success("知识库中未检索到与「\(query)」相关的内容。")
+                }
+                var md: [String] = ["检索到 \(outcome.citations.count) 条结果：", ""]
+                for (index, citation) in outcome.citations.enumerated() {
+                    let heading = citation.heading.isEmpty ? "" : "（\(citation.heading)）"
+                    md.append("### [\(index + 1)] \(citation.source)\(heading)"
+                        + "（score \(String(format: "%.4f", citation.score))）")
+                    md.append(citation.text)
+                    md.append("")
+                }
+                return .success(md.joined(separator: "\n"))
+            } catch {
+                return .failure("检索失败：\(error.localizedDescription)")
+            }
+        }
         do {
             // 图谱策略已启用时走统一检索链路（local/global/hybrid/mix + reranker），
             // 与 App 内 rag_search 保持同一套召回逻辑。

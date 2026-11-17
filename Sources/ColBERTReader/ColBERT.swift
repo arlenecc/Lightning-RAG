@@ -21,6 +21,9 @@ final class ColBERT {
     private let tokenizer: any Tokenizers.Tokenizer
     private let session: ORTSession
     private let outputName: String
+    /// tokenizer 无线程安全承诺：入库（opLock 串行）与检索（无锁）现已可并发
+    /// 进入 encodeIDs，用实例锁串行化 tokenizer 调用；ORT session.run 本身线程安全。
+    private let tokenizerLock = NSLock()
 
     private init(tokenizer: any Tokenizers.Tokenizer, session: ORTSession, outputName: String) {
         self.tokenizer = tokenizer
@@ -64,6 +67,8 @@ final class ColBERT {
 
     private func encodeIDs(_ text: String, kind: Kind) -> [Int] {
         let prefix = kind == .query ? Self.queryPrefix : Self.documentPrefix
+        tokenizerLock.lock()
+        defer { tokenizerLock.unlock() }
         return tokenizer.encode(text: prefix + " " + text, addSpecialTokens: true)
     }
 
@@ -153,47 +158,14 @@ final class ColBERT {
         return out
     }
 
-    /// 对一组词/短语分别编码，取其内容 token 向量均值作为「这个词的向量」。
-    func encodeTerms(_ terms: [String], batchSize: Int = 128) throws -> [[Float]] {
-        guard !terms.isEmpty else { return [] }
-        let seqs = terms.map { encodeIDs($0, kind: .document) }
-        let target = seqs.map(\.count).max() ?? 0
-        var output = [[Float]]()
-        output.reserveCapacity(terms.count)
-        var offset = 0
-        while offset < seqs.count {
-            let end = min(offset + max(1, batchSize), seqs.count)
-            let ids = (offset..<end).map { i -> [Int64] in
-                seqs[i].map { Int64($0) } + Array(repeating: Int64(Self.padID), count: target - seqs[i].count)
-            }
-            let mask = (offset..<end).map { i -> [Int64] in
-                Array(repeating: Int64(1), count: seqs[i].count)
-                    + Array(repeating: 0, count: target - seqs[i].count)
-            }
-            let batch = try run(ids: ids, mask: mask)
-            for (j, seq) in batch.enumerated() {
-                let positions = contentIndices(seqs[offset + j], kind: .document)
-                let chosen = positions.isEmpty ? Array(0..<seq.count) : positions
-                var center = [Float](repeating: 0, count: Self.dimension)
-                for p in chosen where p < seq.count {
-                    for d in 0..<Self.dimension { center[d] += seq[p][d] }
-                }
-                let denom = Float(max(1, chosen.count))
-                output.append(center.map { $0 / denom })
-            }
-            offset = end
-        }
-        return output
-    }
-
     /// 整段编码：把切片正文切成若干 ≤300 token 的小段，批量前向后拼接各段内
     /// 容 token 的向量（标准 ColBERT 的 token 级表示）。
     ///
     /// 两个关键点：
     /// 1. tokenizer.json 写死了 truncation=300，超过 300 token 的部分会被静默丢弃，
     ///    所以必须先按 300 token 分段，否则一本书只有开头几百字参与检索；
-    /// 2. 逐词编码（`encodeTerms`）每个词都要重复一次完整 24 层前向，一本书要数
-    ///    小时；分段批量编码按 batch=8 分摊权重读取，入库耗时降到分钟级。
+    /// 2. 逐词编码每个词都要重复一次完整 24 层前向，一本书要数小时；
+    ///    分段批量编码按 batch=8 分摊权重读取，入库耗时降到分钟级。
     func encodeDocument(_ text: String, maxTokens: Int = 300,
                         batchSize: Int = 8) throws -> [[Float]] {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -262,31 +234,26 @@ final class ColBERT {
         return segments
     }
 
-    /// 查询中心向量：取 query 增强后所有「内容 token」（含 <mask>，排除 <s>/</s>/标记）的均值。
-    func queryCenter(_ query: String) throws -> [Float] {
-        let encoded = try encode([query], kind: .query)
-        guard let seq = encoded.first, !seq.isEmpty else {
+    /// 查询向量：一次前向同时得到簇心（内容 token 均值，归一化）与内容 token 向量。
+    ///
+    /// 检索时既要簇心做粗筛、又要 token 序列做 MaxSim；分开调用会重复编码
+    /// 一遍查询。这里只保留内容 token（排除 <s>/</s>/[QueryMarker]），
+    /// MaxSim 也不会被特殊 token 干扰。
+    func queryVectors(_ query: String) throws -> (center: [Float], tokens: [[Float]]) {
+        guard let seq = try encode([query], kind: .query).first, !seq.isEmpty else {
             throw DocSearchError.model("问句编码为空")
         }
+        let ids = encodeIDs(query, kind: .query)
+        let positions = contentIndices(ids, kind: .query).filter { $0 < seq.count }
+        let chosen = positions.isEmpty ? Array(seq.indices) : positions
+        guard !chosen.isEmpty else { throw DocSearchError.model("问句编码为空") }
+        let tokens = chosen.map { seq[$0] }
         var center = [Float](repeating: 0, count: Self.dimension)
-        let positions = 2..<(seq.count - 1)   // <s>, [QueryMarker] ... </s>
-        for p in positions { for d in 0..<Self.dimension { center[d] += seq[p][d] } }
-        let n = Float(max(1, positions.count))
-        return VectorMath.normalize(center.map { $0 / n })
-    }
-
-    /// 相邻文本块的语义相似度（ColBERT 词向量中心余弦）；失败返回 nil 供切片器回退词法相似度。
-    func adjacentSimilarities(_ texts: [String]) -> [Double]? {
-        guard texts.count >= 2 else { return [] }
-        do {
-            let centers = try encodeTerms(texts)
-            guard centers.count == texts.count else { return nil }
-            return (0..<(texts.count - 1)).map {
-                VectorMath.cosine(centers[$0], centers[$0 + 1])
-            }
-        } catch {
-            return nil
+        for vector in tokens {
+            for d in 0..<Self.dimension { center[d] += vector[d] }
         }
+        let n = Float(max(1, tokens.count))
+        return (VectorMath.normalize(center.map { $0 / n }), tokens)
     }
 }
 

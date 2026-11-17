@@ -21,12 +21,13 @@ enum Chunker {
     private struct Atom { let text: String; let kind: AtomKind }
     private struct Section { let title: String; let atoms: [Atom] }
 
-    static func split(_ text: String, sourceName: String, model: ColBERT?,
+    static func split(_ text: String, sourceName: String,
+                      similarity: (([String]) -> [Double]?)? = nil,
                       options: ChunkOptions = ChunkOptions()) throws -> [ChunkRecord] {
         let sections = parseSections(text, sourceName: sourceName)
         var chunks: [ChunkRecord] = []
         for section in sections {
-            let pieces = try split(section, model: model, options: options)
+            let pieces = try split(section, similarity: similarity, options: options)
             for piece in pieces {
                 chunks.append(ChunkRecord(title: section.title, content: piece))
             }
@@ -124,7 +125,8 @@ enum Chunker {
 
     // MARK: - 章节内切分
 
-    private static func split(_ section: Section, model: ColBERT?,
+    private static func split(_ section: Section,
+                              similarity: (([String]) -> [Double]?)?,
                               options: ChunkOptions) throws -> [String] {
         guard !section.atoms.isEmpty else { return [] }
         var atoms = section.atoms
@@ -136,7 +138,7 @@ enum Chunker {
         if whole.count <= options.maxChars { return [whole] }
 
         let texts = atoms.map(\.text)
-        let semantic = model?.adjacentSimilarities(texts)
+        let semantic = similarity?(texts)
         let similarities = (semantic?.count == texts.count - 1)
             ? semantic!
             : (0..<max(0, texts.count - 1)).map { i in TextAnalysis.lexicalSimilarity(texts[i], texts[i + 1]) }

@@ -296,15 +296,19 @@ manifest 条目同时记录 `chunkCount` 与 `complete`：增量跳过前会校�
 
 | 环节 | 普通 RAG | 检索阅读模式（ColBERT） |
 | --- | --- | --- |
-| 切片 | `TextChunker` 800/80 token 结构 + 语义切片 | ColBERT 大分片（按章节聚合，模型内 token 化） |
+| 切片 | `TextChunker` 800/80 token 结构 + 语义切片 | 章节结构 + 语义切片（共用 potion，7500–8000 字符大分片） |
 | 编码 | jina-v5 单向量 + Matryoshka 128 维 int8 | jina-colbert-v2 多向量（每 token 一个向量）+ 残差量化 |
 | 存储 | `rag_data/<kb>/index.sqlite` | 独立 `rag_data/<kb>/colbert.db`（与普通库互不干扰） |
 | 召回 | 向量 + FTS + RRF → reranker | 簇心粗筛（vec0）→ 残差 MaxSim 精排，可叠加 ANN 索引 |
 | 上下文 | top-1 切片进模型上下文 | 分片**不进入上下文**，全部作为引用气泡，由用户点开阅读 |
 
 - 模型默认 `arlenecc/jina-colbert-v2-64-onnx-int8`（`colbert_model`），clean 版首次使用时经 hf-mirror 断点续传下载到 `<workspace>/models`，之后常驻复用；`colbert_quant_bits`（2/4，默认 4）、`colbert_coarse_candidates`（默认 20）、`colbert_top_n`（默认 3）、`colbert_use_ann`（默认开）可调。
+- **切片与普通 RAG 共用语义模型**：`Chunker` 先按 Markdown/章节结构聚合，再在相邻文本块余弦低谷处断开；相似度由上层注入的 `potion-multilingual-128M`（int4 ONNX）计算，模型不可用时自动回退词重叠相似度。切片边界始终落在句子/表格/代码块等原子边界上，目标 7500–8000 字符、1% 重叠。
 - **与普通 embedding 解耦**：该模式下 `RAGEngine.ingest` 不要求 embedding 模型可用，普通向量库打不开也只记日志、不中断同步；不创建 embedding 调度器、不校验向量库重建闸门、不按 embedding 窗口收口切片。`makeIngestSignature` 只记录 ColBERT 模型与量化配置，因此调整普通 embedding 后端、元素类型、Matryoshka 维度、切片大小都不会触发 ColBERT 库重建。预加载只加载 ColBERT 模型；ANN 自动构建改走 ColBERT 索引；知识图谱增量抽取得以跳过。
 - **引用来源**：`colbert.db` 的 `document.source` 记录入库时的文件相对路径，气泡上的「来源」是文件名，「章节」是切片所在标题；旧库缺少该列时会自动补列并回退到标题。
+- **文档元数据一致**：ColBERT 入库同时登记 `documents` 元数据（普通向量库可用时），文档列表、`rag_outline`、`get_document` 与「遗忘文档」行为与普通模式一致；旧 colbert 库没有登记时自动回退 manifest 的文档名/路径/Markdown 缓存。删除文档不依赖普通 embedding 模型。
+- **检索引导与外部服务**：返回模型的上下文是「已召回 N 条、请引导用户点击引用气泡」的引导语，避免模型在空上下文上声称没找到或编造内容；RAG MCP 服务在启用该模式时直接返回切片原文；`source` 参数同样参与过滤。
+- **可中途停止**：每片编码前检查取消标志；入库采用分批「事务外编码 → 短事务写入」，写锁窗口毫秒级，中断时已写批保留（manifest 未标记完成，下次同步自动重做该文件，最终一致）。
 - **验证工具** `RAGBenchmark`：对同一语料分别用两种链路入库并逐条检索，输出 hit@1 / hit@k / MRR 与平均、中位查询耗时，报告写入 `<workspace>/benchmark_report.json`：
 
 ```bash

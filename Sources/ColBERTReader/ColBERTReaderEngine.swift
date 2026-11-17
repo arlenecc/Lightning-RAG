@@ -76,38 +76,48 @@ public final class ColBERTReaderEngine {
     }
 
     /// 入库一段 markdown 文本。返回写入的切片数。
+    /// `similarity` 用于语义切片（相邻文本块余弦），由上层注入；为空时回退词法相似度。
+    /// `shouldCancel` 在每片编码前检查，取消时整文件事务回滚。
     @discardableResult
     public func ingest(markdown: String, source: String, title: String? = nil,
                        sourceKey: String? = nil,
                        options: ColBERTReaderOptions,
+                       similarity: (([String]) -> [Double]?)? = nil,
+                       shouldCancel: (() -> Bool)? = nil,
                        progress: ((Int, Int) -> Void)? = nil) throws -> Int {
         try engine().addMarkdown(markdown, source: source, title: title,
                                  bits: options.quantBits, sourceKey: sourceKey,
+                                 similarity: similarity, shouldCancel: shouldCancel,
                                  progress: progress)
     }
 
     /// 删除指定来源的全部切片（不依赖模型加载）。
     @discardableResult
-    public func delete(sourceKey: String) throws -> Int {
-        try SearchEngine.deleteSource(db, sourceKey)
+    public func delete(sourceKey: String, fallbackSource: String? = nil) throws -> Int {
+        try SearchEngine.deleteSource(db, sourceKey, fallbackSource: fallbackSource)
     }
 
     /// 指定来源的切片数（不依赖模型加载）。
-    public func chunkCount(sourceKey: String) -> Int {
-        SearchEngine.chunkCount(db, sourceKey)
+    public func chunkCount(sourceKey: String, fallbackSource: String? = nil) throws -> Int {
+        try SearchEngine.chunkCount(db, sourceKey, fallbackSource: fallbackSource)
     }
 
     /// 全库切片总数（不依赖模型加载）。
-    public func totalChunkCount() -> Int {
-        SearchEngine.totalChunkCount(db)
+    public func totalChunkCount() throws -> Int {
+        try SearchEngine.totalChunkCount(db)
     }
 
     /// 检索并返回命中切片（含原文，供 UI 气泡展示）。
-    public func search(query: String, options: ColBERTReaderOptions) throws -> [ColBERTReaderHit] {
+    /// `source` 非空时只返回来源文件名/标题匹配的切片。
+    public func search(query: String, options: ColBERTReaderOptions,
+                       source: String? = nil,
+                       timing: ((String, Double) -> Void)? = nil) throws -> [ColBERTReaderHit] {
         let hits = try engine().search(query: query,
                                        topN: options.topN,
                                        coarse: options.coarseCandidates,
-                                       useANN: options.useANN)
+                                       useANN: options.useANN,
+                                       source: source,
+                                       timing: timing)
         return hits.enumerated().map { index, hit in
             ColBERTReaderHit(docID: hit.docID, title: hit.title,
                              source: hit.source, content: hit.content,
@@ -116,9 +126,10 @@ public final class ColBERTReaderEngine {
     }
 
     /// 构建 / 续建向量索引。返回摘要信息。
+    /// - Parameter shouldCancel: 块间取消检查；中断后已写块保留，续建从水位继续。
     @discardableResult
-    public func buildANN() throws -> String {
-        try ANNIndex(db: db).build().summary
+    public func buildANN(shouldCancel: (() -> Bool)? = nil) throws -> String {
+        try ANNIndex(db: db).build(isCancelled: shouldCancel).summary
     }
 
     public func annStatus() -> String {

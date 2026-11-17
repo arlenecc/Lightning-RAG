@@ -281,6 +281,9 @@ final class AppViewModel: ObservableObject {
     @Published var isBuildingColbertANN = false
     /// 检索阅读模式向量索引构建结果摘要。
     @Published var colbertIndexSummary = ""
+    /// 检索阅读模式 ANN 构建任务与取消标志（块间生效，已写块保留）。
+    private var colbertANNBuildTask: Task<Void, Never>?
+    private let colbertANNCancelFlag = CancelFlag()
     /// 知识图谱是否已构建（决定 4 种图谱检索策略是否可选）。
     @Published var knowledgeGraphBuilt = false
     @Published var knowledgeGraphEntityCount = 0
@@ -1062,6 +1065,13 @@ final class AppViewModel: ObservableObject {
     func preloadRAGModels() async {
         guard let agent else { return }
         let generation = configGeneration
+        // 检索阅读模式模型下载状态上抛到状态栏（几百 MB 下载不再「静默」）。
+        agent.ragEngine.colbertDownloadStatusHandler = { [weak self] text in
+            DispatchQueue.main.async {
+                self?.statusText = text
+                self?.appendLog("[colbert] \(text)")
+            }
+        }
         let outcome = await agent.ragEngine.preloadAuxiliaryModels()
         guard configGeneration == generation else { return }
         if !outcome.loaded.isEmpty {
@@ -2315,27 +2325,48 @@ final class AppViewModel: ObservableObject {
         }
         isBuildingColbertANN = true
         colbertIndexSummary = "构建中…"
+        colbertANNCancelFlag.set(false)
         let target = ObjectIdentifier(agent)
-        Task.detached(priority: .utility) { [weak self] in
+        let cancelledCheck = { [colbertANNCancelFlag] in colbertANNCancelFlag.isCancelled }
+        colbertANNBuildTask = Task.detached(priority: .utility) { [weak self] in
             let result: Result<String, Error>
             do {
-                let summary = try await agent.ragEngine.buildColbertANN()
+                let summary = try await agent.ragEngine
+                    .buildColbertANN(shouldCancel: cancelledCheck)
                 result = .success(summary)
             } catch {
                 result = .failure(error)
             }
             await MainActor.run { [weak self] in
                 guard let self else { return }
-                guard let current = self.agent, ObjectIdentifier(current) == target else { return }
+                // agent 已被重建（构建期间用户重新应用配置）：构建结果作废，
+                // 但必须复位状态，否则按钮永久禁用、摘要永远「构建中…」。
+                guard let current = self.agent, ObjectIdentifier(current) == target else {
+                    self.isBuildingColbertANN = false
+                    self.colbertIndexSummary = ""
+                    return
+                }
                 switch result {
                 case .success(let summary):
                     self.colbertIndexSummary = summary
+                case .failure(let error) where error is CancellationError:
+                    // 用户主动停止：已写块保留，摘要标注可续建。
+                    self.colbertIndexSummary = "已停止（已写块保留，可续建）"
                 case .failure(let error):
                     self.colbertIndexSummary = "失败：\(error.localizedDescription)"
                 }
                 self.isBuildingColbertANN = false
             }
         }
+    }
+
+    /// 停止 ColBERT ANN 索引构建：块间生效，已写块保留，下次从水位续建。
+    func stopColbertANNBuild() {
+        guard isBuildingColbertANN else { return }
+        statusText = "正在停止检索阅读 ANN 索引构建…"
+        appendLog("用户请求停止检索阅读 ANN 索引构建")
+        colbertANNCancelFlag.set(true)
+        colbertANNBuildTask?.cancel()
     }
 
     // MARK: 知识图谱
@@ -2664,7 +2695,8 @@ final class AppViewModel: ObservableObject {
     func syncKnowledgeBase(force: Bool) {
         let restore = pendingSyncRestore
         pendingSyncRestore = nil
-        guard let agent, !isSyncing, !isDeduplicating, !isBuildingANN else { return }
+        guard let agent, !isSyncing, !isDeduplicating, !isBuildingANN,
+              !isBuildingColbertANN else { return }
         if blockForMissingModels("知识库同步") { return }
         cancelIdleUnload()
         if isRunning {
@@ -2892,6 +2924,9 @@ final class AppViewModel: ObservableObject {
         // SemanticChunker 等支持 Task.isCancelled 的步骤立即返回。
         agent?.ragEngine.cancel()
         syncTask?.cancel()
+        // 检索阅读模式：同步触发的模型下载（几百 MB）也一并取消，
+        // 不再让下载在后台「静默」跑完。
+        agent?.ragEngine.cancelColbertLoading()
     }
 
     /// 缓存 RAG 统计，避免 SwiftUI body 每次重绘都查库。
@@ -2914,6 +2949,7 @@ final class AppViewModel: ObservableObject {
                 ?? status["sources"]?.arrayValue?.count ?? 0
             let ann = status["ann_index"]?.stringValue ?? ""
             let binaryANN = status["binary_ann_index"]?.stringValue ?? ""
+            let colbertANN = engine.colbertANNStatus()
             let rebuildRequired = status["vector_rebuild_required"]?.boolValue ?? false
             let rebuildReason = status["rebuild_reason"]?.stringValue ?? ""
             // 超时/不可用时 status 带 error：状态栏给可读提示，不显示误导性的 0 切片。
@@ -2931,6 +2967,13 @@ final class AppViewModel: ObservableObject {
                     self.ragStatusText = text
                     if !ann.isEmpty { self.annStatusText = ann }
                     if !binaryANN.isEmpty { self.binaryANNStatusText = binaryANN }
+                    // 检索阅读模式：启动/刷新时回填索引状态（构建中不覆盖）。
+                    // annStatus 只读内存态不触发模型加载；忙碌（nil，长任务持
+                    // opLock）时跳过本次覆盖，避免状态栏刷新停摆。
+                    if self.config.colbertReaderEnabled, !self.isBuildingColbertANN,
+                       let colbertANN {
+                        self.colbertIndexSummary = colbertANN == "未启用" ? "" : colbertANN
+                    }
                     self.vectorRebuildRequired = rebuildRequired
                     self.vectorRebuildReason = rebuildReason
                 } else {

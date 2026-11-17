@@ -193,7 +193,8 @@ final class ANNIndex {
     @discardableResult
     func build(clusters: Int = ANNIndex.clusters, clusterSize: Int = ANNIndex.clusterSize,
                iterations: Int = ANNIndex.iterations, force: Bool = false,
-               progress: ((Int, Int) -> Void)? = nil) throws -> BuildResult {
+               progress: ((Int, Int) -> Void)? = nil,
+               isCancelled: (() -> Bool)? = nil) throws -> BuildResult {
         try createSchema()
         let started = Date()
         let clusterCount = min(max(2, clusters), 4096)
@@ -217,6 +218,9 @@ final class ANNIndex {
         var watermark = m.lastRowID
 
         while watermark < stopRowID {
+            // 块间检查取消：已写块与水位随每块事务持久化（writeBlock 内提交），
+            // 中断后下次构建从 rowid 水位续建，不丢已索引数据。
+            if isCancelled?() == true { throw CancellationError() }
             var buffer = ANNBlockBuffer()
             try gather(after: watermark, maxRows: blockRows, into: &buffer)
             guard !buffer.rowids.isEmpty else { break }
@@ -245,7 +249,7 @@ final class ANNIndex {
                 SELECT rowid, embedding FROM doc_vectors
                 WHERE rowid > ? ORDER BY rowid LIMIT ?
                 """, [.int(cursor), .int(Int64(maxRows - buffer.count))])
-            guard !rows.isEmpty else { break }
+            guard let lastRowID = rows.last?["rowid"]?.intValue else { break }
             for row in rows {
                 guard let id = row["rowid"]?.intValue,
                       let data = row["embedding"]?.dataValue,
@@ -254,6 +258,9 @@ final class ANNIndex {
                 buffer.append(rowID: id, floats: floats, dim: dim)
                 cursor = id
             }
+            // 防御：cursor 只在成功 append 时前进；窗口内存在损坏 blob（尤其
+            // 全部损坏）时会卡死外层循环。每窗口强制推进到窗口最大 rowid。
+            cursor = max(cursor, lastRowID)
         }
     }
 

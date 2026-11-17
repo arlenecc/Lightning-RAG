@@ -771,24 +771,55 @@ public final class RAGEngine {
         guard config.colbertReaderEnabled else { return nil }
         colbertLock.lock()
         defer { colbertLock.unlock() }
-        if let existing = colbertReader { return existing }
+        if let existing = colbertReader {
+            // handler 可能晚于 service 创建才被设置：每次访问幂等同步，
+            // 保证几百 MB 下载进度始终上抛。
+            existing.downloadStatusHandler = colbertDownloadStatusHandler
+            return existing
+        }
         let service = ColBERTReaderService(config: config, dbPath: colbertDBPath)
+        // 模型下载状态上抛（几百 MB 从 hf-mirror 下载），UI 层可接进度提示。
+        service.downloadStatusHandler = colbertDownloadStatusHandler
         colbertReader = service
         return service
     }
 
+    /// 检索阅读模式模型下载状态回调。
+    /// 读写都经 `colbertLock`（写端在 MainActor、读端在后台线程，裸属性是数据竞争）。
+    public var colbertDownloadStatusHandler: (@Sendable (String) -> Void)? {
+        get {
+            colbertLock.lock()
+            defer { colbertLock.unlock() }
+            return colbertDownloadStatusHandlerStorage
+        }
+        set {
+            colbertLock.lock()
+            defer { colbertLock.unlock() }
+            colbertDownloadStatusHandlerStorage = newValue
+        }
+    }
+
+    private nonisolated(unsafe) var colbertDownloadStatusHandlerStorage: (@Sendable (String) -> Void)?
+
     /// 构建 / 续建检索阅读模式的 ANN 向量索引，返回摘要。
+    /// - Parameter shouldCancel: 块间取消检查；中断后已写块保留，续建从水位继续。
     @discardableResult
-    public func buildColbertANN() async throws -> String {
+    public func buildColbertANN(shouldCancel: (() -> Bool)? = nil) async throws -> String {
         guard let colbert = colbertService() else {
             throw AgentError.storage("检索阅读模式未启用")
         }
-        return try await colbert.buildANN()
+        return try await colbert.buildANN(shouldCancel: shouldCancel)
     }
 
-    /// 检索阅读模式 ANN 索引的当前状态摘要。
-    public func colbertANNStatus() -> String {
-        colbertService()?.annStatus() ?? "未启用"
+    /// 取消检索阅读模式进行中的模型加载/下载（如停止同步时）。
+    public func cancelColbertLoading() {
+        colbertService()?.cancelLoading()
+    }
+
+    /// 检索阅读模式 ANN 索引的当前状态摘要；忙碌（长任务持锁）时返回 nil。
+    public func colbertANNStatus() -> String? {
+        guard config.colbertReaderEnabled else { return "未启用" }
+        return colbertService()?.annStatus()
     }
 
     /// 索引指纹：向量语义 + 落盘布局（`embedding.identifier | dimension |
@@ -1673,9 +1704,18 @@ public final class RAGEngine {
         }
         // 检索阅读模式旁路接管索引库；删除清理也要同步到 colbert 库。
         let colbertRef = colbertService()
-        let existingChunkCount = colbertMode
-            ? (colbertRef?.totalChunkCount() ?? 0)
-            : (store?.count ?? 0)
+        let existingChunkCount: Int
+        do {
+            existingChunkCount = colbertMode
+                ? (try colbertRef?.totalChunkCount() ?? 0)
+                : (store?.count ?? 0)
+        } catch {
+            // colbert.db 打不开/查询失败：本次同步中止。继续写入有把计数
+            // 错当成 0 而误判「索引为空」的风险。
+            stats.errors.append("colbert 索引库读取失败：\(error.localizedDescription)")
+            logFn("RAG: colbert 索引库读取失败，已中止本次同步：\(error.localizedDescription)")
+            return stats
+        }
         // B 方案闸门：配置与索引指纹不符时不静默删数据，但也不能继续写入
         // （新向量与旧向量语义/类型不同，混在一个库里检索结果不可信）。
         // 检索阅读模式不使用普通向量通道，该闸门不适用。
@@ -1702,9 +1742,14 @@ public final class RAGEngine {
         // 数据库被删除/重建但 manifest 还在时，增量逻辑会把所有文件当成
         // 「未变化」而跳过，知识库永久为空；此时必须全量重建。
         // 检索阅读模式用 colbert 库判断「索引是否为空」。
-        let indexHasChunks = colbertMode
-            ? (colbertRef?.totalChunkCount() ?? 0) > 0
-            : (store?.hasChunks ?? false)
+        // colbert 计数失败（-1）时保守视为「有数据」：不能因瞬时 IO 错误
+        // 清空 manifest 触发整库重建，宁可下次同步再判。
+        let indexHasChunks: Bool
+        if colbertMode {
+            indexHasChunks = ((try? colbertRef?.totalChunkCount()) ?? -1) != 0
+        } else {
+            indexHasChunks = store?.hasChunks ?? false
+        }
         if !indexHasChunks, !manifest.isEmpty {
             logFn("RAG: 索引库为空但 manifest 仍存在，执行全量重建")
             manifest.removeAll()
@@ -1827,7 +1872,11 @@ public final class RAGEngine {
             manifest: snapshot,
             sources: currentSources,
             isUsable: { source in
-                Self.chunkCount(source: source, store: storeRef, colbert: colbertRef) > 0
+                // colbert 计数失败（-1）保守视为可用：把有效来源误判为空
+                // 会让内容去重登记表错误地保留/丢弃副本。
+                let count = (try? Self.chunkCount(source: source, store: storeRef,
+                                                  colbert: colbertRef)) ?? -1
+                return count != 0
             })
         let markdownDirRef = markdownDir
         let knowledgeBaseRef = knowledgeBase
@@ -2069,7 +2118,7 @@ public final class RAGEngine {
         signatureHash: String,
         markdownDir: String,
         knowledgeBase: String,
-        isCancelled: () -> Bool,
+        isCancelled: @escaping () -> Bool,
         log: @escaping (String) -> Void,
         progress: ((Int, Int, String) -> Void)?
     ) async -> IngestOutcome {
@@ -2154,11 +2203,16 @@ public final class RAGEngine {
                         || !FileManager.default.fileExists(atPath: entry.mdPath) {
                 redoReason = "Markdown 缓存缺失"
             } else {
-                let actualChunks = Self.chunkCount(source: source, store: store,
-                                                   colbert: colbertReader)
+                // 计数失败（如 colbert.db 瞬时打不开，-1）时保守触发重新入库：
+                // 无法验证切片完整性，重做（重新 ingest 覆盖旧切片）是最终一致
+                // 的选择；绝不能把错误当成 0 条或直接跳过验证。
+                let actualChunks = (try? Self.chunkCount(source: source, store: store,
+                                                         colbert: colbertReader)) ?? -1
                 if actualChunks != entry.chunkCount {
                     // manifest 说完成，但库里没有对应切片（被删除/上次写入中断/外部改动）。
-                    redoReason = "索引切片不完整（\(actualChunks)/\(entry.chunkCount ?? 0)）"
+                    redoReason = actualChunks == -1
+                        ? "索引切片计数失败，保守重做"
+                        : "索引切片不完整（\(actualChunks)/\(entry.chunkCount ?? 0)）"
                 } else {
                     canSkip = true
                 }
@@ -2272,11 +2326,26 @@ public final class RAGEngine {
                 let colbertStarted = Date()
                 do {
                     let count = try await colbertReader.ingest(
-                        markdown: text, source: source, title: file.relativePath)
+                        markdown: text, source: source, title: file.relativePath,
+                        shouldCancel: { isCancelled() || Task.isCancelled })
                     let mdPath = Self.cacheMarkdownPath(for: source,
                                                         markdownDir: markdownDir,
                                                         knowledgeBase: knowledgeBase)
                     try AtomicFile.write(text, to: mdPath)
+                    // 检索阅读模式同样登记 documents 元数据：文档列表、大纲、
+                    // get_document 与「遗忘文档」都依赖这张表。普通向量库
+                    // 不可用时只跳过登记，不影响切片入库与检索。
+                    if let store {
+                        let digestInfo = Self.buildDigest(parsed: parsed,
+                                                          docName: file.relativePath,
+                                                          markdown: text)
+                        try? store.upsertDocument(
+                            docName: file.relativePath,
+                            digest: digestInfo.digest,
+                            chapters: digestInfo.chapters,
+                            mdPath: mdPath,
+                            contentHash: Self.contentHash(text))
+                    }
                     let failedPages = parsed.metadata["failed_pages"].flatMap { Int($0) } ?? 0
                     let entry = RAGManifestEntry(
                         mtime: signature?.mtime ?? 0,
@@ -2300,6 +2369,10 @@ public final class RAGEngine {
                         + "，总 \(Self.elapsedText(fileStarted))")
                     return outcome
                 } catch AgentError.cancelled {
+                    outcome.cancelled = true
+                    return outcome
+                } catch is CancellationError {
+                    // 用户在文件编码中途停止同步：整文件事务已回滚，不写 manifest。
                     outcome.cancelled = true
                     return outcome
                 } catch {
@@ -3289,13 +3362,22 @@ public final class RAGEngine {
         // 检索阅读模式：旁路接管检索召回 + 精排，改用 ColBERT 大分片多向量检索。
         // 分片不进入模型上下文，只作为召回切片气泡附在回复后。
         if let colbert = colbertService() {
+            // 端到端墙钟预算：与普通检索同风格。防极端情况（如库锁升级、
+            // 磁盘抖动）下 rag_search 无限挂起拖死对话。
+            let budget = max(30, resolvedTimeout(nil) * 3)
             do {
-                let outcome = try await colbert.search(query: query)
+                let outcome = try await Self.withTimeout(budget) {
+                    try await colbert.search(query: query, source: source)
+                }
                 if outcome.citations.isEmpty {
                     return RAGRetrievalOutcome(context: "（知识库中未找到相关内容）",
                                                citations: [])
                 }
                 return outcome
+            } catch is RerankTimeout {
+                AgentLog.error("[colbert] 检索阅读检索超时（\(Int(budget))s）")
+                throw AgentError.timeout(
+                    "检索阅读检索超时（\(Int(budget))s），已放弃本次检索；可稍后重试")
             } catch {
                 AgentLog.error("[colbert] 检索阅读检索失败：\(error.localizedDescription)")
                 throw error
@@ -3802,12 +3884,18 @@ public final class RAGEngine {
     }
 
     /// SQL 限量列表：返回前 `limit` 个文档名与总条数。
+    /// 检索阅读模式下 documents 表可能尚未登记（旧库或普通向量库不可用），
+    /// 用 manifest 的已入库文档兜底，保证大纲工具能看到文档。
     public func listDocuments(limit: Int) -> (names: [String], total: Int) {
         let result = withStoreSafe { store -> ([String], Int) in
             (try store.documentNames(limit: limit), try store.documentCount())
         }
-        guard let result else { return ([], 0) }
-        return (names: result.0, total: result.1)
+        if let result, result.1 > 0 { return result }
+        if config.colbertReaderEnabled {
+            let docs = listIngestedDocuments(limit: limit)
+            return (docs.map(\.docName), manifestStore.load().count)
+        }
+        return result ?? ([], 0)
     }
 
     /// 文档查找：精确完整路径/名称 > basename 精确 > 唯一模糊；多候选返回歧义。
@@ -3839,7 +3927,68 @@ public final class RAGEngine {
             if candidates.count > 1 { return .ambiguous(candidates) }
             return .notFound
         }
+        if let result {
+            switch result {
+            case .found, .ambiguous: return result
+            case .notFound: break
+            }
+        }
+        // 检索阅读模式的旧库/普通向量库不可用：documents 表没有登记，
+        // 退回 manifest 匹配，保证 get_document / 遗忘文档仍可用。
+        if config.colbertReaderEnabled { return lookupColbertDocument(target) }
         return result ?? .notFound
+    }
+
+    /// 用 manifest 的 docName / mdPath / 来源路径匹配文档（检索阅读模式兜底）。
+    private func lookupColbertDocument(_ target: String) -> DocumentLookupResult {
+        let manifest = manifestStore.load()
+        let lower = target.lowercased()
+        let standardized = (target as NSString).standardizingPath
+        let basename = (target as NSString).lastPathComponent.lowercased()
+        var exact: [(source: String, entry: RAGManifestEntry)] = []
+        var sameName: [(source: String, entry: RAGManifestEntry)] = []
+        for (source, entry) in manifest where !entry.docName.isEmpty {
+            let docName = entry.docName.lowercased()
+            let mdPath = entry.mdPath.lowercased()
+            if docName == lower
+                || (!mdPath.isEmpty && mdPath == lower)
+                || (!standardized.isEmpty
+                    && (entry.mdPath as NSString).standardizingPath == standardized) {
+                exact.append((source, entry))
+            } else if (entry.docName as NSString).lastPathComponent.lowercased() == basename
+                        || source.lowercased() == lower
+                        || (!mdPath.isEmpty
+                            && (entry.mdPath as NSString).lastPathComponent.lowercased() == basename) {
+                sameName.append((source, entry))
+            }
+        }
+        func records(_ matches: [(source: String, entry: RAGManifestEntry)]) -> [DocumentRecord] {
+            matches.map { Self.colbertDocumentRecord($0.entry) }
+        }
+        if exact.count == 1 { return .found(records(exact)[0]) }
+        if exact.count > 1 { return .ambiguous(records(exact)) }
+        if sameName.count == 1 { return .found(records(sameName)[0]) }
+        if sameName.count > 1 { return .ambiguous(records(sameName)) }
+        return .notFound
+    }
+
+    /// 用 manifest 条目构造文档记录：从 Markdown 缓存重建目录，
+    /// 让旧 colbert 库（documents 表尚未登记）也能使用大纲与 get_document。
+    private static func colbertDocumentRecord(_ entry: RAGManifestEntry) -> DocumentRecord {
+        var digest = entry.digest
+        var chapters = ""
+        if !entry.mdPath.isEmpty,
+           let markdown = try? String(contentsOfFile: entry.mdPath, encoding: .utf8) {
+            let resolved = OutlineResolver.resolve(
+                markdown: markdown, parsedOutline: "", docName: entry.docName,
+                preferParser: OutlineResolver.prefersParserOutline(for: entry.docName),
+                includeSections: false)
+            digest = resolved.digest
+            chapters = resolved.chaptersJSON
+        }
+        return DocumentRecord(docID: "", docName: entry.docName, digest: digest,
+                              chapters: chapters, mdPath: entry.mdPath,
+                              contentHash: entry.digest)
     }
 
     /// 增强目录：修复后的 TOC + 已完成的章节/全书摘要。
@@ -3851,7 +4000,14 @@ public final class RAGEngine {
     /// 按已解析的记录读取增强目录：用 `doc_id` 直接命中，避免同名文档二次查找
     /// 产生歧义，也不会在两次查询之间被路径变化影响。
     public func getEnrichedOutline(for record: DocumentRecord) -> EnrichedDocumentOutline? {
-        guard !record.docID.isEmpty else { return nil }
+        // manifest 兜底记录没有 documents 表 doc_id：直接返回由 Markdown 重建的
+        // 目录（无摘要），大纲工具仍可展示章节结构。
+        if record.docID.isEmpty {
+            return EnrichedDocumentOutline(
+                record: record, chapterSummaries: [], bookSummary: nil,
+                jobProgress: DocumentSummaryProgress(docID: ""),
+                repairedTOC: record.digest)
+        }
         return withStoreSafe { store in
             // 以库内当前行为准；记录可能来自较早的查询。
             let current = try store.document(docID: record.docID) ?? record
@@ -3869,7 +4025,13 @@ public final class RAGEngine {
     }
 
     public func listDocuments() -> [String] {
-        (withStoreSafe { $0.listDocuments() }) ?? []
+        let names = (withStoreSafe { $0.listDocuments() }) ?? []
+        if !names.isEmpty { return names }
+        // 检索阅读模式或普通库不可用：documents 表可能未登记，退回 manifest。
+        if config.colbertReaderEnabled {
+            return listIngestedDocuments(limit: 1000).map(\.docName)
+        }
+        return names
     }
 
     // MARK: - MCP 服务薄层 API（RAGMCPServer 使用，不影响既有入库/检索流程）
@@ -3915,16 +4077,33 @@ public final class RAGEngine {
                 ?? record.mdPath
                 ?? ((knowledgeBase as NSString)
                     .appendingPathComponent((record.docName as NSString).lastPathComponent))
-            // 先清掉切片向量（拿行数做反馈），再走统一的清理路径删除
-            // documents 表记录与 markdown 缓存；removeIndexedSource 内部会再
-            // deleteBySource 一次（幂等，返回 0）。
-            let chunksRemoved = try withStore { store -> Int in
-                let chunks = try store.deleteBySource(source)
-                Self.removeIndexedSource(
-                    source: source, entry: entry?.value, store: store,
-                    colbertReader: colbertService(),
-                    markdownDir: markdownDir, knowledgeBase: knowledgeBase)
-                return chunks
+            // 检索阅读模式：切片只在 colbert.db，且删除不依赖普通向量库
+            // （embedding 缺失时 withStore 会直接失败）。
+            let colbert = colbertService()
+            let chunksRemoved: Int
+            if let colbert {
+                do {
+                    chunksRemoved = try colbert.delete(source: source)
+                } catch {
+                    // colbert 删除失败（如 DB busy）：保留 manifest 条目让下次
+                    // 同步/删除重试。若此时仍移除来源，残留切片会永久留在
+                    // colbert.db 中且继续参与检索，再也无法被清理。
+                    throw error
+                }
+                Self.removeIndexedSource(source: source, entry: entry?.value,
+                                         store: try? ensureStore(),
+                                         colbertReader: colbert,
+                                         markdownDir: markdownDir,
+                                         knowledgeBase: knowledgeBase)
+            } else {
+                chunksRemoved = try withStore { store -> Int in
+                    let chunks = try store.deleteBySource(source)
+                    Self.removeIndexedSource(
+                        source: source, entry: entry?.value, store: store,
+                        colbertReader: nil,
+                        markdownDir: markdownDir, knowledgeBase: knowledgeBase)
+                    return chunks
+                }
             }
             invalidateStatusCache()
             invalidateKnowledgeGraph(reason: "文档已删除")
@@ -4472,7 +4651,8 @@ public final class RAGEngine {
                   (representative.chunkCount ?? 0) > 0 else { continue }
             for file in group.duplicates
             where finalManifest[file.path] != nil
-                || Self.chunkCount(source: file.path, store: store, colbert: colbertReader) > 0 {
+                || (try? Self.chunkCount(source: file.path, store: store,
+                                         colbert: colbertReader)) ?? 0 > 0 {
                 removeSet.insert(file.path)
             }
         }
@@ -4558,9 +4738,11 @@ public final class RAGEngine {
     }
 
     /// 检索阅读模式用 colbert 库计数，普通模式用向量库计数。
+    /// colbert 分支失败上抛：调用方必须区分「真 0 条」与「库读取失败」，
+    /// 否则瞬时错误会被当成 0 条，触发误清理/误重建/误重做。
     private static func chunkCount(source: String, store: VectorStore?,
-                                   colbert: ColBERTReaderService?) -> Int {
-        if let colbert { return colbert.chunkCount(source: source) }
+                                   colbert: ColBERTReaderService?) throws -> Int {
+        if let colbert { return try colbert.chunkCount(source: source) }
         return store?.chunkCount(source: source) ?? 0
     }
 

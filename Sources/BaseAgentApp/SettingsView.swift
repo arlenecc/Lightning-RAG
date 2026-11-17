@@ -747,6 +747,10 @@ struct SettingsView: View {
                                 model.requestColbertANNBuild()
                             }
                             .disabled(model.isBuildingColbertANN || model.isSyncing)
+                            if model.isBuildingColbertANN {
+                                Button("停止") { model.stopColbertANNBuild() }
+                                    .help("停止构建：已写块保留，下次构建从断点续建")
+                            }
                             Spacer(minLength: 8)
                         }
                         .help("启用后旁路接管文档解析→markdown 之后的切片/embedding/入库/检索/精排全流程，"
