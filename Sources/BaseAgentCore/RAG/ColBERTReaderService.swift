@@ -123,6 +123,7 @@ public final class ColBERTReaderService: @unchecked Sendable {
             AgentLog.info("[colbert] 开始下载 \(file.path)（\(file.size / 1_048_576)MB）")
             report("下载 \(label)（\(file.size / 1_048_576)MB，共 "
                 + "\(totalBytes / 1_048_576)MB）")
+            let baseBytes = doneBytes
             try await downloader.download(repo: model.repo, file: file,
                                           into: model.directory) { received, total in
                 // 大文件下载可达数十分钟，每 10% 或 30 秒输出一次，避免用户以为同步卡死。
@@ -132,7 +133,7 @@ public final class ColBERTReaderService: @unchecked Sendable {
                 if enoughTime || (total > 0 && received >= total) {
                     lastLogAt = now
                     let percent = Int(ratio * 100)
-                    let overall = doneBytes + received
+                    let overall = baseBytes + received
                     AgentLog.info("[colbert] 下载 \(label) \(received / 1_048_576)MB"
                         + "/\(total / 1_048_576)MB（\(percent)%）")
                     report("下载 \(label) \(percent)%（累计 \(overall / 1_048_576)"
