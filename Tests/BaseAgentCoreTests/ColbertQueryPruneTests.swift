@@ -47,4 +47,21 @@ final class ColbertQueryPruneTests: XCTestCase {
             XCTAssertFalse(isDiscardable(token), "单字实词 \(token) 不应被误剪")
         }
     }
+
+    // MARK: - 超长查询截断（避免 O(n²) 注意力拖慢 query_center）
+
+    func testTruncateQueryKeepsSpecialTokensAndLeadingContent() {
+        let ids = [0, ColBERT.queryMarkerID] + Array(100..<200) + [2]
+        let truncated = ColBERT.truncateQueryIDs(ids, limit: 10)
+        XCTAssertEqual(truncated.first, 0, "<s> 必须保留")
+        XCTAssertEqual(truncated[1], ColBERT.queryMarkerID, "查询 marker 必须保留")
+        XCTAssertEqual(truncated.last, 2, "</s> 必须保留")
+        let content = truncated.filter { ![0, 2, ColBERT.queryMarkerID].contains($0) }
+        XCTAssertEqual(content, Array(100..<110), "保留前 10 个内容 token")
+    }
+
+    func testTruncateQueryNoopWhenShort() {
+        let ids = [0, ColBERT.queryMarkerID, 100, 101, 2]
+        XCTAssertEqual(ColBERT.truncateQueryIDs(ids, limit: 64), ids, "短查询不改动")
+    }
 }

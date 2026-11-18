@@ -13,6 +13,11 @@ final class ColBERT {
     static let maskID: Int = 250001
     static let padID: Int = 1
     static let queryMaxLen = 32
+    /// 查询 token 上限。ColBERT 查询本应简短（作者训练设置 32），但 agent 常把
+    /// 大段上下文塞进检索词；不截断时注意力 O(n²)，实测 540 字查询编码 ~900ms、
+    /// 是短查询（~110ms）的 8 倍。截到 64 token（中文约 60–120 字）后稳定在
+    /// ~150ms，且保留了查询的主要语义（超长部分的边际信息增益很低）。
+    static let queryTokenLimit = 64
     static let dimension = 64
 
     private static let envLock = NSLock()
@@ -262,11 +267,29 @@ final class ColBERT {
     /// 检索时既要簇心做粗筛、又要 token 序列做 MaxSim；分开调用会重复编码
     /// 一遍查询。`prune=true` 用轻量剪枝剔除标点/空白/核心功能词（保留疑问词与
     /// 形容词）；`false` 则只排除特殊 token、其余全留。两者都排除 <s>/</s>/marker。
+    /// 截断超长查询：只保留前 `queryTokenLimit` 个内容 token，特殊 token
+    /// （<s>/</s>/[QueryMarker]）原样保留在原位，从而维持编码器期待的结构。
+    /// 保留前部内容而非后部：agent 塞入的长检索词，关键信息通常在开头。
+    static func truncateQueryIDs(_ ids: [Int], limit: Int = queryTokenLimit) -> [Int] {
+        let special: Set<Int> = [0, 2, queryMarkerID]
+        var contentSeen = 0
+        var keep = [Bool](repeating: true, count: ids.count)
+        for (i, id) in ids.enumerated() where !special.contains(id) {
+            contentSeen += 1
+            if contentSeen > limit { keep[i] = false }
+        }
+        return ids.indices.compactMap { keep[$0] ? ids[$0] : nil }
+    }
+
     func queryVectors(_ query: String, prune: Bool = true) throws -> (center: [Float], tokens: [[Float]]) {
-        guard let seq = try encode([query], kind: .query).first, !seq.isEmpty else {
+        // 只 tokenize 一次：原实现在 encode 内与此处各编码一遍查询，重复开销浪费在
+        // tokenizerLock 串行段里。同时在此处截断超长查询的内容 token，避免长问句
+        // 触发 O(n²) 注意力、把 query_center 从 ~110ms 拖到 ~900ms。
+        let ids = Self.truncateQueryIDs(encodeIDs(query, kind: .query))
+        guard let seq = try encode(idsList: [ids], kind: .query, batchSize: 1).first,
+              !seq.isEmpty else {
             throw DocSearchError.model("问句编码为空")
         }
-        let ids = encodeIDs(query, kind: .query)
         // 基础位置只排除特殊 token；剪枝后为空（如问句全是功能词）时回退到它，
         // 保证查询仍有内容向量，而不是退回包含标点/空白的全序列。
         let base = contentIndices(ids, kind: .query, policy: .none).filter { $0 < seq.count }

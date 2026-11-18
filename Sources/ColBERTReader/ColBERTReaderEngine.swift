@@ -76,6 +76,14 @@ public final class ColBERTReaderEngine {
 
     public var isModelLoaded: Bool { colbert != nil }
 
+    /// 预热一次查询编码前向：把 ORT 首次 session.run 的惰性初始化成本
+    /// （kernel 选择 / arena 分配 / 线程绑定）从首次检索挪到后台预加载阶段。
+    /// 模型未加载时为空操作；推理失败不抛出，交由首次检索按需重试。
+    public func warmupQueryEncoding() {
+        guard let colbert else { return }
+        _ = try? colbert.queryVectors("检索预热 query warmup", prune: true)
+    }
+
     /// 释放模型与数据库句柄：置 nil 让 ORTSession / tokenizer / SQLiteDB 经 ARC 立即回收，
     /// 而不是等整个引擎对象 deinit。供上层 close/reload 显式调用，避免切换配置后
     /// 旧模型内存（几百 MB）长时间与新模型双份驻留。释放后可再次 loadModel 重建。

@@ -253,7 +253,16 @@ public final class ColBERTReaderService: @unchecked Sendable {
 
     /// 预加载模型并常驻，让首次检索不再现加载。
     public func preload() async throws {
-        _ = try await ensureEngine()
+        let engine = try await ensureEngine()
+        // 只加载 ONNX session 不够：ORT 的算子 kernel 选择 / 内存 arena 分配 /
+        // 线程绑定都惰性发生在首次 session.run()。若不在预加载阶段触发，
+        // 首次检索的 query_center 就会承担这笔开销——真实 App 里主模型已占
+        // 数 GB 内存，首次 arena 分配被放大到秒级（实测日志 1538ms）。
+        // 用固定短句跑一次完整 query 编码，把冷启动成本挪到后台预加载。
+        // 持 opLock 与 ingest/ANN 串行，避免并发触发多次「首次推理」互相争抢。
+        opLock.lock()
+        defer { opLock.unlock() }
+        engine.warmupQueryEncoding()
     }
 
     /// 把 top-1 分片原文格式化为供 LLM 总结的上下文。
