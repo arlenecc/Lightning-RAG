@@ -170,11 +170,58 @@ private func firstSentence(_ text: String) -> String {
     return text
 }
 
-/// 把 `<summary>` 从回复正文里剥掉（UI 展示 / 入库前用）。
+/// 锚点协议的专属行前缀：逐行判定，避免正则一路吞掉其后的正常答复。
+private func isAnchorProtocolLine(_ line: String) -> Bool {
+    let t = line.trimmingCharacters(in: .whitespaces)
+    if t.isEmpty { return true }
+    if t.hasPrefix("Goal:") || t.hasPrefix("Now:") || t.hasPrefix("Remaining:")
+        || t.hasPrefix("Current turn:") { return true }
+    if t.hasPrefix("- [") || t.hasPrefix("-[") { return true }
+    if t.hasPrefix("<key_info>") || t.hasPrefix("</key_info>")
+        || t.hasPrefix("<facts>") || t.hasPrefix("</facts>") { return true }
+    if t.hasPrefix("[SYSTEM]") || t.hasPrefix("[TIPS]") { return true }
+    return false
+}
+
+/// 剥掉模型复述的 `### [PLAN]` / `### [WORKING MEMORY]` 锚点块。
+/// 逐行判定协议行，遇到不属于协议的行即恢复正常输出，不误伤块之后的正文。
+private func stripAnchorProtocolEcho(_ text: String) -> String {
+    let startMarkers = ["### [PLAN]", "###[PLAN]", "### [WORKING MEMORY]", "###[WORKING MEMORY]"]
+    var output: [String] = []
+    var stripping = false
+    for line in text.split(separator: "\n", omittingEmptySubsequences: false) {
+        let raw = String(line)
+        let trimmed = raw.trimmingCharacters(in: .whitespaces)
+        if !stripping {
+            if startMarkers.contains(where: { trimmed.caseInsensitiveCompare($0) == .orderedSame }) {
+                stripping = true
+            } else {
+                output.append(raw)
+            }
+            continue
+        }
+        // 剥离中：遇到新的 ### 标题或「非协议行」立即恢复，该行照常保留。
+        if trimmed.hasPrefix("### ") {
+            stripping = false
+            output.append(raw)
+        } else if !isAnchorProtocolLine(raw) {
+            stripping = false
+            output.append(raw)
+        }
+    }
+    return output.joined(separator: "\n")
+}
+
+/// 把 `<summary>` 与「模型复述的锚点协议块」从回复正文里剥掉（UI 展示 / 入库前用）。
+///
+/// 锚点提示（每轮拼在 user 消息尾部的 `### [PLAN]` / `### [WORKING MEMORY]` /
+/// `<key_info>` 等）是内核内部协议，绝不该出现在给用户的答复里。弱模型偶尔会
+/// 把整段 user 提示原样复述到 assistant 正文，这里兜底剥离。
 public func stripSummaryTags(_ content: String) -> String {
-    KernelRegex.replace(summaryRegex, in: content, with: "",
-                        options: [.dotMatchesLineSeparators, .caseInsensitive])
-        .trimmingCharacters(in: .whitespacesAndNewlines)
+    var cleaned = KernelRegex.replace(summaryRegex, in: content, with: "",
+                                      options: [.dotMatchesLineSeparators, .caseInsensitive])
+    cleaned = stripAnchorProtocolEcho(cleaned)
+    return cleaned.trimmingCharacters(in: .whitespacesAndNewlines)
 }
 
 /// 模型是否**按协议**输出了 `<summary>`。

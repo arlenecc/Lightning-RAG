@@ -2,7 +2,7 @@ import XCTest
 import Foundation
 @testable import BaseAgentCore
 
-/// 内置 reranker 的打包清单与默认配置解析。
+/// 默认配置对内置 reranker 目录的解析（clean 版不走 App 内置模型，靠下载补齐）。
 final class BundledRerankerTests: XCTestCase {
     private static let modelName = "jina-reranker-v2-base-multilingual-onnx"
 
@@ -82,32 +82,6 @@ final class BundledRerankerTests: XCTestCase {
             LocalModelRegistry.onnxSupportDirectory(
                 modelURL: flatWeight, modelRoot: flatWeight).path,
             flat.path)
-    }
-
-    /// 打包脚本必须复制 reranker 的全部运行时文件，避免发布包缺权重。
-    func testPackageScriptBundlesRerankerRuntimeFiles() throws {
-        let repoRoot = URL(fileURLWithPath: #filePath)
-            .deletingLastPathComponent()
-            .deletingLastPathComponent()
-            .deletingLastPathComponent()
-        let script = try String(
-            contentsOf: repoRoot.appendingPathComponent("scripts/package-app.sh"),
-            encoding: .utf8)
-
-        XCTAssertTrue(
-            script.contains("RERANKER_NAME=\"\(Self.modelName)\""),
-            "scripts/package-app.sh 未声明内置 reranker 目录")
-        for file in [
-            "model_quantized.onnx",
-            "tokenizer.json",
-            "tokenizer_config.json",
-            "special_tokens_map.json",
-            "config.json",
-        ] {
-            XCTAssertTrue(
-                script.contains(file),
-                "scripts/package-app.sh 未复制 reranker 运行时文件：\(file)")
-        }
     }
 
     /// 模拟 App bundle 的 Contents/Resources/models，默认配置应命中内置 reranker。

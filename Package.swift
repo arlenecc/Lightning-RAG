@@ -117,6 +117,7 @@ let package = Package(
             name: "BaseAgentCoreTests",
             dependencies: [
                 "BaseAgentCore",
+                "ColBERTReader",
                 .product(name: "ZIPFoundation", package: "ZipFoundation"),
                 .product(name: "MCP", package: "mcp-swift-sdk"),
             ],

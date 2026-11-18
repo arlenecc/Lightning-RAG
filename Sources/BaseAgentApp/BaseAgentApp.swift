@@ -522,7 +522,8 @@ struct MainView: View {
                     .help(modelLabel)
                 Spacer(minLength: 4)
                 if model.isRunning || model.isModelLoading
-                    || model.isWarmingUp || model.isSyncing || model.isBuildingANN {
+                    || model.isWarmingUp || model.isSyncing
+                    || model.isBuildingANN || model.isBuildingColbertANN {
                     ProgressView().controlSize(.mini)
                 }
                 Text(model.statusText)

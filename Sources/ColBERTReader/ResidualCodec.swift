@@ -67,9 +67,19 @@ enum ResidualCodec {
                               blob: Data(packed))
     }
 
+    /// 标准 ColBERT 段落长度（约 300 token）：长度归一化的参考基准。
+    /// 本项目的检索阅读分片把若干 300-token 段拼成一条 record（实测 166~5122
+    /// token），直接用 sum-of-max 会让长片系统性碾压短片，故以此基准做温和归一化。
+    static let referenceTokenCount: Int = 300
+
     /// 流式解压 + vDSP_mmul 矩阵乘：1 字节解 2 个 4bit 值，逐批算 MaxSim，不展开全部 token。
+    ///
+    /// `normalizeLength=true` 时对 sum-of-max 做平方根长度归一化：
+    /// `sum / max(1, sqrt(tokenCount / 300))`。sqrt 而非线性，保留「内容多命中机会大」
+    /// 的合理优势，同时消除 30 倍长度差带来的碾压（5122:166 的倍率从 30 压到 ~5.5）。
     static func maxSim(query: [[Float]], record: ResidualRecord,
-                       queryTokens: [[Float]]? = nil, batchTokens: Int = 256) throws -> Float {
+                       queryTokens: [[Float]]? = nil, batchTokens: Int = 256,
+                       normalizeLength: Bool = false) throws -> Float {
         let q = queryTokens ?? query
         guard !q.isEmpty, record.tokenCount > 0 else { return 0 }
         guard q.allSatisfy({ $0.count == record.dim }) else {
@@ -113,7 +123,10 @@ enum ResidualCodec {
             }
             token += count
         }
-        return maxima.reduce(0, +)
+        let total = maxima.reduce(0, +)
+        guard normalizeLength else { return total }
+        let ratio = Float(record.tokenCount) / Float(Self.referenceTokenCount)
+        return total / max(1, sqrt(max(1, ratio)))
     }
 
     /// 朴素实现，供 vDSP 路径自测对照。

@@ -26,6 +26,9 @@ final class SearchEngine {
     let db: SQLiteDB
     let colbert: ColBERT
     let options: ChunkOptions
+    /// ANN 索引长期持有以复用簇心解码缓存（每次检索 new 会导致全量重解码）。
+    /// centroidCache 用 blocks/clusters/dim 做失效校验，build/reset 后会自清。
+    let ann: ANNIndex
     private let rrfK = 60.0
     /// 最近一次检索的向量通道（ann / vec0-exact），供 CLI 输出。
     /// 最近一次检索的粗筛后端（诊断展示用）。检索已无 opLock 并发进入，
@@ -41,6 +44,7 @@ final class SearchEngine {
         self.db = db
         self.colbert = colbert
         self.options = options
+        self.ann = ANNIndex(db: db)
     }
 
     static func createSchema(_ db: SQLiteDB) throws {
@@ -60,6 +64,9 @@ final class SearchEngine {
                 try db.execute("DROP TABLE IF EXISTS \(table)")
             }
             try createTables(db)
+            // drop() 删掉了 ann_blocks/ann_cells，必须在本会话内重建空表，
+            // 否则 status()/candidates() 查询缺表被吞错，ANN 静默失效到下次进程启动。
+            try ANNIndex(db: db).createSchema()
             Self.setMeta(db, "doc_count", "0")
             Self.setMeta(db, "doc_rowid_seq", "0")
             // 必须回写新维度：doc_meta 不在 DROP 列表中，旧值残留会让下次
@@ -208,7 +215,15 @@ final class SearchEngine {
         let encodeBatch = 32
         var rowSeq = Int64(Self.meta(db, "doc_rowid_seq") ?? "") ?? 0
         var added = 0
-        var replaced = 0
+        // 清理同源旧切片必须在批次循环外独立事务完成：若首批编码结果全为空
+        // （整篇被文档侧剪枝掉），循环内的写入事务会被跳过，旧切片残留、
+        // doc_count 不扣减，导致新旧编码共存。取消检查放在清理前，避免取消时删掉旧数据。
+        if shouldCancel?() == true { throw CancellationError() }
+        try db.transaction {
+            let removed = try Self.deleteChunks(db, sourceID)
+            let previous = Int(Self.meta(db, "doc_count") ?? "") ?? 0
+            Self.setMeta(db, "doc_count", String(max(0, previous - removed)))
+        }
         for batchStart in stride(from: 0, to: chunks.count, by: encodeBatch) {
             let batchEnd = min(batchStart + encodeBatch, chunks.count)
             // —— 事务外：本批编码 + 量化（CPU/GPU 密集，不持任何锁）——
@@ -236,15 +251,11 @@ final class SearchEngine {
                 for i in batchStart..<batchEnd { progress?(i + 1, chunks.count) }
                 continue
             }
-            // —— 短事务：批量写入（毫秒级；首批先清同源旧切片）——
+            // —— 短事务：批量写入（毫秒级；同源旧切片已在循环外清理）——
+            let writeStart = Date()
             try db.transaction {
-                if batchStart == 0 {
-                    // 同一文件重复入库时先清理旧切片（前缀是确定性的 sourceID）。
-                    replaced = try Self.deleteChunks(db, sourceID)
-                }
                 for (i, record) in prepared {
                     let id = String(format: "%@#%04d", sourceID, i)
-                    var stage = Date()
                     rowSeq += 1
                     try db.execute("INSERT INTO document(rowid,doc_id,title,source,content) VALUES(?,?,?,?,?)",
                                    [.int(rowSeq), .text(id), .text(chunks[i].title),
@@ -261,16 +272,14 @@ final class SearchEngine {
                         VALUES(?,?,?,?,?,?,?)
                         """, [.text(id), .int(Int64(record.tokenCount)), .int(Int64(record.dim)), .int(Int64(record.bits)),
                               .double(Double(record.scale)), .double(Double(record.offset)), .blob(record.blob)])
-                    dbTotal += Date().timeIntervalSince(stage)
                     added += 1
                 }
+                // 旧切片的计数扣减已在循环外的清理事务完成，这里只累加本批写入数。
                 let previous = Int(Self.meta(db, "doc_count") ?? "") ?? 0
-                // 重复入库时 deleteChunks 已删掉 replaced 行，计数要同步扣掉（仅首批扣）。
-                let deduct = batchStart == 0 ? replaced : 0
-                Self.setMeta(db, "doc_count",
-                             String(max(0, previous - deduct + prepared.count)))
+                Self.setMeta(db, "doc_count", String(previous + prepared.count))
                 Self.setMeta(db, "doc_rowid_seq", String(rowSeq))
             }
+            dbTotal += Date().timeIntervalSince(writeStart)
             // 进度回调放锁外，避免外部回调拖长写锁窗口。
             for (i, _) in prepared { progress?(i + 1, chunks.count) }
         }
@@ -282,7 +291,9 @@ final class SearchEngine {
         timing?("terms", Double(termTotal))
         timing?("tokens", Double(tokenTotal))
         timing?("chunks", Double(added))
-        return chunks.count
+        // 返回实际写入数而非切片总数：文档侧剪枝会跳过不产生向量的切片，
+        // 上层 manifest 登记实际数，避免下次同步误判「切片数不完整」而反复重做。
+        return added
     }
 
     // MARK: - 按来源删除 / 计数
@@ -367,8 +378,9 @@ final class SearchEngine {
 
     // MARK: - 检索
 
-    func search(query: String, topN: Int = 5, coarse: Int = 20,
-                useANN: Bool = true, nprobe: Int = ANNIndex.defaultNprobe,
+    func search(query: String, topN: Int = 5, coarse: Int = 50,
+                useANN: Bool = true, lengthNorm: Bool = false, queryPrune: Bool = true,
+                nprobe: Int = ANNIndex.defaultNprobe,
                 rescore: Int = ANNIndex.defaultRescore, forceANN: Bool = false,
                 source: String? = nil,
                 timing: ((String, Double) -> Void)? = nil) throws -> [SearchHit] {
@@ -377,39 +389,44 @@ final class SearchEngine {
         var stage = Date()
         // 一次前向同时拿到簇心（粗筛）与内容 token 向量（MaxSim），
         // 不再为两次用途重复编码查询。
-        let encodedQuery = try colbert.queryVectors(query)
+        let encodedQuery = try colbert.queryVectors(query, prune: queryPrune)
         timing?("query_center", Date().timeIntervalSince(stage))
         let center = encodedQuery.center
-        let fetchK = max(60, coarse * 3)
+        // 向量 / BM25 各取 coarse 的 3 倍做 RRF 融合（过召回冗余，融合后再
+        // 截到 coarse 进精排）。严格按面板档位派生，无隐藏下限。
+        let coarseCount = max(1, coarse)
+        let fetchK = Self.coarseFetchK(coarse)
         var candidates: [String: Candidate] = [:]
 
         stage = Date()
-        var pairs: [(id: String, score: Double, distance: Double?)] = []
-        let ann = ANNIndex(db: db)
+        // 粗筛结果先按 rowID 收集，最后一次性 IN 查询取回 doc_id，避免逐候选点查。
+        var coarseHits: [(rowID: Int64, score: Double, distance: Double?)] = []
+        let ann = self.ann
+        let annStatus = ann.status()
         let totalRows = Int(Self.meta(db, "doc_count") ?? "") ?? 0
-        if useANN, (forceANN || totalRows >= ANNIndex.minRowsForANN), ann.status().usable,
+        if useANN, (forceANN || totalRows >= ANNIndex.minRowsForANN), annStatus.usable,
            let found = ann.candidates(query: center, topK: fetchK,
-                                      nprobe: nprobe, rescore: rescore), !found.isEmpty {
+                                      nprobe: nprobe, rescore: rescore,
+                                      knownStatus: annStatus), !found.isEmpty {
             lastVectorBackend = "ANN(nprobe=\(nprobe),rescore=\(rescore))"
-            for item in found {
-                guard let id = try db.query("SELECT doc_id FROM document WHERE rowid = ?",
-                                            [.int(item.rowID)]).first?["doc_id"]?.stringValue else { continue }
-                pairs.append((id, item.score, nil))
-            }
+            coarseHits = found.map { ($0.rowID, $0.score, nil) }
         }
-        if pairs.isEmpty {
+        if coarseHits.isEmpty {
             lastVectorBackend = "vec0-exact"
             let rows = try db.query("""
                 SELECT rowid, distance FROM doc_summary_vec
                 WHERE embedding MATCH ? AND k = ? ORDER BY distance
                 """, [.floats(center), .int(Int64(fetchK))])
             for row in rows {
-                guard let rowID = row["rowid"]?.intValue,
-                      let id = try db.query("SELECT doc_id FROM document WHERE rowid = ?",
-                                            [.int(rowID)]).first?["doc_id"]?.stringValue else { continue }
-                pairs.append((id, 1.0 / (1.0 + (row["distance"]?.doubleValue ?? 2.0)),
-                              row["distance"]?.doubleValue ?? nil))
+                guard let rowID = row["rowid"]?.intValue else { continue }
+                coarseHits.append((rowID, 1.0 / (1.0 + (row["distance"]?.doubleValue ?? 2.0)),
+                                   row["distance"]?.doubleValue ?? nil))
             }
+        }
+        let idByRow = try docIDsByRowID(coarseHits.map(\.rowID))
+        let pairs = coarseHits.compactMap { item -> (id: String, score: Double, distance: Double?)? in
+            guard let id = idByRow[item.rowID] else { return nil }
+            return (id, item.score, item.distance)
         }
         timing?("vector_coarse", Date().timeIntervalSince(stage))
         stage = Date()
@@ -445,17 +462,28 @@ final class SearchEngine {
         var shortlist = Array(candidates.values.sorted {
             if $0.rrf != $1.rrf { return $0.rrf > $1.rrf }
             return $0.docID < $1.docID
-        }.prefix(max(1, coarse)))
+        }.prefix(coarseCount))
         if let source, !source.isEmpty {
-            // 指定来源时，粗筛的 top-60 可能根本不包含该来源：把该来源的全部
-            // 切片直接并入候选（上限 200），避免「明明有却检索不到」。
-            let rows = try db.query("""
-                SELECT doc_id FROM document WHERE source LIKE ? OR title LIKE ? LIMIT 200
-                """, [.text("%\(source)%"), .text("%\(source)%")])
+            // 指定来源时，RRF 粗筛的 top-N 可能根本不包含该来源：把该来源的
+            // 切片直接并入候选，避免「明明有却检索不到」。
+            // sourceLimit 是「注入后 shortlist 的总上限」而非额外增量：已在
+            // shortlist 里的同来源候选先占配额，避免精排规模膨胀到 coarse+limit。
+            // 按 doc_id 排序保证注入确定性（该批无 rrf，最终由 MaxSim 精排打分）。
+            let totalCap = Self.sourceCandidateLimit(coarse)
             var seen = Set(shortlist.map(\.docID))
-            for row in rows {
-                guard let id = row["doc_id"]?.stringValue, seen.insert(id).inserted else { continue }
-                shortlist.append(Candidate(docID: id))
+            // 已有 shortlist 无论是否来自该来源都占配额：总数硬上限 = totalCap。
+            let injectBudget = max(0, totalCap - shortlist.count)
+            if injectBudget > 0 {
+                let rows = try db.query("""
+                    SELECT doc_id FROM document
+                    WHERE source LIKE ? OR title LIKE ?
+                    ORDER BY doc_id LIMIT ?
+                    """, [.text("%\(source)%"), .text("%\(source)%"), .int(Int64(injectBudget))])
+                for row in rows {
+                    guard let id = row["doc_id"]?.stringValue, seen.insert(id).inserted else { continue }
+                    shortlist.append(Candidate(docID: id))
+                    if shortlist.count >= totalCap { break }
+                }
             }
         }
         timing?("rrf", Date().timeIntervalSince(stage))
@@ -505,7 +533,8 @@ final class SearchEngine {
             }
             loadTotal += Date().timeIntervalSince(itemStart)
             itemStart = Date()
-            let score = try ResidualCodec.maxSim(query: queryTokens, record: record)
+            let score = try ResidualCodec.maxSim(query: queryTokens, record: record,
+                                                  normalizeLength: lengthNorm)
             maxsimTotal += Date().timeIntervalSince(itemStart)
             hits.append(SearchHit(docID: candidate.docID, title: meta.title,
                                   source: meta.source, content: meta.content,
@@ -519,6 +548,22 @@ final class SearchEngine {
         timing?("shortlist", Double(shortlist.count))
         timing?("search_total", Date().timeIntervalSince(searchStarted))
         return Array(hits.prefix(max(1, topN)))
+    }
+
+    /// 批量把 rowid 映射到 doc_id（粗筛阶段 ANN/vec0 都返回 rowid，避免逐候选点查）。
+    private func docIDsByRowID(_ rowIDs: [Int64]) throws -> [Int64: String] {
+        guard !rowIDs.isEmpty else { return [:] }
+        let placeholders = rowIDs.map { _ in "?" }.joined(separator: ",")
+        let rows = try db.query("""
+            SELECT rowid, doc_id FROM document WHERE rowid IN (\(placeholders))
+            """, rowIDs.map { .int($0) })
+        var map: [Int64: String] = [:]
+        for row in rows {
+            if let rid = row["rowid"]?.intValue, let id = row["doc_id"]?.stringValue {
+                map[rid] = id
+            }
+        }
+        return map
     }
 
     /// shortlist 候选的文档元信息（命名元组作字典值会让类型推断卡死，用 struct）。
@@ -634,6 +679,13 @@ final class SearchEngine {
     }
 
     // MARK: - helpers
+
+    /// 粗筛池大小：向量/BM25 各取 coarse 的 3 倍供 RRF 融合。纯函数，便于回归
+    /// 「档位严格派生、无隐藏下限」的契约（配置面板 10/20/50/100 均成比例）。
+    static func coarseFetchK(_ coarse: Int) -> Int { max(1, coarse) * 3 }
+
+    /// 指定来源时并入候选的上限：随 coarse 放大，不低于 200 兜底，限制精排开销。
+    static func sourceCandidateLimit(_ coarse: Int) -> Int { max(200, max(1, coarse) * 4) }
 
     private func blob16(_ values: [Float16]) -> Data {
         values.withUnsafeBufferPointer { Data(buffer: $0) }

@@ -48,9 +48,9 @@ final class ColBERT {
         // 完全不参与检索；encodeDocument 按 300 token 切成多段后批量编码。
         let env: ORTEnv
         envLock.lock()
+        defer { envLock.unlock() }
         if sharedEnv == nil { sharedEnv = try ORTEnv(loggingLevel: .warning) }
         let cached = sharedEnv!
-        envLock.unlock()
         env = cached
 
         let options = try ORTSessionOptions()
@@ -72,10 +72,27 @@ final class ColBERT {
         return tokenizer.encode(text: prefix + " " + text, addSpecialTokens: true)
     }
 
-    /// 返回每条文本的非特殊 token 位置（跳过 <s>/</s>/前缀标记）。
-    private func contentIndices(_ ids: [Int], kind: Kind) -> [Int] {
+    /// token 剪枝策略。`.none` 完全不剪（去掉开关时查询侧走这条）；`.light` 查询侧轻量
+    /// （只丢标点/空白/核心功能词，保留疑问词与形容词）；`.full` 文档侧完整剪枝。
+    enum PrunePolicy { case none, light, full }
+
+    /// 返回每条文本的非特殊 token 位置（跳过 <s>/</s>/前缀标记）。按 `policy` 做
+    /// 逐 token 剪枝；位置索引保持与原 ids / 编码器输出严格对齐，只丢弃不重排。
+    private func contentIndices(_ ids: [Int], kind: Kind,
+                                policy: PrunePolicy = .none) -> [Int] {
         let marker = kind == .query ? Self.queryMarkerID : Self.documentMarkerID
-        return ids.indices.filter { ids[$0] != 0 && ids[$0] != 2 && ids[$0] != marker }
+        let positions = ids.indices.filter { ids[$0] != 0 && ids[$0] != 2 && ids[$0] != marker }
+        guard policy != .none else { return positions }
+        tokenizerLock.lock()
+        defer { tokenizerLock.unlock() }
+        return positions.filter { idx in
+            guard let token = tokenizer.convertIdToToken(ids[idx]) else { return true }
+            switch policy {
+            case .light: return !TokenPruner.shared.isLightweightDiscardableToken(token)
+            case .full: return !TokenPruner.shared.isDiscardableToken(token)
+            case .none: return true
+            }
+        }
     }
 
     // MARK: - ONNX
@@ -127,7 +144,12 @@ final class ColBERT {
     /// 批量编码。query 用 <mask> 补齐到至少 32；doc 用 PAD_ID 补齐并屏蔽 padding。
     func encode(_ texts: [String], kind: Kind, batchSize: Int = 32) throws -> [[[Float]]] {
         guard !texts.isEmpty else { return [] }
-        let sequences = texts.map { encodeIDs($0, kind: kind) }
+        return try encode(idsList: texts.map { encodeIDs($0, kind: kind) }, kind: kind, batchSize: batchSize)
+    }
+
+    /// 以已算好的 token ids 编码，供文档侧复用切段时的 tokenize 结果。
+    private func encode(idsList sequences: [[Int]], kind: Kind, batchSize: Int) throws -> [[[Float]]] {
+        guard !sequences.isEmpty else { return [] }
         let target: Int
         if kind == .query {
             target = max(Self.queryMaxLen, sequences.map(\.count).max() ?? 0)
@@ -135,7 +157,7 @@ final class ColBERT {
             target = sequences.map(\.count).max() ?? 0
         }
         var out = [[[Float]]]()
-        out.reserveCapacity(texts.count)
+        out.reserveCapacity(sequences.count)
         var offset = 0
         while offset < sequences.count {
             let end = min(offset + max(1, batchSize), sequences.count)
@@ -173,19 +195,20 @@ final class ColBERT {
         let segments = Self.segment(trimmed, maxTokens: maxTokens,
                                     encodeIDs: { self.encodeIDs($0, kind: .document) })
         guard !segments.isEmpty else { return [] }
-        let encoded = try encode(segments, kind: .document, batchSize: batchSize)
+        // 每段只 tokenize 一次：编码与取剪枝位置共用这批 ids，避免 encode 内与
+        // positions 处各做一次重复 tokenize（长文档下可省一半 tokenizer 调用）。
+        let idsList = segments.map { encodeIDs($0, kind: .document) }
+        let encoded = try encode(idsList: idsList, kind: .document, batchSize: batchSize)
         var vectors: [[Float]] = []
         vectors.reserveCapacity(segments.count * 128)
-        for (i, segment) in segments.enumerated() {
+        for i in segments.indices {
             guard i < encoded.count else { break }
             let seq = encoded[i]
-            let ids = encodeIDs(segment, kind: .document)
-            let positions = contentIndices(ids, kind: .document)
-            if positions.isEmpty {
-                vectors.append(contentsOf: seq)
-            } else {
-                for p in positions where p < seq.count { vectors.append(seq[p]) }
-            }
+            // 文档侧逐 token 剪枝：剔除标点/空白/停用词，只留实词的 token 向量。
+            // 位置索引与原 ids/编码器输出严格对齐；剪枝后为空（整段都是标点或
+            // 停用词）则跳过该段，不再 fallback 到全部向量，否则剪枝失效。
+            let positions = contentIndices(idsList[i], kind: .document, policy: .full)
+            for p in positions where p < seq.count { vectors.append(seq[p]) }
         }
         return vectors
     }
@@ -237,15 +260,20 @@ final class ColBERT {
     /// 查询向量：一次前向同时得到簇心（内容 token 均值，归一化）与内容 token 向量。
     ///
     /// 检索时既要簇心做粗筛、又要 token 序列做 MaxSim；分开调用会重复编码
-    /// 一遍查询。这里只保留内容 token（排除 <s>/</s>/[QueryMarker]），
-    /// MaxSim 也不会被特殊 token 干扰。
-    func queryVectors(_ query: String) throws -> (center: [Float], tokens: [[Float]]) {
+    /// 一遍查询。`prune=true` 用轻量剪枝剔除标点/空白/核心功能词（保留疑问词与
+    /// 形容词）；`false` 则只排除特殊 token、其余全留。两者都排除 <s>/</s>/marker。
+    func queryVectors(_ query: String, prune: Bool = true) throws -> (center: [Float], tokens: [[Float]]) {
         guard let seq = try encode([query], kind: .query).first, !seq.isEmpty else {
             throw DocSearchError.model("问句编码为空")
         }
         let ids = encodeIDs(query, kind: .query)
-        let positions = contentIndices(ids, kind: .query).filter { $0 < seq.count }
-        let chosen = positions.isEmpty ? Array(seq.indices) : positions
+        // 基础位置只排除特殊 token；剪枝后为空（如问句全是功能词）时回退到它，
+        // 保证查询仍有内容向量，而不是退回包含标点/空白的全序列。
+        let base = contentIndices(ids, kind: .query, policy: .none).filter { $0 < seq.count }
+        let positions = prune
+            ? contentIndices(ids, kind: .query, policy: .light).filter { $0 < seq.count }
+            : base
+        let chosen = positions.isEmpty ? base : positions
         guard !chosen.isEmpty else { throw DocSearchError.model("问句编码为空") }
         let tokens = chosen.map { seq[$0] }
         var center = [Float](repeating: 0, count: Self.dimension)

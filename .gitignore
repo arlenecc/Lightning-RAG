@@ -15,3 +15,6 @@ models/
 # Python 缓存
 __pycache__/
 *.pyc
+
+# 本地临时测试产物
+.test-work/

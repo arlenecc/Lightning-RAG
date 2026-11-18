@@ -227,6 +227,8 @@ public final class KernelLoop {
     private var didFallbackSearch = false
     /// 意图空转耗尽后由内核代发过一次 long_memory(op="search")。
     private var didFallbackMemorySearch = false
+    /// 问「知识库里有什么」时内核代发 rag_tools(status) 的兜底（只发一次）。
+    private var didFallbackKBStatus = false
     /// 兜底抓取拿到的真实内容：模型若仍不给正文，失败说明里也要交付它。
     private var fallbackToolText = ""
     private var planNudged = 0
@@ -346,6 +348,18 @@ public final class KernelLoop {
             "行动验证原则", "神圣不可删改性", "<|im_start|>system",
         ]
         if markers.contains(where: { text.contains($0) }) { return true }
+        // 锚点提示（每轮注入 user 消息尾部的内部协议）被模型原样复述时，
+        // 绝不能当答复展示——用户看到的是「### [PLAN] Goal:… Now:…」而非回答。
+        // 用结构化标记判定：单独出现 Goal:/Now: 可能是用户问「我的计划」，
+        // 但配合 [PLAN]/[WORKING MEMORY]/[SYSTEM] 标记就是协议回显。
+        let anchorMarkers = [
+            "### [PLAN]", "###[PLAN]", "### [WORKING MEMORY]", "###[WORKING MEMORY]",
+            "<key_info>", "[SYSTEM]", "<facts>", "[TIPS]",
+        ]
+        if anchorMarkers.contains(where: { text.contains($0) }) { return true }
+        if text.contains("Goal:") && text.contains("Now:") && text.contains("- [") {
+            return true
+        }
         // 轻量轮本该 1-3 句；超长基本都是复述上下文而非回答。
         return text.count > 600
     }
@@ -447,6 +461,7 @@ public final class KernelLoop {
         didFallbackFetch = false
         didFallbackSearch = false
         didFallbackMemorySearch = false
+        didFallbackKBStatus = false
         fallbackToolText = ""
         planNudged = 0
         planFinishNudge = 0
@@ -872,6 +887,39 @@ public final class KernelLoop {
                         log("[kernel] 意图空转 \(intentStall)/\(maxIntentStall)："
                             + "跳过计划门，强制直接调用工具")
                         continue
+                    }
+                    // 三次强制之后模型仍不发工具调用，而用户在问「知识库里有什么」：
+                    // 内核代发一次 rag_tools(op="status")，把真实统计交给模型总结。
+                    // 弱模型常把锚点提示里的 <PLAN> 整段复述成答复而非发 tool_call，
+                    // 兜底保证用户拿到真实数据且不会看到内部协议。
+                    if !didFallbackKBStatus, intentOnly,
+                       Self.looksLikeKnowledgeBaseQuestion(userInput) {
+                        didFallbackKBStatus = true
+                        let call = ToolCall(id: "", name: "rag_tools",
+                                            arguments: ["op": .string("status")])
+                        var stats: [ToolResult] = []
+                        do {
+                            stats = try await runtime.execute([call])
+                        } catch {
+                            log("[kernel] 知识库状态兜底查询失败：\(describe(error))")
+                        }
+                        if let first = stats.first, first.success {
+                            didWork = true
+                            fallbackToolText = first.output
+                            let head = String(first.output.prefix(8_000))
+                            pending = """
+                            [System] 内核已代你执行 rag_tools(op="status")，结果如下。
+                            **不要再调用任何工具，也不要复述 <PLAN> / <WORKING MEMORY> 等
+                            内部提示，也不要只输出 <summary> 元标签**：直接基于下面的
+                            真实统计用中文回答「知识库里有什么」（文档数、切片数、
+                            检索策略等），没有数据就明确说知识库为空，不要编造。
+
+                            \(head)
+                            """
+                            log("[kernel] 意图空转耗尽：内核代发 rag_tools(status)"
+                                + "（\(first.output.count) 字符）")
+                            continue
+                        }
                     }
                     // 三次强制之后模型仍不发工具调用，而用户在问长期记忆：
                     // 内核代发一次 long_memory(op="search")，把真实记忆交给
@@ -2274,6 +2322,7 @@ public final class KernelLoop {
         didFallbackFetch = false
         didFallbackSearch = false
         didFallbackMemorySearch = false
+        didFallbackKBStatus = false
         fallbackToolText = ""
         planNudged = 0
         planFinishNudge = 0

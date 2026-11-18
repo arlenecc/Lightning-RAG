@@ -120,16 +120,32 @@ final class TokenPruner {
         "的 了 着 过 得 地 是 在 和 与 或 也 就 都 而 之 以 于 其 这 那 一 不 很 更 最 可 能 会 要 将 被 把 从 对 为 所 由 并 且 但 则 者 矣 焉 乎 哉 又 再 还 才 只 已 曾 乃 若 即 便 却 竟 偏"
             .filter { !$0.isWhitespace })
 
+    /// 核心英文功能词（不合并哈工大表）。文档侧在 init 里再并大表；查询侧轻量
+    /// 剪枝只用这份核心表，且从中剔除疑问词/程度词，避免误删回答查询必需的信息。
+    private static let coreFunctionWords: Set<String> = [
+        "a", "an", "the", "and", "or", "but", "if", "then", "than", "of", "to", "in",
+        "on", "at", "by", "for", "from", "with", "as", "is", "are", "was", "were", "be",
+        "been", "being", "do", "does", "did", "have", "has", "had", "can", "could",
+        "should", "would", "will", "may", "might", "must", "this", "that", "these",
+        "those", "it", "its", "we", "our", "you", "your", "they", "their", "he", "she",
+        "his", "her", "what", "which", "who", "when", "where", "how", "why", "about",
+        "into", "over", "under", "also", "very", "more", "most", "some", "any", "all",
+    ]
+
+    /// 查询侧轻量剪枝保留词：疑问词（查询语义核心）与程度/形容词性功能词。
+    /// 这些词即使在核心功能词表里也不删——保留形容词与疑问词是查询侧硬要求。
+    private static let queryKeepWords: Set<String> = [
+        "what", "which", "who", "whom", "whose", "when", "where", "how", "why",
+        "very", "more", "most", "better", "best",
+    ]
+
+    /// 查询侧轻量停用词表 = 核心功能词 - 保留词。刻意不读哈工大 2992 词大表：
+    /// 那张表含疑问词与部分形容词，查询侧宁可少删，绝不能误删查询关键词。
+    private static let lightStopwords: Set<String> =
+        Set(coreFunctionWords).subtracting(queryKeepWords)
+
     private init() {
-        var stops: Set<String> = [
-            "a", "an", "the", "and", "or", "but", "if", "then", "than", "of", "to", "in",
-            "on", "at", "by", "for", "from", "with", "as", "is", "are", "was", "were", "be",
-            "been", "being", "do", "does", "did", "have", "has", "had", "can", "could",
-            "should", "would", "will", "may", "might", "must", "this", "that", "these",
-            "those", "it", "its", "we", "our", "you", "your", "they", "their", "he", "she",
-            "his", "her", "what", "which", "who", "when", "where", "how", "why", "about",
-            "into", "over", "under", "also", "very", "more", "most", "some", "any", "all",
-        ]
+        var stops = Self.coreFunctionWords
         if let url = Bundle.module.url(forResource: "stopwords_full", withExtension: "txt"),
            let text = try? String(contentsOf: url, encoding: .utf8) {
             for line in text.split(whereSeparator: \.isNewline) {
@@ -141,6 +157,51 @@ final class TokenPruner {
     }
 
     func isStopword(_ token: String) -> Bool { stopwords.contains(token.lowercased()) }
+
+    /// 逐 token 剪枝判定（文档侧 ColBERT 用）。与 `prune(_:)` 的区别：这里只做
+    /// 「丢弃/保留」二值判断，不去重、不重排、不做词性/长度过滤——ColBERT 的
+    /// 多向量表示与位置严格对齐，去重或词性筛选会破坏 token 序列语义。
+    ///
+    /// 丢弃三类：
+    /// 1. 纯标点 / 空白 token（含 SentencePiece 的 `▁` 占位），清洗后为空；
+    /// 2. 停用词 token（`▁the` → `the` 命中词表）；
+    /// 3. 纯中文虚词 token（`的`/`了` 等全部落在 weakChars）。保留中文单字实词
+    ///    （如「方」「合」）与数字，避免误伤有效信息。
+    func isDiscardableToken(_ token: String) -> Bool {
+        let cleaned = cleanScalars(token)
+        guard !cleaned.isEmpty else { return true }
+        if stopwords.contains(cleaned.lowercased()) { return true }
+        if TextAnalysis.containsCJK(cleaned), cleaned.allSatisfy({ weakChars.contains($0) }) {
+            return true
+        }
+        return false
+    }
+
+    /// 查询侧轻量剪枝判定：只丢「纯标点/空白」「核心功能词」「纯中文虚词单字」，
+    /// 其余一律保留。与文档侧的差别：
+    /// - 停用词只用精简的 `lightStopwords`（疑问词 what/which/… 与程度词
+    ///   very/more/most、形容词 better/best 已剔除），不读哈工大 2992 词大表；
+    /// - 不做词性/去重/长度筛选，形容词、疑问词、实词全部保留；
+    /// - 中文疑问词（什么/怎么/为什么/哪些…）显式保护，即使单字落在虚词表也不删。
+    func isLightweightDiscardableToken(_ token: String) -> Bool {
+        let cleaned = cleanScalars(token)
+        guard !cleaned.isEmpty else { return true }
+        let lower = cleaned.lowercased()
+        if Self.queryKeepWords.contains(lower) { return false }
+        if Self.lightStopwords.contains(lower) { return true }
+        if TextAnalysis.containsCJK(cleaned) {
+            // 中文疑问词整词保护：即使组成字都在 weakChars 也不删。
+            if Self.chineseInterrogatives.contains(cleaned) { return false }
+            if cleaned.allSatisfy({ weakChars.contains($0) }) { return true }
+        }
+        return false
+    }
+
+    /// 中文疑问词（用于查询侧轻量剪枝保护）。
+    private static let chineseInterrogatives: Set<String> = [
+        "什么", "怎么", "怎样", "如何", "为什么", "哪些", "哪个", "哪里", "哪儿",
+        "谁", "多少", "几时", "何时", "可否", "是否", "有无",
+    ]
 
     /// 保留词的字符（汉字/字母/数字），彻底删除标点、空格、换行。
     private func cleanScalars(_ text: String) -> String {

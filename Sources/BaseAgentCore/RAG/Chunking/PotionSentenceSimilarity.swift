@@ -7,8 +7,8 @@ import Tokenizers
 /// potion 是 model2vec 静态词向量模型：每个 token 查表后做 mean-pool + L2
 /// 归一化，没有位置编码，因此不像 bge-small-zh 那样受 512 token 窗口限制，
 /// 长句与长切片都能完整参与相似度计算。
-/// lite 版随 App 资源 bundle 分发；clean 版不带，由启动时的模型自动下载
-/// 流程补齐（落点与 `modelDirectory()` 的回退查找一致）。
+/// 发布包不带此模型，由启动时的模型自动下载流程补齐
+/// （落点与 `modelDirectory()` 的回退查找一致）。
 struct PotionSentenceSimilarity {
     static let resourceName = "potion-multilingual-128M-int4"
     /// SwiftPM 资源 bundle 名（potion 是该 bundle 的唯一资源）。
@@ -31,9 +31,9 @@ struct PotionSentenceSimilarity {
 
     /// 资源目录；环境变量仅用于开发/基准替换模型。
     ///
-    /// 查找顺序：环境变量覆盖 → App 资源 bundle（lite 版内置）→
+    /// 查找顺序：环境变量覆盖 → App 资源 bundle →
     /// 应用 models 目录 → 配置目录 `~/.base-agent/models`
-    /// （clean 版启动自动下载的落点）。
+    /// （启动自动下载的落点）。
     static func modelDirectory() -> URL? {
         let override = ProcessInfo.processInfo.environment["BASE_AGENT_SEMANTIC_MODEL"] ?? ""
         if !override.isEmpty {

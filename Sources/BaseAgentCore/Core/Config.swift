@@ -342,17 +342,26 @@ public struct AgentConfig: Sendable {
 
     // 检索阅读模式（ColBERT 多向量大分片检索）
     /// 启用后旁路接管文档解析→markdown 之后的切片、embedding、入库、检索、
-    /// reranker 全流程，改用 ColBERT 大分片多向量检索。分片不再进入模型
-    /// 上下文，只作为召回切片气泡附在回复后供用户点击阅读，并可切换前后切片。
+    /// reranker 全流程，改用 ColBERT 大分片多向量检索。得分最高的 1 条分片
+    /// 进入模型上下文供总结，其余分片作为召回切片气泡附在回复后供用户点击
+    /// 阅读，并可切换前后切片。
     public var colbertReaderEnabled: Bool = false
     /// 残差量化位数：2 或 4。2bit 更省空间但精度略低。
     public var colbertQuantBits: Int = 4
-    /// 粗筛候选数（10/20/50/100，默认 20）：先粗筛出候选再做 MaxSim 精排。
-    public var colbertCoarseCandidates: Int = 20
+    /// 粗筛候选数（10/20/50/100，默认 50）：先粗筛出候选再做 MaxSim 精排。
+    /// 大分片库里 20 太小（实测 155 片只送 13% 进精排），真相关片常被粗筛淘汰。
+    public var colbertCoarseCandidates: Int = 50
     /// 精选返回条数（1/3/5，默认 3）。
     public var colbertTopN: Int = 3
     /// 是否使用 ANN 向量索引加速检索。
     public var colbertUseANN: Bool = true
+    /// MaxSim 精排是否做分片长度归一化（默认关，原始 sum-of-max）。归一化可能
+    /// 带来副作用（压制长片的同时也削弱命中的长片），故默认不启用；配置面板可开
+    /// 做 A/B 对比。这是检索期参数，不进 ingest 签名，切换无需重建索引。
+    public var colbertLengthNorm: Bool = false
+    /// 查询侧 token 轻量剪枝（默认开）：丢标点/空白/核心功能词，保留疑问词与形容词。
+    /// 关闭则查询侧完全不剪枝。检索期参数，不进 ingest 签名。
+    public var colbertQueryPrune: Bool = true
     /// 检索阅读模式使用的模型仓库名（自动从 hf-mirror.com 下载）。
     public var colbertModel: String = "arlenecc/jina-colbert-v2-64-onnx-int8"
 
@@ -660,12 +669,14 @@ public struct AgentConfig: Sendable {
             colbertQuantBits = (v == 2) ? 2 : 4
         }
         if let v = int("colbert_coarse_candidates") {
-            colbertCoarseCandidates = [10, 20, 50, 100].contains(v) ? v : 20
+            colbertCoarseCandidates = [10, 20, 50, 100].contains(v) ? v : 50
         }
         if let v = int("colbert_top_n") {
             colbertTopN = [1, 3, 5].contains(v) ? v : 3
         }
         if let v = bool("colbert_use_ann") { colbertUseANN = v }
+        if let v = bool("colbert_length_norm") { colbertLengthNorm = v }
+        if let v = bool("colbert_query_prune") { colbertQueryPrune = v }
         if let v = string("colbert_model"), !v.isEmpty { colbertModel = v }
         if let v = int("rag_vision_concurrency") { ragVisionConcurrency = max(0, v) }
         if let v = int("rag_ovis_instances") { ragOvisInstances = min(max(1, v), 2) }
@@ -1090,6 +1101,8 @@ public struct AgentConfig: Sendable {
             "colbert_coarse_candidates": colbertCoarseCandidates,
             "colbert_top_n": colbertTopN,
             "colbert_use_ann": colbertUseANN,
+            "colbert_length_norm": colbertLengthNorm,
+            "colbert_query_prune": colbertQueryPrune,
             "colbert_model": colbertModel,
             "rag_vision_concurrency": ragVisionConcurrency,
             "rag_ovis_instances": ragOvisInstances,

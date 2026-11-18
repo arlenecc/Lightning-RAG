@@ -7,8 +7,8 @@ import ColBERTReader
 /// 负责 ColBERT 模型的自动下载（hf-mirror.com）与加载、文档入库、
 /// 检索召回、向量索引构建，并把结果映射为 `RAGCitation` 召回切片气泡。
 ///
-/// 启用该模式后，分片不再进入模型上下文（`context` 置空、全部
-/// `isPrimary == false`），模型只回复引导性信息，用户点击气泡阅读原文。
+/// 启用该模式后，得分最高的第 1 条分片原文进入模型上下文供 LLM 总结
+/// （`isPrimary == true`），其余召回分片作为引用气泡供用户点开阅读。
 public final class ColBERTReaderService: @unchecked Sendable {
     private let config: AgentConfig
     private let dbPath: String
@@ -17,8 +17,28 @@ public final class ColBERTReaderService: @unchecked Sendable {
     private let opLock = NSRecursiveLock()
     private var engine: ColBERTReaderEngine?
     private var loadTask: Task<ColBERTReaderEngine, Error>?
+    /// 加载代数：cancelLoading 会递增，旧 task 完成/失败时凭代数判断是否仍属自己，
+    /// 避免无条件清空 loadTask 把 cancel 后新起的 task「遗忘」造成并发下载。
+    private var loadGeneration: UInt64 = 0
+    /// 当前下载器（供 cancelLoading 中断进行中的大文件下载，.part 断点保留）。
+    private var activeDownloader: HFModelDownloader?
     /// 模型下载状态上抛（供 UI 显示进度提示；节流后的关键节点 + 阶段变化）。
-    public var downloadStatusHandler: (@Sendable (String) -> Void)?
+    /// 读写都经 lock：写端在 RAGEngine（持 colbertLock）经 colbertService() 幂等同步，
+    /// 读端在下载 Task 内，裸属性会构成跨对象数据竞争。
+    private var downloadStatusHandlerStorage: (@Sendable (String) -> Void)?
+
+    public var downloadStatusHandler: (@Sendable (String) -> Void)? {
+        get {
+            lock.lock()
+            defer { lock.unlock() }
+            return downloadStatusHandlerStorage
+        }
+        set {
+            lock.lock()
+            defer { lock.unlock() }
+            downloadStatusHandlerStorage = newValue
+        }
+    }
 
     public init(config: AgentConfig, dbPath: String) {
         self.config = config
@@ -39,7 +59,9 @@ public final class ColBERTReaderService: @unchecked Sendable {
             quantBits: config.colbertQuantBits,
             coarseCandidates: config.colbertCoarseCandidates,
             topN: config.colbertTopN,
-            useANN: config.colbertUseANN)
+            useANN: config.colbertUseANN,
+            lengthNorm: config.colbertLengthNorm,
+            queryPrune: config.colbertQueryPrune)
     }
 
     /// 由来源路径生成稳定的 doc_id 前缀（16 位十六进制，避免特殊字符干扰 LIKE）。
@@ -61,6 +83,7 @@ public final class ColBERTReaderService: @unchecked Sendable {
             lock.unlock()
             return try await loadTask.value
         }
+        let generation = loadGeneration
         let task = Task<ColBERTReaderEngine, Error> { [config, dbPath, weak self] in
             guard let self else { throw AgentError.cancelled }
             let model = RequiredModel(
@@ -82,12 +105,21 @@ public final class ColBERTReaderService: @unchecked Sendable {
         do {
             let engine = try await task.value
             lock.lock()
-            self.engine = engine
+            // 仅当代数未变（未被 cancelLoading 打断并另起 task）才采纳结果、
+            // 清空 loadTask 与下载器引用：否则 cancel 后新起的 T2 会被误清。
+            if generation == loadGeneration {
+                self.engine = engine
+                loadTask = nil
+                activeDownloader = nil
+            }
             lock.unlock()
             return engine
         } catch {
             lock.lock()
-            loadTask = nil
+            if generation == loadGeneration {
+                loadTask = nil
+                activeDownloader = nil
+            }
             lock.unlock()
             throw error
         }
@@ -109,6 +141,14 @@ public final class ColBERTReaderService: @unchecked Sendable {
         let report: @Sendable (String) -> Void = { handler?($0) }
         report("正在下载检索阅读模型（\(model.repo)）…")
         let downloader = HFModelDownloader()
+        lock.lock()
+        activeDownloader = downloader
+        lock.unlock()
+        defer {
+            lock.lock()
+            if activeDownloader === downloader { activeDownloader = nil }
+            lock.unlock()
+        }
         let files = try await downloader.listNeededFiles(repo: model.repo)
         let scoped = RequiredModelCatalog.scopedFiles(for: model, in: files)
         let totalBytes = scoped.reduce(Int64(0)) { $0 + $1.size }
@@ -216,7 +256,24 @@ public final class ColBERTReaderService: @unchecked Sendable {
         _ = try await ensureEngine()
     }
 
-    /// 检索并返回召回切片（全部不进模型上下文）。
+    /// 把 top-1 分片原文格式化为供 LLM 总结的上下文。
+    /// 分片按 7500~8000 字符的大分片入库，单条体量在主模型 30k 预算内，完整给出。
+    static func primaryContext(citations: [RAGCitation]) -> String {
+        guard let first = citations.first else {
+            return "（知识库中未找到相关内容）"
+        }
+        let heading = first.heading.isEmpty ? "" : "\n章节: \(first.heading)"
+        let header = citations.count == 1
+            ? "本次检索召回 1 条相关切片，已全部进入上下文："
+            : "本次共召回 \(citations.count) 条相关分片。得分最高的 1 条已进入上下文供你总结，"
+                + "其余 \(citations.count - 1) 条已作为引用气泡展示给用户"
+                + "（用户可自行点开查看）。请基于下面的原文作答，不要臆造原文没有的内容："
+        return header + "\n\n### 来源: \(first.source) (相关度: "
+            + String(format: "%.4f", first.score) + ")\(heading)\n\(first.text)"
+    }
+
+    /// 检索并返回召回切片：得分最高的第 1 条进入模型上下文供 LLM 总结，
+    /// 全部召回切片（含 top-1）作为引用气泡展示。
     /// `source` 非空时只返回该来源文件/标题内的切片。
     ///
     /// 检索路径只读（SQLite WAL 快照隔离 + FULLMUTEX 句柄串行），不持 opLock：
@@ -246,15 +303,13 @@ public final class ColBERTReaderService: @unchecked Sendable {
                 heading: hit.title == source ? "" : hit.title,
                 text: hit.content,
                 score: hit.score,
-                isPrimary: false))
+                isPrimary: rank == 1))
             rank += 1
         }
-        // 检索阅读模式：分片不进入模型上下文，但必须明确告诉模型「已召回、
-        // 内容在气泡里」，否则模型只看到空上下文会声称「没找到」或臆造内容。
-        let guide = "本次检索在知识库中召回 \(citations.count) 条原文切片，"
-            + "已作为引用气泡展示给用户。检索阅读模式不把切片正文放进模型上下文："
-            + "不要猜测或复述切片内容，用一两句话说明已找到相关资料，"
-            + "并引导用户点击下方引用气泡阅读原文。"
+        // 得分最高的 1 条进入模型上下文供 LLM 总结；其余切片仍以引用气泡
+        // 展示。这里给出上下文文本：直接用 top-1 原文，引导模型据此作答、
+        // 不臆造内容；其余切片提示用户点开气泡查看。
+        let guide = Self.primaryContext(citations: citations)
         // 分阶段耗时日志：编码/粗筛/融合/精排各阶段毫秒 + 候选数。
         let totalMs = Date().timeIntervalSince(timingStarted) * 1000
         let stages = stageTimings
@@ -278,17 +333,38 @@ public final class ColBERTReaderService: @unchecked Sendable {
     /// ANN 索引状态摘要（读路径；opLock 与长任务互斥，避免读到中间状态）。
     /// 忙碌（ingest/构建持锁）时返回 nil：状态栏刷新不应在 opLock 上排队停摆。
     public func annStatus() -> String? {
+        // engine 写入在 lock 下（ensureEngine 84/ensureEngineInstance 102），
+        // 锁外读构成数据竞争；先取 lock 快照，再判 opLock 是否空闲。
+        lock.lock()
+        let current = engine
+        lock.unlock()
         guard opLock.try() else { return nil }
         defer { opLock.unlock() }
-        return engine?.annStatus() ?? "未加载"
+        return current?.annStatus() ?? "未加载"
+    }
+
+    /// 结构化 ANN 状态，语义与 annStatus() 一致（非阻塞，忙碌返回 nil）。
+    public func annStatusDetail() -> ColBERTReaderEngine.ANNStatus? {
+        lock.lock()
+        let current = engine
+        lock.unlock()
+        guard opLock.try() else { return nil }
+        defer { opLock.unlock() }
+        return current?.annStatusDetail()
     }
 
     /// 取消进行中的模型加载/下载（如停止同步时）；任务失败后下次调用重新加载。
     public func cancelLoading() {
         lock.lock()
         let task = loadTask
+        let downloader = activeDownloader
         loadTask = nil
+        activeDownloader = nil
+        loadGeneration &+= 1
         lock.unlock()
+        // 先取消 URLSession 下载：否则 await loadTask.value 会挂到网络自然结束
+        // （Task.cancel 只被 Task.checkCancellation 在文件边界检查，传输中不生效）。
+        downloader?.cancelCurrent()
         task?.cancel()
     }
 }

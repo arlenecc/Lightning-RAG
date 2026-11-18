@@ -773,6 +773,13 @@ final class AppViewModel: ObservableObject {
                 // 取消旧知识库同步，避免旧 agent 的 ingest 在 close 时占着锁，
                 // 导致连接迟迟不释放（close 会在同步结束后补关）。
                 self.agent?.ragEngine.cancel()
+                // ColBERT ANN 构建是独立的 detached task：配置切换必须显式停掉并复位，
+                // 否则旧任务对已关闭引擎继续跑，按钮永久停在「索引构建中…」。
+                self.colbertANNCancelFlag.set(true)
+                self.colbertANNBuildTask?.cancel()
+                self.colbertANNBuildTask = nil
+                self.isBuildingColbertANN = false
+                if !newConfig.colbertReaderEnabled { self.colbertIndexSummary = "" }
                 self.syncGeneration += 1
                 self.syncTask?.cancel()
                 self.syncTask = nil
@@ -795,6 +802,7 @@ final class AppViewModel: ObservableObject {
                 self.pendingToolIndices.removeAll()
                 self.toolEvents.removeAll()
                 self.cancelFlag.set(false)
+                self.colbertANNCancelFlag.set(false)
                 self.appendLog("配置已应用："
                     + (self.config.llmProvider == "local"
                        ? self.config.localLLMModel : self.config.model))
@@ -1984,6 +1992,10 @@ final class AppViewModel: ObservableObject {
             showInfoAlert(title: "暂不能向量去重", message: "ANN 索引维护正在进行，请稍后再试。")
             return
         }
+        if isBuildingColbertANN {
+            showInfoAlert(title: "暂不能向量去重", message: "检索阅读索引正在构建，请稍后再试。")
+            return
+        }
         if isModelLoading || isWarmingUp {
             showInfoAlert(title: "暂不能向量去重", message: "模型正在加载或预热，请稍后再试。")
             return
@@ -2161,6 +2173,11 @@ final class AppViewModel: ObservableObject {
                           message: "正在构建向量索引。可点「停止构建」中断，已写完的块会保留，下次从断点续建。")
             return
         }
+        if isBuildingColbertANN {
+            showInfoAlert(title: "暂不能构建向量索引",
+                          message: "检索阅读索引正在构建，请等它结束后再试。")
+            return
+        }
         if isModelLoading || isWarmingUp {
             showInfoAlert(title: "暂不能构建向量索引", message: "模型正在加载或预热，请稍后再试。")
             return
@@ -2318,9 +2335,11 @@ final class AppViewModel: ObservableObject {
             showInfoAlert(title: "检索阅读模式", message: "RAG 尚未就绪，请先应用配置。")
             return
         }
-        if isSyncing || isBuildingANN || isBuildingKG || isBuildingColbertANN {
+        if isSyncing || isBuildingANN || isBuildingKG || isBuildingColbertANN
+            || isDeduplicating || isResolvingEntities || isRunning
+            || isModelLoading || isWarmingUp {
             showInfoAlert(title: "暂不能构建向量索引",
-                          message: "知识同步或其它索引任务正在进行，请稍后再试。")
+                          message: "知识同步、其它索引任务或对话正在进行，请稍后再试。")
             return
         }
         isBuildingColbertANN = true
@@ -2563,8 +2582,8 @@ final class AppViewModel: ObservableObject {
             showInfoAlert(title: "向量索引", message: "RAG 尚未就绪，请先在知识同步配置中应用配置。")
             return
         }
-        guard !isSyncing, !isBuildingANN, !isDeduplicating, !isRunning,
-              !isModelLoading, !isWarmingUp else {
+        guard !isSyncing, !isBuildingANN, !isBuildingColbertANN, !isDeduplicating,
+              !isRunning, !isModelLoading, !isWarmingUp else {
             showInfoAlert(title: "暂不能删除索引", message: "当前有任务正在进行，请稍后再试。")
             return
         }
@@ -2970,9 +2989,12 @@ final class AppViewModel: ObservableObject {
                     // 检索阅读模式：启动/刷新时回填索引状态（构建中不覆盖）。
                     // annStatus 只读内存态不触发模型加载；忙碌（nil，长任务持
                     // opLock）时跳过本次覆盖，避免状态栏刷新停摆。
-                    if self.config.colbertReaderEnabled, !self.isBuildingColbertANN,
-                       let colbertANN {
-                        self.colbertIndexSummary = colbertANN == "未启用" ? "" : colbertANN
+                    // 检索阅读模式：构建中不覆盖；关闭模式或「未启用」时清空旧摘要。
+                    if !self.config.colbertReaderEnabled {
+                        self.colbertIndexSummary = ""
+                    } else if !self.isBuildingColbertANN {
+                        let text = colbertANN ?? ""
+                        self.colbertIndexSummary = text == "未启用" ? "" : text
                     }
                     self.vectorRebuildRequired = rebuildRequired
                     self.vectorRebuildReason = rebuildReason

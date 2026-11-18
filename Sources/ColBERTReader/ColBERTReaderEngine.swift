@@ -27,13 +27,21 @@ public struct ColBERTReaderOptions: Sendable {
     public var coarseCandidates: Int
     public var topN: Int
     public var useANN: Bool
+    /// MaxSim 精排是否按分片 token 数做长度归一化（A/B 对比用）。
+    public var lengthNorm: Bool
+    /// 查询侧 token 轻量剪枝（默认开：丢标点/空白/核心功能词，保留疑问词与形容词）。
+    /// 关闭则查询侧完全不剪枝。检索期参数，不进 ingest 签名。
+    public var queryPrune: Bool
 
-    public init(quantBits: Int = 4, coarseCandidates: Int = 20,
-                topN: Int = 3, useANN: Bool = true) {
+    public init(quantBits: Int = 4, coarseCandidates: Int = 50,
+                topN: Int = 3, useANN: Bool = true, lengthNorm: Bool = false,
+                queryPrune: Bool = true) {
         self.quantBits = quantBits
         self.coarseCandidates = coarseCandidates
         self.topN = topN
         self.useANN = useANN
+        self.lengthNorm = lengthNorm
+        self.queryPrune = queryPrune
     }
 }
 
@@ -116,6 +124,8 @@ public final class ColBERTReaderEngine {
                                        topN: options.topN,
                                        coarse: options.coarseCandidates,
                                        useANN: options.useANN,
+                                       lengthNorm: options.lengthNorm,
+                                       queryPrune: options.queryPrune,
                                        source: source,
                                        timing: timing)
         return hits.enumerated().map { index, hit in
@@ -125,14 +135,34 @@ public final class ColBERTReaderEngine {
         }
     }
 
+    /// 与检索共享同一 ANN 实例，保证 build 后簇心缓存随之失效。
+    private var sharedANN: ANNIndex { searchEngine?.ann ?? ANNIndex(db: db) }
+
     /// 构建 / 续建向量索引。返回摘要信息。
     /// - Parameter shouldCancel: 块间取消检查；中断后已写块保留，续建从水位继续。
     @discardableResult
     public func buildANN(shouldCancel: (() -> Bool)? = nil) throws -> String {
-        try ANNIndex(db: db).build(isCancelled: shouldCancel).summary
+        try sharedANN.build(isCancelled: shouldCancel).summary
     }
 
     public func annStatus() -> String {
-        ANNIndex(db: db).status().summary
+        sharedANN.status().summary
+    }
+
+    /// 结构化 ANN 状态（供上层 status 快照填 ann_usable / ann_needs_rebuild）。
+    public struct ANNStatus: Sendable {
+        public var summary: String
+        public var usable: Bool
+        public var needsRebuild: Bool
+        public var indexedRows: Int
+        public var tailRows: Int
+        public var totalRows: Int
+    }
+
+    public func annStatusDetail() -> ANNStatus {
+        let s = sharedANN.status()
+        return ANNStatus(summary: s.summary, usable: s.usable,
+                         needsRebuild: s.needsRebuild, indexedRows: s.indexedRows,
+                         tailRows: s.tailRows, totalRows: s.totalRows)
     }
 }

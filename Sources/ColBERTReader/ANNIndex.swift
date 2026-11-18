@@ -348,13 +348,15 @@ final class ANNIndex {
     // MARK: - search
 
     /// 返回 nil 表示 ANN 不可用，调用方应回退精确检索。
+    /// `knownStatus` 由调用方复用已算好的 status（避免每次检索重复查 doc_meta / COUNT）。
     func candidates(query: [Float], topK: Int, nprobe: Int = ANNIndex.defaultNprobe,
-                    rescore: Int = ANNIndex.defaultRescore) -> [Candidate]? {
+                    rescore: Int = ANNIndex.defaultRescore,
+                    knownStatus: Status? = nil) -> [Candidate]? {
         let m = meta()
         guard m.blocks > 0, m.version == Self.version, m.dim == dim,
               query.count == dim else { return nil }
         let cap = tailCap(dim: dim)
-        let currentStatus = status()
+        let currentStatus = knownStatus ?? status()
         guard currentStatus.tailRows <= cap else { return nil }
         guard let cache = centroidCache(for: m) else { return nil }
         do {
@@ -455,7 +457,7 @@ final class ANNIndex {
             let rows = try db.query("""
             SELECT rowid, embedding FROM doc_vectors WHERE rowid > ? ORDER BY rowid LIMIT ?
             """, [.int(cursor), .int(Int64(min(1024, limit - scanned)))])
-            guard !rows.isEmpty else { break }
+            guard let lastRowID = rows.last?["rowid"]?.intValue else { break }
             for row in rows {
                 guard let id = row["rowid"]?.intValue, let data = row["embedding"]?.dataValue,
                       data.count == dim * MemoryLayout<Float>.stride else { continue }
@@ -468,9 +470,12 @@ final class ANNIndex {
                     }
                 }
                 pool.offer(rowid: id, score: Double(dot))
-                cursor = id
                 scanned += 1
             }
+            // 防御：坏 BLOB 行会被上面的 guard 跳过，若整批都损坏，cursor 与
+            // scanned 都不前进，会用同一 cursor 反复查同一批行造成死循环。
+            // 每批无条件推进到窗口最大 rowid（与 gather 同策略）。
+            cursor = max(cursor, lastRowID)
         }
     }
 

@@ -771,15 +771,18 @@ public final class RAGEngine {
         guard config.colbertReaderEnabled else { return nil }
         colbertLock.lock()
         defer { colbertLock.unlock() }
+        // 此处已持有 colbertLock，必须直接读 storage；若走计算属性
+        // colbertDownloadStatusHandler 的 getter 会再次 lock 同一把非递归
+        // NSLock，造成自重入死锁（启动预加载与状态刷新会互相挂死）。
         if let existing = colbertReader {
             // handler 可能晚于 service 创建才被设置：每次访问幂等同步，
             // 保证几百 MB 下载进度始终上抛。
-            existing.downloadStatusHandler = colbertDownloadStatusHandler
+            existing.downloadStatusHandler = colbertDownloadStatusHandlerStorage
             return existing
         }
         let service = ColBERTReaderService(config: config, dbPath: colbertDBPath)
         // 模型下载状态上抛（几百 MB 从 hf-mirror 下载），UI 层可接进度提示。
-        service.downloadStatusHandler = colbertDownloadStatusHandler
+        service.downloadStatusHandler = colbertDownloadStatusHandlerStorage
         colbertReader = service
         return service
     }
@@ -803,12 +806,19 @@ public final class RAGEngine {
 
     /// 构建 / 续建检索阅读模式的 ANN 向量索引，返回摘要。
     /// - Parameter shouldCancel: 块间取消检查；中断后已写块保留，续建从水位继续。
+    ///   未传时也始终检查 `cancel()` 与外层 Task 取消——否则自动续建无法中断。
     @discardableResult
     public func buildColbertANN(shouldCancel: (() -> Bool)? = nil) async throws -> String {
         guard let colbert = colbertService() else {
             throw AgentError.storage("检索阅读模式未启用")
         }
-        return try await colbert.buildANN(shouldCancel: shouldCancel)
+        // 构建开始重置 cancel 标志，与普通 ANN 构建一致，避免上一次的残留取消态。
+        cancelLock.lock(); cancelRequested = false; cancelLock.unlock()
+        let combined: () -> Bool = {
+            if shouldCancel?() == true { return true }
+            return Task.isCancelled || self.isCancelled
+        }
+        return try await colbert.buildANN(shouldCancel: combined)
     }
 
     /// 取消检索阅读模式进行中的模型加载/下载（如停止同步时）。
@@ -2033,6 +2043,9 @@ public final class RAGEngine {
                 // 模型仓库与量化位数决定多向量语义与落盘格式，变化必须重建。
                 ("colbert_model", config.colbertModel),
                 ("colbert_quant_bits", String(config.colbertQuantBits)),
+                // 文档侧 token 剪枝改变了 token 序列与量化残差；v1 起旧库必须
+                // 重建，避免新旧编码混用导致 MaxSim 分数不可比。
+                ("colbert_token_prune", "1"),
             ])
             return fields.map { "\($0.0)=\($0.1)" }.joined(separator: "\n")
         }
@@ -2321,8 +2334,8 @@ public final class RAGEngine {
 
             if let colbertReader {
                 // 检索阅读模式：旁路接管切片/embedding/入库/检索/精排全流程，
-                // 改用 ColBERT 大分片多向量检索。分片不进入模型上下文，只作为
-                // 召回切片气泡附在回复后供用户点击阅读。
+                // 改用 ColBERT 大分片多向量检索。top-1 分片进上下文供 LLM 总结，
+                // 其余召回切片作为引用气泡附在回复后供用户点击阅读。
                 let colbertStarted = Date()
                 do {
                     let count = try await colbertReader.ingest(
@@ -2760,6 +2773,8 @@ public final class RAGEngine {
     public enum ANNIndexTarget: String, Sendable {
         case dense
         case binary
+        /// 检索阅读模式的 ColBERT 向量索引（独立 colbert.db）。
+        case colbert
     }
 
     /// 当前配置下应构建哪种 ANN：二值粗筛开启且签名覆盖完整 → binary。
@@ -2879,6 +2894,10 @@ public final class RAGEngine {
                 result = try store.buildANNIndex(
                     clusters: clusters, clusterSize: clusterSize,
                     progress: progressHandler, isCancelled: cancelled)
+            case .colbert:
+                // 普通 ANN 构建不会走到这里（ColBERT 走 buildColbertANN），
+                // 防御性抛错而非静默建错库。
+                throw AgentError.storage("检索阅读模式请使用独立的向量索引构建")
             }
             logFn("RAG: \(result.summary)")
             invalidateStatusCache()
@@ -2997,6 +3016,8 @@ public final class RAGEngine {
             return
         }
         annBuildScheduled = true
+        annBuildTarget = .colbert
+        annBuildActive = true
         annBuildGeneration &+= 1
         let generation = annBuildGeneration
         annBuildLock.unlock()
@@ -3006,6 +3027,8 @@ public final class RAGEngine {
             do {
                 let summary = try await self.buildColbertANN()
                 logFn("RAG: ColBERT 向量索引构建完成：\(summary)")
+            } catch is CancellationError {
+                logFn("RAG: ColBERT 向量索引构建已取消（已写块保留，可续建）")
             } catch {
                 logFn("RAG: ColBERT 向量索引构建失败：\(error.localizedDescription)")
             }
@@ -3141,6 +3164,19 @@ public final class RAGEngine {
     public func search(query: String, topK: Int = 3,
                        source: String? = nil,
                        timeout: Double? = nil) async throws -> [SearchHit] {
+        // 检索阅读模式：普通向量库/embedding 不参与，改走 ColBERT 多向量检索。
+        // 供公开 API / benchmark / searchFormatted（MCP）使用，避免误报
+        // 「embedding 模型不可用」。UI 与 RAGTool 另走 searchWithCitations。
+        if config.colbertReaderEnabled {
+            let outcome = try await searchWithCitations(query: query, topK: topK,
+                                                        source: source)
+            return outcome.citations.prefix(topK).map { citation in
+                let rowID = Int64(abs(citation.id.hashValue))
+                return SearchHit(rowID: rowID, text: citation.text,
+                                 source: citation.source, chunkIndex: citation.rank - 1,
+                                 heading: citation.heading, score: citation.score)
+            }
+        }
         let limit = resolvedTimeout(timeout)
         // 端到端总预算：单段各有超时（embedding 20s、查询 5s、rerank 5s），
         // 但串起来最坏 ~150s，rag_query_timeout 根本约束不到。给整段一个
@@ -3360,7 +3396,8 @@ public final class RAGEngine {
     public func searchWithCitations(query: String, topK: Int = 3,
                                     source: String? = nil) async throws -> RAGRetrievalOutcome {
         // 检索阅读模式：旁路接管检索召回 + 精排，改用 ColBERT 大分片多向量检索。
-        // 分片不进入模型上下文，只作为召回切片气泡附在回复后。
+        // top-1 分片进上下文供 LLM 总结（由 ColBERTReaderService 格式化），
+        // 其余召回切片作为引用气泡附在回复后。
         if let colbert = colbertService() {
             // 端到端墙钟预算：与普通检索同风格。防极端情况（如库锁升级、
             // 磁盘抖动）下 rag_search 无限挂起拖死对话。
@@ -3880,7 +3917,14 @@ public final class RAGEngine {
     // MARK: Meta
 
     public func getDocumentOutline(docName: String) -> DocumentRecord? {
-        try? withStore { $0.getDocumentDigest(docName: docName) }
+        if let fromStore = try? withStore({ $0.getDocumentDigest(docName: docName) }) {
+            return fromStore
+        }
+        // 检索阅读模式下普通向量库可能未登记 documents，用 manifest 兜底目录。
+        if config.colbertReaderEnabled {
+            if case .found(let record) = lookupDocument(docName) { return record }
+        }
+        return nil
     }
 
     /// SQL 限量列表：返回前 `limit` 个文档名与总条数。
@@ -4155,6 +4199,12 @@ public final class RAGEngine {
     public func status(sourceLimit: Int = 256,
                        maxAge: TimeInterval = 600,
                        timeout: Double? = nil) -> [String: JSONValue] {
+        // 检索阅读模式：普通向量库不参与，单独从 colbert.db 取切片数/来源数，
+        // 否则 withStoreBounded 会尝试打开不存在的 index.sqlite 并返回 error 快照，
+        // 状态栏误报「向量库不可用」、切片数恒为 0。
+        if config.colbertReaderEnabled {
+            return mergingANNBuildState(colbertStatusSnapshot(sourceLimit: sourceLimit))
+        }
         // provider/存储层明确不支持的元素类型：打开库会直接失败，优先给出配置
         // 原因，否则调用方只能看到笼统的「向量库不可用」。当前四种类型均可用。
         if let unsupported = effectiveVectorElementType.unsupportedReason {
@@ -4338,6 +4388,41 @@ public final class RAGEngine {
         guard let statusSkipSnapshot,
               Date().timeIntervalSince1970 < statusSkipUntil else { return nil }
         return statusSkipSnapshot
+    }
+
+    /// 检索阅读模式的状态快照：切片数来自 colbert.db，来源名单来自 manifest。
+    /// 不打开普通向量库，避免误报「向量库不可用」。
+    private func colbertStatusSnapshot(sourceLimit: Int) -> [String: JSONValue] {
+        let manifest = manifestStore.load()
+        let entries = manifest.filter { ($0.value.duplicateOf ?? "").isEmpty }
+        let sortedSources = entries.keys.sorted()
+        let sources = sourceLimit > 0
+            ? Array(sortedSources.prefix(sourceLimit)) : sortedSources
+        let colbert = colbertService()
+        let count: Int? = try? colbert?.totalChunkCount()
+        // ANN 真实状态：忙碌（构建/入库持 opLock）时 detail 为 nil，保持「未知」而非
+        // 误报不可用；未加载时同样 nil。用摘要字符串填 ann_index，布尔项从结构化状态取。
+        let ann = colbert?.annStatusDetail()
+        var snapshot: [String: JSONValue] = [
+            "knowledge_base": .string(knowledgeBase),
+            "rag_dir": .string(ragDir),
+            "chunks_stored": .int(count ?? 0),
+            "source_count": .int(entries.count),
+            "sources": .array(sources.map { .string($0) }),
+            "vector_backend": .string("colbert"),
+            "rag_mode": .string("colbert"),
+            "ann_index": .string(ann?.summary ?? ""),
+            "ann_usable": .bool(ann?.usable ?? false),
+            "ann_needs_rebuild": .bool(ann.map { $0.needsRebuild || $0.tailRows > 0 } ?? false),
+            "ann_bypassed": .bool(false),
+            "binary_coarse": .string("off"),
+            "vector_rebuild_required": .bool(false),
+            "rebuild_reason": .null,
+        ]
+        if count == nil {
+            snapshot["error"] = .string("检索阅读索引库暂不可用")
+        }
+        return snapshot
     }
 
     /// sqlite-vec 不支持当前元素类型时的状态快照：保留上次统计，

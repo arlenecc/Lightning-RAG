@@ -16,8 +16,8 @@ macOS 原生自主 Agent。控制流是**三态自动机 + 五级上下文压缩
   - LLM：MLX-LM / MLX-VLM 模型目录、GGUF 文件、ONNX 解码器目录（`input_ids` + `logits`，可选 `past_key_values`）
   - OCR VLM：MLX 模型目录、GGUF + mmproj；ONNX VLM 暂无通用图适配
   - Embedding / Reranker：ONNX 模型目录（含 `tokenizer.json`）、MLX 模型目录或 GGUF 文件
-  - 默认 Embedding 为 lite 版内置（clean 版首次启动自动下载）的 `jina-embeddings-v5-text-nano-mlx-int4`（EuroBERT-210M，int4），未配置时开箱可用；`jina-embeddings-v5-text-nano-onnx-int8` 为可选后端
-  - 默认 Reranker 为 lite 版内置（clean 版首次启动自动下载）的 `jina-reranker-v2-base-multilingual-onnx`（XLM-R base，ONNX int8，`model_quantized.onnx` 约 267MB），配置留空时开箱可用；RAG 全链路（切片 / 向量 / 召回 / 重排）无需配置任何本地模型，只需配置主模型与辅助模型
+  - 默认 Embedding 为 `jina-embeddings-v5-text-nano-mlx-int4`（EuroBERT-210M，int4），首次启动时自动下载，未配置时开箱可用；`jina-embeddings-v5-text-nano-onnx-int8` 为可选后端
+  - 默认 Reranker 为 `jina-reranker-v2-base-multilingual-onnx`（XLM-R base，ONNX int8，`model_quantized.onnx` 约 267MB），首次启动时自动下载，配置留空时开箱可用；RAG 全链路（切片 / 向量 / 召回 / 重排）无需配置任何本地模型，只需配置主模型与辅助模型
   - 默认主模型 `models/qwen3.5-4b-agentic-coder-v4-4bit-mlx`；辅助模型默认 `models/Qwen3.5-2B-MLX-4bit`，但默认**不启用**，需要在配置窗口显式勾选「启用」
   - 检索阅读模式（可选）：`arlenecc/jina-colbert-v2-64-onnx-int8`（ONNX int8 约 560MB），启用该模式后首次同步时从 hf-mirror 断点续传下载到 `<workspace>/models`；不启用则不下载、不加载
 - 运行时已随包内置：
@@ -44,23 +44,13 @@ swift test --disable-sandbox
 ## 打包
 
 ```bash
-swift build -c release --disable-sandbox
-
-# 两种版本（VARIANT 默认 clean）
-VARIANT=clean scripts/package-app.sh release && VARIANT=clean scripts/package-dmg.sh
-VARIANT=lite  scripts/package-app.sh release && VARIANT=lite  scripts/package-dmg.sh
+scripts/package-app.sh release && scripts/package-dmg.sh
 ```
 
-| VARIANT | 内置模型 | DMG |
-|---|---|---|
-| `clean`（默认） | 无；potion 语义切片 / jina embedding / jina reranker 均在首次启动时从 hf-mirror 自动下载 | `dist/Lightning-RAG-1.3.27-clean.dmg` |
-| `lite` | potion-multilingual-128M int4（语义切片）+ jina-embeddings-v5-text-nano-mlx-int4 + jina-reranker-v2-base-multilingual-onnx | `dist/Lightning-RAG-1.3.27-lite.dmg` |
-
-两个版本共用 `dist/Lightning-RAG.app`（应用本体与显示名不变，只有内置模型不同），
-因此需按「打包 App → 打包 DMG」的顺序逐个构建。两个版本都不含主模型、辅助模型
-与 OCR，需要在配置中指定本地模型路径。`clean` 把体积压到最小（DMG 约 39MB），
-适合网络良好的环境；`lite` 内置三个基础 RAG 模型（DMG 约 449MB），首次启动即可
-离线使用语义切片、Embedding 与重排。版本号可通过 `VERSION` 环境变量或
+只产出单一形态：应用本体不含任何内置模型，potion 语义切片 / jina embedding /
+jina reranker 均在首次启动时从 hf-mirror 自动下载；主模型、辅助模型与 OCR 需在
+配置中指定本地模型路径。按「打包 App → 打包 DMG」顺序构建，产物为
+`dist/Lightning-RAG-1.3.29.dmg`（约 40MB）。版本号可通过 `VERSION` 环境变量或
 `package-dmg.sh` 的参数覆盖。
 
 测试覆盖（当前 1000+ 个 XCTest；真实模型 E2E 在本地权重存在时随每次测试自动运行，缺少权重或需要外网/GGUF 等环境的用例会跳过）：sqlite-vec 事务写入/回滚、两段式 KNN、二值签名编码与 LSB-first 位打包、
@@ -127,9 +117,11 @@ HTML 与 Office 解析另有专项覆盖：HTML 保存页的本地 iframe / fram
 
 **自定义 system prompt**：首次启动会在 `<workspace>/assets/system_prompt.txt` 写出内置的 `BASE_SYSTEM_PROMPT`；之后每次启动读取该文件并替换内置提示词，可直接用文本编辑器调整模型行为规则，**重启（或重新应用配置）后生效**（会话期间保持不变，以免 system 前缀抖动使 KV cache 反复重建）。文件内容空白或不可读时本次回退内置提示词，且不会覆盖文件。它替换的是协议主体，L0 META-SOP 与 L1 全局索引仍按多级记忆机制追加在其后；轻量轮（纯寒暄/能力问询）使用内核的极简提示，不受该文件影响。内置提示词中的 `<summary>` 标签、`rag_tools(op="outline")` 起手式、工具状态词等是内核回注与测试的硬依赖，建议在原文基础上调整，不要整段删除。
 
-**v1.3.27（当前）**：修复检索阅读模式知识同步长时间无进展。**编码实现**：ColBERT 入库由「逐词编码」（每个词重复一次 24 层 XLM-R-large 前向，一本书数小时）改为「按 300 token 分段 + batch=8 整段编码」，一本 26.5 万字符书籍实测入库约 9.3 分钟；切片器不再把 ColBERT 当语义相似度模型逐句调用，改用结构与词法边界。**截断修复**：模型 `tokenizer.json` 写死 `truncation=300`，旧实现整段编码时会静默丢弃切片尾部 95% 正文，现按 300 token 分段后再编码。**可观测性**：模型下载（约 560MB）与切片编码每 30 秒输出 `[colbert]` 进度日志，不再出现长时间静默；ONNX 推理线程数改为物理核数（上限 8）。三文档冒烟语料两链路仍 6/6 命中，真实书籍查询 hit@1 2/2。
+**v1.3.29（当前）**：检索阅读模式全流程审查与修复。**协议回显**：模型复述内核 `### [PLAN]` / `### [WORKING MEMORY]` 锚点不再进入答复正文（展示层剥离 + 内核回显检测 + KB 问题兜底代查）。**上下文**：检索阅读改为得分最高的 top-1 分片原文进上下文供 LLM 总结，其余分片仍作引用气泡。**token 剪枝**：文档侧逐 token 剪枝（标点/空白/停用词，保留实词）；查询侧新增「查询侧剪枝」选择框（轻量/不剪枝，默认轻量，保留疑问词与形容词）；两者均不改变位置对齐，文档侧变更通过 `colbert_token_prune` 签名触发存量库重建。**检索质量**：粗筛候选默认 50 全链路贯通并去掉硬编码下限/上限，MaxSim 长度归一化改为默认关（配置面板可开做 A/B）。**健壮性与性能**：修复 ANN 坏数据尾扫死循环、首批空批跳过清理、入库计数虚高、维度切换后 ANN 表缺失、status 的 ANN 字段恒假、source 注入无排序/上限膨胀；粗筛改批量 rowid→doc_id 映射消除 N+1 点查，ANN 实例与簇心缓存复用，文档编码每段只 tokenize 一次。
 
-**v1.3.26**：新增**检索阅读模式**（`colbert_reader_enabled`）。解析之后的切片、embedding、入库、检索、精排由 ColBERT 多向量检索旁路接管：jina-colbert-v2 ONNX int8 + 残差量化写入独立 `colbert.db`，簇心粗筛 + MaxSim 精排 + 可选 ANN，分片不进入模型上下文、全部作为引用气泡供用户点开阅读。该模式与普通 embedding / 向量库**完全解耦**：embedding 不可用时同步与检索照常工作，普通 embedding 配置变化不再触发 ColBERT 重建，预加载、ANN 自动构建与知识图谱调度均按模式分流。同步修正引用来源：`document.source` 记录文件相对路径，气泡「来源」为文件名、「章节」为切片标题。新增 `RAGBenchmark` CLI 对比两种链路的 hit@1 / hit@k / MRR 与耗时（支持 `--no-embedding` 验证解耦）；三文档冒烟语料两链路均 6/6 命中，检索阅读平均耗时约 123ms，普通 RAG（含 reranker）约 456ms。
+**v1.3.27**：修复检索阅读模式知识同步长时间无进展。**编码实现**：ColBERT 入库由「逐词编码」（每个词重复一次 24 层 XLM-R-large 前向，一本书数小时）改为「按 300 token 分段 + batch=8 整段编码」，一本 26.5 万字符书籍实测入库约 9.3 分钟；切片器不再把 ColBERT 当语义相似度模型逐句调用，改用结构与词法边界。**截断修复**：模型 `tokenizer.json` 写死 `truncation=300`，旧实现整段编码时会静默丢弃切片尾部 95% 正文，现按 300 token 分段后再编码。**可观测性**：模型下载（约 560MB）与切片编码每 30 秒输出 `[colbert]` 进度日志，不再出现长时间静默；ONNX 推理线程数改为物理核数（上限 8）。三文档冒烟语料两链路仍 6/6 命中，真实书籍查询 hit@1 2/2。
+
+**v1.3.26**：新增**检索阅读模式**（`colbert_reader_enabled`）。解析之后的切片、embedding、入库、检索、精排由 ColBERT 多向量检索旁路接管：jina-colbert-v2 ONNX int8 + 残差量化写入独立 `colbert.db`，簇心粗筛 + MaxSim 精排 + 可选 ANN，分片不进入模型上下文、全部作为引用气泡供用户点开阅读。该模式与普通 embedding / 向量库**完全解耦**：embedding 不可用时同步与检索照常工作，普通 embedding 配置变化不再触发 ColBERT 重建，预加载、ANN 自动构建与知识图谱调度均按模式分流。同步修正引用来源：`document.source` 记录文件相对路径，气泡「来源」为文件名、「章节」为切片标题。新增 `RAGBenchmark` CLI 对比两种链路的 hit@1 / hit@k / MRR 与耗时（支持 `--no-embedding` 验证解耦）；三文档冒烟语料两链路均 6/6 命中，检索阅读平均耗时约 123ms，普通 RAG（含 reranker）约 456ms。（后续已调整：得分最高的 1 条分片进入模型上下文供 LLM 总结，其余仍作气泡展示。）
 
 **v1.3.24**：新增 `web_search` 多引擎聚合搜索与 50 个备用检索源。主引擎（Google / Bing / DuckDuckGo / Brave / 百度 / 搜狗 / 360）并发查询，结果不足时按查询意图自动补位备用源；结果统一去重、过滤、排序，模型再从结果取真实 URL 交给 `web_scan` 读正文。系统提示要求本地知识库缺失信息主动搜索。内核同步收紧计划空转保护：`update_plan` 不再计为实际工作，计划闭合但零工具调用时强制真实工具，收尾时把无验证的 `done` 降级为 `skipped`；搜索类意图空转耗尽时内核代发一次 `web_search`。
 
@@ -300,9 +292,9 @@ manifest 条目同时记录 `chunkCount` 与 `complete`：增量跳过前会校�
 | 编码 | jina-v5 单向量 + Matryoshka 128 维 int8 | jina-colbert-v2 多向量（每 token 一个向量）+ 残差量化 |
 | 存储 | `rag_data/<kb>/index.sqlite` | 独立 `rag_data/<kb>/colbert.db`（与普通库互不干扰） |
 | 召回 | 向量 + FTS + RRF → reranker | 簇心粗筛（vec0）→ 残差 MaxSim 精排，可叠加 ANN 索引 |
-| 上下文 | top-1 切片进模型上下文 | 分片**不进入上下文**，全部作为引用气泡，由用户点开阅读 |
+| 上下文 | top-1 切片进模型上下文 | 得分最高的 1 条大分片进上下文供 LLM 总结，其余分片作为引用气泡点开阅读 |
 
-- 模型默认 `arlenecc/jina-colbert-v2-64-onnx-int8`（`colbert_model`），clean 版首次使用时经 hf-mirror 断点续传下载到 `<workspace>/models`，之后常驻复用；`colbert_quant_bits`（2/4，默认 4）、`colbert_coarse_candidates`（默认 20）、`colbert_top_n`（默认 3）、`colbert_use_ann`（默认开）可调。
+- 模型默认 `arlenecc/jina-colbert-v2-64-onnx-int8`（`colbert_model`），clean 版首次使用时经 hf-mirror 断点续传下载到 `<workspace>/models`，之后常驻复用；`colbert_quant_bits`（2/4，默认 4）、`colbert_coarse_candidates`（默认 50）、`colbert_top_n`（默认 3）、`colbert_use_ann`（默认开）、`colbert_length_norm`（MaxSim 长度归一化，默认关，配置面板可开启对比效果）、`colbert_query_prune`（查询侧 token 轻量剪枝，默认开：只丢标点/空白/核心功能词，保留疑问词与形容词；选「不剪枝」则查询侧 token 全保留）可调。
 - **切片与普通 RAG 共用语义模型**：`Chunker` 先按 Markdown/章节结构聚合，再在相邻文本块余弦低谷处断开；相似度由上层注入的 `potion-multilingual-128M`（int4 ONNX）计算，模型不可用时自动回退词重叠相似度。切片边界始终落在句子/表格/代码块等原子边界上，目标 7500–8000 字符、1% 重叠。
 - **与普通 embedding 解耦**：该模式下 `RAGEngine.ingest` 不要求 embedding 模型可用，普通向量库打不开也只记日志、不中断同步；不创建 embedding 调度器、不校验向量库重建闸门、不按 embedding 窗口收口切片。`makeIngestSignature` 只记录 ColBERT 模型与量化配置，因此调整普通 embedding 后端、元素类型、Matryoshka 维度、切片大小都不会触发 ColBERT 库重建。预加载只加载 ColBERT 模型；ANN 自动构建改走 ColBERT 索引；知识图谱增量抽取得以跳过。
 - **引用来源**：`colbert.db` 的 `document.source` 记录入库时的文件相对路径，气泡上的「来源」是文件名，「章节」是切片所在标题；旧库缺少该列时会自动补列并回退到标题。

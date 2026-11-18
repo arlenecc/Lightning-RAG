@@ -524,9 +524,8 @@ public enum RequiredModelCatalog {
             add(kind: "OCR", registryKind: .vlm, value: value)
         }
         if config.ragSemanticChunking {
-            // 语义切片模型：lite 版随资源 bundle 内置（modelDirectory 直接
-            // 命中 bundle，isComplete 为真不触发下载）；clean 版不带，从
-            // 仓库 int4/ 子目录下载并剥前缀，落点与加载查找保持一致。
+            // 语义切片模型：发布包不带，从仓库 int4/ 子目录下载并剥前缀，
+            // 落点与加载查找保持一致。
             let dir = PotionSentenceSimilarity.modelDirectory()
                 ?? PotionSentenceSimilarity.downloadDirectory()
             out.append(RequiredModel(
