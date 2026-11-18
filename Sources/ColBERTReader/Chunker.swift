@@ -6,9 +6,12 @@ struct ChunkRecord {
 }
 
 struct ChunkOptions {
-    var minChars = 7500
-    var maxChars = 8000
-    var targetChars = 7750
+    /// 检索阅读模式：默认切片 3000 字（原 8000），下限 2500 字。
+    /// 大分片决定 top-1 进模型上下文的体积，3000 字既能覆盖一个完整小节、
+    /// 又不致压占主模型上下文预算。
+    var minChars = 2500
+    var maxChars = 3000
+    var targetChars = 2750
     var overlapRatio = 0.01
     var semanticThreshold = 0.55
     var similarityFloor = 0.15
@@ -314,13 +317,17 @@ enum Chunker {
         for chunk in chunks {
             if let last = out.last,
                last.content.count < options.minChars || chunk.content.count < options.minChars {
+                // 跨小节（title 不同）只允许整节合并：不切断任何一个小节。
+                // 整节合并后内容含两节全文（各自标题行仍在正文里），不构成「切分小节」。
                 if last.content.count + chunk.content.count + 1 <= options.maxChars {
                     out[out.count - 1] = ChunkRecord(title: last.title,
                                                     content: last.content + "\n" + chunk.content)
                     continue
                 }
-                // 合成会超上限：从上一片尾部按句界搬句子给短片，两片都回到目标区间。
-                if let split = rebalance(last, chunk, options: options) {
+                // 合成会超上限：只在同一小节内部（超长被切成多片）搬句子补齐；
+                // 跨小节搬句子会把一节正文拆散到两片，违背「小节尽量不切分」。
+                if last.title == chunk.title,
+                   let split = rebalance(last, chunk, options: options) {
                     out.removeLast()
                     out.append(contentsOf: split)
                     continue
@@ -335,9 +342,11 @@ enum Chunker {
     }
 
     /// 首片偏短时从下一片头部递归搬句子（先保证下一片自身达标）。
+    /// 只在同一小节内部搬运，跨小节保持边界完整。
     private static func ensureMinForward(_ index: Int, in chunks: inout [ChunkRecord],
                                          options: ChunkOptions) {
         guard index + 1 < chunks.count, chunks[index].content.count < options.minChars else { return }
+        guard chunks[index].title == chunks[index + 1].title else { return }
         ensureMinForward(index + 1, in: &chunks, options: options)
         while chunks[index].content.count < options.minChars {
             let nextSentences = TextAnalysis.sentences(chunks[index + 1].content)
@@ -351,8 +360,10 @@ enum Chunker {
     }
 
     /// 从尾到头递归补齐短片：先补上一片，再从上一片句尾搬句子过来。
+    /// 只在同一小节内部搬运，跨小节保持边界完整。
     private static func ensureMin(_ index: Int, in chunks: inout [ChunkRecord], options: ChunkOptions) {
         guard index > 0, chunks[index].content.count < options.minChars else { return }
+        guard chunks[index].title == chunks[index - 1].title else { return }
         ensureMin(index - 1, in: &chunks, options: options)
         while chunks[index].content.count < options.minChars {
             let donorSentences = TextAnalysis.sentences(chunks[index - 1].content)

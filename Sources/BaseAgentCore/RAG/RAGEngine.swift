@@ -562,6 +562,9 @@ public final class RAGEngine {
     private var embedding: EmbeddingProvider?
     private var reranker: RerankProvider?
     private var store: VectorStore?
+    /// 仅元数据用途的库连接（目录/摘要读写），不依赖 embedding。检索阅读模式下
+    /// 普通 embedding 常未就绪，主 store 打不开，用它保证文档元数据照常读写。
+    private var metadataStore: VectorStore?
     private let storeLock = NSLock()
     /// 检索阅读模式（ColBERT 大分片多向量检索）的服务实例（惰性）。
     private var colbertReader: ColBERTReaderService?
@@ -737,6 +740,18 @@ public final class RAGEngine {
     deinit {
         // 兜底：调用方忘记 close 时也不要把 SQLite 连接留到进程结束。
         store?.close()
+        shutdownColbert()
+    }
+
+    /// 释放检索阅读模式的模型与 colbert.db 连接。close/reload/deinit 共用。
+    /// 先在 colbertLock 内摘下 service 引用（后续访问会按需新建），再在锁外做
+    /// 可能阻塞的 shutdown（opLock + SQLite close），避免持 colbertLock 拖慢状态刷新。
+    private func shutdownColbert() {
+        colbertLock.lock()
+        let service = colbertReader
+        colbertReader = nil
+        colbertLock.unlock()
+        service?.shutdown()
     }
 
     // MARK: Store
@@ -883,6 +898,18 @@ public final class RAGEngine {
         return newStore
     }
 
+    /// 文档元数据（目录/章节摘要/全书摘要）专用库连接：不依赖 embedding 可用性。
+    /// 主 store 已打开时直接复用；否则开一个仅元数据的连接（向量通道可能待重建，
+    /// 但 documents / summary 系列表照常读写）。检索阅读模式下用这条路径。
+    private func ensureMetadataStore() throws -> VectorStore {
+        storeLock.lock(); defer { storeLock.unlock() }
+        if let store { return store }
+        if let metadataStore { return metadataStore }
+        let opened = try VectorStore.openForMetadata(dbPath: self.indexDBPath)
+        metadataStore = opened
+        return opened
+    }
+
     /// 在读锁内使用 store：close/reload 会等待整个 body 结束。
     private func withStore<T>(_ body: (VectorStore) throws -> T) throws -> T {
         searchLock.lock(); defer { searchLock.unlock() }
@@ -900,6 +927,17 @@ public final class RAGEngine {
         } catch {
             AgentLog.warning("RAG: 只读查询失败（\(String(format: "%.0f", budget))s）："
                 + error.localizedDescription)
+            return nil
+        }
+    }
+
+    /// 文档元数据只读封装：用不依赖 embedding 的元数据 store。检索阅读模式下
+    /// ensureStore 会因 embedding 未就绪失败，这里保证目录/摘要/文档列表照常可读。
+    private func withMetadataStoreSafe<T>(_ body: (VectorStore) throws -> T) -> T? {
+        do {
+            return try body(try ensureMetadataStore())
+        } catch {
+            AgentLog.warning("RAG: 文档元数据读取失败：\(error.localizedDescription)")
             return nil
         }
     }
@@ -1032,10 +1070,14 @@ public final class RAGEngine {
             return
         }
         defer { releaseIngestFlag() }
+        // 显式释放 ColBERT 模型/DB（可能阻塞），放在其它锁之前，避免持锁等待。
+        shutdownColbert()
         searchLock.lock(); defer { searchLock.unlock() }
         storeLock.lock(); defer { storeLock.unlock() }
         store?.close()
         store = nil
+        metadataStore?.close()
+        metadataStore = nil
         kgLock.lock()
         kgGraph = nil
         kgStore = nil
@@ -1051,10 +1093,14 @@ public final class RAGEngine {
             invalidateStatusCache()
             releaseIngestFlag()
         }
+        // 注意：reload 在每次同步结束都会调用，ColBERT 服务刻意保持常驻（预热意图），
+        // 不随 reload 释放；仅在 close/deinit（切换配置/销毁引擎）时显式 shutdown。
         searchLock.lock(); defer { searchLock.unlock() }
         storeLock.lock()
         store?.close()
         store = nil
+        metadataStore?.close()
+        metadataStore = nil
         storeLock.unlock()
     }
 
@@ -1609,6 +1655,8 @@ public final class RAGEngine {
         storeLock.lock()
         store?.close()
         store = nil
+        metadataStore?.close()
+        metadataStore = nil
         storeLock.unlock()
     }
 
@@ -1698,10 +1746,12 @@ public final class RAGEngine {
         // （embedding 模型缺失/未就绪）不阻塞 ColBERT 同步与检索。
         let store: VectorStore?
         if colbertMode {
-            store = try? ensureStore()
+            // 检索阅读模式用「仅元数据」store 登记 documents/大纲/摘要：它不依赖
+            // embedding 是否就绪，保证目录与摘要稳定写入 index.sqlite；向量检索
+            // 仍完全由 ColBERT 库承担，两者互不干扰。
+            store = try? ensureMetadataStore()
             if store == nil {
-                logFn("RAG: 普通向量库未打开（embedding 未就绪）；"
-                    + "检索阅读模式不受影响")
+                logFn("RAG: 文档元数据库未打开；检索不受影响，但目录/摘要可能不可用")
             }
         } else {
             do {
@@ -1738,10 +1788,16 @@ public final class RAGEngine {
         logFn("RAG: 索引库就绪（现有 \(existingChunkCount) 切片）")
         if effectiveForce {
             // force 会先删后插全部来源；旧索引的 rowid 全部失效，续建没有意义。
-            // 同步开始前直接重置，结束后由后台任务按需全量重建。
+            // 同步开始前直接重置对应库的 ANN，结束后由后台任务按需全量重建。
+            // 检索阅读模式的索引在 colbert.db（colbertRef），不在 index.sqlite（store）。
             do {
-                try store?.dropANNIndex()
-                logFn("RAG: 强制同步前已重置 ANN 索引，结束后将按需重建")
+                if colbertMode {
+                    try colbertRef?.resetANN()
+                } else {
+                    try store?.dropANNIndex()
+                }
+                logFn("RAG: 强制同步前已重置 \(colbertMode ? "ColBERT" : "普通向量") ANN 索引，"
+                    + "结束后将按需重建")
             } catch {
                 logFn("RAG: 重置 ANN 索引失败（不影响本次同步）：\(error.localizedDescription)")
             }
@@ -1806,9 +1862,21 @@ public final class RAGEngine {
                     _ = try store?.deleteBySource(source)
                 }
                 // 文档摘要/大纲记录也要删除，否则 rag_outline 会一直列出已删文件。
-                try? store?.deleteDocumentByMdPath(entry.mdPath)
-                try? store?.deleteDocument(docName: entry.docName)
-                try? FileManager.default.removeItem(atPath: entry.mdPath)
+                // 用一个错误聚合把附属删除也纳入失败判定：任一失败都不从 manifest 移除，
+                // 下次同步重新遍历该来源再试，避免 documents 表留下孤儿记录。
+                var cleanupError: String?
+                do { try store?.deleteDocumentByMdPath(entry.mdPath) }
+                catch { cleanupError = error.localizedDescription }
+                do { try store?.deleteDocument(docName: entry.docName) }
+                catch { cleanupError = cleanupError ?? error.localizedDescription }
+                if FileManager.default.fileExists(atPath: entry.mdPath) {
+                    do { try FileManager.default.removeItem(atPath: entry.mdPath) }
+                    catch { cleanupError = cleanupError ?? error.localizedDescription }
+                }
+                if let cleanupError {
+                    stats.errors.append("删除附属记录失败 \(source): \(cleanupError)")
+                    continue
+                }
                 removedKeys.insert(source)
                 stats.removed += 1
                 logFn("RAG: 删除已不存在文档 \(source)")
@@ -2281,13 +2349,20 @@ public final class RAGEngine {
                     chunkCount: 0,
                     complete: true,
                     discarded: true)
-                // 没有切片/向量，下次同步内容不变时按 manifest 标记直接跳过。
-                manifestStore.merge(updated: [source: marker], removed: [])
                 // 该来源此前可能已入库（例如文件被改短）：旧切片、缓存 Markdown
                 // 与文档记录/摘要必须一起清掉，避免继续命中旧内容。
-                removeIndexedSource(source: source, entry: previous, store: store,
-                                    colbertReader: colbertReader,
-                                    markdownDir: markdownDir, knowledgeBase: knowledgeBase)
+                // 核心切片删除失败时不写 discarded 标记，保留 manifest 让下次同步重试，
+                // 否则残留切片会永久留在库里参与检索。
+                guard removeIndexedSource(source: source, entry: previous, store: store,
+                                          colbertReader: colbertReader,
+                                          markdownDir: markdownDir,
+                                          knowledgeBase: knowledgeBase) else {
+                    outcome.error = "\(file.relativePath): 旧切片清理失败，已保留记录待重试"
+                    log("RAG: ✗ \(file.relativePath) 旧切片清理失败，保留记录待重试")
+                    return outcome
+                }
+                // 没有切片/向量，下次同步内容不变时按 manifest 标记直接跳过。
+                manifestStore.merge(updated: [source: marker], removed: [])
                 outcome.discarded = true
                 log("RAG: \(job.label) 丢弃（正文仅 \(bodyCharacters) 字，视为无效碎片）")
                 return outcome
@@ -2315,12 +2390,18 @@ public final class RAGEngine {
                     chunkCount: 0,
                     complete: false,
                     duplicateOf: canonical)
-                manifestStore.merge(updated: [source: marker], removed: [])
                 // 该来源之前可能以独立文档入过库：清掉旧向量与 Markdown/摘要，
-                // 避免检索同时命中两份正文。
-                removeIndexedSource(source: source, entry: previous, store: store,
-                                    colbertReader: colbertReader,
-                                    markdownDir: markdownDir, knowledgeBase: knowledgeBase)
+                // 避免检索同时命中两份正文。删除失败则不写 tombstone、保留 manifest
+                // 待下次重试；否则 duplicateOf 会让该来源被永久跳过、残留切片无法清理。
+                guard removeIndexedSource(source: source, entry: previous, store: store,
+                                          colbertReader: colbertReader,
+                                          markdownDir: markdownDir,
+                                          knowledgeBase: knowledgeBase) else {
+                    outcome.error = "\(file.relativePath): 重复来源清理失败，已保留记录待重试"
+                    log("RAG: ✗ \(file.relativePath) 重复来源清理失败，保留记录待重试")
+                    return outcome
+                }
+                manifestStore.merge(updated: [source: marker], removed: [])
                 outcome.skipped = true
                 outcome.deduplicated = true
                 let keepName = manifestSnapshot[canonical]?.docName
@@ -2346,13 +2427,14 @@ public final class RAGEngine {
                                                         knowledgeBase: knowledgeBase)
                     try AtomicFile.write(text, to: mdPath)
                     // 检索阅读模式同样登记 documents 元数据：文档列表、大纲、
-                    // get_document 与「遗忘文档」都依赖这张表。普通向量库
-                    // 不可用时只跳过登记，不影响切片入库与检索。
+                    // 章节/全书摘要都依赖这张表。store 由顶层用「仅元数据」方式打开
+                    // （不依赖 embedding），保证目录与摘要稳定写入 index.sqlite；
+                    // 切换回普通模式时读的就是同一份数据。
                     if let store {
                         let digestInfo = Self.buildDigest(parsed: parsed,
                                                           docName: file.relativePath,
                                                           markdown: text)
-                        try? store.upsertDocument(
+                        try store.upsertDocument(
                             docName: file.relativePath,
                             digest: digestInfo.digest,
                             chapters: digestInfo.chapters,
@@ -3161,6 +3243,22 @@ public final class RAGEngine {
         return Array(output.prefix(topK))
     }
 
+    /// 由 docID 生成跨进程稳定的 rowID（替代每进程随机化的 String.hashValue）。
+    /// 取 SHA256 前 8 字节，转成非负 Int64。
+    static func stableRowID(_ docID: String) -> Int64 {
+        let digest = SHA256.hash(data: Data(docID.utf8))
+        let value = digest.prefix(8).reduce(UInt64(0)) { ($0 << 8) | UInt64($1) }
+        return Int64(value & 0x7fff_ffff_ffff_ffff)
+    }
+
+    /// 从 colbert docID（"<sourceKey>#NNNN"）解析文档内真实切片序号；
+    /// 解析失败回退到调用方给的名次。
+    static func colbertChunkIndex(_ docID: String, fallback: Int) -> Int {
+        guard let hashIndex = docID.lastIndex(of: "#") else { return fallback }
+        let suffix = docID[docID.index(after: hashIndex)...]
+        return Int(suffix) ?? fallback
+    }
+
     public func search(query: String, topK: Int = 3,
                        source: String? = nil,
                        timeout: Double? = nil) async throws -> [SearchHit] {
@@ -3169,11 +3267,16 @@ public final class RAGEngine {
         // 「embedding 模型不可用」。UI 与 RAGTool 另走 searchWithCitations。
         if config.colbertReaderEnabled {
             let outcome = try await searchWithCitations(query: query, topK: topK,
-                                                        source: source)
+                                                        source: source, timeout: timeout)
             return outcome.citations.prefix(topK).map { citation in
-                let rowID = Int64(abs(citation.id.hashValue))
+                // docID 形如 "<sourceKey>#0000"，末尾是文档内真实切片序号；
+                // rowID 用稳定的确定性哈希（非 String.hashValue——后者每进程随机化，
+                // 且 abs(Int.min) 会溢出），保证跨进程一致、可用于定位/去重。
+                let docID = citation.id
+                let rowID = Self.stableRowID(docID)
+                let chunkIndex = Self.colbertChunkIndex(docID, fallback: citation.rank - 1)
                 return SearchHit(rowID: rowID, text: citation.text,
-                                 source: citation.source, chunkIndex: citation.rank - 1,
+                                 source: citation.source, chunkIndex: chunkIndex,
                                  heading: citation.heading, score: citation.score)
             }
         }
@@ -3398,18 +3501,19 @@ public final class RAGEngine {
     /// - 图谱策略：实体/关系照常进 `context`，原文片段同样只留 1 条；
     /// - 全部召回切片（含 top-1）放进 `citations` 供 UI 气泡展示。
     public func searchWithCitations(query: String, topK: Int = 3,
-                                    source: String? = nil) async throws -> RAGRetrievalOutcome {
+                                    source: String? = nil,
+                                    timeout: Double? = nil) async throws -> RAGRetrievalOutcome {
         // 绑定本次检索的耗时收集器：下游各阶段通过 @TaskLocal 写入，返回时统一
         // 打印一条「整体 + 各阶段」汇总，避免耗时信息散落在多行日志里。
         let timing = RAGSearchTiming()
         return try await RAGSearchTiming.$current.withValue(timing) {
             try await searchWithCitationsImpl(query: query, topK: topK,
-                                              source: source, timing: timing)
+                                              source: source, timeout: timeout, timing: timing)
         }
     }
 
     private func searchWithCitationsImpl(query: String, topK: Int,
-                                         source: String?,
+                                         source: String?, timeout: Double?,
                                          timing: RAGSearchTiming) async throws -> RAGRetrievalOutcome {
         // 入口总账：覆盖「召回 + condense + 上下文组装」全程。下游 [rag] search /
         // [kg] retriever / [colbert] 各打点只覆盖召回段，这里补齐端到端墙钟。
@@ -3432,11 +3536,14 @@ public final class RAGEngine {
         if let colbert = colbertService() {
             branch = "colbert"
             // 端到端墙钟预算：与普通检索同风格。防极端情况（如库锁升级、
-            // 磁盘抖动）下 rag_search 无限挂起拖死对话。
-            let budget = max(30, resolvedTimeout(nil) * 3)
+            // 磁盘抖动）下 rag_search 无限挂起拖死对话。显式 timeout 优先，
+            // 且遵守「0 = 关闭超时」契约（用极大预算替代，而非强制 30 秒）。
+            let effectiveTimeout = resolvedTimeout(timeout)
+            let budget = effectiveTimeout == 0 ? Double.greatestFiniteMagnitude
+                : max(30, effectiveTimeout * 3)
             do {
                 let outcome = try await Self.withTimeout(budget) {
-                    try await colbert.search(query: query, source: source)
+                    try await colbert.search(query: query, source: source, topK: topK)
                 }
                 if outcome.citations.isEmpty {
                     return RAGRetrievalOutcome(context: "（知识库中未找到相关内容）",
@@ -3988,7 +4095,7 @@ public final class RAGEngine {
     // MARK: Meta
 
     public func getDocumentOutline(docName: String) -> DocumentRecord? {
-        if let fromStore = try? withStore({ $0.getDocumentDigest(docName: docName) }) {
+        if let fromStore = withMetadataStoreSafe({ $0.getDocumentDigest(docName: docName) }) {
             return fromStore
         }
         // 检索阅读模式下普通向量库可能未登记 documents，用 manifest 兜底目录。
@@ -4002,7 +4109,7 @@ public final class RAGEngine {
     /// 检索阅读模式下 documents 表可能尚未登记（旧库或普通向量库不可用），
     /// 用 manifest 的已入库文档兜底，保证大纲工具能看到文档。
     public func listDocuments(limit: Int) -> (names: [String], total: Int) {
-        let result = withStoreSafe { store -> ([String], Int) in
+        let result = withMetadataStoreSafe { store -> ([String], Int) in
             (try store.documentNames(limit: limit), try store.documentCount())
         }
         if let result, result.1 > 0 { return result }
@@ -4017,7 +4124,7 @@ public final class RAGEngine {
     public func lookupDocument(_ query: String) -> DocumentLookupResult {
         let target = query.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !target.isEmpty else { return .notFound }
-        let result = withStoreSafe { store -> DocumentLookupResult in
+        let result = withMetadataStoreSafe { store -> DocumentLookupResult in
             let candidates = try store.lookupDocuments(query: target, limit: 50)
             let lower = target.lowercased()
             let standardized = (target as NSString).standardizingPath
@@ -4123,7 +4230,7 @@ public final class RAGEngine {
                 jobProgress: DocumentSummaryProgress(docID: ""),
                 repairedTOC: record.digest)
         }
-        return withStoreSafe { store in
+        return withMetadataStoreSafe { store in
             // 以库内当前行为准；记录可能来自较早的查询。
             let current = try store.document(docID: record.docID) ?? record
             let chapters = try store.chapterSummaries(docID: current.docID)
@@ -4140,7 +4247,7 @@ public final class RAGEngine {
     }
 
     public func listDocuments() -> [String] {
-        let names = (withStoreSafe { $0.listDocuments() }) ?? []
+        let names = (withMetadataStoreSafe { $0.listDocuments() }) ?? []
         if !names.isEmpty { return names }
         // 检索阅读模式或普通库不可用：documents 表可能未登记，退回 manifest。
         if config.colbertReaderEnabled {
@@ -4245,7 +4352,12 @@ public final class RAGEngine {
         transientAuxFactory: (@Sendable (AgentConfig) -> LLMService)? = nil,
         log: @escaping @Sendable (String) -> Void = { _ in }
     ) throws -> BookSummaryCoordinator {
-        let store = try ensureStore()
+        // 检索阅读模式下普通 embedding 常未就绪，ensureStore 会抛错导致摘要任务
+        // 根本无法启动；目录/摘要与向量模型无关，改用仅元数据 store，两种模式
+        // 共用 index.sqlite 的 documents/summary 表，切换模式时读同一份数据。
+        let store = config.colbertReaderEnabled
+            ? try ensureMetadataStore()
+            : try ensureStore()
         let config = self.config
         return BookSummaryCoordinator(
             engine: BookSummaryEngine(store: store),
@@ -4838,11 +4950,16 @@ public final class RAGEngine {
 
         guard !removeSet.isEmpty || !tombstoneCanonical.isEmpty else { return 0 }
 
+        // 核心切片删除失败的来源不从 manifest 移除/写 tombstone，留待下次同步重试；
+        // 否则残留切片会永久留在库里，且因 tombstone 跳过再无清理机会。
+        var removedOK = Set<String>()
         for source in removeSet.sorted() {
             let entry = finalManifest[source]
-            removeIndexedSource(source: source, entry: entry, store: store,
-                                colbertReader: colbertReader,
-                                markdownDir: markdownDir, knowledgeBase: knowledgeBase)
+            guard removeIndexedSource(source: source, entry: entry, store: store,
+                                      colbertReader: colbertReader,
+                                      markdownDir: markdownDir,
+                                      knowledgeBase: knowledgeBase) else { continue }
+            removedOK.insert(source)
             let name = entry?.docName
                 ?? relativeSourcePath(source, knowledgeBase: knowledgeBase)
             log("RAG: 去重移除副本 \(name)")
@@ -4851,9 +4968,10 @@ public final class RAGEngine {
         var tombstones: [String: RAGManifestEntry] = [:]
         for (source, canonical) in tombstoneCanonical {
             guard let entry = finalManifest[source] else { continue }
-            removeIndexedSource(source: source, entry: entry, store: store,
-                                colbertReader: colbertReader,
-                                markdownDir: markdownDir, knowledgeBase: knowledgeBase)
+            guard removeIndexedSource(source: source, entry: entry, store: store,
+                                      colbertReader: colbertReader,
+                                      markdownDir: markdownDir,
+                                      knowledgeBase: knowledgeBase) else { continue }
             var marker = entry
             marker.duplicateOf = canonical
             marker.chunkCount = 0
@@ -4864,10 +4982,15 @@ public final class RAGEngine {
             let keepName = finalManifest[canonical]?.docName ?? canonical
             log("RAG: 去重移除副本 \(entry.docName)，保留 \(keepName)")
         }
-        manifestStore.merge(updated: tombstones, removed: removeSet)
-        return removeSet.count + tombstones.count
+        manifestStore.merge(updated: tombstones, removed: removedOK)
+        return removedOK.count + tombstones.count
     }
 
+    /// 清理一个来源的切片与附属记录。返回「核心切片是否删除成功」：
+    /// colbert/向量切片删除失败时不能写 tombstone 或从 manifest 移除，否则下次同步
+    /// 会跳过该来源，残留切片永久留在库里继续参与检索且再无机会清理。
+    /// documents 记录与 md 缓存属附属数据，失败可容忍（下次 upsertDocument 覆盖）。
+    @discardableResult
     private static func removeIndexedSource(
         source: String,
         entry: RAGManifestEntry?,
@@ -4875,11 +4998,29 @@ public final class RAGEngine {
         colbertReader: ColBERTReaderService?,
         markdownDir: String,
         knowledgeBase: String
-    ) {
+    ) -> Bool {
+        let coreDeleted: Bool
         if let colbertReader {
-            _ = try? colbertReader.delete(source: source)
+            do {
+                _ = try colbertReader.delete(source: source)
+                coreDeleted = true
+            } catch {
+                AgentLog.warning("RAG: 清理 colbert 切片失败（\(source)）："
+                    + error.localizedDescription)
+                coreDeleted = false
+            }
+        } else if let store {
+            do {
+                _ = try store.deleteBySource(source)
+                coreDeleted = true
+            } catch {
+                AgentLog.warning("RAG: 清理向量切片失败（\(source)）："
+                    + error.localizedDescription)
+                coreDeleted = false
+            }
         } else {
-            _ = try? store?.deleteBySource(source)
+            // 没有核心存储可删（不应发生）；视作成功，避免误留孤儿 manifest。
+            coreDeleted = true
         }
         let mdPath = entry?.mdPath
             ?? cacheMarkdownPath(for: source, markdownDir: markdownDir,
@@ -4891,6 +5032,7 @@ public final class RAGEngine {
         if !mdPath.isEmpty {
             try? FileManager.default.removeItem(atPath: mdPath)
         }
+        return coreDeleted
     }
 
     /// 检索阅读模式用 colbert 库计数，普通模式用向量库计数。
@@ -4922,9 +5064,13 @@ public final class RAGEngine {
         return FileSignature(mtime: mtime, size: size.int64Value)
     }
 
+    /// 正文内容哈希：128 位（SHA256 前 16 字节）。正文去重用它分组，32 位时
+    /// 约 6.5 万篇即有 3% 碰撞概率、会误删不同文档；扩到 128 位后碰撞可忽略。
+    /// 兼容旧库：旧记录存 8 位短哈希，长度不同只会被当成新内容触发一次重算，
+    /// 不会误判为相同（去重分组按完整字符串精确匹配）。
     static func contentHash(_ text: String) -> String {
         let digest = SHA256.hash(data: Data(text.utf8))
-        return digest.prefix(8).map { String(format: "%02x", $0) }.joined()
+        return digest.prefix(16).map { String(format: "%02x", $0) }.joined()
     }
 
     static func fileSizeText(_ path: String) -> String {

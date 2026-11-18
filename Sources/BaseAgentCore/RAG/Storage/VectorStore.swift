@@ -170,6 +170,34 @@ public final class VectorStore: @unchecked Sendable {
         }
     }
 
+    /// 仅元数据用途打开库（目录 / 章节摘要 / 全书摘要的读写），不依赖 embedding 实例。
+    /// 检索阅读模式下普通 embedding 可能未就绪，但文档元数据与向量模型无关：从库内
+    /// meta 读取已存维度（空库用 1，此时无数据不会触发重建）、元素类型与索引指纹，
+    /// 复用库内配置避免元数据连接误判「配置变化」。向量通道可能被标记待重建，
+    /// 但 documents / summary 系列表照常可读写。
+    public static func openForMetadata(dbPath: String) throws -> VectorStore {
+        // 用可写连接探测 meta：首次同步时 index.sqlite（及其 rag 父目录）可能尚
+        // 不存在，只读连接（SQLITE_OPEN_READONLY）会因无法建库直接失败，父目录缺失
+        // 时连可写连接也打不开，导致目录/摘要无法登记。先确保父目录存在，再用可写
+        // 连接探测；meta 表不存在时读取失败回退默认值，由 init 的 createBaseSchema 建表。
+        try FileManager.default.createDirectory(
+            atPath: (dbPath as NSString).deletingLastPathComponent,
+            withIntermediateDirectories: true
+        )
+        let probe = try SQLiteDatabase(path: dbPath)
+        defer { probe.close() }
+        func meta(_ key: String) -> String? {
+            try? probe.scalar("SELECT value FROM meta WHERE key = ?",
+                              [.text(key)]).stringValue
+        }
+        let dimension = meta(dimensionKey).flatMap(Int.init).map { max(1, $0) } ?? 1
+        let element = meta(elementTypeKey).flatMap(VectorElementType.init(rawValue:)) ?? .fp32
+        let fingerprint = meta(fingerprintKey) ?? ""
+        return try VectorStore(dbPath: dbPath, dimension: dimension,
+                               enableSQLiteVec: false, elementType: element,
+                               indexFingerprint: fingerprint)
+    }
+
     public func close() {
         lock.lock()
         readLock.lock()

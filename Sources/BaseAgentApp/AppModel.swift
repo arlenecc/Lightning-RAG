@@ -773,6 +773,10 @@ final class AppViewModel: ObservableObject {
                 // 取消旧知识库同步，避免旧 agent 的 ingest 在 close 时占着锁，
                 // 导致连接迟迟不释放（close 会在同步结束后补关）。
                 self.agent?.ragEngine.cancel()
+                // 检索阅读模式下若正在下载/加载 ColBERT 模型（几百 MB），配置切换会
+                // 重建 Agent；不取消旧 service 的下载任务，它会因 loadTask 引用环继续
+                // 写同一个 .part 文件，与重建后的新 service 争用导致下载反复失败。
+                self.agent?.ragEngine.cancelColbertLoading()
                 // ColBERT ANN 构建是独立的 detached task：配置切换必须显式停掉并复位，
                 // 否则旧任务对已关闭引擎继续跑，按钮永久停在「索引构建中…」。
                 self.colbertANNCancelFlag.set(true)

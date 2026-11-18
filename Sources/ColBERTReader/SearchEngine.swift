@@ -474,11 +474,15 @@ final class SearchEngine {
             // 已有 shortlist 无论是否来自该来源都占配额：总数硬上限 = totalCap。
             let injectBudget = max(0, totalCap - shortlist.count)
             if injectBudget > 0 {
+                // LIKE 中 % / _ / \ 是通配符/转义符：来自工具参数的 source 必须转义，
+                // 否则含这些字符的来源会放大注入候选集（后端还会再按 contains 过滤，
+                // 结果虽不会错，但会无谓拉大批次做 MaxSim）。
+                let escaped = Self.likePattern(source)
                 let rows = try db.query("""
                     SELECT doc_id FROM document
-                    WHERE source LIKE ? OR title LIKE ?
+                    WHERE source LIKE ? ESCAPE '\\' OR title LIKE ? ESCAPE '\\'
                     ORDER BY doc_id LIMIT ?
-                    """, [.text("%\(source)%"), .text("%\(source)%"), .int(Int64(injectBudget))])
+                    """, [.text(escaped), .text(escaped), .int(Int64(injectBudget))])
                 for row in rows {
                     guard let id = row["doc_id"]?.stringValue, seen.insert(id).inserted else { continue }
                     shortlist.append(Candidate(docID: id))
@@ -686,6 +690,17 @@ final class SearchEngine {
 
     /// 指定来源时并入候选的上限：随 coarse 放大，不低于 200 兜底，限制精排开销。
     static func sourceCandidateLimit(_ coarse: Int) -> Int { max(200, max(1, coarse) * 4) }
+
+    /// 把字面量转成 LIKE 匹配串：转义 \ / % / _ 并包裹通配符，配合 `ESCAPE '\'` 使用。
+    static func likePattern(_ literal: String) -> String {
+        var out = ""
+        out.reserveCapacity(literal.count + 2)
+        for ch in literal {
+            if ch == "\\" || ch == "%" || ch == "_" { out.append("\\") }
+            out.append(ch)
+        }
+        return "%\(out)%"
+    }
 
     private func blob16(_ values: [Float16]) -> Data {
         values.withUnsafeBufferPointer { Data(buffer: $0) }

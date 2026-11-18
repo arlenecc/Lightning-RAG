@@ -87,12 +87,25 @@ enum ResidualCodec {
         }
         let dim = record.dim
         let qCount = q.count
+        // 损坏/截断记录防御：校验维度、量化位数与 blob 长度后再做裸下标访问，
+        // 否则 bytes[(index*dim+d)/perByte] 越界会让整次检索 trap，破坏
+        // 「单候选失败只丢一条」的容错语义。
+        guard record.bits == 2 || record.bits == 4 else {
+            throw DocSearchError.quant("非法量化位数 \(record.bits)")
+        }
+        guard record.centerFP16.count == dim else {
+            throw DocSearchError.quant("残差中心维度不符：\(record.centerFP16.count) != \(dim)")
+        }
         var queryFlat = [Float](repeating: 0, count: qCount * dim)
         for i in 0..<qCount {
             queryFlat.replaceSubrange((i * dim)..<((i + 1) * dim), with: q[i])
         }
         let bytes = [UInt8](record.blob)
         let perByte = 8 / record.bits
+        let requiredBytes = (record.tokenCount * dim + perByte - 1) / perByte
+        guard bytes.count >= requiredBytes else {
+            throw DocSearchError.quant("残差 blob 截断：\(bytes.count) < \(requiredBytes)")
+        }
         let mask = (1 << record.bits) - 1
         var maxima = [Float](repeating: -Float.greatestFiniteMagnitude, count: qCount)
 

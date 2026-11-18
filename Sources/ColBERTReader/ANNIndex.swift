@@ -16,9 +16,28 @@ final class ANNIndex {
 
     private let db: SQLiteDB
     private let dim = ColBERT.dimension
+    /// 簇心缓存可被并发的检索线程读、后台构建线程清空。用独立锁保护属性访问，
+    /// 且绝不持锁做 db.query / db.transaction，避免与 DB 锁形成 ABBA 死锁。
+    private let cacheLock = NSLock()
     private var centroidCache: ANNCentroidCache?
 
     init(db: SQLiteDB) { self.db = db }
+
+    /// 锁内读取缓存；仅当簇心布局与当前 meta 一致才复用。
+    private func cachedCentroids(matching m: Meta) -> ANNCentroidCache? {
+        cacheLock.lock(); defer { cacheLock.unlock() }
+        guard let cache = centroidCache,
+              cache.blocks == m.blocks, cache.clusters == m.clusters,
+              cache.dim == m.dim else { return nil }
+        return cache
+    }
+
+    /// 线程安全地写入或清空缓存（不持锁做任何 db 操作）。
+    private func storeCentroids(_ cache: ANNCentroidCache?) {
+        cacheLock.lock()
+        centroidCache = cache
+        cacheLock.unlock()
+    }
 
     struct Status {
         var blocks = 0
@@ -120,7 +139,7 @@ final class ANNIndex {
         try db.execute("DELETE FROM ann_cells")
         try db.execute("DELETE FROM ann_blocks")
         try db.execute("DELETE FROM doc_meta WHERE key GLOB 'ann_*'")
-        centroidCache = nil
+        storeCentroids(nil)
     }
 
     func drop() throws {
@@ -129,7 +148,7 @@ final class ANNIndex {
             try db.execute("DROP TABLE IF EXISTS ann_blocks")
             try db.execute("DELETE FROM doc_meta WHERE key GLOB 'ann_*'")
         }
-        centroidCache = nil
+        storeCentroids(nil)
     }
 
     /// 删除/替换已索引行时累计陈旧计数；超过阈值触发整体重建。
@@ -317,7 +336,7 @@ final class ANNIndex {
             m.builtAt = Date().timeIntervalSince1970
             try writeMeta(m, accumulateRows: rows)
         }
-        centroidCache = nil
+        storeCentroids(nil)
     }
 
     private func seedCentroids(buffer: ANNBlockBuffer, clusters: Int) -> [Float]? {
@@ -386,8 +405,8 @@ final class ANNIndex {
     }
 
     private func centroidCache(for m: Meta) -> ANNCentroidCache? {
-        if let cache = centroidCache, cache.blocks == m.blocks,
-           cache.clusters == m.clusters, cache.dim == m.dim { return cache }
+        // 只在锁内读；db.query / 解码放在锁外，避免与构建线程的 DB 事务形成 ABBA 死锁。
+        if let cache = cachedCentroids(matching: m) { return cache }
         guard let rows = try? db.query("SELECT block_id,payload FROM ann_blocks ORDER BY block_id"),
               rows.count == m.blocks else { return nil }
         var codes: [Int8] = []
@@ -403,7 +422,7 @@ final class ANNIndex {
         }
         let cache = ANNCentroidCache(blocks: m.blocks, clusters: m.clusters,
                                      dim: m.dim, codes: codes, scales: scales)
-        centroidCache = cache
+        storeCentroids(cache)
         return cache
     }
 

@@ -279,12 +279,18 @@ public final class ColBERTReaderService: @unchecked Sendable {
     /// 检索路径只读（SQLite WAL 快照隔离 + FULLMUTEX 句柄串行），不持 opLock：
     /// ANN 构建/同步入库期间发起的对话检索可立即执行（读到构建前的索引快照），
     /// 不会在 opLock 上排队等待长任务结束。
-    public func search(query: String, source: String? = nil) async throws -> RAGRetrievalOutcome {
+    public func search(query: String, source: String? = nil,
+                       topK: Int? = nil) async throws -> RAGRetrievalOutcome {
         let engine = try await ensureEngine()
+        // 显式 topK（来自 rag_search 的 top_k / 公开 API）覆盖面板 colbertTopN：
+        // 工具契约是「top_k 决定气泡数量」，不能静默失效。clamp 到工具声明的 1...10，
+        // 未传时沿用配置面板的 colbertTopN。
+        var effectiveOptions = options
+        if let topK { effectiveOptions.topN = min(max(topK, 1), 10) }
         // 分阶段耗时接线：每次检索输出一行汇总，定位慢查询（编码/粗筛/精排）。
         let timingStarted = Date()
         var stageTimings: [(String, Double)] = []
-        let hits = try engine.search(query: query, options: options, source: source) {
+        let hits = try engine.search(query: query, options: effectiveOptions, source: source) {
             key, seconds in
             stageTimings.append((key, seconds))
             // 写入统一收集器，入口「检索汇总」行也能看到 ColBERT 各阶段。
@@ -320,6 +326,14 @@ public final class ColBERTReaderService: @unchecked Sendable {
             .joined(separator: " ")
         AgentLog.info("[colbert] 检索 \(Int(totalMs))ms 候选=\(hits.count) \(stages)")
         return RAGRetrievalOutcome(context: guide, citations: citations)
+    }
+
+    /// 重置 ANN 索引（force 全量同步前调用；不依赖模型加载）。
+    public func resetANN() throws {
+        let engine = try ensureEngineInstance()
+        opLock.lock()
+        defer { opLock.unlock() }
+        try engine.resetANN()
     }
 
     /// 构建 / 续建向量索引，返回摘要。
@@ -368,5 +382,23 @@ public final class ColBERTReaderService: @unchecked Sendable {
         // （Task.cancel 只被 Task.checkCancellation 在文件边界检查，传输中不生效）。
         downloader?.cancelCurrent()
         task?.cancel()
+    }
+
+    /// 释放模型与数据库句柄：供 RAGEngine close/reload/deinit 显式调用，
+    /// 避免切换配置后旧模型内存（几百 MB）靠 ARC 延迟回收、与新模型双份驻留。
+    /// 释放后再次使用会经 ensureEngine 重新下载/加载（若模型文件完整则直接从磁盘加载）。
+    public func shutdown() {
+        cancelLoading()
+        opLock.lock()
+        lock.lock()
+        let current = engine
+        engine = nil
+        loadTask = nil
+        activeDownloader = nil
+        loadGeneration &+= 1
+        lock.unlock()
+        // db.close 可能阻塞在 SQLite 锁上，放在 opLock 内但 lock 外执行。
+        current?.shutdown()
+        opLock.unlock()
     }
 }

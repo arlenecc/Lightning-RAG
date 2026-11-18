@@ -717,7 +717,7 @@ struct SettingsView: View {
                         Divider()
                         HStack(spacing: 8) {
                             Text("检索阅读模式").font(.caption).bold()
-                            Toggle("启用检索阅读模式", isOn: $colbertReaderEnabled)
+                            Toggle("启用", isOn: $colbertReaderEnabled)
                                 .toggleStyle(.checkbox)
                             Text("量化残差").font(.caption2).foregroundStyle(.secondary)
                             Picker("", selection: $colbertQuantBits) {

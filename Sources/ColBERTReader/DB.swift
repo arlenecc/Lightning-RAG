@@ -96,7 +96,16 @@ final class SQLiteDB {
         if !vecLoaded { throw DocSearchError.storage("sqlite-vec 初始化失败，无法创建 vec0 表") }
     }
 
-    deinit { sqlite3_close_v2(handle) }
+    deinit { close() }
+
+    /// 显式关闭句柄（幂等）：供上层 shutdown 在对象仍被引用时提前释放连接。
+    func close() {
+        lock.lock(); defer { lock.unlock() }
+        if let handle {
+            sqlite3_close_v2(handle)
+            self.handle = nil
+        }
+    }
 
     @discardableResult
     func exec(_ sql: String) throws -> Int {

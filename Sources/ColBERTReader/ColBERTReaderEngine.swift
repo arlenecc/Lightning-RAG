@@ -76,6 +76,15 @@ public final class ColBERTReaderEngine {
 
     public var isModelLoaded: Bool { colbert != nil }
 
+    /// 释放模型与数据库句柄：置 nil 让 ORTSession / tokenizer / SQLiteDB 经 ARC 立即回收，
+    /// 而不是等整个引擎对象 deinit。供上层 close/reload 显式调用，避免切换配置后
+    /// 旧模型内存（几百 MB）长时间与新模型双份驻留。释放后可再次 loadModel 重建。
+    public func shutdown() {
+        searchEngine = nil
+        colbert = nil
+        db.close()
+    }
+
     private func engine() throws -> SearchEngine {
         guard let engine = searchEngine else {
             throw DocSearchError.model("模型尚未加载")
@@ -126,6 +135,11 @@ public final class ColBERTReaderEngine {
                                        useANN: options.useANN,
                                        lengthNorm: options.lengthNorm,
                                        queryPrune: options.queryPrune,
+                                       // 开关开启即视为允许绕过「小库 < 2 万行不建 ANN」
+                                       // 的隐藏门槛：UI 的「使用 ANN」才真正生效。
+                                       // 无可用索引时 candidates 返回 nil，自然回退精确，
+                                       // 因此小库开启也不会因缺索引而检索失败。
+                                       forceANN: options.useANN,
                                        source: source,
                                        timing: timing)
         return hits.enumerated().map { index, hit in
@@ -137,6 +151,14 @@ public final class ColBERTReaderEngine {
 
     /// 与检索共享同一 ANN 实例，保证 build 后簇心缓存随之失效。
     private var sharedANN: ANNIndex { searchEngine?.ann ?? ANNIndex(db: db) }
+
+    /// 重置 ANN 索引（force 全量同步前调用：旧 rowid 全部失效，续建无意义）。
+    /// drop + 立即重建空表，避免 status/candidates 因缺表吞错而静默失效。
+    public func resetANN() throws {
+        let ann = sharedANN
+        try ann.drop()
+        try ann.createSchema()
+    }
 
     /// 构建 / 续建向量索引。返回摘要信息。
     /// - Parameter shouldCancel: 块间取消检查；中断后已写块保留，续建从水位继续。
