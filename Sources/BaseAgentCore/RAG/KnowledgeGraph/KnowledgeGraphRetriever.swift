@@ -44,6 +44,7 @@ public final class KnowledgeGraphRetriever {
         }
         let totalStarted = Date()
         var keywordSeconds = 0.0
+        var keywordLLMSeconds = 0.0
         var embedSeconds = 0.0
         var vectorSearchSeconds = 0.0
         var expandSeconds = 0.0
@@ -53,8 +54,14 @@ public final class KnowledgeGraphRetriever {
         var chunkCount = 0
         let ms: (Double) -> String = { String(format: "%.0fms", $0 * 1000) }
         defer {
+            let timing = RAGSearchTiming.current
+            timing?.set("kg_关键词LLM", seconds: keywordLLMSeconds)
+            timing?.set("kg_查询向量", seconds: embedSeconds)
+            timing?.set("kg_实体关系检索", seconds: vectorSearchSeconds)
+            timing?.set("kg_图谱扩展", seconds: expandSeconds)
+            timing?.set("kg_原文检索", seconds: directSeconds)
             AgentLog.info("[kg] retriever 阶段耗时: "
-                + "关键词=\(ms(keywordSeconds)), "
+                + "关键词=\(ms(keywordSeconds))(LLM=\(ms(keywordLLMSeconds))), "
                 + "查询向量=\(ms(embedSeconds)), "
                 + "实体/关系向量检索=\(ms(vectorSearchSeconds)), "
                 + "图谱扩展/排序=\(ms(expandSeconds)), "
@@ -75,8 +82,10 @@ public final class KnowledgeGraphRetriever {
         let keywordStarted = Date()
         let keywords: KGKeywords
         if strategy.usesKnowledgeGraph {
+            let llmStarted = Date()
             keywords = (try? await builder.extractKeywords(query: trimmed))
                 ?? KGKeywords(highLevel: [trimmed], lowLevel: [trimmed])
+            keywordLLMSeconds = Date().timeIntervalSince(llmStarted)
         } else {
             keywords = KGKeywords(highLevel: [trimmed], lowLevel: [trimmed])
         }

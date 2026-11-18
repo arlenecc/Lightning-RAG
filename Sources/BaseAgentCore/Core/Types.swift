@@ -585,6 +585,33 @@ public func expandPath(_ path: String) -> String {
 }
 
 /// 进程内简单日志（UI 通过 AgentCallbacks.onLog 接管展示）。
+/// 单次检索的分阶段耗时收集器。用 @TaskLocal 在 async 调用链中隐式传递，
+/// 无需给每个下游函数加参数；在检索入口绑定、返回时统一打印一条汇总行。
+/// 各阶段沿同一 task 链串行写入（withTimeout 的 task group 内仅 operation 写），
+/// 主线程入口读取汇总，不跨并发任务共享可变状态。
+public final class RAGSearchTiming: @unchecked Sendable {
+    public init() {}
+    @TaskLocal public static var current: RAGSearchTiming?
+
+    private var stages: [String: Double] = [:]
+    private var orderedKeys: [String] = []
+
+    /// 记录某阶段耗时（秒）。同名阶段取最后一次值，顺序稳定。
+    public func set(_ key: String, seconds: Double) {
+        guard seconds > 0 else { return }
+        if stages[key] == nil { orderedKeys.append(key) }
+        stages[key] = seconds
+    }
+
+    /// 按记录顺序输出，汇总时稳定可读。
+    public func snapshot() -> [(key: String, seconds: Double)] {
+        orderedKeys.compactMap { key in
+            guard let s = stages[key] else { return nil }
+            return (key, s)
+        }
+    }
+}
+
 public enum AgentLog {
     private static let queue = DispatchQueue(label: "base-agent.log")
     /// GUI 启动时 stderr 不落盘，性能问题无法事后定位；所有日志同步追加到

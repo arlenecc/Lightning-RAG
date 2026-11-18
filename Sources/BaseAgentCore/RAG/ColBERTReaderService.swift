@@ -287,6 +287,8 @@ public final class ColBERTReaderService: @unchecked Sendable {
         let hits = try engine.search(query: query, options: options, source: source) {
             key, seconds in
             stageTimings.append((key, seconds))
+            // 写入统一收集器，入口「检索汇总」行也能看到 ColBERT 各阶段。
+            RAGSearchTiming.current?.set("cb_\(key)", seconds: seconds)
         }
 
         var citations: [RAGCitation] = []

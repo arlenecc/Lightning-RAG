@@ -1629,6 +1629,11 @@ public final class VectorStore: @unchecked Sendable {
         } else {
             results = try run()
         }
+        // 细分阶段写入统一收集器（键名带 vec_ 前缀，与 searchBody 的聚合项区分）。
+        let timing = RAGSearchTiming.current
+        timing?.set("vec_向量", seconds: vectorSeconds)
+        timing?.set("vec_FTS", seconds: ftsSeconds)
+        timing?.set("vec_RRF+hydrate", seconds: fusionSeconds)
         AgentLog.info("[rag][vector] 混合检索耗时: "
             + "向量=\(ms(vectorSeconds))（候选 \(vectorCandidateCount), \(vectorMode)）, "
             + "FTS=\(ms(ftsSeconds))（候选 \(ftsResultCount)）, "

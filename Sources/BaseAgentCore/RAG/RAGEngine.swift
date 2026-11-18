@@ -3206,6 +3206,10 @@ public final class RAGEngine {
         var finalCount = 0
         let ms: (Double) -> String = { String(format: "%.0fms", $0 * 1000) }
         defer {
+            let timing = RAGSearchTiming.current
+            timing?.set("query_embed", seconds: embedSeconds)
+            timing?.set("retrieval", seconds: retrievalSeconds)
+            timing?.set("rerank", seconds: rerankSeconds)
             AgentLog.info("[rag] search 阶段耗时: "
                 + "query_embed=\(ms(embedSeconds)), "
                 + "向量+FTS+RRF=\(ms(retrievalSeconds)), "
@@ -3395,10 +3399,38 @@ public final class RAGEngine {
     /// - 全部召回切片（含 top-1）放进 `citations` 供 UI 气泡展示。
     public func searchWithCitations(query: String, topK: Int = 3,
                                     source: String? = nil) async throws -> RAGRetrievalOutcome {
+        // 绑定本次检索的耗时收集器：下游各阶段通过 @TaskLocal 写入，返回时统一
+        // 打印一条「整体 + 各阶段」汇总，避免耗时信息散落在多行日志里。
+        let timing = RAGSearchTiming()
+        return try await RAGSearchTiming.$current.withValue(timing) {
+            try await searchWithCitationsImpl(query: query, topK: topK,
+                                              source: source, timing: timing)
+        }
+    }
+
+    private func searchWithCitationsImpl(query: String, topK: Int,
+                                         source: String?,
+                                         timing: RAGSearchTiming) async throws -> RAGRetrievalOutcome {
+        // 入口总账：覆盖「召回 + condense + 上下文组装」全程。下游 [rag] search /
+        // [kg] retriever / [colbert] 各打点只覆盖召回段，这里补齐端到端墙钟。
+        let totalStarted = Date()
+        var branch = "naive"
+        var citationCount = 0
+        let ms: (Double) -> String = { String(format: "%.0fms", $0 * 1000) }
+        defer {
+            // 每次检索返回时统一打一条：整体耗时 + 收集到的各阶段耗时。
+            let stages = timing.snapshot().map { "\($0.key)=\(ms($0.seconds))" }
+                .joined(separator: ", ")
+            AgentLog.info("[rag] 检索汇总 总计=\(ms(Date().timeIntervalSince(totalStarted)))"
+                + "；阶段: \(stages.isEmpty ? "无" : stages)"
+                + "；branch=\(branch), citations=\(citationCount), "
+                + "strategy=\(config.ragRetrievalStrategy.rawValue)")
+        }
         // 检索阅读模式：旁路接管检索召回 + 精排，改用 ColBERT 大分片多向量检索。
         // top-1 分片进上下文供 LLM 总结（由 ColBERTReaderService 格式化），
         // 其余召回切片作为引用气泡附在回复后。
         if let colbert = colbertService() {
+            branch = "colbert"
             // 端到端墙钟预算：与普通检索同风格。防极端情况（如库锁升级、
             // 磁盘抖动）下 rag_search 无限挂起拖死对话。
             let budget = max(30, resolvedTimeout(nil) * 3)
@@ -3410,6 +3442,7 @@ public final class RAGEngine {
                     return RAGRetrievalOutcome(context: "（知识库中未找到相关内容）",
                                                citations: [])
                 }
+                citationCount = outcome.citations.count
                 return outcome
             } catch is RerankTimeout {
                 AgentLog.error("[colbert] 检索阅读检索超时（\(Int(budget))s）")
@@ -3424,6 +3457,8 @@ public final class RAGEngine {
         if config.ragRetrievalStrategy.usesKnowledgeGraph {
             if let outcome = try await knowledgeGraphSearchWithCitations(query: query,
                                                                          source: source) {
+                branch = "kg"
+                citationCount = outcome.citations.count
                 let condensed = await condenseIfNeeded(outcome.context)
                 return RAGRetrievalOutcome(context: condensed, citations: outcome.citations)
             }
@@ -3438,6 +3473,7 @@ public final class RAGEngine {
                         heading: hit.heading, text: hit.text, score: hit.score,
                         isPrimary: index == 0)
         }
+        citationCount = citations.count
         return RAGRetrievalOutcome(context: Self.formatPrimaryContext(hits: hits),
                                    citations: citations)
     }
@@ -3487,6 +3523,19 @@ public final class RAGEngine {
         -> (context: String, chunks: [KGPassage])? {
         guard config.ragRetrievalStrategy.usesKnowledgeGraph else { return nil }
         guard let embedding else { return nil }
+        let totalStarted = Date()
+        var prepareSeconds = 0.0
+        var retrieveSeconds = 0.0
+        var outcomeCount = 0
+        let ms: (Double) -> String = { String(format: "%.0fms", $0 * 1000) }
+        defer {
+            let timing = RAGSearchTiming.current
+            timing?.set("kg_准备", seconds: prepareSeconds)
+            timing?.set("kg_召回+精排格式化", seconds: retrieveSeconds)
+            AgentLog.info("[kg] knowledgeGraphSearch 总计=\(ms(Date().timeIntervalSince(totalStarted)))"
+                + "；准备=\(ms(prepareSeconds)), strategy=\(config.ragRetrievalStrategy.rawValue), "
+                + "原文候选=\(outcomeCount)")
+        }
         let (kgStore, kgGraph) = try ensureKnowledgeGraph()
         // 构建中/知识库已变化（stale）的图谱不可用于检索，避免拿旧图谱回答。
         if let state = kgStore.buildState(), state != .complete {
@@ -3510,10 +3559,15 @@ public final class RAGEngine {
         let retriever = KnowledgeGraphRetriever(kgStore: kgStore, graph: kgGraph,
                                                 builder: builder, embedding: embedding,
                                                 config: config, chunkStore: store)
+        prepareSeconds = Date().timeIntervalSince(totalStarted)
+        let retrieveStarted = Date()
         let candidates = try await retriever.retrieve(query: query, source: source)
         guard !candidates.isEmpty else { return nil }
-        return await formatKnowledgeGraph(query: query, candidates: candidates,
-                                          chunksInContext: chunksInContext)
+        let outcome = await formatKnowledgeGraph(query: query, candidates: candidates,
+                                                 chunksInContext: chunksInContext)
+        retrieveSeconds = Date().timeIntervalSince(retrieveStarted)
+        outcomeCount = outcome.chunks.count
+        return outcome
     }
 
     /// 三路候选统一走同一个 reranker 精排，并对实体/关系/原文统一做阈值过滤；
@@ -3757,14 +3811,24 @@ public final class RAGEngine {
                              chunks: [(title: String, text: String)]) async -> String {
         guard let condenser = auxCondenser else { return output }
         let condenseStarted = Date()
+        var mapSeconds = 0.0
+        var reduceSeconds = 0.0
+        let ms: (Double) -> String = { String(format: "%.0fms", $0 * 1000) }
         defer {
-            AgentLog.info("[rag] condense 耗时="
-                + String(format: "%.0fms", Date().timeIntervalSince(condenseStarted) * 1000)
-                + "；分片=\(chunks.count), 输入=\(output.count) 字符")
+            let timing = RAGSearchTiming.current
+            timing?.set("condense_map", seconds: mapSeconds)
+            timing?.set("condense_reduce", seconds: reduceSeconds)
+            AgentLog.info("[rag][condense] 耗时="
+                + ms(Date().timeIntervalSince(condenseStarted))
+                + "；map=\(ms(mapSeconds)), reduce=\(ms(reduceSeconds)), "
+                + "分片=\(chunks.count), 输入=\(output.count) 字符")
         }
         guard chunks.count > 1 else {
+            // 单块：只有一次 merge（reduce），无 map。
             let single = output.count <= Self.condenseChapterChars
                 ? output : (chunks.first?.text ?? output)
+            let mergeStarted = Date()
+            defer { reduceSeconds = Date().timeIntervalSince(mergeStarted) }
             if let condensed = await condenser(single, .merge), !condensed.isEmpty {
                 return condensed
             }
@@ -3776,6 +3840,7 @@ public final class RAGEngine {
         // 一旦 map 输出不比输入短，reduce 会多轮膨胀、检索耗时失控。
         var parts: [String] = []
         parts.reserveCapacity(chunks.count)
+        let mapStarted = Date()
         for chunk in chunks {
             let input = "【\(chunk.title)】\n\(chunk.text)"
             // 过短碎片摘要没有压缩价值，还多付一次模型调用，直接保留原文。
@@ -3791,37 +3856,43 @@ public final class RAGEngine {
                 parts.append(input)
             }
         }
+        mapSeconds = Date().timeIntervalSince(mapStarted)
 
-        // reduce：合并去重，必要时多轮分批压缩。
-        var current = parts
-        guard current.count > 1 else { return current[0] }
-        for _ in 0..<Self.condenseMaxRounds {
-            let joined = current.joined(separator: "\n\n")
-            if joined.count <= Self.condenseChapterChars {
-                if let merged = await condenser(joined, .merge), !merged.isEmpty {
-                    return merged
+        // reduce：合并去重，必要时多轮分批压缩。用局部 async 闭包包住主体，
+        // 这样 defer 能统一覆盖内部所有 return 点，不必逐个埋点。
+        let reduceStarted = Date()
+        defer { reduceSeconds = Date().timeIntervalSince(reduceStarted) }
+        return await {
+            var current = parts
+            guard current.count > 1 else { return current[0] }
+            for _ in 0..<Self.condenseMaxRounds {
+                let joined = current.joined(separator: "\n\n")
+                if joined.count <= Self.condenseChapterChars {
+                    if let merged = await condenser(joined, .merge), !merged.isEmpty {
+                        return merged
+                    }
+                    return joined
                 }
-                return joined
-            }
-            var next: [String] = []
-            for batch in Self.splitByLines(joined, limit: Self.condenseChapterChars) {
-                if let merged = await condenser(batch, .merge), !merged.isEmpty {
-                    next.append(merged)
-                } else {
-                    next.append(batch)
+                var next: [String] = []
+                for batch in Self.splitByLines(joined, limit: Self.condenseChapterChars) {
+                    if let merged = await condenser(batch, .merge), !merged.isEmpty {
+                        next.append(merged)
+                    } else {
+                        next.append(batch)
+                    }
+                }
+                // 没有变得更短就停止，避免无效轮次。
+                guard next.count < current.count else { return joined }
+                current = next
+                if current.count == 1 {
+                    if let merged = await condenser(current[0], .merge), !merged.isEmpty {
+                        return merged
+                    }
+                    return current[0]
                 }
             }
-            // 没有变得更短就停止，避免无效轮次。
-            guard next.count < current.count else { return joined }
-            current = next
-            if current.count == 1 {
-                if let merged = await condenser(current[0], .merge), !merged.isEmpty {
-                    return merged
-                }
-                return current[0]
-            }
-        }
-        return current.joined(separator: "\n\n")
+            return current.joined(separator: "\n\n")
+        }()
     }
 
     /// 把命中结果按「文档 / 章节标题」聚成章节，超长章节按行切成 ≤limit 的片。
