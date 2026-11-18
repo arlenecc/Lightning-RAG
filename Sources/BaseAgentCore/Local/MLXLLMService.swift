@@ -64,6 +64,28 @@ public final class MLXLLMService: LLMService, PreloadableLLMService,
     /// prefill 好的前缀；否则并发 prefill 会踩踏 GPU 并让首轮全量重建。
     private let warmupLock = NSLock()
     private var activeWarmup: Task<Void, Error>?
+
+    /// 会话级生成硬屏障：同一 service（同一 KV cache/会话）内，新一轮 prefill
+    /// 必须等上一轮 generation Task 真正退出才能开始。此前只靠"Agent 串行驱动"
+    /// 的注释约定，但取消是协作式的：AppModel.isRunning 在底层 Task 退出前就会
+    /// 重置，新一轮 prefill 与上一轮 decode 可并发踩同一模型数组状态，触发
+    /// MLX "[eval] Attempting to eval an array without a primitive" 崩溃。
+    /// 只在本实例内串行——隔离副本是不同实例，其并发 decode 是设计允许的。
+    private let generationGateLock = NSLock()
+    private var activeGeneration: Task<Void, Never>?
+
+    private func registerGeneration(_ task: Task<Void, Never>) {
+        generationGateLock.lock()
+        activeGeneration = task
+        generationGateLock.unlock()
+    }
+
+    private func waitForPreviousGeneration() async {
+        generationGateLock.lock()
+        let previous = activeGeneration
+        generationGateLock.unlock()
+        _ = await previous?.value
+    }
     /// 请求级 thinking 覆盖用的持久副本（按 thinking 值缓存）。
     /// 旧实现每次 options 调用都新建副本且 `kvReuse=false`：连续 3 次空正文
     /// 重试就是 3 次全量 prefill（4B 模型真机实测约 80s/次）。副本与主服务
@@ -214,6 +236,10 @@ public final class MLXLLMService: LLMService, PreloadableLLMService,
                     if let warmup = self.currentWarmup() {
                         try? await warmup.value
                     }
+                    // 会话级硬屏障：等上一轮的 MLX generation Task 真正退出，再进入
+                    // 本轮 prefill/tokenize。避免取消协作式导致的"旧轮 decode 未退、
+                    // 新轮 prefill 已入"并发踩踏（本次 SIGTRAP 崩溃的根因）。
+                    await self.waitForPreviousGeneration()
                     try Task.checkCancellation()
                     let container = try await state.container(directory: directory)
                     let probe = try await state.templateProbe(
@@ -469,9 +495,16 @@ public final class MLXLLMService: LLMService, PreloadableLLMService,
                         state = nil
                     }
 
-                    let iterator = try TokenIterator(
-                        input: input, model: model, cache: cache, state: state,
-                        parameters: parameters)
+                    // prefill 阶段的 TokenIterator.init 内部走裸 eval()，MLX 底层错误
+                    // （如与上一轮 decode 并发时的 "eval an array without a primitive"）
+                    // 若不经 task-local handler 就会落到全局 fatalError 直接杀进程。
+                    // 用 withError 把这段同步求值包起来，转成可捕获的 Swift 错误，
+                    // 交由下方 catch 统一取消生成/丢弃缓存，而不是崩溃。
+                    let iterator = try withError {
+                        try TokenIterator(
+                            input: input, model: model, cache: cache, state: state,
+                            parameters: parameters)
+                    }
                     let wrapped = StatefulTokenIterator(iterator: iterator)
                     // 预填充后、生成前的状态，供下一次调用接续。
                     rawState = wrapped.state
@@ -489,6 +522,8 @@ public final class MLXLLMService: LLMService, PreloadableLLMService,
                         tools: toolSpecs,
                         toolCallPolicy: parameters.toolCallPolicy)
                     innerTask.task = generationTask
+                    // 登记到会话级屏障：下一轮 prefill 前会 await 它真正退出。
+                    self.registerGeneration(generationTask)
                     // 竞态兜底：外层取消可能发生在生成任务挂载之前。
                     try Task.checkCancellation()
                     AgentLog.info("[mlx-kv] reuse=\(reuseCache || prefixReuse) cached=\(cachedPromptTokens) "

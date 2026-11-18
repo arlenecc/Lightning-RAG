@@ -716,7 +716,7 @@ struct SettingsView: View {
                               + "修改监听范围或端口后需停止再启动才生效。默认仅本机 127.0.0.1:8080")
                         Divider()
                         HStack(spacing: 8) {
-                            Text("检索阅读模式").font(.caption).bold()
+                            Text("极速检索模式").font(.caption).bold()
                             Toggle("启用", isOn: $colbertReaderEnabled)
                                 .toggleStyle(.checkbox)
                             Text("量化残差").font(.caption2).foregroundStyle(.secondary)
