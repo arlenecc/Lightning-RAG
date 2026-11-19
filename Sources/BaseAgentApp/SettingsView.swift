@@ -141,6 +141,15 @@ struct SettingsView: View {
     @State private var colbertLengthNorm = false
     @State private var colbertQueryPrune = true
 
+    // MARK: RAG 模式三选一 + 决策判定
+    @State private var ragMode = "vector"
+    @State private var decisionModelBackend = "mlx-vlm"
+    @State private var decisionModelPath = "models/PKU-KCL-Meteor-0.8B-mlx-int4"
+    @State private var decisionCoarseCandidates = 50
+    @State private var decisionUseCoreSentences = true
+    @State private var decisionCoreSentenceCount = 3
+    @State private var decisionTopN = 5
+
     @State private var statusMessage = ""
 
     private let llmTypes: [(id: String, label: String)] = [
@@ -161,6 +170,7 @@ struct SettingsView: View {
             ScrollView {
                 VStack(alignment: .leading, spacing: 16) {
                     agentSection
+                    directorySection
                     knowledgeSection
                 }
                 .padding(16)
@@ -523,26 +533,20 @@ struct SettingsView: View {
     private var knowledgeSection: some View {
         GroupBox {
             VStack(alignment: .leading, spacing: 12) {
-                // 工作目录行（独立一行）。
+                // RAG 模式三选一：切换即切换检索召回路径。
                 HStack(spacing: 8) {
-                    Text("工作目录").font(.caption)
-                    TextField("~/base-agent-workspace", text: $workspace)
-                        .textFieldStyle(.roundedBorder)
-                    Button("选择…") { chooseDirectory($workspace, title: "选择工作目录") }
+                    Text("RAG模式").font(.caption).bold()
+                    Picker("", selection: $ragMode) {
+                        Text("向量检索模式").tag("vector")
+                        Text("极速检索模式").tag("colbert")
+                        Text("决策判定模式").tag("decision")
+                    }
+                    .pickerStyle(.segmented)
+                    .frame(maxWidth: 320)
+                    Spacer(minLength: 8)
                 }
 
-                // 源目录行：目录选择之后紧跟四个操作按钮（应用配置 / 同步知识 /
-                // 停止同步 / 向量去重），同一行内排列，不再单独成块折行。
-                HStack(spacing: 8) {
-                    Text("源目录").font(.caption)
-                    TextField("留空 = workspace/knowledge_base", text: $knowledgeBase)
-                        .textFieldStyle(.roundedBorder)
-                        .frame(maxWidth: .infinity)
-                    Button("选择…") { chooseDirectory($knowledgeBase, title: "选择源目录") }
-                    knowledgeButtons()
-                    stopAndDedupeButtons()
-                }
-
+                if ragMode == "vector" {
                 // Embedding 行：模型类型 / 本地路径之后紧接切片设置（语义切片 +
                 // 切片大小 + overlap）。优先单行；窗口极窄时把切片设置换到下一行，
                 // 避免控件被裁剪。
@@ -643,6 +647,17 @@ struct SettingsView: View {
                     .font(.caption2)
                     .foregroundStyle(.red)
                 }
+                // 向量库完备状态 + 手动补做（不完备时按钮出现）
+                vectorCompletenessRow
+                } // end if ragMode == vector
+
+                if ragMode == "colbert" {
+                    colbertConfigBlock
+                }
+
+                if ragMode == "decision" {
+                    decisionConfigBlock
+                }
 
                 DisclosureGroup("高级设置", isExpanded: $showAdvanced) {
                     VStack(alignment: .leading, spacing: 10) {
@@ -715,76 +730,6 @@ struct SettingsView: View {
                         .help("把知识库 RAG 能力以 MCP 服务（Streamable HTTP）提供给其它大模型应用；"
                               + "修改监听范围或端口后需停止再启动才生效。默认仅本机 127.0.0.1:8080")
                         Divider()
-                        HStack(spacing: 8) {
-                            Text("极速检索模式").font(.caption).bold()
-                            Toggle("启用", isOn: $colbertReaderEnabled)
-                                .toggleStyle(.checkbox)
-                            Text("量化残差").font(.caption2).foregroundStyle(.secondary)
-                            Picker("", selection: $colbertQuantBits) {
-                                Text("2bit").tag(2)
-                                Text("4bit").tag(4)
-                            }
-                            .labelsHidden()
-                            .frame(width: 70)
-                            Text("粗筛候选").font(.caption2).foregroundStyle(.secondary)
-                            Picker("", selection: $colbertCoarseCandidates) {
-                                Text("10").tag(10)
-                                Text("20").tag(20)
-                                Text("50").tag(50)
-                                Text("100").tag(100)
-                            }
-                            .labelsHidden()
-                            .frame(width: 64)
-                            Text("精选topN").font(.caption2).foregroundStyle(.secondary)
-                            Picker("", selection: $colbertTopN) {
-                                Text("1").tag(1)
-                                Text("3").tag(3)
-                                Text("5").tag(5)
-                            }
-                            .labelsHidden()
-                            .frame(width: 56)
-                            Toggle("使用ANN", isOn: $colbertUseANN)
-                                .toggleStyle(.checkbox)
-                            Toggle("长度归一化", isOn: $colbertLengthNorm)
-                                .toggleStyle(.checkbox)
-                                .help("MaxSim 精排按分片长度归一化，抑制长片碾压短片。"
-                                      + "默认关闭（原始 sum-of-max）：归一化有副作用，"
-                                      + "开启可对比效果；此为检索期参数，切换无需重建索引。")
-                            Text("查询侧剪枝").font(.caption2).foregroundStyle(.secondary)
-                            Picker("", selection: $colbertQueryPrune) {
-                                Text("轻量").tag(true)
-                                Text("不剪枝").tag(false)
-                            }
-                            .labelsHidden()
-                            .frame(width: 70)
-                            .help("查询侧 token 剪枝：默认「轻量」只丢标点/空白/功能词，"
-                                  + "保留疑问词与形容词；选「不剪枝」则查询侧 token 全部保留。"
-                                  + "检索期参数，切换无需重建索引。")
-                            Button(model.isBuildingColbertANN ? "索引构建中…" : "构建/续建向量索引") {
-                                model.requestColbertANNBuild()
-                            }
-                            .disabled(model.isBuildingColbertANN || model.isSyncing)
-                            if model.isBuildingColbertANN {
-                                Button("停止") { model.stopColbertANNBuild() }
-                                    .help("停止构建：已写块保留，下次构建从断点续建")
-                            }
-                            Spacer(minLength: 8)
-                        }
-                        .help("启用后旁路接管文档解析→markdown 之后的切片/embedding/入库/检索/精排全流程，"
-                              + "改用 ColBERT 大分片多向量检索。得分最高的 1 条分片进入模型上下文供总结，"
-                              + "其余召回分片作为引用气泡附在回复后供点击阅读，并可切换前后切片。"
-                              + "所需模型自动从 hf-mirror.com 下载。")
-                        HStack(spacing: 8) {
-                            Text("模型").font(.caption2).foregroundStyle(.secondary)
-                            Text("arlenecc/jina-colbert-v2-64-onnx-int8")
-                                .font(.caption2).foregroundStyle(.secondary)
-                                .textSelection(.enabled)
-                            if !model.colbertIndexSummary.isEmpty {
-                                Text(model.colbertIndexSummary)
-                                    .font(.caption2).foregroundStyle(.secondary)
-                            }
-                            Spacer(minLength: 8)
-                        }
                         HStack(spacing: 8) {
                             Text("自定义OCR模型").font(.caption)
                             Picker("", selection: $vlmBackend) {
@@ -954,7 +899,149 @@ struct SettingsView: View {
             }
             .padding(8)
         } label: {
-            Text("知识同步配置").font(.headline)
+            Text("RAG模式配置").font(.headline)
+        }
+    }
+
+    // MARK: - 工作目录配置区
+    private var directorySection: some View {
+        GroupBox {
+            VStack(alignment: .leading, spacing: 10) {
+                HStack(spacing: 8) {
+                    Text("工作目录").font(.caption)
+                    TextField("~/base-agent-workspace", text: $workspace)
+                        .textFieldStyle(.roundedBorder)
+                    Button("选择…") { chooseDirectory($workspace, title: "选择工作目录") }
+                }
+                HStack(spacing: 8) {
+                    Text("源目录").font(.caption)
+                    TextField("留空 = workspace/knowledge_base", text: $knowledgeBase)
+                        .textFieldStyle(.roundedBorder)
+                        .frame(maxWidth: .infinity)
+                    Button("选择…") { chooseDirectory($knowledgeBase, title: "选择源目录") }
+                    knowledgeButtons()
+                    stopAndDedupeButtons()
+                }
+            }
+            .padding(8)
+        } label: {
+            Text("工作目录配置").font(.headline)
+        }
+    }
+
+    // MARK: - 极速检索模式配置（原在高级设置）
+    private var colbertConfigBlock: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 8) {
+                Text("量化残差").font(.caption2).foregroundStyle(.secondary)
+                Picker("", selection: $colbertQuantBits) {
+                    Text("2bit").tag(2); Text("4bit").tag(4)
+                }
+                .labelsHidden().frame(width: 70)
+                Text("粗筛候选").font(.caption2).foregroundStyle(.secondary)
+                Picker("", selection: $colbertCoarseCandidates) {
+                    Text("10").tag(10); Text("20").tag(20)
+                    Text("50").tag(50); Text("100").tag(100)
+                }
+                .labelsHidden().frame(width: 64)
+                Text("精选topN").font(.caption2).foregroundStyle(.secondary)
+                Picker("", selection: $colbertTopN) {
+                    Text("1").tag(1); Text("3").tag(3); Text("5").tag(5)
+                }
+                .labelsHidden().frame(width: 56)
+                Toggle("使用ANN", isOn: $colbertUseANN).toggleStyle(.checkbox)
+                Toggle("长度归一化", isOn: $colbertLengthNorm).toggleStyle(.checkbox)
+                Text("查询侧剪枝").font(.caption2).foregroundStyle(.secondary)
+                Picker("", selection: $colbertQueryPrune) {
+                    Text("轻量").tag(true); Text("不剪枝").tag(false)
+                }
+                .labelsHidden().frame(width: 70)
+                Spacer(minLength: 8)
+            }
+            HStack(spacing: 8) {
+                Button(model.isBuildingColbertANN ? "索引构建中…" : "构建/续建向量索引") {
+                    model.requestColbertANNBuild()
+                }
+                .disabled(model.isBuildingColbertANN || model.isSyncing)
+                if model.isBuildingColbertANN {
+                    Button("停止") { model.stopColbertANNBuild() }
+                }
+                Text("模型 arlenecc/jina-colbert-v2-64-onnx-int8")
+                    .font(.caption2).foregroundStyle(.secondary)
+                if !model.colbertIndexSummary.isEmpty {
+                    Text(model.colbertIndexSummary).font(.caption2).foregroundStyle(.secondary)
+                }
+                Spacer(minLength: 8)
+            }
+            // ColBERT 编码完备状态 + 手动补做（不完备时按钮出现）
+            vectorCompletenessRow
+        }
+    }
+
+    // MARK: - 决策判定模式配置
+    private var decisionConfigBlock: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 8) {
+                Text("决策模型").font(.caption)
+                Picker("", selection: $decisionModelBackend) {
+                    Text("MLX-LM").tag("mlx-lm")
+                    Text("MLX-VLM").tag("mlx-vlm")
+                    Text("GGUF").tag("gguf")
+                }
+                .labelsHidden().frame(width: 110)
+                TextField("模型路径", text: $decisionModelPath)
+                    .textFieldStyle(.roundedBorder)
+                Button("选择…") { chooseDirectory($decisionModelPath, title: "选择决策模型目录") }
+            }
+            HStack(spacing: 8) {
+                Text("粗筛数量").font(.caption)
+                Picker("", selection: $decisionCoarseCandidates) {
+                    Text("20").tag(20); Text("50").tag(50); Text("100").tag(100)
+                }
+                .labelsHidden().frame(width: 80)
+                Toggle("使用核心句判定", isOn: $decisionUseCoreSentences)
+                    .toggleStyle(.checkbox)
+                Text("核心句数").font(.caption2).foregroundStyle(.secondary)
+                Picker("", selection: $decisionCoreSentenceCount) {
+                    Text("3").tag(3); Text("5").tag(5)
+                }
+                .labelsHidden().frame(width: 56)
+                .disabled(!decisionUseCoreSentences)
+                Text("判定返回TopN").font(.caption2).foregroundStyle(.secondary)
+                Picker("", selection: $decisionTopN) {
+                    Text("3").tag(3); Text("5").tag(5); Text("10").tag(10)
+                }
+                .labelsHidden().frame(width: 64)
+                Spacer(minLength: 8)
+            }
+            Text("先用字符级 BM25 从原文切片抽取核心句，再由决策模型对粗筛切片逐一判定相关性，返回得分最高的 TopN。")
+                .font(.caption2).foregroundStyle(.secondary)
+            if decisionModelBackend != "mlx-vlm" {
+                Text("提示：PKU-KCL-Meteor 目前仅支持 MLX-VLM 后端；当前所选后端暂未实现，将回退到 MLX-VLM 加载。")
+                    .font(.caption2).foregroundStyle(.orange)
+            }
+        }
+    }
+
+    /// 向量库完备状态行：向量/极速模式共用。不完备时显示「补做向量」按钮。
+    @ViewBuilder
+    private var vectorCompletenessRow: some View {
+        if !model.vectorCompletenessText.isEmpty {
+            HStack(spacing: 8) {
+                Text(model.vectorCompletenessText)
+                    .font(.caption2)
+                    .foregroundStyle(model.vectorIsComplete ? Color.secondary : Color.orange)
+                    .lineLimit(2)
+                // 库不可用（total<0）时按钮无效，不展示——避免反复点击浪费 3 秒并给出误导成功提示。
+                if !model.vectorIsComplete && !model.vectorCompletenessText.contains("不可用") {
+                    Button(model.isBackfillingVectors ? "补做中…" : "补做向量") {
+                        model.requestVectorBackfill()
+                    }
+                    .disabled(model.isBackfillingVectors || model.isSyncing)
+                    .help("把尚未计算向量的切片入队，后台异步补齐；补齐前这些切片仍可被全文检索命中")
+                }
+                Spacer(minLength: 8)
+            }
         }
     }
 
@@ -1523,6 +1610,13 @@ struct SettingsView: View {
         colbertUseANN = config.colbertUseANN
         colbertLengthNorm = config.colbertLengthNorm
         colbertQueryPrune = config.colbertQueryPrune
+        ragMode = config.ragMode
+        decisionModelBackend = config.decisionModelBackend
+        decisionModelPath = config.decisionModelPath
+        decisionCoarseCandidates = config.decisionCoarseCandidates
+        decisionUseCoreSentences = config.decisionUseCoreSentences
+        decisionCoreSentenceCount = config.decisionCoreSentenceCount
+        decisionTopN = config.decisionTopN
         retrievalStrategy = config.ragRetrievalStrategy
         refreshEmbeddingLimit()
     }
@@ -1863,7 +1957,17 @@ struct SettingsView: View {
                                                     config.ragEmbeddingTokenBudgetMax)
         config.ragEmbeddingTokenBudgetStep = min(max(128, embeddingTokenBudgetStep), 8_192)
         config.ragVerifyFingerprint = verifyFingerprint
-        config.colbertReaderEnabled = colbertReaderEnabled
+        config.ragMode = ["vector", "colbert", "decision"].contains(ragMode) ? ragMode : "vector"
+        config.colbertReaderEnabled = (config.ragMode == "colbert")
+        config.decisionModelBackend = ["mlx-lm", "mlx-vlm", "gguf"].contains(decisionModelBackend)
+            ? decisionModelBackend : "mlx-vlm"
+        config.decisionModelPath = decisionModelPath.trimmingCharacters(in: .whitespacesAndNewlines)
+        config.decisionCoarseCandidates = [20, 50, 100].contains(decisionCoarseCandidates)
+            ? decisionCoarseCandidates : 50
+        config.decisionUseCoreSentences = decisionUseCoreSentences
+        config.decisionCoreSentenceCount = [3, 5].contains(decisionCoreSentenceCount)
+            ? decisionCoreSentenceCount : 3
+        config.decisionTopN = [3, 5, 10].contains(decisionTopN) ? decisionTopN : 5
         config.colbertQuantBits = colbertQuantBits == 2 ? 2 : 4
         config.colbertCoarseCandidates = [10, 20, 50, 100].contains(colbertCoarseCandidates)
             ? colbertCoarseCandidates : 50

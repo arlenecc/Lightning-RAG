@@ -60,7 +60,7 @@ final class SearchEngine {
             // 上层同步面板会显示切片数为 0，提示用户重新同步。
             try ANNIndex(db: db).drop()
             for table in ["document", "document_fts", "doc_summary_vec",
-                          "doc_vectors", "doc_residuals"] {
+                          "doc_vectors", "doc_residuals", "pending_colbert"] {
                 try db.execute("DROP TABLE IF EXISTS \(table)")
             }
             try createTables(db)
@@ -91,6 +91,32 @@ final class SearchEngine {
                 .first?["n"]?.intValue) ?? 0
             Self.setMeta(db, "doc_rowid_seq", String(maxID))
         }
+        // 旧库兼容：pending_colbert 新增 created_at 列（退避重试用）。
+        let hasCreatedAt = (try? db.query("PRAGMA table_info(pending_colbert)")
+            .contains { $0["name"]?.stringValue == "created_at" }) ?? true
+        if !hasCreatedAt {
+            try? db.execute("ALTER TABLE pending_colbert ADD COLUMN created_at REAL NOT NULL DEFAULT 0")
+            try? db.execute("CREATE INDEX IF NOT EXISTS idx_pending_colbert_time ON pending_colbert(created_at)")
+        }
+    }
+
+    /// 显式重建 ColBERT 库（用户点「重建向量库」时在极速模式调用）：
+    /// 清掉全部切片/向量/pending/ANN，重建空表。返回被清掉的切片数。
+    static func rebuildDatabase(_ db: SQLiteDB) throws -> Int {
+        let removed = try totalChunkCount(db)
+        try ANNIndex(db: db).drop()
+        try db.transaction {
+            for table in ["document", "document_fts", "doc_summary_vec",
+                          "doc_vectors", "doc_residuals", "pending_colbert"] {
+                try db.execute("DROP TABLE IF EXISTS \(table)")
+            }
+        }
+        try createTables(db)
+        try ANNIndex(db: db).createSchema()
+        setMeta(db, "doc_count", "0")
+        setMeta(db, "doc_rowid_seq", "0")
+        setMeta(db, "vec_dim", String(ColBERT.dimension))
+        return removed
     }
 
     /// 全部数据表（document/document_fts/doc_summary_vec/doc_vectors/doc_residuals）。
@@ -138,6 +164,18 @@ final class SearchEngine {
             offset REAL NOT NULL,
             residual_blob BLOB NOT NULL
         );
+        -- 异步 ColBERT 编码回填队列：document 正文先行入库，残差/向量由后台补齐。
+        CREATE TABLE IF NOT EXISTS pending_colbert (
+            doc_id TEXT PRIMARY KEY,
+            rowid INTEGER NOT NULL,
+            title TEXT NOT NULL DEFAULT '',
+            source TEXT NOT NULL DEFAULT '',
+            content TEXT NOT NULL,
+            bits INTEGER NOT NULL DEFAULT 4,
+            created_at REAL NOT NULL DEFAULT 0
+        );
+        CREATE INDEX IF NOT EXISTS idx_pending_colbert_rowid ON pending_colbert(rowid);
+        CREATE INDEX IF NOT EXISTS idx_pending_colbert_time ON pending_colbert(created_at);
         """)
     }
 
@@ -195,7 +233,7 @@ final class SearchEngine {
             base = (base as NSString).deletingPathExtension
         }
         if base.isEmpty { base = "doc" }
-        let sourceID = sourceKey ?? (base + "-" + hash8(text))
+        let sourceID = sourceKey ?? (base + "-" + Self.hash8(text))
         let docTitle = title ?? base
         let addStarted = Date()
         // 边界优先落在语义低谷（相邻句向量余弦最低处），模型不可用时
@@ -296,6 +334,129 @@ final class SearchEngine {
         return added
     }
 
+    // MARK: - 异步 ColBERT 编码回填（正文先入库，向量后台补齐）
+
+    /// 待回填编码的切片数。
+    public func pendingEncodeCount() -> Int {
+        Int((try? db.query("SELECT COUNT(*) AS n FROM pending_colbert")
+            .first?["n"]?.intValue) ?? 0)
+    }
+
+    /// 只写正文 + FTS + pending 队列，不编码/写向量。供同步时「文本入库即完成」。
+    /// 静态方法：不依赖 ColBERT 模型/实例，模型未下载时也能入库。
+    /// rowid 序号在写事务内读取并递增（SQLite 写事务互斥），避免并发 worker 冲突。
+    @discardableResult
+    static func addMarkdownTextsOnly(
+        _ db: SQLiteDB, text: String, source: String, title: String? = nil,
+        bits: Int = 4, sourceKey: String? = nil, options: ChunkOptions = ChunkOptions(),
+        similarity: (([String]) -> [Double]?)? = nil,
+        shouldCancel: (() -> Bool)? = nil
+    ) throws -> Int {
+        var base = (source as NSString).lastPathComponent
+        if !base.isEmpty { base = (base as NSString).deletingPathExtension }
+        if base.isEmpty { base = "doc" }
+        let sourceID = sourceKey ?? (base + "-" + hash8(text))
+        let docTitle = title ?? base
+        let chunks = try Chunker.split(text, sourceName: docTitle,
+                                       similarity: similarity, options: options)
+        guard !chunks.isEmpty else { throw DocSearchError.chunking("没有产生任何切片") }
+        if shouldCancel?() == true { throw CancellationError() }
+        var added = 0
+        try db.transaction {
+            let removed = try Self.deleteChunks(db, sourceID)
+            let previous = Int(Self.meta(db, "doc_count") ?? "") ?? 0
+            Self.setMeta(db, "doc_count", String(max(0, previous - removed)))
+            // rowid 序号必须在事务内读取：并发 worker 的写事务互斥，事务内读到的
+            // 是已提交的最新值，避免多文件同时入库分配相同 rowid。
+            var rowSeq = Int64(Self.meta(db, "doc_rowid_seq") ?? "") ?? 0
+            for (i, chunk) in chunks.enumerated() {
+                let id = String(format: "%@#%04d", sourceID, i)
+                rowSeq += 1
+                // source 列统一存原始来源路径（供删除/计数按 source 兜底），
+                // 不能存 docTitle（相对文件名）——否则与上层传入的原始 source 不匹配，
+                // 按 doc_id 前缀（哈希）删不到时会连兜底也失效，孤儿永久残留。
+                try db.execute("INSERT INTO document(rowid,doc_id,title,source,content) VALUES(?,?,?,?,?)",
+                               [.int(rowSeq), .text(id), .text(chunk.title),
+                                .text(source), .text(chunk.content)])
+                try db.execute("INSERT INTO document_fts(doc_id,title_tokens,content_tokens) VALUES(?,?,?)",
+                               [.text(id), .text(TextAnalysis.ftsIndexText(chunk.title)),
+                                .text(TextAnalysis.ftsIndexText(chunk.content))])
+                try db.execute("""
+                    INSERT OR REPLACE INTO pending_colbert(doc_id,rowid,title,source,content,bits)
+                    VALUES(?,?,?,?,?,?)
+                    """, [.text(id), .int(rowSeq), .text(chunk.title),
+                          .text(source), .text(chunk.content), .int(Int64(bits))])
+                added += 1
+            }
+            let previousAfterDelete = Int(Self.meta(db, "doc_count") ?? "") ?? 0
+            Self.setMeta(db, "doc_count", String(previousAfterDelete + added))
+            Self.setMeta(db, "doc_rowid_seq", String(rowSeq))
+        }
+        return added
+    }
+
+    /// 取一批待回填切片的正文（供后台编码）。
+    func nextPendingEncode(limit: Int) -> [(docID: String, rowid: Int64, title: String,
+                                            source: String, content: String, bits: Int)] {
+        let rows = (try? db.query("""
+            SELECT doc_id, rowid, title, source, content, bits
+            FROM pending_colbert
+            WHERE created_at <= ?
+            ORDER BY created_at, rowid LIMIT ?
+            """, [.double(Date().timeIntervalSince1970),
+                  .int(Int64(max(1, limit)))])) ?? []
+        return rows.compactMap { row in
+            guard let id = row["doc_id"]?.stringValue,
+                  let rid = row["rowid"]?.intValue,
+                  let content = row["content"]?.stringValue else { return nil }
+            return (id, rid, row["title"]?.stringValue ?? "",
+                    row["source"]?.stringValue ?? "", content,
+                    Int(row["bits"]?.intValue ?? 4))
+        }
+    }
+
+    /// 编码失败后退避重试：把 pending 的 created_at 推后，按时间排序时排到队尾。
+    /// 既不永久丢弃（临时模型/DB 错误可恢复），也不让坏记录每批占队首。
+    func retryPending(docID: String, backoffSeconds: Double = 2) throws {
+        let retryAt = Date().timeIntervalSince1970 + backoffSeconds
+        try db.execute("UPDATE pending_colbert SET created_at = ? WHERE doc_id = ?",
+                       [.double(retryAt), .text(docID)])
+    }
+
+    /// 整段被剪枝为空（无有效向量）时移除该幽灵切片：正文/FTS/pending/d_count
+    /// 一起清掉——它不产生向量，留在库里只会计入切片数却永远无法被检索命中。
+    func dropPendingGhost(docID: String, rowid: Int64) throws {
+        try db.transaction {
+            try db.execute("DELETE FROM document WHERE doc_id = ?", [.text(docID)])
+            try db.execute("DELETE FROM document_fts WHERE doc_id = ?", [.text(docID)])
+            try db.execute("DELETE FROM doc_residuals WHERE doc_id = ?", [.text(docID)])
+            try db.execute("DELETE FROM doc_summary_vec WHERE rowid = ?", [.int(rowid)])
+            try db.execute("DELETE FROM doc_vectors WHERE rowid = ?", [.int(rowid)])
+            try db.execute("DELETE FROM pending_colbert WHERE doc_id = ?", [.text(docID)])
+            let previous = Int(Self.meta(db, "doc_count") ?? "") ?? 0
+            Self.setMeta(db, "doc_count", String(max(0, previous - 1)))
+        }
+    }
+
+    /// 写入一条编码结果（三张向量表）并从 pending 出队。幂等：先删同 rowid/doc_id 旧行。
+    func fillPendingEncode(docID: String, rowid: Int64, record: ResidualRecord) throws {
+        try db.transaction {
+            try db.execute("DELETE FROM doc_summary_vec WHERE rowid = ?", [.int(rowid)])
+            try db.execute("DELETE FROM doc_vectors WHERE rowid = ?", [.int(rowid)])
+            try db.execute("INSERT INTO doc_summary_vec(rowid,embedding) VALUES(?,?)",
+                           [.int(rowid), .floats(record.center)])
+            try db.execute("INSERT INTO doc_vectors(rowid,embedding) VALUES(?,?)",
+                           [.int(rowid), .floats(record.center)])
+            try db.execute("""
+                INSERT OR REPLACE INTO doc_residuals(doc_id,token_count,dim,quant_bits,scale,offset,residual_blob)
+                VALUES(?,?,?,?,?,?,?)
+                """, [.text(docID), .int(Int64(record.tokenCount)), .int(Int64(record.dim)),
+                      .int(Int64(record.bits)), .double(Double(record.scale)),
+                      .double(Double(record.offset)), .blob(record.blob)])
+            try db.execute("DELETE FROM pending_colbert WHERE doc_id = ?", [.text(docID)])
+        }
+    }
+
     // MARK: - 按来源删除 / 计数
 
     /// 按稳定前缀删除某来源的全部切片（不开事务，调用方负责包裹）。
@@ -328,6 +489,7 @@ final class SearchEngine {
             try db.execute("DELETE FROM document WHERE doc_id = ?", [.text(id)])
             try db.execute("DELETE FROM document_fts WHERE doc_id = ?", [.text(id)])
             try db.execute("DELETE FROM doc_residuals WHERE doc_id = ?", [.text(id)])
+            try db.execute("DELETE FROM pending_colbert WHERE doc_id = ?", [.text(id)])
             removed += 1
         }
         try ann.recordStale(rowIDs: staleIDs)
@@ -374,6 +536,18 @@ final class SearchEngine {
     static func totalChunkCount(_ db: SQLiteDB) throws -> Int {
         let rows = try db.query("SELECT COUNT(*) AS n FROM document")
         return Int(rows.first?["n"]?.intValue ?? 0)
+    }
+
+    /// 已编码（有残差向量）的切片数（不依赖模型加载）。
+    static func encodedChunkCount(_ db: SQLiteDB) throws -> Int {
+        let rows = try db.query("SELECT COUNT(*) AS n FROM doc_residuals")
+        return Int(rows.first?["n"]?.intValue ?? 0)
+    }
+
+    /// 待编码队列长度（不依赖模型加载）。
+    static func pendingEncodeCount(_ db: SQLiteDB) -> Int {
+        Int((try? db.query("SELECT COUNT(*) AS n FROM pending_colbert")
+            .first?["n"]?.intValue) ?? 0)
     }
 
     // MARK: - 检索
@@ -527,8 +701,7 @@ final class SearchEngine {
         loadTotal += Date().timeIntervalSince(itemStart)
         for candidate in shortlist {
             itemStart = Date()
-            guard let record = shortlistData.residuals[candidate.docID],
-                  let meta = shortlistData.metas[candidate.docID] else { continue }
+            guard let meta = shortlistData.metas[candidate.docID] else { continue }
             // 来源过滤：匹配文件名/相对路径或章节标题，向后兼容未单独建索引的旧库。
             if let source, !source.isEmpty,
                !meta.source.localizedCaseInsensitiveContains(source),
@@ -536,9 +709,25 @@ final class SearchEngine {
                 continue
             }
             loadTotal += Date().timeIntervalSince(itemStart)
+            guard let record = shortlistData.residuals[candidate.docID] else {
+                // 正文已入库但 ColBERT 编码尚未回填：用 BM25 命中做一个兜底分数，
+                // 让未回填切片仍能被关键词检索到（排在已回填的 MaxSim 结果之后）。
+                // 无 BM25 命中（仅来自向量粗筛却缺残差）则跳过。
+                if candidate.bm25Rank != nil {
+                    let fallbackScore = Float(1.0 / (60.0 + Double(candidate.bm25Rank ?? 999)))
+                    hits.append(SearchHit(docID: candidate.docID, title: meta.title,
+                                          source: meta.source, content: meta.content,
+                                          score: fallbackScore, vectorRank: nil,
+                                          bm25Rank: candidate.bm25Rank, rrf: candidate.rrf))
+                }
+                continue
+            }
             itemStart = Date()
-            let score = try ResidualCodec.maxSim(query: queryTokens, record: record,
-                                                  normalizeLength: lengthNorm)
+            // 单条残差损坏（blob 截断/维度不符）只丢弃该候选，不让整次检索失败。
+            guard let score = try? ResidualCodec.maxSim(query: queryTokens, record: record,
+                                                        normalizeLength: lengthNorm) else {
+                continue
+            }
             maxsimTotal += Date().timeIntervalSince(itemStart)
             hits.append(SearchHit(docID: candidate.docID, title: meta.title,
                                   source: meta.source, content: meta.content,
@@ -711,7 +900,7 @@ final class SearchEngine {
         return data.withUnsafeBytes { Array($0.bindMemory(to: Float16.self)) }
     }
 
-    private func hash8(_ text: String) -> String {
+    private static func hash8(_ text: String) -> String {
         var hash: UInt64 = 0xcbf29ce484222325
         for byte in text.utf8 {
             hash ^= UInt64(byte)

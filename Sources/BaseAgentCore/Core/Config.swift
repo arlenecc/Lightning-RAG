@@ -365,6 +365,28 @@ public struct AgentConfig: Sendable {
     /// 检索阅读模式使用的模型仓库名（自动从 hf-mirror.com 下载）。
     public var colbertModel: String = "arlenecc/jina-colbert-v2-64-onnx-int8"
 
+    // MARK: RAG 模式三选一 + 决策判定模式
+    /// 检索召回模式：vector（向量检索）/ colbert（极速检索）/ decision（决策判定）。
+    /// 默认 vector；旧配置用 colbertReaderEnabled，migrate 时据此转换。
+    public var ragMode: String = "vector"
+    /// 决策模型后端：mlx-lm / mlx-vlm / gguf。
+    public var decisionModelBackend: String = "mlx-vlm"
+    /// 决策模型目录（相对 workspace 或绝对路径）。
+    public var decisionModelPath: String = "models/PKU-KCL-Meteor-0.8B-mlx-int4"
+    /// BM25 粗筛候选数（20/50/100，默认 50）。
+    public var decisionCoarseCandidates: Int = 50
+    /// 是否用字符级 BM25 核心句代表切片参与判定。
+    public var decisionUseCoreSentences: Bool = true
+    /// 每个切片取的核心句数（3/5，默认 3）。
+    public var decisionCoreSentenceCount: Int = 3
+    /// 判定返回的相关切片数（3/5/10，默认 5）。
+    public var decisionTopN: Int = 5
+
+    /// 当前是否启用极速检索（兼容旧字段与三选一模式）。
+    public var isColbertMode: Bool { ragMode == "colbert" }
+    /// 当前是否启用决策判定模式。
+    public var isDecisionMode: Bool { ragMode == "decision" }
+
     // SQLite + sqlite-vec 存储
     /// 预留（当前固定 sqlite）：migrate() 会把非 "sqlite" 的配置强制归一，
     /// 生产检索只由 ragSQLiteVecEnabled / elementType 决定存储形态。
@@ -664,6 +686,19 @@ public struct AgentConfig: Sendable {
             ragIngestConcurrency = min(max(1, v), 10)
         }
         if let v = bool("rag_verify_fingerprint") { ragVerifyFingerprint = v }
+        if let v = string("rag_mode") { ragMode = v }
+        if let v = string("decision_model_backend") { decisionModelBackend = v }
+        if let v = string("decision_model_path") { decisionModelPath = v }
+        if let v = int("decision_coarse_candidates") {
+            decisionCoarseCandidates = [20, 50, 100].contains(v) ? v : 50
+        }
+        if let v = bool("decision_use_core_sentences") { decisionUseCoreSentences = v }
+        if let v = int("decision_core_sentence_count") {
+            decisionCoreSentenceCount = [3, 5].contains(v) ? v : 3
+        }
+        if let v = int("decision_top_n") {
+            decisionTopN = [3, 5, 10].contains(v) ? v : 5
+        }
         if let v = bool("colbert_reader_enabled") { colbertReaderEnabled = v }
         if let v = int("colbert_quant_bits") {
             colbertQuantBits = (v == 2) ? 2 : 4
@@ -870,6 +905,21 @@ public struct AgentConfig: Sendable {
 
     /// 旧版本配置迁移（docling/marker → ovis、旧 embedding/reranker 名）。
     public mutating func migrate() {
+        // RAG 模式三选一：旧配置只有 colbert_reader_enabled，迁移到 ragMode。
+        // 新配置若显式给了合法 rag_mode 则以它为准；否则按旧布尔字段推导。
+        let validModes: Set<String> = ["vector", "colbert", "decision"]
+        if !validModes.contains(ragMode) {
+            ragMode = colbertReaderEnabled ? "colbert" : "vector"
+        }
+        // 保持 colbertReaderEnabled 与 ragMode 一致（供旧代码路径兼容）。
+        colbertReaderEnabled = (ragMode == "colbert")
+        // 决策判定字段收口到合法档位。
+        if !["mlx-lm", "mlx-vlm", "gguf"].contains(decisionModelBackend) {
+            decisionModelBackend = "mlx-vlm"
+        }
+        if ![20, 50, 100].contains(decisionCoarseCandidates) { decisionCoarseCandidates = 50 }
+        if ![3, 5].contains(decisionCoreSentenceCount) { decisionCoreSentenceCount = 3 }
+        if ![3, 5, 10].contains(decisionTopN) { decisionTopN = 5 }
         // rerank 候选池倍数：手改配置可能越界，统一收口到 1...5，
         // 避免一次把上百条切片送进 ONNX。
         ragRerankCandidateMultiplier = max(1, min(5, ragRerankCandidateMultiplier))
@@ -1096,6 +1146,13 @@ public struct AgentConfig: Sendable {
             "rag_semantic_chunking": ragSemanticChunking,
             "rag_ingest_concurrency": ragIngestConcurrency,
             "rag_verify_fingerprint": ragVerifyFingerprint,
+            "rag_mode": ragMode,
+            "decision_model_backend": decisionModelBackend,
+            "decision_model_path": decisionModelPath,
+            "decision_coarse_candidates": decisionCoarseCandidates,
+            "decision_use_core_sentences": decisionUseCoreSentences,
+            "decision_core_sentence_count": decisionCoreSentenceCount,
+            "decision_top_n": decisionTopN,
             "colbert_reader_enabled": colbertReaderEnabled,
             "colbert_quant_bits": colbertQuantBits,
             "colbert_coarse_candidates": colbertCoarseCandidates,

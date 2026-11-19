@@ -50,7 +50,7 @@ scripts/package-app.sh release && scripts/package-dmg.sh
 只产出单一形态：应用本体不含任何内置模型，potion 语义切片 / jina embedding /
 jina reranker 均在首次启动时从 hf-mirror 自动下载；主模型、辅助模型与 OCR 需在
 配置中指定本地模型路径。按「打包 App → 打包 DMG」顺序构建，产物为
-`dist/Lightning-RAG-1.3.31.dmg`（约 40MB）。版本号可通过 `VERSION` 环境变量或
+`dist/Lightning-RAG-1.4.0.dmg`（约 40MB）。版本号可通过 `VERSION` 环境变量或
 `package-dmg.sh` 的参数覆盖。
 
 测试覆盖（当前 1000+ 个 XCTest；真实模型 E2E 在本地权重存在时随每次测试自动运行，缺少权重或需要外网/GGUF 等环境的用例会跳过）：sqlite-vec 事务写入/回滚、两段式 KNN、二值签名编码与 LSB-first 位打包、
@@ -117,7 +117,9 @@ HTML 与 Office 解析另有专项覆盖：HTML 保存页的本地 iframe / fram
 
 **自定义 system prompt**：首次启动会在 `<workspace>/assets/system_prompt.txt` 写出内置的 `BASE_SYSTEM_PROMPT`；之后每次启动读取该文件并替换内置提示词，可直接用文本编辑器调整模型行为规则，**重启（或重新应用配置）后生效**（会话期间保持不变，以免 system 前缀抖动使 KV cache 反复重建）。文件内容空白或不可读时本次回退内置提示词，且不会覆盖文件。它替换的是协议主体，L0 META-SOP 与 L1 全局索引仍按多级记忆机制追加在其后；轻量轮（纯寒暄/能力问询）使用内核的极简提示，不受该文件影响。内置提示词中的 `<summary>` 标签、`rag_tools(op="outline")` 起手式、工具状态词等是内核回注与测试的硬依赖，建议在原文基础上调整，不要整段删除。
 
-**v1.3.31（当前）**：MLX 生成并发崩溃修复与 UI 调整。**崩溃修复**：新增会话级生成硬屏障，新一轮 prefill 前等待上一轮 generation Task 真正退出，消除「prefill 与 decode 并发踩同一模型数组状态」触发的 `[eval] Attempting to eval an array without a primitive` SIGTRAP 崩溃；prefill 的 `TokenIterator` 构造包进 `withError`，MLX 底层错误转成可捕获的 Swift 错误（取消生成→等退出→裁/弃 KV），不再走全局 `fatalError` 杀进程，全局 fatal handler 保留为未覆盖路径的最后防线。**UI**：配置窗口「检索阅读模式」标签改名为「极速检索模式」。
+**v1.4.0（当前）**：RAG 三模式重构与全流程加固。**新检索模式**：新增第三种「决策判定模式」——用 PKU-KCL-Meteor 决策模型（VLM 加载 + readout hidden 打分，支持批量前向）对 BM25 粗筛切片做相关性判定；字符级 3-gram BM25（K1=1.6、b=0.4）抽取核心句代表切片；配置窗口新增「工作目录配置区」，「知识同步配置」改名「RAG模式配置」，向量/极速/决策三选一，各模式显示对应配置项。**异步向量化**：三种模式同步时切片正文先行入库（FTS 立即可检索），embedding/ColBERT 编码由后台异步补齐；进度落库、App 重启续做、向量模式自动补齐；完备状态展示与「补做向量」手动触发。**模式切换**：manifest 按切片存储归属分组（向量/决策共用、极速独立），模式切换互不触发全量重建，仅源目录切换重建、内容变化走增量。**全流程加固**：重建向量库按模式清对库；回填失败退避重试；停止同步停后台任务；ANN 构建等回填完成；决策模式解耦 embedding；修复极速模式 source 身份、单条失败阻塞、状态刷新、完备态误报等一批缺陷；166 项相关测试全过。
+
+**v1.3.31**：MLX 生成并发崩溃修复与 UI 调整。**崩溃修复**：新增会话级生成硬屏障，新一轮 prefill 前等待上一轮 generation Task 真正退出，消除「prefill 与 decode 并发踩同一模型数组状态」触发的 `[eval] Attempting to eval an array without a primitive` SIGTRAP 崩溃；prefill 的 `TokenIterator` 构造包进 `withError`，MLX 底层错误转成可捕获的 Swift 错误（取消生成→等退出→裁/弃 KV），不再走全局 `fatalError` 杀进程，全局 fatal handler 保留为未覆盖路径的最后防线。**UI**：配置窗口「检索阅读模式」标签改名为「极速检索模式」。
 
 **v1.3.30**：检索阅读模式专项加固与切片调整。**元数据**：目录/章节摘要/全书摘要统一存 `index.sqlite`，两种检索模式共用同一份文档元数据；新增不依赖 embedding 的仅元数据连接，修复首次同步空库无法登记目录的问题。**参数贯通**：`rag_search` 的 `top_k` 真正决定 ColBERT 气泡数（不再被面板 TopN 静默覆盖）；显式 `timeout` 及「0=关闭超时」在检索阅读链路生效。**全流程审查修复**：ANN 簇心缓存加锁消除数据竞争；删除失败保留 manifest 以便重试（残留切片不再永久滞留）；配置切换取消旧 Colbert 模型下载避免争写；force 同步按模式重置对应 ANN；稳定 rowID 替代随机 hash、残差损坏记录不再越界崩溃、LIKE 通配符转义、正文哈希扩至 128 位降低碰撞。**切片**：默认 8000→3000 字、下限 2500 字，目录结构优先且小节不被跨节搬句子切散。配置窗口「启用检索阅读模式」勾选文案简化为「启用」。
 

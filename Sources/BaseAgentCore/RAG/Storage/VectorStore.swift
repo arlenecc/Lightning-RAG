@@ -29,6 +29,10 @@ public final class VectorStore: @unchecked Sendable {
     public static let binaryVectorTable = "chunk_vectors_bin"
     /// stage 2 精排的主向量镜像（普通表，按 rowid 点查）。
     public static let rerankVectorTable = "chunk_vectors_rerank"
+    /// 异步 embedding 回填队列：切片正文先行入库，向量由后台服务按 rowid 补齐。
+    /// 行存在即表示对应 chunk 的向量尚未计算/写入；回填成功后删除该行。
+    /// 以「向量表缺行」天然表达 pending，不新增 chunk 列，重启后可全量重扫续做。
+    public static let pendingTable = "pending_embeddings"
 
     public let db: SQLiteDatabase
     /// 数据库路径；检索用独立的只读连接打开 WAL 快照，不阻塞写入。
@@ -350,6 +354,14 @@ public final class VectorStore: @unchecked Sendable {
             key TEXT PRIMARY KEY,
             value TEXT NOT NULL
         );
+
+        CREATE TABLE IF NOT EXISTS pending_embeddings (
+            rowid INTEGER PRIMARY KEY,
+            source TEXT NOT NULL,
+            chunk_index INTEGER NOT NULL DEFAULT 0,
+            created_at REAL NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_pending_source ON pending_embeddings(source);
         """)
         // 旧库没有 content_hash：补列后才能判断正文是否变化。
         try ensureColumn(table: Self.documentsTable, column: "content_hash",
@@ -430,6 +442,7 @@ public final class VectorStore: @unchecked Sendable {
             // 空库也可能残留 documents/计数器（上次同步中断），一并归零。
             try db.execute("DELETE FROM \(Self.chunksTable)")
             try db.execute("DELETE FROM \(Self.ftsTable)")
+            try db.execute("DELETE FROM \(Self.pendingTable)")
             try db.execute("DELETE FROM \(Self.documentsTable)")
             try db.execute("DELETE FROM \(Self.chapterSummariesTable)")
             try db.execute("DELETE FROM \(Self.chapterSegmentsTable)")
@@ -617,12 +630,199 @@ public final class VectorStore: @unchecked Sendable {
         return inserted
     }
 
+    // MARK: - 异步 embedding 回填（切片文本先入库，向量后台补齐）
+
+    /// 向量库完备状态：(切片总数, 已回填数, 待回填数)。
+    /// 已回填数按「切片总数 - 待回填」推算，避免对 vec0 表做全表 COUNT。
+    public func vectorCompleteness() -> (total: Int, filled: Int, pending: Int) {
+        let total = count
+        let pending = pendingVectorCount()
+        return (total, max(0, total - pending), pending)
+    }
+
+    /// 待回填向量数量（pending 队列长度）。供后台服务与状态栏读取。
+    public func pendingVectorCount() -> Int {
+        lock.lock(); defer { lock.unlock() }
+        return Int((try? db.scalar("SELECT COUNT(*) FROM \(Self.pendingTable)").intValue) ?? 0)
+    }
+
+    /// 只写切片正文 + FTS + pending 队列，不计算/写入向量。
+    /// 用于同步时「文本入库即完成」：向量由后台服务随后异步补齐。
+    /// 返回每个 chunk 对应的 rowid（与入队顺序一致），当前不对外使用但保留以便诊断。
+    @discardableResult
+    public func addTextsOnly(chunks: [Chunk], enqueuePending: Bool = true) throws -> [Int64] {
+        guard !chunks.isEmpty else { return [] }
+        // FTS 预分词放写锁外（纯 CPU，占写入大头），与 add 一致。
+        let ftsTexts = TextAnalyzer.ftsIndexTexts(chunks.map(\.text))
+        lock.lock(); defer { lock.unlock() }
+        if let rebuildReason {
+            throw AgentError.storage("向量库需要重建（\(rebuildReason)）；请先重建向量库")
+        }
+        ensureChunkCounterLocked()
+        let uniqueSources = Set(chunks.map(\.source))
+        var rowids: [Int64] = []
+        var inserted = 0
+        try withChunkCounterRollback {
+            try db.transaction {
+                for source in uniqueSources {
+                    _ = try deleteBySourceLocked(source)
+                }
+                var offset = 0
+                while offset < chunks.count {
+                    let end = min(offset + insertBatchSize, chunks.count)
+                    for i in offset..<end {
+                        let chunk = chunks[i]
+                        let metadataJSON = JSONValue.object(chunk.metadata.mapValues { .string($0) }).jsonString()
+                        let returned = try db.query("""
+                        INSERT INTO chunks(id, source, source_hash, chunk_index, text, heading, metadata, created_at)
+                        VALUES(?, ?, ?, ?, ?, ?, ?, ?) RETURNING rowid
+                        """, [
+                            .text(chunk.id), .text(chunk.source),
+                            .text(Self.hashSource(chunk.source)),
+                            .int(Int64(chunk.chunkIndex)), .text(chunk.text),
+                            .text(chunk.heading), .text(metadataJSON),
+                            .double(Date().timeIntervalSince1970),
+                        ])
+                        guard let rowID = returned.first?["rowid"]?.intValue else {
+                            throw AgentError.storage("写入 chunks 后未返回 rowid: \(chunk.id)")
+                        }
+                        try db.execute(
+                            "INSERT INTO chunks_fts(rowid, tokens, source_hash, chunk_index) VALUES(?, ?, ?, ?)",
+                            [.int(rowID), .text(ftsTexts[i]),
+                             .text(Self.hashSource(chunk.source)), .int(Int64(chunk.chunkIndex))]
+                        )
+                        // 入队：以向量表缺行 + pending 行共同表达「待回填」。
+                        // 决策判定模式只用 FTS、不需要向量，跳过入队避免堆积无效 pending。
+                        if enqueuePending {
+                            try db.execute("""
+                            INSERT OR REPLACE INTO \(Self.pendingTable)(rowid, source, chunk_index, created_at)
+                            VALUES(?, ?, ?, ?)
+                            """, [.int(rowID), .text(chunk.source),
+                                  .int(Int64(chunk.chunkIndex)),
+                                  .double(Date().timeIntervalSince1970)])
+                        }
+                        rowids.append(rowID)
+                        inserted += 1
+                    }
+                    offset = end
+                }
+                if let cachedChunkCount {
+                    self.cachedChunkCount = cachedChunkCount + inserted
+                    try persistChunkCounterLocked()
+                }
+            }
+        }
+        AgentLog.info("VectorStore: 文本先行写入 \(inserted) 个切片（\(uniqueSources.count) 个来源），向量待后台回填")
+        return rowids
+    }
+
+    /// 扫描 chunks 表中「有正文、但向量尚未回填、且未入队」的切片，补入 pending。
+    /// 用于从决策模式切回向量模式时补齐此前未计算的向量（决策模式入库不入队）。
+    /// 分批 LIMIT 入队，避免大库一次性锁表；返回本次新入队条数。
+    @discardableResult
+    public func enqueueMissingVectors(limit: Int = 10_000) -> Int {
+        lock.lock(); defer { lock.unlock() }
+        guard rebuildReason == nil else { return 0 }
+        let rows = (try? db.query("""
+            SELECT c.rowid, c.source, c.chunk_index
+            FROM \(Self.chunksTable) c
+            WHERE NOT EXISTS (SELECT 1 FROM \(Self.vectorTable) v WHERE v.rowid = c.rowid)
+              AND NOT EXISTS (SELECT 1 FROM \(Self.pendingTable) p WHERE p.rowid = c.rowid)
+            LIMIT ?
+            """, [.int(Int64(max(1, limit)))])) ?? []
+        guard !rows.isEmpty else { return 0 }
+        var added = 0
+        try? db.transaction {
+            let now = Date().timeIntervalSince1970
+            for row in rows {
+                guard let rid = row["rowid"]?.intValue else { continue }
+                try db.execute("""
+                    INSERT OR IGNORE INTO \(Self.pendingTable)(rowid, source, chunk_index, created_at)
+                    VALUES(?, ?, ?, ?)
+                    """, [.int(rid), .text(row["source"]?.stringValue ?? ""),
+                          .int(row["chunk_index"]?.intValue ?? 0), .double(now)])
+                added += 1
+            }
+        }
+        if added > 0 {
+            AgentLog.info("VectorStore: 补入 \(added) 条缺失向量到回填队列")
+        }
+        return added
+    }
+
+    /// 待回填的一批：rowid + 正文文本（供后台计算 embedding）。
+    public func nextPendingTexts(limit: Int) -> [(rowid: Int64, text: String, source: String)] {
+        lock.lock(); defer { lock.unlock() }
+        // 按 created_at 排序：失败的项被 retryPendingVector 推后，不占队首；
+        // 同时过滤仍在退避期（created_at 在未来）的项，避免 tight retry。
+        let rows = (try? db.query("""
+            SELECT p.rowid, c.text, p.source
+            FROM \(Self.pendingTable) p JOIN \(Self.chunksTable) c ON c.rowid = p.rowid
+            WHERE p.created_at <= ?
+            ORDER BY p.created_at, p.rowid LIMIT ?
+            """, [.double(Date().timeIntervalSince1970),
+                  .int(Int64(max(1, limit)))])) ?? []
+        return rows.compactMap { row in
+            guard let rid = row["rowid"]?.intValue, let text = row["text"]?.stringValue else { return nil }
+            return (rid, text, row["source"]?.stringValue ?? "")
+        }
+    }
+
+    /// 回填失败后退避重试：把该 pending 的 created_at 推后，按时间排序时排到队尾，
+    /// 既不永久丢弃（临时 DB 锁/IO 错误可恢复），也不让坏记录每批都占队首。
+    public func retryPendingVector(rowid: Int64, backoffSeconds: Double = 2) {
+        lock.lock(); defer { lock.unlock() }
+        let retryAt = Date().timeIntervalSince1970 + backoffSeconds
+        try? db.execute("UPDATE \(Self.pendingTable) SET created_at = ? WHERE rowid = ?",
+                        [.double(retryAt), .int(rowid)])
+    }
+
+    /// 回填单条向量：写向量表（幂等）+ 二值签名（可选），并从 pending 队列出队。
+    /// `vector` 维度必须与库一致；不一致抛错且不出队，留待下次重试。
+    public func fillPendingVector(rowid: Int64, vector: [Float], binarySignature: Data? = nil) throws {
+        guard vector.count == dimension else {
+            throw AgentError.storage("回填向量维度 \(vector.count) != \(dimension)")
+        }
+        if let binarySignature, binaryStorageEnabled {
+            let expected = binaryDimension / 8
+            guard binarySignature.count == expected else {
+                throw AgentError.storage("回填二值签名字节数 \(binarySignature.count) != \(expected)")
+            }
+        }
+        lock.lock(); defer { lock.unlock() }
+        try withChunkCounterRollback {
+            try db.transaction {
+                // 幂等：重启续做时同一 rowid 可能被重复回填，先删再插避免重复行。
+                try db.execute("DELETE FROM \(Self.vectorTable) WHERE rowid = ?", [.int(rowid)])
+                let normalized = VectorCodec.normalize(vector)
+                let blob = VectorEncoder.encode(normalized, as: elementType)
+                let expression = vectorEnabled ? elementType.bindExpression("?") : "?"
+                try db.execute(
+                    "INSERT INTO \(Self.vectorTable)(rowid, embedding) VALUES(?, \(expression))",
+                    [.int(rowid), .blob(blob)])
+                try upsertRerankVector(rowID: rowid, blob: blob)
+                if binaryStorageEnabled, let binarySignature {
+                    // 先判断是否已有 bin 行，避免重复回填把计数算重。
+                    let existed = (try? db.scalar(
+                        "SELECT 1 FROM \(Self.binaryVectorTable) WHERE rowid = ?",
+                        [.int(rowid)]).intValue) != nil
+                    try db.execute("DELETE FROM \(Self.binaryVectorTable) WHERE rowid = ?", [.int(rowid)])
+                    try insertBinarySignature(rowID: rowid, signature: binarySignature)
+                    if !existed { binaryRows += 1 }
+                    try persistBinaryCounterLocked()
+                }
+                try db.execute("DELETE FROM \(Self.pendingTable) WHERE rowid = ?", [.int(rowid)])
+            }
+        }
+    }
+
     /// 仅在库为空时重建向量表（调用方已持锁）。
     private func rebuildDimensionLocked(_ newDimension: Int) throws {
         let resolved = max(1, newDimension)
         try elementType.validate(dimension: resolved)
         try db.transaction {
             try db.execute("DROP TABLE IF EXISTS \(Self.vectorTable)")
+            try db.execute("DELETE FROM \(Self.pendingTable)")
             // 只在空库上重建，但旧维度的 ANN 索引同样必须丢弃。
             try? resetANNIndexLocked()
             try? dropBinaryANNIndexLocked()
@@ -701,6 +901,7 @@ public final class VectorStore: @unchecked Sendable {
             try db.execute("DELETE FROM \(Self.chunksTable) WHERE rowid IN (\(placeholders))", args)
             try db.execute("DELETE FROM \(Self.ftsTable) WHERE rowid IN (\(placeholders))", args)
             try db.execute("DELETE FROM \(Self.vectorTable) WHERE rowid IN (\(placeholders))", args)
+            try db.execute("DELETE FROM \(Self.pendingTable) WHERE rowid IN (\(placeholders))", args)
             try deleteRerankRowsLocked(batch)
             if binaryStorageEnabled {
                 let removedBinary = try db.execute(
@@ -846,6 +1047,7 @@ public final class VectorStore: @unchecked Sendable {
             try db.transaction {
                 try db.execute("DELETE FROM \(Self.chunksTable)")
                 try db.execute("DELETE FROM \(Self.ftsTable)")
+                try db.execute("DELETE FROM \(Self.pendingTable)")
                 if !needsRecreate {
                     try db.execute("DELETE FROM \(Self.vectorTable)")
                 }
@@ -892,6 +1094,7 @@ public final class VectorStore: @unchecked Sendable {
                     .flatMap { Int($0) } ?? maxRowIDLocked
                 try db.execute("DELETE FROM \(Self.chunksTable)")
                 try db.execute("DELETE FROM \(Self.ftsTable)")
+                try db.execute("DELETE FROM \(Self.pendingTable)")
                 try db.execute("DELETE FROM \(Self.documentsTable)")
                 try db.execute("DELETE FROM \(Self.chapterSummariesTable)")
                 try db.execute("DELETE FROM \(Self.chapterSegmentsTable)")

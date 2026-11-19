@@ -578,6 +578,15 @@ public final class RAGEngine {
     private let kgIncrementalLock = NSLock()
     private var kgIncrementalScheduled = false
     private var kgIncrementalPending = false
+    /// 后台向量/编码回填服务：切片正文先入库后，异步补齐 embedding 与 ColBERT 编码。
+    private var backfillService: VectorBackfillService?
+    private let backfillLock = NSLock()
+    /// 决策判定模型打分器（懒加载，与检索阅读模式互斥）。
+    private var decisionScorer: MeteorDecisionScorer?
+    private let decisionLock = NSLock()
+    /// 后台任务（回填排空 / ANN 构建完成）状态变化时回调，供 UI 刷新完备状态。
+    public var onBackgroundStatusChanged: (() -> Void)?
+
     /// 知识图谱抽取/关键词提取用的辅助模型（由 AppModel 注入，与 Agent.auxLLM 同实例）。
     public var auxLLM: LLMService?
     /// 保护「使用 store」的整段读操作；close/reload 必须等读操作结束。
@@ -651,8 +660,13 @@ public final class RAGEngine {
                                 workspace: config.workspace,
                                 currentKB: self.knowledgeBase)
         self.markdownDir = (self.ragDir as NSString).appendingPathComponent("documents")
+        // manifest 按「切片存储归属」分组，而非按模式逐个拆：
+        // - 向量检索 / 决策判定共用 index.sqlite 的 chunks，签名相同 → 共用 manifest.json；
+        // - 极速检索的切片在独立 colbert.db，用 manifest-colbert.json，与向量组互不干扰。
+        // 这样模式切换后各自读回自己的 manifest、签名自洽，不会触发全量重建；
+        // 只有源目录（knowledgeBase）变化才会因 ragDir 不同而换一套 manifest + 索引。
         self.manifestStore = ManifestStore(
-            path: (self.ragDir as NSString).appendingPathComponent("manifest.json")
+            path: (self.ragDir as NSString).appendingPathComponent(Self.manifestFileName(for: config))
         )
         // Matryoshka：nomic / jina-v3 等支持俄罗斯套娃的模型先截断、再重新归一化。
         // 入库与查询必须共用同一实例，保证两侧变换完全一致。
@@ -1062,6 +1076,10 @@ public final class RAGEngine {
         // 有同步在途时不要关闭连接：事务被打断会留下未完成状态。
         // 记下 pending，等同步收尾后自动关闭，避免旧连接长期悬挂。
         guard tryBeginIngest() else {
+            // 同步在途也要停回填：close 终将关闭 store/colbert，不能让后台继续写。
+            backfillLock.lock()
+            backfillService?.requestStop()
+            backfillLock.unlock()
             storeLock.lock()
             closePending = true
             storeLock.unlock()
@@ -1070,6 +1088,10 @@ public final class RAGEngine {
             return
         }
         defer { releaseIngestFlag() }
+        // 停止后台回填：close 后 store/colbert 会失效，避免后台任务访问已关闭实例。
+        backfillLock.lock()
+        backfillService?.requestStop()
+        backfillLock.unlock()
         // 显式释放 ColBERT 模型/DB（可能阻塞），放在其它锁之前，避免持锁等待。
         shutdownColbert()
         searchLock.lock(); defer { searchLock.unlock() }
@@ -1573,6 +1595,177 @@ public final class RAGEngine {
     /// 首次检索现场加载 ONNX session 实测要 10~15s；提前加载后首问只付检索时间。
     /// 单个模型失败只记录到 `failures`，不影响另一个模型继续预加载。
     @discardableResult
+    /// 组装（幂等）后台回填服务。闭包在运行时取当前 store/embedding/colbert，
+    /// 避免持有失效引用（配置切换/close 后会重建这些实例）。
+    private func ensureBackfillService() -> VectorBackfillService {
+        backfillLock.lock()
+        if let service = backfillService {
+            backfillLock.unlock()
+            return service
+        }
+        let context = VectorBackfillService.Context(
+            vectorPendingCount: { [weak self] in
+                guard let self, !self.config.colbertReaderEnabled,
+                      !self.config.isDecisionMode,
+                      let store = try? self.ensureStore() else { return 0 }
+                return store.pendingVectorCount()
+            },
+            backfillVectorBatch: { [weak self] limit, cancel in
+                guard let self, !self.config.isDecisionMode,
+                      let store = try? self.ensureStore(),
+                      let embedding = self.currentEmbedding() else { return 0 }
+                let pending = store.nextPendingTexts(limit: limit)
+                guard !pending.isEmpty else { return 0 }
+                let texts = pending.map(\.text)
+                let vectors: [[Float]]
+                var signatures: [Data]? = nil
+                // 二值粗筛默认开启：回填也要生成签名，否则新切片永远缺 bin 行、
+                // binaryRows==chunkRows 守卫失败、二值粗筛被静默跳过。
+                if store.binaryStorageEnabled,
+                   let signing = embedding as? EmbeddingBinarySigning {
+                    let output = try await signing.embedDocumentsWithSignatures(texts)
+                    vectors = output.vectors
+                    signatures = output.signatures
+                } else {
+                    vectors = try await embedding.embedDocuments(texts)
+                }
+                guard vectors.count == pending.count,
+                      signatures == nil || signatures?.count == pending.count else {
+                    throw AgentError.storage("回填 embedding 数量与待处理切片不一致")
+                }
+                var done = 0
+                for (i, item) in pending.enumerated() {
+                    if cancel() { break }
+                    do {
+                        try store.fillPendingVector(rowid: item.rowid, vector: vectors[i],
+                                                    binarySignature: signatures?[i])
+                        done += 1
+                    } catch {
+                        // 单条失败退避重试（可能是临时 DB 锁/IO 错误）：排到队尾，
+                        // 既不永久丢弃也不占队首饿死后续健康切片。
+                        store.retryPendingVector(rowid: item.rowid)
+                        AgentLog.warning("[backfill] 切片回填失败，30s 后重试 rowid=\(item.rowid)："
+                            + error.localizedDescription)
+                    }
+                }
+                return done
+            },
+            colbertPendingCount: { [weak self] in
+                guard let self, self.config.colbertReaderEnabled,
+                      let colbert = self.colbertService() else { return 0 }
+                return colbert.pendingEncodeCount()
+            },
+            backfillColbertBatch: { [weak self] limit, cancel in
+                guard let self, let colbert = self.currentColbert() else { return 0 }
+                return try await colbert.backfillPending(limit: limit, shouldCancel: cancel)
+            },
+            rescanMissing: { [weak self] in
+                guard let self, !self.config.colbertReaderEnabled,
+                      !self.config.isDecisionMode,
+                      let store = try? self.ensureStore() else { return 0 }
+                return store.enqueueMissingVectors()
+            },
+            onDrained: { [weak self] hadWork in
+                guard let self else { return }
+                // 仅当本轮确实回填过切片才触发 ANN：避免无 pending 的纯同步
+                // 每 3 秒空转后也去构建/续建索引，产生无谓开销和误导日志。
+                if hadWork {
+                    self.scheduleANNAutoBuild(log: { AgentLog.info($0) })
+                }
+                // 通知 UI 刷新完备状态（自动回填不经过 AppModel 的事件点）。
+                self.onBackgroundStatusChanged?()
+            },
+            log: { message in AgentLog.info(message) })
+        let service = VectorBackfillService(context: context)
+        backfillService = service
+        backfillLock.unlock()
+        return service
+    }
+
+    /// 当前可用的普通向量库（持锁读取，配置切换时为 nil）。
+    private func currentStore() -> VectorStore? {
+        storeLock.lock(); defer { storeLock.unlock() }
+        return store
+    }
+
+    private func currentEmbedding() -> EmbeddingProvider? {
+        storeLock.lock(); defer { storeLock.unlock() }
+        return embedding
+    }
+
+    private func currentColbert() -> ColBERTReaderService? {
+        colbertLock.lock(); defer { colbertLock.unlock() }
+        return colbertReader
+    }
+
+    /// 同步完成后启动/继续后台回填。幂等。
+    /// 向量模式下先扫描 chunks 中缺向量的行补入队列：从决策模式切回时，
+    /// 决策入库跳过了 embedding（enqueuePending=false），这些切片需要在此补齐。
+    public func kickBackfill() {
+        if !config.colbertReaderEnabled && !config.isDecisionMode,
+           let store = try? ensureStore() {
+            store.enqueueMissingVectors()
+        }
+        ensureBackfillService().kick()
+    }
+
+    /// 同步请求停止后台回填（stopSync 用）：不等待退出，循环下一检查点即停。
+    public func requestStopBackfill() {
+        backfillLock.lock()
+        backfillService?.requestStop()
+        backfillLock.unlock()
+    }
+
+    /// 停止后台回填（close/deinit 用）。
+    private func stopBackfill() async {
+        backfillLock.lock()
+        let service = backfillService
+        backfillLock.unlock()
+        await service?.stop()
+    }
+
+    /// 当前模式向量库完备状态：(切片总数, 已计算数, 待计算数, 是否完备)。
+    /// 向量模式看 index.sqlite chunks/pending；极速模式看 colbert.db document/编码队列。
+    /// 决策模式不用向量，返回完备（UI 不显示该行）。
+    public func vectorCompleteness() -> (total: Int, filled: Int, pending: Int, complete: Bool) {
+        if config.isColbertMode {
+            guard let colbert = colbertService() else { return (-1, 0, 0, false) }
+            let c = colbert.encodingCompleteness()
+            guard c.total >= 0 else { return (-1, 0, 0, false) }
+            return (c.total, c.filled, c.pending,
+                    c.pending == 0 && c.filled >= c.total)
+        }
+        if config.isDecisionMode { return (0, 0, 0, true) }
+        guard let store = try? ensureStore() else { return (-1, 0, 0, false) }
+        let c = store.vectorCompleteness()
+        return (c.total, c.filled, c.pending,
+                c.pending == 0 && c.filled >= c.total)
+    }
+
+    /// 手动触发向量增补：入队缺失项并启动后台回填；返回本次新入队条数。
+    @discardableResult
+    public func requestVectorBackfill() -> Int {
+        var enqueued = 0
+        if config.isColbertMode {
+            // 极速模式：pending 由 texts-only 自动入队；这里只 kick 后台编码。
+            kickBackfill()
+        } else if !config.isDecisionMode, let store = try? ensureStore() {
+            enqueued = store.enqueueMissingVectors()
+            kickBackfill()
+        }
+        return enqueued
+    }
+
+    /// 后台回填状态（供 UI/诊断）。
+    public func backfillStatus() -> (running: Bool, pending: Int, processed: Int, error: String?) {
+        backfillLock.lock()
+        let service = backfillService
+        backfillLock.unlock()
+        guard let service else { return (false, 0, 0, nil) }
+        return (service.isRunning, service.pendingCount,
+                service.processedTotal, service.lastError)
+    }
+
     public func preloadAuxiliaryModels() async -> RAGPreloadOutcome {
         var loaded: [String] = []
         var failures: [String] = []
@@ -1696,9 +1889,9 @@ public final class RAGEngine {
             invalidateStatusCache()
             releaseIngestFlag()
             closeIfPending()
-            if autoBuildRequested {
-                scheduleANNAutoBuild(log: logFn)
-            }
+            // ANN 构建改由后台回填服务的 onDrained 回调触发：等向量全部回填
+            // 完成后再建，避免早期构建的索引漏掉后回填的低 rowid 切片。
+            // autoBuildRequested 保留供诊断，不再在此立即调度。
             Task { await LocalModelFactory.shared.endOCRJob() }
         }
         cancelLock.lock(); cancelRequested = false; cancelLock.unlock()
@@ -1708,7 +1901,8 @@ public final class RAGEngine {
             return stats
         }
         let colbertMode = config.colbertReaderEnabled
-        if !colbertMode {
+        // 决策判定模式只用 FTS，不需要 embedding；向量模式必须有 embedding。
+        if !colbertMode && !config.isDecisionMode {
             guard embedding != nil else {
                 stats.errors.append("embedding 模型不可用")
                 return stats
@@ -1745,10 +1939,9 @@ public final class RAGEngine {
         // 检索阅读模式旁路普通向量库；该库仅用于文档元数据/大纲，打开失败
         // （embedding 模型缺失/未就绪）不阻塞 ColBERT 同步与检索。
         let store: VectorStore?
-        if colbertMode {
-            // 检索阅读模式用「仅元数据」store 登记 documents/大纲/摘要：它不依赖
-            // embedding 是否就绪，保证目录与摘要稳定写入 index.sqlite；向量检索
-            // 仍完全由 ColBERT 库承担，两者互不干扰。
+        if colbertMode || config.isDecisionMode {
+            // 检索阅读 / 决策判定模式用「仅元数据」store：不依赖 embedding 是否就绪。
+            // 极速的向量检索由 ColBERT 库承担；决策只用 FTS。两者都只需 chunks+FTS。
             store = try? ensureMetadataStore()
             if store == nil {
                 logFn("RAG: 文档元数据库未打开；检索不受影响，但目录/摘要可能不可用")
@@ -1891,7 +2084,8 @@ public final class RAGEngine {
         //    embedding 由共享调度器串行进入模型，并按吞吐/内存自动调整子批。
         //    检索阅读模式完全旁路该调度器（nil），不依赖 embedding 模型。
         let scheduler: AdaptiveEmbeddingScheduler?
-        if colbertMode {
+        if colbertMode || config.isDecisionMode {
+            // 两种模式都不做 embedding（极速用 ColBERT 编码，决策只用 FTS）。
             scheduler = nil
         } else if let baseEmbedding = embedding {
             scheduler = AdaptiveEmbeddingScheduler(
@@ -2060,6 +2254,8 @@ public final class RAGEngine {
                              metrics.maxBatchTexts))
             }
             logFn("RAG: 同步完成 — \(stats.summary)")
+            // 切片正文已入库，启动后台向量/编码回填；同步到此即刻返回，软件可立即使用。
+            kickBackfill()
             // 同步成功后按需构建/续建 ANN 索引。放到 defer 里、独占标志释放后
             // 由后台任务执行：同步返回即可继续检索，构建不再冻结读路径。
             autoBuildRequested = true
@@ -2070,8 +2266,9 @@ public final class RAGEngine {
         manifestStore.compact()
         // 新切片/去重完成后：去重改变了 chunk 标识，只能重建；纯新增则增量更新图谱。
         // 增量抽取转到后台，同步立即返回，不再等图谱抽完。
-        // 检索阅读模式没有普通切片，知识图谱不参与，跳过图谱调度。
-        if colbertMode {
+        // 极速/决策模式都不参与知识图谱：极速没有普通切片；决策只用 FTS、
+        // 设计上不依赖 embedding，而 KG 的实体向量化强依赖 embedding。
+        if colbertMode || config.isDecisionMode {
             // no-op
         } else if stats.deduplicated > 0 {
             invalidateKnowledgeGraph(reason: "切片去重改变了 chunk 标识")
@@ -2086,6 +2283,13 @@ public final class RAGEngine {
     /// 检索阅读模式与普通 embedding / 切片参数完全解耦：该模式下只记录
     /// ColBERT 相关的模型与量化配置，普通 embedding 后端、向量元素类型、
     /// Matryoshka 维度、切片大小等变化都不会触发 ColBERT 库重建。
+    /// manifest 文件名按「切片存储归属」分组：向量/决策共用 index.sqlite 的 chunks
+    /// → 共用 manifest.json；极速用 colbert.db → 独立 manifest-colbert.json。
+    /// 这样模式切换后各自读回自己的 manifest、签名自洽，不触发全量重建。
+    static func manifestFileName(for config: AgentConfig) -> String {
+        config.isColbertMode ? "manifest-colbert.json" : "manifest.json"
+    }
+
     private func makeIngestSignature() -> String {
         // 渲染/清洗逻辑变化时递增，强制旧缓存文件重建。
         // 8：结构化清洗档（HTML/Office/EPUB 保真）+ HTML 本地框架接力 +
@@ -2419,8 +2623,10 @@ public final class RAGEngine {
                 // 其余召回切片作为引用气泡附在回复后供用户点击阅读。
                 let colbertStarted = Date()
                 do {
-                    let count = try await colbertReader.ingest(
+                    // 正文先入库，ColBERT 编码由后台回填服务异步补齐；同步不再等待编码。
+                    let count = try colbertReader.ingestTextsOnly(
                         markdown: text, source: source, title: file.relativePath,
+                        sourceKey: source,
                         shouldCancel: { isCancelled() || Task.isCancelled })
                     let mdPath = Self.cacheMarkdownPath(for: source,
                                                         markdownDir: markdownDir,
@@ -2478,8 +2684,12 @@ public final class RAGEngine {
                 }
             }
 
-            // 非检索阅读模式：普通向量库与 embedding 调度器必须可用。
-            guard let store, let embedding else {
+            // 非检索阅读模式：向量库必须可用；embedding 调度器仅在向量模式必需
+            // （决策判定模式只用 FTS，scheduler 为 nil 是合法的）。
+            guard let store else {
+                throw AgentError.storage("向量库不可用")
+            }
+            if !config.isDecisionMode && embedding == nil {
                 throw AgentError.storage("embedding 模型不可用")
             }
 
@@ -2514,45 +2724,15 @@ public final class RAGEngine {
             let chunkSeconds = Date().timeIntervalSince(chunkStarted)
             if isCancelled() || Task.isCancelled { throw AgentError.cancelled }
 
-            // markdown 已就绪后立即进入 embedding；共享调度器会串行调用模型，
-            // 并按当前吞吐与进程内存自动调整子批大小。
-            let embedStarted = Date()
-            var lastEmbedLog = Date()
-            let onEmbedProgress: (Int, Int) -> Void = { done, count in
-                let now = Date()
-                guard now.timeIntervalSince(lastEmbedLog) >= 60 else { return }
-                lastEmbedLog = now
-                log("RAG: \(job.label) 向量化中 \(done)/\(count)"
-                    + "（已用 \(Self.elapsedText(embedStarted))）")
-            }
-            let texts = chunks.map(\.text)
-            let signed: BinaryEmbeddingOutput?
-            if binarySignaturesEnabled {
-                signed = try await embedding.embedDocumentsWithSignatures(
-                    texts, progress: onEmbedProgress)
-            } else {
-                signed = nil
-            }
-            let vectors: [[Float]]
-            if let signed {
-                vectors = signed.vectors
-            } else {
-                vectors = try await embedding.embedDocuments(
-                    texts, progress: onEmbedProgress)
-            }
-            guard vectors.count == chunks.count else {
-                throw AgentError.storage("embedding 数量与切片不一致")
-            }
-            if let signed, signed.signatures.count != chunks.count {
-                throw AgentError.storage("embedding 签名数量与切片不一致")
-            }
-            let embedSeconds = Date().timeIntervalSince(embedStarted)
-            if isCancelled() || Task.isCancelled { throw AgentError.cancelled }
-
+            // 异步向量化：切片正文先落库（FTS 立即可检索），embedding 计算转为
+            // 后台任务——同步不必再等整篇切片向量化完成即可结束、软件立即可用。
+            // 向量由 VectorBackfillService 按 pending 队列异步补齐；期间检索走
+            // 「已回填向量 + 全部 FTS」混合，未回填切片仍可被关键词命中。
             let writeStarted = Date()
-            _ = try store.add(chunks: chunks, vectors: vectors,
-                              binarySignatures: signed?.signatures)
+            _ = try store.addTextsOnly(chunks: chunks,
+                                        enqueuePending: !config.isDecisionMode)
             let writeSeconds = Date().timeIntervalSince(writeStarted)
+            let embedSeconds = 0.0
             if isCancelled() || Task.isCancelled { throw AgentError.cancelled }
 
             // 缓存 Markdown/规范化正文，供 rag_outline 与调试使用。
@@ -2602,7 +2782,7 @@ public final class RAGEngine {
                 + "\(chunks.count) 片\(failedPart)；"
                 + "解析 \(parsePart)，切片 \(String(format: "%.1fs", chunkSeconds))"
                 + "，embedding \(String(format: "%.1fs", embedSeconds))"
-                + "（子批 \(embedding.currentBatchSize)）"
+                + (embedding.map { "（子批 \($0.currentBatchSize)）" } ?? "（决策模式跳过）")
                 + "，入库 \(String(format: "%.1fs", writeSeconds))"
                 + "，缓存/摘要 \(String(format: "%.1fs", cacheSeconds))"
                 + "，总 \(Self.elapsedText(fileStarted))"
@@ -3177,8 +3357,14 @@ public final class RAGEngine {
             invalidateStatusCache()
             releaseIngestFlag()
             closeIfPending()
+            onBackgroundStatusChanged?()
         }
-        cancelLock.lock(); cancelRequested = false; cancelLock.unlock()
+        // 不在构建前清零 cancelRequested：用户「停止同步」的请求应能中断自动 ANN 构建。
+        // performANNBuild 内部通过 self.isCancelled 在块边界检查取消。
+        guard !isCancelled else {
+            logFn("RAG: 已请求停止，跳过自动 ANN 构建\(label)")
+            return
+        }
         _ = performANNBuild(progress: nil, log: logFn)
     }
 
@@ -3512,6 +3698,92 @@ public final class RAGEngine {
         }
     }
 
+    /// 决策判定模型路径：相对路径按 workspace 解析。
+    private func resolvedDecisionModelPath() -> String {
+        let p = config.decisionModelPath
+        if p.hasPrefix("/") { return p }
+        return (config.workspace as NSString).appendingPathComponent(p)
+    }
+
+    private func ensureDecisionScorer() throws -> MeteorDecisionScorer {
+        decisionLock.lock(); defer { decisionLock.unlock() }
+        if let scorer = decisionScorer { return scorer }
+        let scorer = MeteorDecisionScorer(modelDir: resolvedDecisionModelPath())
+        decisionScorer = scorer
+        return scorer
+    }
+
+    /// 决策判定模式检索：BM25 粗筛 → 核心句 → 模型判定 → TopN。
+    private func decisionSearch(query: String, topK: Int, source: String?,
+                                timeout: Double?) async throws -> RAGRetrievalOutcome {
+        let started = Date()
+        // 决策模式只用 FTS 粗筛，不依赖 embedding：用「仅元数据」连接打开 index.sqlite，
+        // 避免未下载 embedding 模型时决策检索整体不可用。
+        guard let store = try? ensureMetadataStore() else {
+            throw AgentError.storage("向量库不可用，无法执行决策判定检索")
+        }
+        // 1) BM25 粗筛前 N 个原文切片（只走 FTS，不依赖 embedding）。
+        // 传 source 定向过滤：与向量模式一致，MCP/工具限定来源时不能搜全库。
+        let coarse = try store.searchFTS(query: query,
+                                         topK: max(1, config.decisionCoarseCandidates),
+                                         sourceContains: source)
+        guard !coarse.isEmpty else {
+            return RAGRetrievalOutcome(context: "（知识库中未找到相关内容）", citations: [])
+        }
+        // 2) 模型判定（核心句代表切片）。
+        let scorer = try ensureDecisionScorer()
+        let passages = coarse.map(\.text)
+        var lastProgress = 0
+        // 端到端墙钟预算：与其它检索模式一致，避免模型前向卡死拖垮对话。
+        let effectiveTimeout = resolvedTimeout(timeout)
+        let budget = effectiveTimeout == 0 ? Double.greatestFiniteMagnitude
+            : max(30, effectiveTimeout * 3)
+        let scores = try await Self.withTimeout(budget) {
+            try await scorer.score(
+                query: query, passages: passages,
+                coreSentenceCount: self.config.decisionCoreSentenceCount,
+                useCoreSentences: self.config.decisionUseCoreSentences,
+                progress: { done, total in
+                    // 每 10 片或完成时打一条进度，避免刷屏。
+                    if done - lastProgress >= 10 || done == total {
+                        lastProgress = done
+                        AgentLog.info("[rag] 决策判定进度 \(done)/\(total)")
+                    }
+                })
+        }
+        // 3) 按判定分排序，取 TopN（top_k 与配置 decisionTopN 取较大者，保证工具契约）。
+        // 同分按 BM25 原始名次稳定排序，避免并列时结果抖动。
+        let n = max(1, max(topK, config.decisionTopN))
+        // BM25 粗筛返回顺序即初始名次，作为同分时的稳定 tie-break。
+        struct DecisionPair { let hit: SearchHit; let score: Double; let bm25Rank: Int }
+        let pairs: [DecisionPair] = zip(coarse.enumerated(), scores).map { enumerated, score in
+            DecisionPair(hit: enumerated.element, score: score, bm25Rank: enumerated.offset)
+        }
+        let ranked = pairs.sorted { a, b in
+            if a.score != b.score { return a.score > b.score }
+            return a.bm25Rank < b.bm25Rank
+        }
+        .prefix(n)
+        let citations = ranked.enumerated().map { index, item in
+            RAGCitation(id: String(item.hit.rowID), rank: index + 1,
+                        source: (item.hit.source as NSString).lastPathComponent,
+                        heading: item.hit.heading, text: item.hit.text,
+                        score: item.score, isPrimary: index == 0)
+        }
+        let timing = RAGSearchTiming.current
+        timing?.set("decision_bm25", seconds: 0.01)
+        timing?.set("decision_score", seconds: Date().timeIntervalSince(started))
+        AgentLog.info("[rag] 决策判定检索 \(Int(Date().timeIntervalSince(started) * 1000))ms "
+            + "粗筛=\(coarse.count) 返回=\(citations.count)")
+        let hits = ranked.map { item -> SearchHit in
+            var h = item.hit
+            h.score = item.score
+            return h
+        }
+        return RAGRetrievalOutcome(context: Self.formatPrimaryContext(hits: hits),
+                                   citations: citations)
+    }
+
     private func searchWithCitationsImpl(query: String, topK: Int,
                                          source: String?, timeout: Double?,
                                          timing: RAGSearchTiming) async throws -> RAGRetrievalOutcome {
@@ -3529,6 +3801,14 @@ public final class RAGEngine {
                 + "；阶段: \(stages.isEmpty ? "无" : stages)"
                 + "；branch=\(branch), citations=\(citationCount), "
                 + "strategy=\(config.ragRetrievalStrategy.rawValue)")
+        }
+        // 决策判定模式：BM25 粗筛 + 字符级核心句 + 决策模型判定 TopN。
+        if config.isDecisionMode {
+            branch = "decision"
+            let outcome = try await decisionSearch(query: query, topK: topK,
+                                                   source: source, timeout: timeout)
+            citationCount = outcome.citations.count
+            return outcome
         }
         // 检索阅读模式：旁路接管检索召回 + 精排，改用 ColBERT 大分片多向量检索。
         // top-1 分片进上下文供 LLM 总结（由 ColBERTReaderService 格式化），
@@ -4355,7 +4635,7 @@ public final class RAGEngine {
         // 检索阅读模式下普通 embedding 常未就绪，ensureStore 会抛错导致摘要任务
         // 根本无法启动；目录/摘要与向量模型无关，改用仅元数据 store，两种模式
         // 共用 index.sqlite 的 documents/summary 表，切换模式时读同一份数据。
-        let store = config.colbertReaderEnabled
+        let store = (config.colbertReaderEnabled || config.isDecisionMode)
             ? try ensureMetadataStore()
             : try ensureStore()
         let config = self.config
@@ -4517,7 +4797,7 @@ public final class RAGEngine {
                 "rebuild_reason": store.rebuildReason.map { .string($0) } ?? .null,
             ]
         }
-        guard let snapshot else {
+        guard var snapshot else {
             // 超时/库不可用：返回「跳过」快照，保留上一次已知统计。
             return skipSnapshot(limit: limit)
         }
@@ -4549,6 +4829,12 @@ public final class RAGEngine {
         if running && target == .binary {
             output["binary_ann"] = .string("building")
         }
+        // 后台向量回填状态：变化频繁，同样每次叠加实时值、不进缓存。
+        // backfillStatus 只读 service 的内存快照，不触发任何 DB IO。
+        let backfill = self.backfillStatus()
+        output["backfill_pending"] = .int(backfill.pending)
+        output["backfill_running"] = .bool(backfill.running)
+        output["backfill_processed"] = .int(backfill.processed)
         return output
     }
 
@@ -4708,8 +4994,19 @@ public final class RAGEngine {
         var removed = 0
         var failure: Error?
         do {
-            try withStore { store in
-                removed = try store.rebuildForCurrentConfiguration()
+            if config.isColbertMode {
+                // 极速模式的切片在 colbert.db：必须清对库，否则清了 index.sqlite
+                // 却留下 ColBERT 旧切片，manifest 清空后变成永远清不掉的孤儿。
+                if let colbert = colbertService() {
+                    removed = try colbert.rebuildDatabase()
+                } else {
+                    throw AgentError.storage("检索阅读库不可用，无法重建")
+                }
+            } else {
+                // 向量/决策共用 index.sqlite chunks：重建共用库。
+                try withStore { store in
+                    removed = try store.rebuildForCurrentConfiguration()
+                }
             }
         } catch {
             failure = error

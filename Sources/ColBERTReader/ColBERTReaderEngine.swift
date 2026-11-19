@@ -116,6 +116,80 @@ public final class ColBERTReaderEngine {
                                  progress: progress)
     }
 
+    /// 只写正文 + FTS + pending，不编码、不依赖模型。供同步时「文本入库即完成」。
+    /// 直接走静态 DB 路径，模型未下载/未加载也能入库。
+    @discardableResult
+    public func ingestTextsOnly(markdown: String, source: String, title: String? = nil,
+                                sourceKey: String? = nil, bits: Int = 4,
+                                similarity: (([String]) -> [Double]?)? = nil,
+                                shouldCancel: (() -> Bool)? = nil) throws -> Int {
+        try SearchEngine.addMarkdownTextsOnly(
+            db, text: markdown, source: source, title: title,
+            bits: bits, sourceKey: sourceKey, similarity: similarity,
+            shouldCancel: shouldCancel)
+    }
+
+    /// 后台回填一批待编码切片：取 pending → 编码 → 量化 → 写向量表并出队。
+    /// 需要模型已加载；每片独立事务，单片失败不影响其它片（留 pending 下次重试）。
+    /// 返回本批实际回填条数。
+    @discardableResult
+    public func backfillPending(limit: Int,
+                                shouldCancel: (() -> Bool)? = nil,
+                                onError: ((String) -> Void)? = nil) throws -> Int {
+        let se = try engine()
+        guard let model = colbert else { throw DocSearchError.model("模型尚未加载") }
+        let batch = se.nextPendingEncode(limit: limit)
+        guard !batch.isEmpty else { return 0 }
+        var done = 0
+        var failures = 0
+        for item in batch {
+            if shouldCancel?() == true { break }
+            do {
+                let vectors = try model.encodeDocument(item.content)
+                guard !vectors.isEmpty else {
+                    // 整段被剪枝为空：移除幽灵切片（正文/FTS/count/pending 一起清）。
+                    try se.dropPendingGhost(docID: item.docID, rowid: item.rowid)
+                    done += 1
+                    continue
+                }
+                let record = try ResidualCodec.quantize(
+                    docID: item.docID, vectors: vectors,
+                    dim: ColBERT.dimension, bits: item.bits)
+                try se.fillPendingEncode(docID: item.docID, rowid: item.rowid,
+                                         record: record)
+                done += 1
+            } catch {
+                // 单条失败退避重试：排到队尾，既不永久丢弃也不饿死后续健康切片。
+                failures += 1
+                try? se.retryPending(docID: item.docID)
+                onError?("\(item.docID): \(error.localizedDescription)")
+            }
+        }
+        return done
+    }
+
+    /// 显式重建 ColBERT 库（清全部切片/向量/ANN），返回清掉的切片数。
+    @discardableResult
+    public func rebuildDatabase() throws -> Int {
+        try SearchEngine.rebuildDatabase(db)
+    }
+
+    /// 待回填编码的切片数（不依赖模型加载）。
+    public func pendingEncodeCount() -> Int {
+        SearchEngine.pendingEncodeCount(db)
+    }
+
+    /// ColBERT 编码完备状态：(切片总数, 已编码数, 待编码数)（不依赖模型加载）。
+    /// total = -1 表示库打不开/查询失败——调用方不得据此判定「完备」。
+    public func encodingCompleteness() -> (total: Int, filled: Int, pending: Int) {
+        guard let total = try? SearchEngine.totalChunkCount(db),
+              let filled = try? SearchEngine.encodedChunkCount(db) else {
+            return (-1, 0, 0)
+        }
+        let pending = SearchEngine.pendingEncodeCount(db)
+        return (total, filled, pending)
+    }
+
     /// 删除指定来源的全部切片（不依赖模型加载）。
     @discardableResult
     public func delete(sourceKey: String, fallbackSource: String? = nil) throws -> Int {

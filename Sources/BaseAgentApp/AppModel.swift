@@ -304,6 +304,11 @@ final class AppViewModel: ObservableObject {
     /// 当前索引与配置不匹配，需要用户显式重建。
     @Published var vectorRebuildRequired = false
     @Published var vectorRebuildReason = ""
+    /// 当前模式向量/编码完备状态（设置窗口 RAG 模式配置区显示）。
+    @Published var vectorCompletenessText = "向量库：未统计"
+    @Published var vectorIsComplete = true
+    /// 手动补做向量进行中。
+    @Published var isBackfillingVectors = false
     @Published var isModelLoading = false
     /// 主模型加载完成后的 KV 预热阶段；期间禁止发送消息，避免和 prefill 争夺模型。
     @Published var isWarmingUp = false
@@ -467,6 +472,10 @@ final class AppViewModel: ObservableObject {
             // 默认模型缺失：预加载必然失败，等下载补齐后由用户重新触发加载。
             appendLog("[models] 默认模型缺失，已跳过预加载："
                 + missingDefaultModels.map(\.repo).joined(separator: ", "))
+            // 但向量回填续做不应被无关模型（如主 LLM）缺失阻断：
+            // 普通模式回填在无模型时也能读 pending；这里独立 kick 一次。
+            // 与 preloadRAGModels 末尾的 kick 幂等。
+            agent?.ragEngine.kickBackfill()
         }
         // 即使无需预加载模型（API 模式/未启用辅助模型），也要让闲时摘要
         // 在启动后按空闲计时自动开始。
@@ -718,6 +727,14 @@ final class AppViewModel: ObservableObject {
         newAgent.auxLLM = config.auxEnabled
             ? LocalModelFactory.shared.makeAuxLLM(config: config)
             : nil
+        // 后台回填排空 / ANN 构建完成后回调刷新 UI 完备状态（这些流程不经过
+        // 同步结束等 AppModel 事件点）。回主线程刷新，且只刷新仍存活的当前 agent。
+        newAgent.ragEngine.onBackgroundStatusChanged = { [weak self] in
+            Task { @MainActor [weak self] in
+                guard let self, self.agent === newAgent else { return }
+                self.refreshRAGStatus()
+            }
+        }
         // 知识图谱抽取/关键词提取复用辅助模型实例。
         newAgent.ragEngine.auxLLM = newAgent.auxLLM
         agent = newAgent
@@ -1092,6 +1109,9 @@ final class AppViewModel: ObservableObject {
         for failure in outcome.failures {
             appendLog("[model] 预加载失败：\(failure)")
         }
+        // 启动续做：若上次同步中断留下「正文已入库、向量未回填」的切片，
+        // 预加载完成后启动后台回填补齐；无待回填项时循环会自行退出。
+        agent.ragEngine.kickBackfill()
     }
 
     /// 用稳定的 system prompt + 工具清单预热主模型 KV cache，并更新状态栏。
@@ -2392,6 +2412,40 @@ final class AppViewModel: ObservableObject {
         colbertANNBuildTask?.cancel()
     }
 
+    /// 手动补做当前模式的向量/编码：入队缺失项并启动后台回填。
+    /// 期间显示忙碌态，后台回填跑完（或超时）后刷新完备状态。
+    func requestVectorBackfill() {
+        guard let agent, !isBackfillingVectors, !isSyncing else { return }
+        isBackfillingVectors = true
+        statusText = "正在补做向量…"
+        appendLog("[backfill] 用户手动触发向量补做")
+        let targetID = ObjectIdentifier(agent)
+        let engine = agent.ragEngine
+        Task.detached(priority: .utility) { [weak self] in
+            let enqueued = engine.requestVectorBackfill()
+            // 等后台回填告一段落（最多 ~90 秒），期间定期刷新状态文本。
+            for i in 0..<30 {
+                try? await Task.sleep(nanoseconds: 3_000_000_000)
+                if Task.isCancelled { break }
+                // 每轮回主线程刷新完备状态文本，用户能看到待补做数递减。
+                if i % 2 == 0 {
+                    await MainActor.run { [weak self] in self?.refreshRAGStatus() }
+                }
+                if !engine.backfillStatus().running { break }
+            }
+            await MainActor.run { [weak self] in
+                guard let self else { return }
+                self.isBackfillingVectors = false
+                guard let current = self.agent, ObjectIdentifier(current) == targetID else { return }
+                self.statusText = enqueued > 0
+                    ? "向量补做已启动（新入队 \(enqueued) 条），后台进行中"
+                    : "向量补做已触发，后台进行中"
+                self.appendLog("[backfill] 手动补做触发完成（新入队 \(enqueued) 条）")
+                self.refreshRAGStatus()
+            }
+        }
+    }
+
     // MARK: 知识图谱
 
     private var kgBuildTask: Task<Void, Never>?
@@ -2946,6 +3000,8 @@ final class AppViewModel: ObservableObject {
         // 内部标志让 RAG 在文件/embedding 批次边界退出；Task 取消让
         // SemanticChunker 等支持 Task.isCancelled 的步骤立即返回。
         agent?.ragEngine.cancel()
+        // 同步期间 kick 的后台向量/编码回填也要停：它是独立 Task，syncTask.cancel 传不到。
+        agent?.ragEngine.requestStopBackfill()
         syncTask?.cancel()
         // 检索阅读模式：同步触发的模型下载（几百 MB）也一并取消，
         // 不再让下载在后台「静默」跑完。
@@ -2975,6 +3031,28 @@ final class AppViewModel: ObservableObject {
             let colbertANN = engine.colbertANNStatus()
             let rebuildRequired = status["vector_rebuild_required"]?.boolValue ?? false
             let rebuildReason = status["rebuild_reason"]?.stringValue ?? ""
+            // 当前模式向量/编码完备状态（决策模式不用向量，返回空文案由 UI 隐藏）。
+            let completeness = engine.vectorCompleteness()
+            let completenessText: String
+            let isComplete: Bool
+            if engine.config.isDecisionMode {
+                completenessText = ""
+                isComplete = true
+            } else if completeness.total < 0 {
+                // 库打不开/查询失败：明确提示不可用，不能显示「完备」误导用户。
+                let label = engine.config.colbertReaderEnabled ? "ColBERT 编码" : "向量"
+                completenessText = "\(label)库：状态不可用（索引未就绪或模型加载失败）"
+                isComplete = false
+            } else {
+                let label = engine.config.colbertReaderEnabled ? "ColBERT 编码" : "向量"
+                if completeness.pending > 0 {
+                    completenessText = "\(label)库：\(completeness.filled)/\(completeness.total) 已就绪，"
+                        + "\(completeness.pending) 待补做"
+                } else {
+                    completenessText = "\(label)库：\(completeness.filled)/\(completeness.total) 已就绪"
+                }
+                isComplete = completeness.complete
+            }
             // 超时/不可用时 status 带 error：状态栏给可读提示，不显示误导性的 0 切片。
             let text: String
             if let reason = status["error"]?.stringValue {
@@ -3002,6 +3080,8 @@ final class AppViewModel: ObservableObject {
                     }
                     self.vectorRebuildRequired = rebuildRequired
                     self.vectorRebuildReason = rebuildReason
+                    self.vectorCompletenessText = completenessText
+                    self.vectorIsComplete = isComplete
                 } else {
                     // agent 已切换：丢弃旧结果，重新为新实例取一次状态。
                     self.refreshRAGStatus()

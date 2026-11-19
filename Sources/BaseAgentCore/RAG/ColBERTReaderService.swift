@@ -265,6 +265,48 @@ public final class ColBERTReaderService: @unchecked Sendable {
         engine.warmupQueryEncoding()
     }
 
+    /// 只写正文 + FTS，编码转后台。供同步时「文本入库即完成」。
+    /// 不触发模型下载/加载：ensureEngineInstance 只打开 schema，文本入库纯 DB 操作。
+    public func ingestTextsOnly(markdown: String, source: String, title: String? = nil,
+                                sourceKey sourceKeyOverride: String? = nil,
+                                shouldCancel: (() -> Bool)? = nil) throws -> Int {
+        let engine = try ensureEngineInstance()
+        opLock.lock()
+        defer { opLock.unlock() }
+        let similarity = PotionSentenceSimilarity().adjacentCosines
+        // doc_id 前缀必须与 delete/chunkCount 的 sourceKey(source) 一致（SHA256 前 8 字节），
+        // 否则按来源删除/计数永远匹配不到，孤儿残留 + 未变化文件反复重做。
+        let key = sourceKey(source)
+        return try engine.ingestTextsOnly(markdown: markdown, source: source,
+                                          title: title, sourceKey: key,
+                                          bits: config.colbertQuantBits,
+                                          similarity: similarity,
+                                          shouldCancel: shouldCancel)
+    }
+
+    /// 待回填编码的切片数（不触发模型加载/下载，供状态栏与后台循环查询）。
+    public func pendingEncodeCount() -> Int {
+        (try? ensureEngineInstance().pendingEncodeCount()) ?? 0
+    }
+
+    /// ColBERT 编码完备状态（不触发模型加载/下载）。
+    public func encodingCompleteness() -> (total: Int, filled: Int, pending: Int) {
+        (try? ensureEngineInstance().encodingCompleteness()) ?? (-1, 0, 0)
+    }
+
+    /// 后台回填一批待编码切片。确保模型已加载后委托 engine。
+    /// 持 opLock 与 ingest/delete/shutdown 串行（texts-only 与回填都写 colbert.db）。
+    public func backfillPending(limit: Int,
+                                shouldCancel: (() -> Bool)? = nil) async throws -> Int {
+        let engine = try await ensureEngine()
+        opLock.lock()
+        defer { opLock.unlock() }
+        return try engine.backfillPending(limit: limit, shouldCancel: shouldCancel,
+                                          onError: { message in
+            AgentLog.warning("[colbert] 回填失败（保留待重试）：\(message)")
+        })
+    }
+
     /// 把 top-1 分片原文格式化为供 LLM 总结的上下文。
     /// 分片按 7500~8000 字符的大分片入库，单条体量在主模型 30k 预算内，完整给出。
     static func primaryContext(citations: [RAGCitation]) -> String {
@@ -335,6 +377,15 @@ public final class ColBERTReaderService: @unchecked Sendable {
             .joined(separator: " ")
         AgentLog.info("[colbert] 检索 \(Int(totalMs))ms 候选=\(hits.count) \(stages)")
         return RAGRetrievalOutcome(context: guide, citations: citations)
+    }
+
+    /// 显式重建 ColBERT 库（清全部切片/向量/ANN），返回清掉的切片数。
+    @discardableResult
+    public func rebuildDatabase() throws -> Int {
+        let engine = try ensureEngineInstance()
+        opLock.lock()
+        defer { opLock.unlock() }
+        return try engine.rebuildDatabase()
     }
 
     /// 重置 ANN 索引（force 全量同步前调用；不依赖模型加载）。

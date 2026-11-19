@@ -64,6 +64,20 @@ extension VectorStore {
         rerankRows += 1
     }
 
+    /// 幂等 upsert（回填专用）：仅当该 rowid 此前没有镜像行时才增加计数，
+    /// 避免重复回填 / 重启续做导致 rerankRows 虚高。
+    func upsertRerankVector(rowID: Int64, blob: Data) throws {
+        guard rerankStorageEnabled else { return }
+        let existed = (try? db.scalar(
+            "SELECT 1 FROM \(Self.rerankVectorTable) WHERE rowid = ?",
+            [.int(rowID)]).intValue) != nil
+        try db.execute(
+            "INSERT OR REPLACE INTO \(Self.rerankVectorTable)(rowid, embedding) VALUES(?, ?)",
+            [.int(rowID), .blob(blob)])
+        if !existed { rerankRows += 1 }
+        try persistRerankCounterLocked()
+    }
+
     @discardableResult
     func deleteRerankRowsLocked(_ rowIDs: [Int64]) throws -> Int {
         guard rerankStorageEnabled, !rowIDs.isEmpty else { return 0 }
