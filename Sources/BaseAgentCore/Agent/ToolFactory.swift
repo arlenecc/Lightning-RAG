@@ -13,6 +13,8 @@ public enum AgentToolFactory {
                              skillIndex: SkillIndex,
                              skillRetriever: SkillRetriever,
                              checkpointCompressor: ((String) async -> String?)? = nil,
+                             multiZoneSearch: RagSearchTool.SearchHandler? = nil,
+                             zoneSummaryProvider: RagStatusTool.ZoneSummaryProvider? = nil,
                              sopTracker: SOPReadTracker = SOPReadTracker()) -> ToolRegistry {
         let registry = ToolRegistry(config: config, callbacks: callbacks)
         registry.session = session
@@ -122,11 +124,12 @@ public enum AgentToolFactory {
                 + "- op=\"ingest\": build/update the index (force).",
             subcommands: [
                 ("search", RagSearchTool(config: config, callbacks: callbacks, registry: registry,
-                                         engine: ragEngine)),
+                                         engine: ragEngine, searchHandler: multiZoneSearch)),
                 ("outline", RagOutlineTool(config: config, callbacks: callbacks, registry: registry,
                                            engine: ragEngine)),
                 ("status", RagStatusTool(config: config, callbacks: callbacks, registry: registry,
-                                         engine: ragEngine)),
+                                         engine: ragEngine,
+                                         zoneSummaryProvider: zoneSummaryProvider)),
                 ("ingest", RagIngestTool(config: config, callbacks: callbacks, registry: registry,
                                          engine: ragEngine)),
             ]))

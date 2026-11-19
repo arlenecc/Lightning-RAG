@@ -581,6 +581,10 @@ public final class RAGEngine {
     /// 后台向量/编码回填服务：切片正文先入库后，异步补齐 embedding 与 ColBERT 编码。
     private var backfillService: VectorBackfillService?
     private let backfillLock = NSLock()
+    /// 跨 engine 共享的 embedding 串行闸：多分区实例共用同一 provider，
+    /// 后台回填必须全局串行，避免并发 forward 触发 Metal 竞态。
+    private static let backfillEmbeddingGate = AsyncSemaphore(value: 1)
+
     /// 决策判定模型打分器（懒加载，与检索阅读模式互斥）。
     private var decisionScorer: MeteorDecisionScorer?
     private let decisionLock = NSLock()
@@ -1617,6 +1621,11 @@ public final class RAGEngine {
                 let pending = store.nextPendingTexts(limit: limit)
                 guard !pending.isEmpty else { return 0 }
                 let texts = pending.map(\.text)
+                // 多分区实例共享同一 embedding provider：跨 engine 的后台回填必须
+                // 全局串行，否则并发 forward 触发 Metal 竞态（崩溃）。
+                let gate = Self.backfillEmbeddingGate
+                guard await gate.acquire() else { return 0 }
+                defer { gate.release() }
                 let vectors: [[Float]]
                 var signatures: [Data]? = nil
                 // 二值粗筛默认开启：回填也要生成签名，否则新切片永远缺 bin 行、
@@ -1855,6 +1864,8 @@ public final class RAGEngine {
         metadataStore?.close()
         metadataStore = nil
         storeLock.unlock()
+        // 延迟关闭路径也要释放 ColBERT 连接/模型，否则多分区 close 时泄漏。
+        shutdownColbert()
     }
 
     public func cancel() {
@@ -3709,12 +3720,21 @@ public final class RAGEngine {
         return (config.workspace as NSString).appendingPathComponent(p)
     }
 
+    public func sharedDecisionScorer() throws -> MeteorDecisionScorer { try ensureDecisionScorer() }
+
     private func ensureDecisionScorer() throws -> MeteorDecisionScorer {
         decisionLock.lock(); defer { decisionLock.unlock() }
         if let scorer = decisionScorer { return scorer }
         let scorer = MeteorDecisionScorer(modelDir: resolvedDecisionModelPath())
         decisionScorer = scorer
         return scorer
+    }
+
+    /// 决策判定模式的 BM25 粗筛（供多分区联合检索复用）：只走 FTS。
+    public func decisionCoarseFTS(query: String, topK: Int,
+                                  source: String? = nil) throws -> [SearchHit] {
+        guard let store = try? ensureMetadataStore() else { return [] }
+        return try store.searchFTS(query: query, topK: max(1, topK), sourceContains: source)
     }
 
     /// 决策判定模式检索：BM25 粗筛 → 核心句 → 模型判定 → TopN。

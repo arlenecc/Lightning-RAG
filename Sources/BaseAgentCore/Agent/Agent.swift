@@ -227,6 +227,9 @@ public final class Agent: @unchecked Sendable {
     public let skillIndex: SkillIndex
     public let skillRetriever: SkillRetriever
     public let ragEngine: RAGEngine
+    /// 多知识分区：默认分区即 ragEngine；其余挂载分区各一个独立 engine（共享模型）。
+    /// key = zone.id，value 为对应分区的 engine；默认分区的 id 也在此表中指向 ragEngine。
+    public let zoneEngines: [String: RAGEngine]
     public let session: Session
     /// 协议主体（BASE）system prompt。默认内置常量；应用启动时可由
     /// `<workspace>/assets/system_prompt.txt` 替换，见 `SystemPromptFile`。
@@ -322,6 +325,19 @@ public final class Agent: @unchecked Sendable {
         self.skillRetriever = SkillRetriever(manager: self.skills, embedding: embedding,
                                              reranker: reranker)
         self.ragEngine = RAGEngine(config: config, embedding: embedding, reranker: reranker)
+        // 多知识分区：默认分区用 ragEngine；每个额外挂载分区独立建 engine，
+        // 共享同一 embedding/reranker provider（工厂按 config 缓存，避免重复加载权重）。
+        var zoneMap: [String: RAGEngine] = [:]
+        if let defaultZone = config.defaultZone {
+            zoneMap[defaultZone.id] = self.ragEngine
+        }
+        for zone in config.knowledgeZones where zone.enabled && !(config.defaultZone?.id == zone.id) {
+            var zoneConfig = config
+            zoneConfig.knowledgeBase = zone.source
+            zoneMap[zone.id] = RAGEngine(config: zoneConfig, embedding: embedding,
+                                         reranker: reranker)
+        }
+        self.zoneEngines = zoneMap
         let memoryDir = MemoryDirectory(workspace: config.workspace)
         memoryDir.ensureLayout()
         self.memoryDirectory = memoryDir
@@ -350,6 +366,9 @@ public final class Agent: @unchecked Sendable {
             // init 未完成前不能在逃逸闭包里捕获 self（存储属性尚未全部初始化），
             // 先用局部转发闭包占位，注册完成后再指向真正的压缩实现。
             var compressorForward: ((String) async -> String?)?
+            var multiZoneSearchForward: RagSearchTool.SearchHandler?
+            let defaultEngine = self.ragEngine
+            let zoneEngineMap = self.zoneEngines
             self.tools = AgentToolFactory.build(
                 config: config, callbacks: callbacks, session: self.session,
                 ragEngine: self.ragEngine, skillManager: self.skills,
@@ -357,7 +376,35 @@ public final class Agent: @unchecked Sendable {
                 checkpointCompressor: { text in
                     await compressorForward?(text)
                 },
+                multiZoneSearch: { query, topK, source in
+                    if let handler = multiZoneSearchForward {
+                        return try await handler(query, topK, source)
+                    }
+                    return try await defaultEngine.searchWithCitations(
+                        query: query, topK: topK, source: source)
+                },
+                zoneSummaryProvider: {
+                    let zones = config.knowledgeZones.filter { $0.enabled }
+                    guard zones.count > 1 else { return [] }
+                    return zones.compactMap { zone in
+                        guard let e = zoneEngineMap[zone.id],
+                              let st = e.cachedStatus() else { return nil }
+                        return (name: zone.name,
+                                chunks: st["chunks_stored"]?.intValue ?? 0,
+                                sources: st["sources"]?.arrayValue?.compactMap(\.stringValue) ?? [])
+                    }
+                },
                 sopTracker: sharedSOPTracker)
+            multiZoneSearchForward = { [weak self] query, topK, source in
+                guard let self else {
+                    throw AgentError.storage("知识分区不可用")
+                }
+                if self.config.isDecisionMode {
+                    return try await self.decisionMultiZoneSearch(query: query,
+                                                                   topK: topK, source: source)
+                }
+                return try await self.multiZoneSearch(query: query, topK: topK, source: source)
+            }
             compressorForward = { [weak self] text in
                 await self?.compressCheckpointText(text)
             }
@@ -518,6 +565,139 @@ public final class Agent: @unchecked Sendable {
         return hadPersisted
     }
 
+    /// 多分区联合检索：并行检索所有挂载分区，RRF 融合后返回单一 outcome。
+    /// 只挂一个分区（或无多分区配置）时直接走默认 engine，保持既有行为。
+    public func multiZoneSearch(query: String, topK: Int,
+                                source: String? = nil) async throws -> RAGRetrievalOutcome {
+        let zones = config.mountedZones
+        guard zones.count > 1, zoneEngines.count > 1 else {
+            return try await ragEngine.searchWithCitations(query: query,
+                                                           topK: topK, source: source)
+        }
+        // 并行检索各分区（每个 engine 有自己的 searchLock/ingest 状态）。
+        let results = await withTaskGroup(of: MultiZoneRetrieval.ZoneResult?.self) { group in
+            for zone in zones {
+                guard let engine = zoneEngines[zone.id] else { continue }
+                group.addTask {
+                    do {
+                        let outcome = try await engine.searchWithCitations(
+                            query: query, topK: max(topK, 10), source: source)
+                        return MultiZoneRetrieval.ZoneResult(zoneID: zone.id,
+                                                             zoneName: zone.name,
+                                                             citations: outcome.citations)
+                    } catch {
+                        AgentLog.warning("[multi-zone] 分区 \(zone.name) 检索失败："
+                            + error.localizedDescription)
+                        return nil
+                    }
+                }
+            }
+            var collected: [MultiZoneRetrieval.ZoneResult] = []
+            for await result in group { if let result { collected.append(result) } }
+            return collected
+        }
+        guard !results.isEmpty else {
+            return try await ragEngine.searchWithCitations(query: query, topK: topK, source: source)
+        }
+        let fused = MultiZoneRetrieval.fuse(results, topK: topK, rrfK: config.ragRRFK)
+        return RAGRetrievalOutcome(context: MultiZoneRetrieval.primaryContext(fused),
+                                   citations: fused)
+    }
+
+    /// 决策模式多分区检索：两次判定。
+    /// ① 依据对话状态+问句判定从哪些知识分区检索；② 各分区 FTS 粗筛 50 →
+    /// 按判定分加权 RRF 融合取前 20 → 判定模型按核心句评判 → 取 Top3。
+    public func decisionMultiZoneSearch(query: String, topK: Int,
+                                        source: String? = nil) async throws -> RAGRetrievalOutcome {
+        let zones = config.mountedZones
+        guard zones.count > 1, zoneEngines.count > 1 else {
+            return try await ragEngine.searchWithCitations(query: query, topK: topK, source: source)
+        }
+        guard let scorer = try? ragEngine.sharedDecisionScorer() else {
+            // 判定模型不可用：降级为普通多分区联合检索。
+            return try await multiZoneSearch(query: query, topK: topK, source: source)
+        }
+        // 对话状态：最近一条用户输入 + 当前问句。
+        let stateText = "用户问句：\(query)"
+        // ① 第一次判定：为每个分区构造「领域名 + 代表文档名」描述，模型打分选库。
+        let zoneDescriptions = zones.map { zone -> String in
+            let docs = (try? zoneEngines[zone.id]?.listDocuments(limit: 8).names) ?? []
+            return "知识分区【\(zone.name)】：代表文档 \(docs.joined(separator: "、"))"
+        }
+        if Task.isCancelled { throw CancellationError() }
+        // 与单库 decisionSearch 一致的墙钟预算，避免模型 forward 卡住拖垮整轮。
+        let timeout = config.ragQueryTimeoutSeconds
+        let budget = timeout == 0 ? Double.greatestFiniteMagnitude : max(30, timeout * 3)
+        let zoneScores = try await RAGEngine.withTimeout(budget) {
+            try await scorer.score(query: stateText, passages: zoneDescriptions,
+                                   coreSentenceCount: 3, useCoreSentences: false)
+        }
+        var selected: [(zone: KnowledgeZone, weight: Double)] = []
+        for (i, zone) in zones.enumerated() {
+            let s = i < zoneScores.count ? zoneScores[i] : 0
+            if s >= 0.4 { selected.append((zone, s)) }
+        }
+        if selected.isEmpty {
+            // 全不达标时保守选全部（避免漏检），权重用各分区自己的判定分+0.01。
+            selected = zones.enumerated().map { i, zone in
+                let own = i < zoneScores.count ? zoneScores[i] : 0
+                return (zone, own + 0.01)
+            }
+        }
+        AgentLog.info("[decision-multi] 选库 \(selected.map { "\($0.zone.name):\($0.weight)" }.joined(separator: ","))")
+
+        // ② 各选中分区 FTS 粗筛 50。
+        let perZone = config.decisionCoarseCandidates
+        let coarseResults: [(zone: KnowledgeZone, weight: Double, hits: [SearchHit])] =
+            selected.compactMap { item in
+                guard let engine = zoneEngines[item.zone.id] else { return nil }
+                let hits = (try? engine.decisionCoarseFTS(query: query, topK: perZone,
+                                                          source: source)) ?? []
+                return hits.isEmpty ? nil : (item.zone, item.weight, hits)
+            }
+        guard !coarseResults.isEmpty else {
+            return RAGRetrievalOutcome(context: "（知识库中未找到相关内容）", citations: [])
+        }
+        // 加权 RRF 融合取前 20。
+        let zoneResults = coarseResults.map { item in
+            MultiZoneRetrieval.ZoneResult(
+                zoneID: item.zone.id,
+                zoneName: item.zone.name,
+                citations: item.hits.prefix(perZone).map { hit in
+                    RAGCitation(id: "\(item.zone.id):\(hit.rowID)", rank: 0,
+                                source: (hit.source as NSString).lastPathComponent,
+                                heading: hit.heading, text: hit.text,
+                                score: hit.score, isPrimary: false)
+                },
+                weight: item.weight)
+        }
+        let fused20 = Array(MultiZoneRetrieval.fuse(zoneResults,
+                                                     topK: max(20, topK),
+                                                     rrfK: config.ragRRFK).prefix(20))
+        guard !fused20.isEmpty else {
+            return RAGRetrievalOutcome(context: "（知识库中未找到相关内容）", citations: [])
+        }
+        // ③ 第二次判定：按核心句评判 20 个候选，取 Top3（或 decisionTopN）。
+        if Task.isCancelled { throw CancellationError() }
+        let passages = fused20.map(\.text)
+        let scores = try await RAGEngine.withTimeout(budget) {
+            try await scorer.score(query: query, passages: passages,
+                                   coreSentenceCount: self.config.decisionCoreSentenceCount,
+                                   useCoreSentences: self.config.decisionUseCoreSentences)
+        }
+        let n = max(1, min(config.decisionTopN, fused20.count))
+        let ranked = zip(fused20, scores).sorted { $0.1 > $1.1 }.prefix(n)
+        let citations = ranked.enumerated().map { index, pair in
+            var c = pair.0
+            c.rank = index + 1
+            c.score = pair.1
+            c.isPrimary = index == 0
+            return c
+        }
+        return RAGRetrievalOutcome(context: MultiZoneRetrieval.primaryContext(citations),
+                                   citations: citations)
+    }
+
     public func close() {
         takeBackgroundTask()?.cancel()
         mcpTaskLock.lock()
@@ -531,6 +711,8 @@ public final class Agent: @unchecked Sendable {
         mcpClients.removeAll()
         skillRetriever.close()
         ragEngine.close()
+        // 额外分区 engine 也要关闭；跳过 ragEngine 本身避免重复 close。
+        for engine in zoneEngines.values where engine !== ragEngine { engine.close() }
         GraphMemoryStore.flushShared()
         GraphMemoryStore.releaseShared(workspace: config.workspace)
         (llm as? ClosableLLMService)?.close()
@@ -564,6 +746,7 @@ public final class Agent: @unchecked Sendable {
         mcpClients.removeAll()
         skillRetriever.close()
         ragEngine.close()
+        for engine in zoneEngines.values where engine !== ragEngine { engine.close() }
         if let service = llm as? AsyncUnloadableLLMService {
             await service.unloadAndWait()
         } else {

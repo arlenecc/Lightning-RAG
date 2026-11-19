@@ -2,6 +2,39 @@ import Foundation
 import CryptoKit
 import Darwin
 
+// MARK: - 多知识分区
+
+/// 一个知识分区：领域名 + 源目录 + 是否启用挂载 + 是否为默认分区。
+/// 每个分区按源目录哈希拥有独立的 ragDir / index.sqlite / colbert.db / manifest。
+public struct KnowledgeZone: Codable, Sendable, Equatable {
+    /// 稳定的唯一标识（源目录哈希派生；迁移旧配置时取默认分区）。
+    public var id: String
+    /// 领域名（供 UI 展示与决策模型判定选库使用）。
+    public var name: String
+    /// 源目录路径（原始文件目录，只读）。
+    public var source: String
+    /// 是否挂载参与联合检索。
+    public var enabled: Bool
+    /// 是否为默认分区（单库操作用它；与 knowledgeBase 字段兼容）。
+    public var isDefault: Bool
+
+    public init(id: String, name: String, source: String,
+                enabled: Bool = true, isDefault: Bool = false) {
+        self.id = id
+        self.name = name
+        self.source = source
+        self.enabled = enabled
+        self.isDefault = isDefault
+    }
+
+    /// 用源目录生成稳定 id（SHA256 前 8 字节 hex），与 ragDir 哈希口径独立但同样稳定。
+    public static func makeID(source: String) -> String {
+        let expanded = expandPath(source)
+        let digest = SHA256.hash(data: Data(expanded.utf8))
+        return digest.prefix(4).map { String(format: "%02x", $0) }.joined()
+    }
+}
+
 // MARK: - MCP
 
 public struct MCPServerConfig: Codable, Sendable, Equatable {
@@ -119,6 +152,19 @@ public struct AgentConfig: Sendable {
     public var repetitionPenalty: Double = 1.0
     public var workspace: String = expandPath("~/base-agent-workspace")
     public var knowledgeBase: String = ""
+    /// 多知识分区。默认分区与 knowledgeBase 保持一致；旧配置迁移为单分区。
+    public var knowledgeZones: [KnowledgeZone] = []
+
+    /// 默认分区：优先取 isDefault，否则取 source == knowledgeBase 的分区。
+    public var defaultZone: KnowledgeZone? {
+        knowledgeZones.first { $0.isDefault }
+            ?? knowledgeZones.first { $0.source == knowledgeBase }
+    }
+    /// 当前挂载（启用）的分区；空数组时视为单库模式（用 knowledgeBase）。
+    public var mountedZones: [KnowledgeZone] {
+        let enabled = knowledgeZones.filter { $0.enabled }
+        return enabled.isEmpty ? [] : enabled
+    }
     public var requestTimeout: Double = 120.0
     public var maxIterations: Int = 15
     /// 预留（当前未接线）：历史窗口实际由 kernelRawTurns / kernelConsolidateEvery
@@ -659,6 +705,18 @@ public struct AgentConfig: Sendable {
         if let v = double("repetition_penalty") { repetitionPenalty = v }
         if let v = string("workspace"), !v.isEmpty { workspace = expandPath(v) }
         if let v = string("knowledge_base") { knowledgeBase = v }
+        if let zones = d["knowledge_zones"]?.arrayValue {
+            knowledgeZones = zones.compactMap { item in
+                guard let o = item.objectValue,
+                      let name = o["name"]?.stringValue,
+                      let source = o["source"]?.stringValue else { return nil }
+                return KnowledgeZone(
+                    id: o["id"]?.stringValue ?? KnowledgeZone.makeID(source: source),
+                    name: name, source: source,
+                    enabled: o["enabled"]?.boolValue ?? true,
+                    isDefault: o["is_default"]?.boolValue ?? false)
+            }
+        }
         if let v = double("request_timeout") { requestTimeout = v }
         if let v = int("max_iterations") { maxIterations = v }
         if let v = int("max_history") { maxHistory = v }
@@ -911,6 +969,53 @@ public struct AgentConfig: Sendable {
 
     /// 旧版本配置迁移（docling/marker → ovis、旧 embedding/reranker 名）。
     public mutating func migrate() {
+        // 多知识分区：旧配置无 knowledge_zones 时，用 knowledgeBase 建默认单分区；
+        // 已有 zones 时确保 id 非空、恰有一个默认。
+        if knowledgeZones.isEmpty {
+            let source = knowledgeBase.isEmpty
+                ? (workspace as NSString).appendingPathComponent("knowledge_base")
+                : knowledgeBase
+            knowledgeZones = [KnowledgeZone(id: KnowledgeZone.makeID(source: source),
+                                            name: "默认知识库", source: source,
+                                            enabled: true, isDefault: true)]
+        } else {
+            // 源目录留空的分区（UI 支持「留空=默认目录」）不能丢弃：补成默认目录，
+            // 否则用户新建但暂未填路径的分区会在下次启动静默消失。
+            let fallback = knowledgeBase.isEmpty
+                ? (workspace as NSString).appendingPathComponent("knowledge_base")
+                : knowledgeBase
+            for i in knowledgeZones.indices {
+                if knowledgeZones[i].source.isEmpty { knowledgeZones[i].source = fallback }
+                if knowledgeZones[i].id.isEmpty {
+                    knowledgeZones[i].id = KnowledgeZone.makeID(source: knowledgeZones[i].source)
+                }
+            }
+            if !knowledgeZones.contains(where: { $0.isDefault }) {
+                let idx = knowledgeZones.firstIndex { $0.source == knowledgeBase } ?? 0
+                for i in knowledgeZones.indices { knowledgeZones[i].isDefault = (i == idx) }
+            } else {
+                var seen = false
+                for i in knowledgeZones.indices {
+                    if knowledgeZones[i].isDefault {
+                        if seen { knowledgeZones[i].isDefault = false } else { seen = true }
+                    }
+                }
+            }
+        }
+        // 同源分区去重：两个分区指向同一目录会建两个 engine 写同一个 sqlite，
+        // manifest 互相覆盖、检索重复召回。保留第一个（通常是默认）。
+        var seenSources: Set<String> = []
+        knowledgeZones = knowledgeZones.filter { zone in
+            let key = (expandPath(zone.source) as NSString).standardizingPath
+            if seenSources.contains(key) { return false }
+            seenSources.insert(key)
+            return true
+        }
+        // 默认分区 source 必须与 knowledgeBase 一致：ragEngine 绑定 knowledgeBase，
+        // zoneEngines[默认id] 指向它，不一致会导致默认库查错目录。
+        if let def = knowledgeZones.first(where: { $0.isDefault }) {
+            knowledgeBase = def.source
+        }
         // RAG 模式三选一：旧配置只有 colbert_reader_enabled，迁移到 ragMode。
         // 新配置若显式给了合法 rag_mode 则以它为准；否则按旧布尔字段推导。
         let validModes: Set<String> = ["vector", "colbert", "decision"]
@@ -1133,6 +1238,10 @@ public struct AgentConfig: Sendable {
             "top_p": topP, "min_p": minP, "top_k": topK,
             "repetition_penalty": repetitionPenalty,
             "workspace": workspace, "knowledge_base": knowledgeBase,
+            "knowledge_zones": knowledgeZones.map { zone in
+                ["id": zone.id, "name": zone.name, "source": zone.source,
+                 "enabled": zone.enabled, "is_default": zone.isDefault]
+            },
             "request_timeout": requestTimeout, "max_iterations": maxIterations,
             "max_history": maxHistory, "max_context_tokens": maxContextTokens,
             "context_shrink_ratio": contextShrinkRatio,

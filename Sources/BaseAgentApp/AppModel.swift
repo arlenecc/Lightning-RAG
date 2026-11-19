@@ -335,6 +335,9 @@ final class AppViewModel: ObservableObject {
     /// 给一次 5 秒宽限，避免把刚恢复的任务误判为「模型未加载」直接跳过。
     private var didWaitForInitialPreload = false
     private var syncTask: Task<Void, Never>?
+    /// 多分区同步：当前分区同步 Task 与目标分区 id（供「停止同步」中断对应 engine）。
+    private var zoneSyncTask: Task<Void, Never>?
+    private var zoneSyncEngineID: String?
     /// 空闲内存回收：无前台活动 3 分钟后释放可重建的 OCR 权重。
     private var idleUnloadTask: Task<Void, Never>?
     /// 闲时摘要计时：需要比 OCR 回收更长的空闲窗口，避免和前台抢 GPU。
@@ -2417,6 +2420,69 @@ final class AppViewModel: ObservableObject {
         colbertANNBuildTask?.cancel()
     }
 
+    /// 同步指定知识分区（多分区）：用该分区独立的 engine 做全链路同步。
+    func syncZone(zoneID: String) {
+        guard let agent, let engine = agent.zoneEngines[zoneID],
+              !isSyncing, !isDeduplicating, !isBuildingColbertANN else { return }
+        if blockForMissingModels("知识分区同步") { return }
+        let zoneName = agent.config.knowledgeZones.first { $0.id == zoneID }?.name ?? zoneID
+        isSyncing = true
+        isStoppingSync = false
+        syncGeneration += 1
+        let generation = syncGeneration
+        statusText = "同步知识分区「\(zoneName)」…"
+        appendLog("[rag] 开始同步知识分区「\(zoneName)」")
+        cancelIdleUnload()
+        // 与主库同步一致：分区大库同步前卸载本地 LLM/OCR 权重，避免 OCR/embedding
+        // 与常驻 KV 争用 MLX 统一内存导致 OOM；结束后按同步前状态恢复并预热。
+        let restoreMain = mainModelLoaded || agent.llm is PreloadableLLMService
+        let restoreAux = config.auxEnabled
+            && (auxModelLoaded || agent.auxLLM is PreloadableLLMService)
+        Task { await self.stopSummaryIdleSession() }
+        suspendModelsForSync()
+        zoneSyncEngineID = zoneID
+        let task = Task.detached(priority: .utility) { [weak self] in
+            let stats = await engine.ingest(log: { line in
+                Task { @MainActor [weak self] in self?.appendLog(line) }
+            })
+            await MainActor.run { [weak self] in
+                guard let self else { return }
+                self.zoneSyncTask = nil
+                self.zoneSyncEngineID = nil
+                guard self.syncGeneration == generation else { return }
+                self.isSyncing = false
+                let cancelled = stats.cancelled
+                self.statusText = cancelled
+                    ? "分区「\(zoneName)」同步已停止"
+                    : "分区「\(zoneName)」同步完成：\(stats.processed) 文件 / \(stats.chunks) 切片"
+                self.appendLog("[rag] 分区「\(zoneName)」\(cancelled ? "同步已停止" : "同步完成")："
+                    + "\(stats.processed) 文件，\(stats.chunks) 切片，错误 \(stats.errors.count)")
+                Task { await self.resumeModelsAfterSync(main: restoreMain, aux: restoreAux) }
+                self.refreshRAGStatus()
+                self.scheduleIdleUnload()
+            }
+        }
+        zoneSyncTask = task
+    }
+
+    /// 对指定源目录的知识分区做向量去重。
+    func dedupeZone(source: String) {
+        guard let agent, !isDeduplicating, !isSyncing else { return }
+        let zone = agent.config.knowledgeZones.first { $0.source == source }
+        let engine = zone.flatMap { agent.zoneEngines[$0.id] } ?? agent.ragEngine
+        isDeduplicating = true
+        statusText = "知识分区向量去重中…"
+        Task.detached(priority: .utility) { [weak self] in
+            let stats = try? engine.deduplicateVectors()
+            await MainActor.run { [weak self] in
+                guard let self else { return }
+                self.isDeduplicating = false
+                self.statusText = "向量去重完成：清理 \(stats?.removedChunks ?? 0) 个重复切片"
+                self.refreshRAGStatus()
+            }
+        }
+    }
+
     /// 手动补做当前模式的向量/编码：入队缺失项并启动后台回填。
     /// 期间显示忙碌态，后台回填跑完（或超时）后刷新完备状态。
     func requestVectorBackfill() {
@@ -3005,6 +3071,12 @@ final class AppViewModel: ObservableObject {
         // 内部标志让 RAG 在文件/embedding 批次边界退出；Task 取消让
         // SemanticChunker 等支持 Task.isCancelled 的步骤立即返回。
         agent?.ragEngine.cancel()
+        // 多分区同步：中断目标分区 engine（它有自己的 cancel 标志）。
+        if let zoneID = zoneSyncEngineID, let zoneEngine = agent?.zoneEngines[zoneID] {
+            zoneEngine.cancel()
+            zoneEngine.requestStopBackfill()
+        }
+        zoneSyncTask?.cancel()
         // 同步期间 kick 的后台向量/编码回填也要停：它是独立 Task，syncTask.cancel 传不到。
         agent?.ragEngine.requestStopBackfill()
         syncTask?.cancel()
@@ -3025,12 +3097,23 @@ final class AppViewModel: ObservableObject {
         // 用 ObjectIdentifier 判新旧实例，避免在并发闭包里捕获会变化的 agent 引用。
         let targetID = ObjectIdentifier(agent)
         let engine = agent.ragEngine
+        // 多分区：预取其它挂载分区缓存状态（cachedStatus 不查库，仅内存读），
+        // 用于状态栏显示总规模；首次未同步的分区没有缓存，按 0 计。
+        let zoneSummaries = agent.config.mountedZones.compactMap { zone -> (chunks: Int, sources: Int)? in
+            guard let ze = agent.zoneEngines[zone.id], ze !== engine,
+                  let st = ze.cachedStatus() else { return nil }
+            return (st["chunks_stored"]?.intValue ?? 0,
+                    st["source_count"]?.intValue ?? 0)
+        }
         Task.detached(priority: .utility) { [weak self] in
             let status = engine.status()
             let chunks = status["chunks_stored"]?.intValue ?? 0
             let backend = status["vector_backend"]?.stringValue ?? "sqlite"
             let sources = status["source_count"]?.intValue
                 ?? status["sources"]?.arrayValue?.count ?? 0
+            let totalChunks = chunks + zoneSummaries.reduce(0) { $0 + $1.chunks }
+            let totalSources = sources + zoneSummaries.reduce(0) { $0 + $1.sources }
+            let zoneSuffix = zoneSummaries.isEmpty ? "" : "（含 \(zoneSummaries.count) 个其它分区）"
             let ann = status["ann_index"]?.stringValue ?? ""
             let binaryANN = status["binary_ann_index"]?.stringValue ?? ""
             let colbertANN = engine.colbertANNStatus()
@@ -3062,8 +3145,10 @@ final class AppViewModel: ObservableObject {
             let text: String
             if let reason = status["error"]?.stringValue {
                 text = "知识库\(reason)（上次统计：\(chunks) 切片 · \(sources) 文件）"
-            } else {
+            } else if zoneSummaries.isEmpty {
                 text = "\(chunks) 切片 · \(sources) 文件 · \(backend)"
+            } else {
+                text = "\(totalChunks) 切片 · \(totalSources) 文件 · \(backend)\(zoneSuffix)"
             }
             await MainActor.run { [weak self] in
                 guard let self else { return }

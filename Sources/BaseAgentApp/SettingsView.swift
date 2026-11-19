@@ -143,6 +143,16 @@ struct SettingsView: View {
     /// Weighted RRF 向量路权重（BM25 = 1 - 该值）；向量/极速模式共用。
     @State private var rrfVectorWeight: Double = 0.7
 
+    /// 多知识分区配置行（UI 可增删）。
+    private struct ZoneRow: Identifiable {
+        let id: String
+        var name: String
+        var source: String
+        var enabled: Bool
+        var isDefault: Bool
+    }
+    @State private var zoneRows: [ZoneRow] = []
+
     // MARK: RAG 模式三选一 + 决策判定
     @State private var ragMode = "vector"
     @State private var decisionModelBackend = "mlx-vlm"
@@ -906,7 +916,7 @@ struct SettingsView: View {
         }
     }
 
-    // MARK: - 工作目录配置区
+    // MARK: - 工作目录配置区（多知识分区）
     private var directorySection: some View {
         GroupBox {
             VStack(alignment: .leading, spacing: 10) {
@@ -916,20 +926,77 @@ struct SettingsView: View {
                         .textFieldStyle(.roundedBorder)
                     Button("选择…") { chooseDirectory($workspace, title: "选择工作目录") }
                 }
-                HStack(spacing: 8) {
-                    Text("源目录").font(.caption)
-                    TextField("留空 = workspace/knowledge_base", text: $knowledgeBase)
-                        .textFieldStyle(.roundedBorder)
-                        .frame(maxWidth: .infinity)
-                    Button("选择…") { chooseDirectory($knowledgeBase, title: "选择源目录") }
-                    knowledgeButtons()
-                    stopAndDedupeButtons()
+                ForEach($zoneRows) { $zone in
+                    VStack(alignment: .leading, spacing: 4) {
+                        HStack(spacing: 6) {
+                            Text("启用").font(.caption2)
+                            Toggle("", isOn: $zone.enabled).toggleStyle(.checkbox)
+                            Button(zone.isDefault ? "默认" : "设为默认") {
+                                setDefaultZone(zone.id)
+                            }
+                            .buttonStyle(.borderless)
+                            .font(.caption2)
+                            .disabled(zone.isDefault)
+                            if !zone.isDefault {
+                                Button("删除") { removeZone(zone.id) }
+                                    .buttonStyle(.borderless).font(.caption2)
+                            }
+                            Text("源知识库").font(.caption2)
+                            TextField("领域名（如 法律、医学）", text: $zone.name)
+                                .textFieldStyle(.roundedBorder)
+                                .frame(maxWidth: 180)
+                        }
+                        HStack(spacing: 6) {
+                            Text("源目录").font(.caption2)
+                            TextField("留空 = workspace/knowledge_base", text: $zone.source)
+                                .textFieldStyle(.roundedBorder)
+                                .frame(maxWidth: .infinity)
+                            Button("选择…") {
+                                chooseDirectory(Binding(get: { zone.source },
+                                                        set: { zone.source = $0 }),
+                                                title: "选择 \(zone.name) 源目录")
+                            }
+                        }
+                        HStack(spacing: 6) {
+                            Button("应用配置") { applyAllConfig() }
+                            Button("同步知识") { applyAndSyncZone(zone.id) }
+                            Button("停止同步") { model.stopSync() }
+                            Button("向量去重") { model.dedupeZone(source: zone.source) }
+                        }
+                        .buttonStyle(.borderless)
+                        .font(.caption2)
+                    }
+                    .padding(6)
+                    .background(zone.isDefault ? Color.accentColor.opacity(0.08) : Color.clear)
+                    .cornerRadius(4)
+                }
+                HStack {
+                    Button("添加新知识库") { addZone() }
+                        .buttonStyle(.borderless)
+                    Spacer()
                 }
             }
             .padding(8)
         } label: {
             Text("工作目录配置").font(.headline)
         }
+    }
+
+    private func addZone() {
+        let id = String(UUID().uuidString.prefix(8))
+        zoneRows.append(ZoneRow(id: id, name: "新知识库",
+                                source: "", enabled: true, isDefault: zoneRows.isEmpty))
+    }
+
+    private func setDefaultZone(_ id: String) {
+        for i in zoneRows.indices { zoneRows[i].isDefault = (zoneRows[i].id == id) }
+    }
+
+    private func removeZone(_ id: String) {
+        zoneRows.removeAll { $0.id == id }
+        // 独立存储目录（rag_data/<hash>）保留，不误删用户数据；点「应用配置」后
+        // 该分区不再挂载，需要彻底删除可手动清理对应 rag_data 子目录。
+        statusMessage = "已从配置移除知识分区（索引数据保留在 rag_data，可手动清理）"
     }
 
     // MARK: - 极速检索模式配置（原在高级设置）
@@ -1643,6 +1710,10 @@ struct SettingsView: View {
         colbertLengthNorm = config.colbertLengthNorm
         colbertQueryPrune = config.colbertQueryPrune
         rrfVectorWeight = config.ragRRFVectorWeight
+        zoneRows = config.knowledgeZones.map {
+            ZoneRow(id: $0.id, name: $0.name, source: $0.source,
+                    enabled: $0.enabled, isDefault: $0.isDefault)
+        }
         ragMode = config.ragMode
         decisionModelBackend = config.decisionModelBackend
         decisionModelPath = config.decisionModelPath
@@ -1734,6 +1805,15 @@ struct SettingsView: View {
             : "配置已应用，正在同步知识库…"
         model.applyConfig(config) {
             model.syncKnowledgeBase(force: kbChanged)
+        }
+    }
+
+    /// 应用配置后同步指定知识分区（分区有独立 engine 与存储目录）。
+    private func applyAndSyncZone(_ zoneID: String) {
+        guard let config = buildConfig() else { return }
+        statusMessage = "配置已应用，正在同步知识分区…"
+        model.applyConfig(config) {
+            model.syncZone(zoneID: zoneID)
         }
     }
 
@@ -2024,6 +2104,14 @@ struct SettingsView: View {
         config.colbertLengthNorm = colbertLengthNorm
         config.colbertQueryPrune = colbertQueryPrune
         config.ragRRFVectorWeight = min(max(rrfVectorWeight, 0.1), 0.9)
+        config.knowledgeZones = zoneRows.map {
+            KnowledgeZone(id: $0.id, name: $0.name, source: $0.source,
+                          enabled: $0.enabled, isDefault: $0.isDefault)
+        }
+        // 默认分区的 source 同步到 knowledgeBase（兼容单库字段）。
+        if let def = config.knowledgeZones.first(where: { $0.isDefault }) {
+            config.knowledgeBase = def.source
+        }
         // 图谱未建成（或已失效）时只允许 naive，避免保存一个不可用的策略。
         config.ragRetrievalStrategy = model.knowledgeGraphBuilt ? retrievalStrategy : .naive
 

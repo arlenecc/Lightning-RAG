@@ -68,14 +68,19 @@ public final class RagSearchTool: AgentTool {
     ])
 
     private let engine: RAGEngine
+    /// 多分区联合检索处理器：非空时优先使用它（多分区挂载），否则退回单 engine。
+    public typealias SearchHandler = (_ query: String, _ topK: Int, _ source: String?) async throws -> RAGRetrievalOutcome
+    private let searchHandler: SearchHandler?
     /// 检索即展示：召回切片通过回调推给 UI 气泡；无 UI 调用方为 nil。
     private weak var callbacks: AgentCallbacks?
 
     public init(config: AgentConfig,
                 callbacks: AgentCallbacks? = nil,
                 registry: ToolRegistry? = nil,
-                engine: RAGEngine) {
+                engine: RAGEngine,
+                searchHandler: SearchHandler? = nil) {
         self.engine = engine
+        self.searchHandler = searchHandler
         self.callbacks = callbacks
     }
 
@@ -85,10 +90,15 @@ public final class RagSearchTool: AgentTool {
         let topK = args.boundedInt("top_k", default: 3, range: 1...10)
         let source = args.trimmedString("source")
         do {
-            let outcome = try await engine.searchWithCitations(
-                query: query,
-                topK: topK,
-                source: source.isEmpty ? nil : source)
+            let outcome: RAGRetrievalOutcome
+            if let handler = searchHandler {
+                outcome = try await handler(query, topK, source.isEmpty ? nil : source)
+            } else {
+                outcome = try await engine.searchWithCitations(
+                    query: query,
+                    topK: topK,
+                    source: source.isEmpty ? nil : source)
+            }
             if !outcome.citations.isEmpty {
                 callbacks?.onRetrievedChunks(outcome.citations)
             }
@@ -278,12 +288,17 @@ public final class RagStatusTool: AgentTool {
     ])
 
     private let engine: RAGEngine
+    /// 多分区概览提供者：非空时在每个分区 status 后追加总览（名字/切片/文档）。
+    public typealias ZoneSummaryProvider = () -> [(name: String, chunks: Int, sources: [String])]
+    private let zoneSummaryProvider: ZoneSummaryProvider?
 
     public init(config: AgentConfig,
                 callbacks: AgentCallbacks? = nil,
                 registry: ToolRegistry? = nil,
-                engine: RAGEngine) {
+                engine: RAGEngine,
+                zoneSummaryProvider: ZoneSummaryProvider? = nil) {
         self.engine = engine
+        self.zoneSummaryProvider = zoneSummaryProvider
     }
 
     public func run(_ args: [String: JSONValue]) async throws -> ToolResult {
@@ -394,6 +409,19 @@ public final class RagStatusTool: AgentTool {
         }
         if let error = status["error"]?.stringValue, !error.isEmpty {
             lines.append("  错误: \(error)")
+        }
+        // 多分区总览：让用户/模型一眼看到所有知识分区的领域名与规模。
+        if let provider = zoneSummaryProvider {
+            let summaries = provider()
+            if summaries.count > 1 {
+                lines.append("")
+                lines.append("知识分区总览（共 \(summaries.count) 个）：")
+                for s in summaries {
+                    let docs = s.sources.prefix(8).joined(separator: "、")
+                    lines.append("  - \(s.name)：\(s.chunks) 切片，\(s.sources.count) 文档"
+                        + (docs.isEmpty ? "" : "（\(docs)）"))
+                }
+            }
         }
         return .ok(lines.joined(separator: "\n"))
     }
