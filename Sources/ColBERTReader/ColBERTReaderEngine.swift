@@ -32,16 +32,19 @@ public struct ColBERTReaderOptions: Sendable {
     /// 查询侧 token 轻量剪枝（默认开：丢标点/空白/核心功能词，保留疑问词与形容词）。
     /// 关闭则查询侧完全不剪枝。检索期参数，不进 ingest 签名。
     public var queryPrune: Bool
+    /// Weighted RRF 向量路权重（0...1，默认 0.7）；BM25 权重 = 1 - 该值。
+    public var rrfVectorWeight: Double
 
     public init(quantBits: Int = 4, coarseCandidates: Int = 50,
                 topN: Int = 3, useANN: Bool = true, lengthNorm: Bool = false,
-                queryPrune: Bool = true) {
+                queryPrune: Bool = true, rrfVectorWeight: Double = 0.7) {
         self.quantBits = quantBits
         self.coarseCandidates = coarseCandidates
         self.topN = topN
         self.useANN = useANN
         self.lengthNorm = lengthNorm
         self.queryPrune = queryPrune
+        self.rrfVectorWeight = rrfVectorWeight
     }
 }
 
@@ -217,6 +220,7 @@ public final class ColBERTReaderEngine {
                                        useANN: options.useANN,
                                        lengthNorm: options.lengthNorm,
                                        queryPrune: options.queryPrune,
+                                       rrfVectorWeight: options.rrfVectorWeight,
                                        // 开关开启即视为允许绕过「小库 < 2 万行不建 ANN」
                                        // 的隐藏门槛：UI 的「使用 ANN」才真正生效。
                                        // 无可用索引时 candidates 返回 nil，自然回退精确，

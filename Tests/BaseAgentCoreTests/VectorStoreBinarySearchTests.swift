@@ -96,8 +96,10 @@ final class VectorStoreBinarySearchTests: XCTestCase {
         _ = try store.add(chunks: chunks, vectors: vectors,
                           binarySignatures: signatures)
 
+        // 本测试验证的是「FTS-only 候选不被误标 binary/vector 分」这一正交语义，
+        // 与 Weighted RRF 权重无关：显式用等权 0.5，保证 needle 仍进 top10。
         let hits = try store.hybridSearch(
-            vector: query, query: "needle", topK: 10,
+            vector: query, query: "needle", topK: 10, vectorWeight: 0.5,
             binary: BinaryCoarseOptions(signature: querySignature,
                                         candidateLimit: 20))
         let needle = try XCTUnwrap(hits.first { $0.text == "needle" })

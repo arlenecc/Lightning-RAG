@@ -839,7 +839,7 @@ public final class RAGEngine {
     @discardableResult
     public func buildColbertANN(shouldCancel: (() -> Bool)? = nil) async throws -> String {
         guard let colbert = colbertService() else {
-            throw AgentError.storage("检索阅读模式未启用")
+            throw AgentError.storage("极速检索模式未启用，请先在 RAG 模式配置中切换到极速检索模式并应用配置")
         }
         // 构建开始重置 cancel 标志，与普通 ANN 构建一致，避免上一次的残留取消态。
         cancelLock.lock(); cancelRequested = false; cancelLock.unlock()
@@ -1633,18 +1633,22 @@ public final class RAGEngine {
                       signatures == nil || signatures?.count == pending.count else {
                     throw AgentError.storage("回填 embedding 数量与待处理切片不一致")
                 }
+                // embedding 前向可能耗时数秒；期间同步结束的 closeIfPending 会关闭 store。
+                // 必须重新取一次连接，否则下面的 fill 全部报「数据库已关闭」。
+                guard let writeStore = try? self.ensureStore() else { return 0 }
                 var done = 0
                 for (i, item) in pending.enumerated() {
                     if cancel() { break }
                     do {
-                        try store.fillPendingVector(rowid: item.rowid, vector: vectors[i],
-                                                    binarySignature: signatures?[i])
+                        try writeStore.fillPendingVector(rowid: item.rowid, vector: vectors[i],
+                                                         binarySignature: signatures?[i])
                         done += 1
                     } catch {
-                        // 单条失败退避重试（可能是临时 DB 锁/IO 错误）：排到队尾，
-                        // 既不永久丢弃也不占队首饿死后续健康切片。
-                        store.retryPendingVector(rowid: item.rowid)
-                        AgentLog.warning("[backfill] 切片回填失败，30s 后重试 rowid=\(item.rowid)："
+                        // 单条失败退避重试（2s，排到队尾），不永久丢弃、不饿死后续切片。
+                        // 若连接刚被关闭，重新取连接再退避，避免对已关闭库执行 UPDATE。
+                        let retryStore = (try? self.ensureStore()) ?? writeStore
+                        retryStore.retryPendingVector(rowid: item.rowid)
+                        AgentLog.warning("[backfill] 切片回填失败，2s 后重试 rowid=\(item.rowid)："
                             + error.localizedDescription)
                     }
                 }
@@ -3563,7 +3567,7 @@ public final class RAGEngine {
                 try store.hybridSearch(
                     vector: queryVector, query: query, topK: candidateCount,
                     sourceFilter: sourceFilter, sourceContains: sourceContains,
-                    rrfK: config.ragRRFK,
+                    rrfK: config.ragRRFK, vectorWeight: config.ragRRFVectorWeight,
                     overfetch: config.ragVectorOverfetch,
                     ftsOverfetch: config.ragFTSOverfetch,
                     binary: binaryOptions,
@@ -4666,7 +4670,15 @@ public final class RAGEngine {
         // 否则 withStoreBounded 会尝试打开不存在的 index.sqlite 并返回 error 快照，
         // 状态栏误报「向量库不可用」、切片数恒为 0。
         if config.colbertReaderEnabled {
-            return mergingANNBuildState(colbertStatusSnapshot(sourceLimit: sourceLimit))
+            let snapshot = colbertStatusSnapshot(sourceLimit: sourceLimit)
+            // 与普通分支一致写入缓存：Agent.dynamicContextPrompt() 的
+            // 「# Knowledge base」段读 cachedStatus()，不写缓存会导致极速模式
+            // 永远拿不到文档列表、退化成「Indexed locally」无列表文案。
+            statusLock.lock()
+            statusSnapshot = snapshot
+            statusSnapshotTime = Date().timeIntervalSince1970
+            statusLock.unlock()
+            return mergingANNBuildState(snapshot)
         }
         // provider/存储层明确不支持的元素类型：打开库会直接失败，优先给出配置
         // 原因，否则调用方只能看到笼统的「向量库不可用」。当前四种类型均可用。
@@ -4859,15 +4871,16 @@ public final class RAGEngine {
         return statusSkipSnapshot
     }
 
-    /// 检索阅读模式的状态快照：切片数来自 colbert.db，来源名单来自 manifest。
-    /// 不打开普通向量库，避免误报「向量库不可用」。
+    /// 极速检索模式的状态快照：文档名单/目录/摘要统一存主库 index.sqlite 的
+    /// documents 表（与 rag_outline 同源），这里复用 listDocuments(limit:)；
+    /// 实际检索用的 colbert.db 只提供切片数。manifest 仅在主库 documents 空时兜底。
     private func colbertStatusSnapshot(sourceLimit: Int) -> [String: JSONValue] {
+        let colbert = colbertService()
+        let docResult = listDocuments(limit: sourceLimit > 0 ? sourceLimit : 1000)
+        let sources = docResult.names
         let manifest = manifestStore.load()
         let entries = manifest.filter { ($0.value.duplicateOf ?? "").isEmpty }
-        let sortedSources = entries.keys.sorted()
-        let sources = sourceLimit > 0
-            ? Array(sortedSources.prefix(sourceLimit)) : sortedSources
-        let colbert = colbertService()
+        let sourceCount = docResult.total > 0 ? docResult.total : entries.count
         let count: Int? = try? colbert?.totalChunkCount()
         // ANN 真实状态：忙碌（构建/入库持 opLock）时 detail 为 nil，保持「未知」而非
         // 误报不可用；未加载时同样 nil。用摘要字符串填 ann_index，布尔项从结构化状态取。
@@ -4876,7 +4889,7 @@ public final class RAGEngine {
             "knowledge_base": .string(knowledgeBase),
             "rag_dir": .string(ragDir),
             "chunks_stored": .int(count ?? 0),
-            "source_count": .int(entries.count),
+            "source_count": .int(sourceCount),
             "sources": .array(sources.map { .string($0) }),
             "vector_backend": .string("colbert"),
             "rag_mode": .string("colbert"),

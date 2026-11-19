@@ -14,6 +14,32 @@ final class VectorStoreTests: XCTestCase {
         try? FileManager.default.removeItem(at: directory)
     }
 
+    /// Weighted RRF：向量路命中 vs BM25 路命中，权重 0.7 时向量优先、0.3 时反转。
+    func testHybridSearchWeightedRRF() throws {
+        let store = try VectorStore(dbPath: directory.appendingPathComponent("wrrf.sqlite").path,
+                                    dimension: 3, enableSQLiteVec: true)
+        // A 只被向量路命中（query 向量 [1,0,0]）；B 只被 BM25 命中（词 zebraquokka）。
+        let chunks = [
+            Chunk(text: "alpha general text", source: "a.md", chunkIndex: 0),
+            Chunk(text: "zebraquokka rareword", source: "b.md", chunkIndex: 0),
+        ]
+        XCTAssertEqual(try store.add(chunks: chunks,
+                                     vectors: [[1, 0, 0], [0, 1, 0]]), 2)
+        // 向量权重 0.7：向量命中的 a 应排前
+        let high = try store.hybridSearch(vector: [1, 0, 0], query: "zebraquokka",
+                                          topK: 2, rrfK: 60, vectorWeight: 0.7)
+        // a 只被向量路命中（BM25 词只在 b 中），其 rrfScore 应严格等于 w/(k+1)：
+        // 权重 0.7 → 0.7/61，权重 0.3 → 0.3/61，证明权重真正作用于融合公式。
+        let aHigh = high.first(where: { $0.source.hasPrefix("a.md") })
+        let low = try store.hybridSearch(vector: [1, 0, 0], query: "zebraquokka",
+                                         topK: 2, rrfK: 60, vectorWeight: 0.3)
+        let aLow = low.first(where: { $0.source.hasPrefix("a.md") })
+        XCTAssertNotNil(aHigh)
+        XCTAssertNotNil(aLow)
+        XCTAssertEqual(aHigh?.rrfScore ?? 0, 0.7 / 61.0, accuracy: 1e-4)
+        XCTAssertEqual(aLow?.rrfScore ?? 0, 0.3 / 61.0, accuracy: 1e-4)
+    }
+
     func testSQLiteVecTransactionalWriteTwoStageKNNAndHybridSearch() throws {
         let store = try VectorStore(dbPath: directory.appendingPathComponent("index.sqlite").path,
                                     dimension: 3, enableSQLiteVec: true)

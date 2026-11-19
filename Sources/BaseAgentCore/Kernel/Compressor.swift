@@ -119,7 +119,12 @@ public func l1TrimResult(_ name: String, _ content: String, maxChars: Int) -> St
 /// 优先用模型按协议输出的 `<summary>`；缺失时回退到「剥掉代码/标签后的首句」，
 /// 再不行就用工具名拼一句。**永不返回空串**。
 public func l2Summary(_ content: String, toolNames: [String] = [], maxChars: Int = 60) -> String {
-    if content.isEmpty {
+    // 先剥掉模型复述的 `### [WORKING MEMORY]` / `### [PLAN]` 锚点块：这种复述
+    // 不是本轮成果，若被存进 summary，折叠时会随 digestLine 回注 <earlier_context>，
+    // 后续轮看到满屏协议复述更容易继续复读，形成「折叠后不往下走」的空转。
+    let cleaned = stripAnchorProtocolEcho(content)
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+    if cleaned.isEmpty {
         if !toolNames.isEmpty {
             return "调用 " + toolNames.prefix(3).joined(separator: ",")
         }
@@ -127,12 +132,12 @@ public func l2Summary(_ content: String, toolNames: [String] = [], maxChars: Int
     }
 
     let matches = KernelRegex.matches(
-        summaryRegex, content,
+        summaryRegex, cleaned,
         options: [.dotMatchesLineSeparators, .caseInsensitive]
     )
     if let m = matches.first, m.numberOfRanges > 1,
-       let range = Range(m.range(at: 1), in: content) {
-        let s = String(content[range])
+       let range = Range(m.range(at: 1), in: cleaned) {
+        let s = String(cleaned[range])
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .replacingOccurrences(of: "\n", with: " ")
         if !s.isEmpty {
@@ -140,7 +145,7 @@ public func l2Summary(_ content: String, toolNames: [String] = [], maxChars: Int
         }
     }
 
-    var stripped = KernelRegex.replace(codeFenceRegex, in: content, with: " ")
+    var stripped = KernelRegex.replace(codeFenceRegex, in: cleaned, with: " ")
     stripped = KernelRegex.replace(protocolTagRegex, in: stripped, with: " ",
                                    options: [.caseInsensitive])
     stripped = KernelRegex.replace("\\s+", in: stripped, with: " ")
@@ -180,6 +185,19 @@ private func isAnchorProtocolLine(_ line: String) -> Bool {
     if t.hasPrefix("<key_info>") || t.hasPrefix("</key_info>")
         || t.hasPrefix("<facts>") || t.hasPrefix("</facts>") { return true }
     if t.hasPrefix("[SYSTEM]") || t.hasPrefix("[TIPS]") { return true }
+    // anchorPrompt 尾部注入的 dynamic context 段（见 Agent.dynamicContextPrompt）。
+    // 模型复述 WORKING MEMORY 时会把这几段一起复述；不识别就会把它们当本轮摘要
+    // 存进 summary，折叠后回注 <earlier_context> 诱发复读空转。
+    if t.hasPrefix("# Working checkpoint") || t.hasPrefix("# Active skill:")
+        || t.hasPrefix("# Knowledge base") || t.hasPrefix("#Knowledgebase") { return true }
+    if t.contains("chunks in") && t.contains("file(s)") { return true }
+    if t.contains("这些文档名是向量库的索引标识") { return true }
+    if t.contains("rag_tools") || t.contains("Follow the knowledge-base strategy") { return true }
+    if t.contains("web_scan") || t.contains("web_search") { return true }
+    if t.contains("file_tools") || t.contains("shell_run") || t.contains("code_run") { return true }
+    if t.contains("本说明只针对知识库文档") || t.contains("已索引文档没有覆盖")
+        || t.contains("取真实可用的URL") || t.contains("取真实可用的 URL") { return true }
+    if t.contains("无需再找原文件") || t.contains("返回片段即正文") { return true }
     return false
 }
 
@@ -193,8 +211,22 @@ private func stripAnchorProtocolEcho(_ text: String) -> String {
         let raw = String(line)
         let trimmed = raw.trimmingCharacters(in: .whitespaces)
         if !stripping {
-            if startMarkers.contains(where: { trimmed.caseInsensitiveCompare($0) == .orderedSame }) {
+            // 行首完整匹配；或 `<summary>` 等元标签后紧跟锚点（模型把协议复述
+            // 塞进 summary 单行里）——两种都要进入剥离状态。
+            let isStart = startMarkers.contains(where: {
+                trimmed.caseInsensitiveCompare($0) == .orderedSame
+            }) || startMarkers.contains(where: { marker in
+                trimmed.range(of: marker, options: .caseInsensitive) != nil
+            })
+            if isStart {
                 stripping = true
+                // 锚点标记之前若有 `<summary>` 包装号，去掉它，避免残留尖括号。
+                if let idx = raw.range(of: "###", options: .caseInsensitive) {
+                    let before = String(raw[..<idx.lowerBound])
+                        .replacingOccurrences(of: "<summary>", with: "")
+                        .trimmingCharacters(in: .whitespaces)
+                    if !before.isEmpty { output.append(before) }
+                }
             } else {
                 output.append(raw)
             }

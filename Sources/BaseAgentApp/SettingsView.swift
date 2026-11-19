@@ -140,6 +140,8 @@ struct SettingsView: View {
     @State private var colbertUseANN = true
     @State private var colbertLengthNorm = false
     @State private var colbertQueryPrune = true
+    /// Weighted RRF 向量路权重（BM25 = 1 - 该值）；向量/极速模式共用。
+    @State private var rrfVectorWeight: Double = 0.7
 
     // MARK: RAG 模式三选一 + 决策判定
     @State private var ragMode = "vector"
@@ -647,7 +649,8 @@ struct SettingsView: View {
                     .font(.caption2)
                     .foregroundStyle(.red)
                 }
-                // 向量库完备状态 + 手动补做（不完备时按钮出现）
+                // Weighted RRF 混合权重 + 向量库完备状态
+                rrfWeightRow
                 vectorCompletenessRow
                 } // end if ragMode == vector
 
@@ -959,8 +962,22 @@ struct SettingsView: View {
                 Spacer(minLength: 8)
             }
             HStack(spacing: 8) {
+                // ColBERT 编码完备状态 + 手动补做，与构建按钮同一行（状态在前）。
+                if !model.vectorCompletenessText.isEmpty {
+                    Text(model.vectorCompletenessText)
+                        .font(.caption2)
+                        .foregroundStyle(model.vectorIsComplete ? Color.secondary : Color.orange)
+                        .lineLimit(1)
+                    if !model.vectorIsComplete && !model.vectorCompletenessText.contains("不可用") {
+                        Button(model.isBackfillingVectors ? "补做中…" : "补做向量") {
+                            model.requestVectorBackfill()
+                        }
+                        .disabled(model.isBackfillingVectors || model.isSyncing)
+                        .help("把尚未编码的切片入队，后台异步补齐；补齐前仍可被关键词检索命中")
+                    }
+                }
                 Button(model.isBuildingColbertANN ? "索引构建中…" : "构建/续建向量索引") {
-                    model.requestColbertANNBuild()
+                    applyAndBuildColbertANN()
                 }
                 .disabled(model.isBuildingColbertANN || model.isSyncing)
                 if model.isBuildingColbertANN {
@@ -973,8 +990,8 @@ struct SettingsView: View {
                 }
                 Spacer(minLength: 8)
             }
-            // ColBERT 编码完备状态 + 手动补做（不完备时按钮出现）
-            vectorCompletenessRow
+            // Weighted RRF 混合权重（向量粗筛 vs BM25 粗筛）
+            rrfWeightRow
         }
     }
 
@@ -1021,6 +1038,21 @@ struct SettingsView: View {
                     .font(.caption2).foregroundStyle(.orange)
             }
         }
+    }
+
+    /// Weighted RRF 权重行：向量/极速模式共用。BM25 权重 = 1 - 向量权重。
+    private var rrfWeightRow: some View {
+        HStack(spacing: 8) {
+            Text("混合权重").font(.caption2).foregroundStyle(.secondary)
+            Text("向量 \(Int((rrfVectorWeight * 100).rounded()))%")
+                .font(.caption2).monospacedDigit()
+            Slider(value: $rrfVectorWeight, in: 0.1...0.9, step: 0.1)
+                .frame(maxWidth: 200)
+            Text("BM25 \(Int(((1 - rrfVectorWeight) * 100).rounded()))%")
+                .font(.caption2).monospacedDigit().foregroundStyle(.secondary)
+            Spacer(minLength: 8)
+        }
+        .help("Weighted RRF：向量路与 BM25 路按权重融合名次（默认 7:3）")
     }
 
     /// 向量库完备状态行：向量/极速模式共用。不完备时显示「补做向量」按钮。
@@ -1610,6 +1642,7 @@ struct SettingsView: View {
         colbertUseANN = config.colbertUseANN
         colbertLengthNorm = config.colbertLengthNorm
         colbertQueryPrune = config.colbertQueryPrune
+        rrfVectorWeight = config.ragRRFVectorWeight
         ragMode = config.ragMode
         decisionModelBackend = config.decisionModelBackend
         decisionModelPath = config.decisionModelPath
@@ -1701,6 +1734,21 @@ struct SettingsView: View {
             : "配置已应用，正在同步知识库…"
         model.applyConfig(config) {
             model.syncKnowledgeBase(force: kbChanged)
+        }
+    }
+
+    /// 极速检索模式「构建/续建向量索引」：先把窗口内选中的 RAG 模式应用到引擎，
+    /// 再构建 ColBERT ANN。否则刚切到极速模式就点构建时，引擎仍是旧模式，
+    /// buildColbertANN 会因 colbertReaderEnabled=false 报「检索阅读模式未启用」。
+    private func applyAndBuildColbertANN() {
+        guard let config = buildConfig() else { return }
+        guard config.colbertReaderEnabled else {
+            statusMessage = "请先切换到极速检索模式，再构建向量索引"
+            return
+        }
+        statusMessage = "配置已应用，正在构建向量索引…"
+        model.applyConfig(config) {
+            model.requestColbertANNBuild()
         }
     }
 
@@ -1975,6 +2023,7 @@ struct SettingsView: View {
         config.colbertUseANN = colbertUseANN
         config.colbertLengthNorm = colbertLengthNorm
         config.colbertQueryPrune = colbertQueryPrune
+        config.ragRRFVectorWeight = min(max(rrfVectorWeight, 0.1), 0.9)
         // 图谱未建成（或已失效）时只允许 naive，避免保存一个不可用的策略。
         config.ragRetrievalStrategy = model.knowledgeGraphBuilt ? retrievalStrategy : .naive
 

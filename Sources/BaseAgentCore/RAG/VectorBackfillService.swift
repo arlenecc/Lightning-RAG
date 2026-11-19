@@ -109,7 +109,8 @@ public final class VectorBackfillService: @unchecked Sendable {
         _running = true
         _lastError = nil
         lock.unlock()
-        context.log("[backfill] 后台向量回填已启动，待回填 \(pendingCount) 条")
+        // pendingCount 是上次快照，循环首轮会立即刷新；这里只表示「已启动」。
+        context.log("[backfill] 后台向量回填已启动")
     }
 
     /// 请求停止（同步，不等待退出）。供 close 使用；递增 generation 令在途循环失效。

@@ -394,6 +394,11 @@ public struct AgentConfig: Sendable {
     public var ragSQLiteVecEnabled: Bool = true
     /// 混合检索 RRF 常数（原项目 RRF k=60）。
     public var ragRRFK: Int = 60
+    /// Weighted RRF 中向量路的权重（0...1，默认 0.7）；BM25 权重 = 1 - 该值。
+    /// 向量检索模式与极速检索模式共用；决策模式不用 RRF。
+    public var ragRRFVectorWeight: Double = 0.7
+    /// BM25 路权重（派生，恒等于 1 - ragRRFVectorWeight）。
+    public var ragRRFBM25Weight: Double { 1.0 - ragRRFVectorWeight }
     /// 向量召回 over-fetch 倍数。混合检索先融合 rowid/分数再 hydrate，
     /// 内层只需比最终条数多 1-2 倍；定向来源（sourceContains）按需自动放大。
     public var ragVectorOverfetch: Int = 2
@@ -763,6 +768,7 @@ public struct AgentConfig: Sendable {
         if let v = string("rag_storage_backend") { ragStorageBackend = v }
         if let v = bool("rag_sqlite_vec_enabled") { ragSQLiteVecEnabled = v }
         if let v = int("rag_rrf_k") { ragRRFK = v }
+        if let v = double("rag_rrf_vector_weight") { ragRRFVectorWeight = v }
         if let v = double("rag_rerank_threshold") { ragRerankThreshold = v }
         if let v = int("rag_search_max_chars_per_result") { ragSearchMaxCharsPerResult = v }
         if let v = int("rag_search_max_total_chars") { ragSearchMaxTotalChars = v }
@@ -920,6 +926,10 @@ public struct AgentConfig: Sendable {
         if ![20, 50, 100].contains(decisionCoarseCandidates) { decisionCoarseCandidates = 50 }
         if ![3, 5].contains(decisionCoreSentenceCount) { decisionCoreSentenceCount = 3 }
         if ![3, 5, 10].contains(decisionTopN) { decisionTopN = 5 }
+        // Weighted RRF 向量权重收口到 [0.1, 0.9]，非法值回落 0.7。
+        if !ragRRFVectorWeight.isFinite || ragRRFVectorWeight < 0.1 || ragRRFVectorWeight > 0.9 {
+            ragRRFVectorWeight = 0.7
+        }
         // rerank 候选池倍数：手改配置可能越界，统一收口到 1...5，
         // 避免一次把上百条切片送进 ONNX。
         ragRerankCandidateMultiplier = max(1, min(5, ragRerankCandidateMultiplier))
@@ -1208,6 +1218,7 @@ public struct AgentConfig: Sendable {
             "rag_storage_backend": ragStorageBackend,
             "rag_sqlite_vec_enabled": ragSQLiteVecEnabled,
             "rag_rrf_k": ragRRFK,
+            "rag_rrf_vector_weight": ragRRFVectorWeight,
             "rag_rerank_threshold": ragRerankThreshold,
             "rag_search_max_chars_per_result": ragSearchMaxCharsPerResult,
             "rag_search_max_total_chars": ragSearchMaxTotalChars,

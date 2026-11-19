@@ -2356,7 +2356,12 @@ final class AppViewModel: ObservableObject {
     /// 点击「构建/续建向量索引」：为检索阅读模式的 ColBERT 大分片库构建 ANN 索引。
     func requestColbertANNBuild() {
         guard let agent else {
-            showInfoAlert(title: "检索阅读模式", message: "RAG 尚未就绪，请先应用配置。")
+            showInfoAlert(title: "极速检索模式", message: "RAG 尚未就绪，请先应用配置。")
+            return
+        }
+        guard agent.ragEngine.config.colbertReaderEnabled else {
+            showInfoAlert(title: "极速检索模式",
+                          message: "当前未启用极速检索模式。请在 RAG 模式配置中选择「极速检索模式」并应用配置后再构建索引。")
             return
         }
         if isSyncing || isBuildingANN || isBuildingKG || isBuildingColbertANN

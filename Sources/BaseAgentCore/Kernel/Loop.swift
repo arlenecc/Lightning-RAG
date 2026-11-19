@@ -1605,6 +1605,10 @@ public final class KernelLoop {
                     baseStream = runtime.stream(messages, toolSchemas, config.temperature)
                 }
                 let stream = cancellableStream(baseStream)
+                // 模型若把注入的锚点提示（### [WORKING MEMORY] / ### [PLAN]）原样
+                // 复述，从标记出现起把后续内容转进思考区，不让它进对话气泡。
+                var inAnchorEcho = false
+                var anchorTail = ""
                 for try await event in stream {
                     gotAny = true
                     if self.cancelled() {
@@ -1622,8 +1626,33 @@ public final class KernelLoop {
                     }
                     switch event.kind {
                     case .content:
+                        // contentBuf 累积完整响应文本（判定用），回调则按锚点复述分流：
+                        // 模型复述注入的 ### [WORKING MEMORY] / ### [PLAN] 时，从标记起
+                        // 转进思考区，不让内部协议进对话气泡。
                         contentBuf.append(event.content)
-                        callbacks.onContent(event.content)
+                        let probe = anchorTail + event.content
+                        if inAnchorEcho {
+                            callbacks.onReasoning(event.content)
+                        } else {
+                            let markers = ["### [WORKING MEMORY]", "###[WORKING MEMORY]",
+                                           "### [PLAN]", "###[PLAN]"]
+                            if let hit = markers.first(where: { probe.contains($0) }),
+                               let idx = probe.range(of: hit)?.lowerBound {
+                                inAnchorEcho = true
+                                anchorTail = ""
+                                let before = String(probe[..<idx])
+                                if !before.isEmpty { callbacks.onContent(before) }
+                                let echo = String(probe[idx...])
+                                if !echo.isEmpty { callbacks.onReasoning(echo) }
+                            } else {
+                                // 保留可能构成标记前缀的尾部（如 "### [WORK..."），
+                                // 避免标记被拆到两个 chunk 时漏判。
+                                let keep = Self.anchorPrefixSuffixLength(probe)
+                                let emit = String(probe.dropLast(keep))
+                                anchorTail = String(probe.suffix(keep))
+                                if !emit.isEmpty { callbacks.onContent(emit) }
+                            }
+                        }
                         liveEst += TokenEstimator.estimate(event.content)
                     case .reasoning:
                         reasoningBuf.append(event.content)
@@ -1646,6 +1675,10 @@ public final class KernelLoop {
                                                Double(liveEst) / elapsed)
                         lastEmit = now
                     }
+                }
+                // 流结束：暂存的标记前缀若未构成完整锚点，还原为正文显示。
+                if !anchorTail.isEmpty && !inAnchorEcho {
+                    callbacks.onContent(anchorTail)
                 }
                 break
             } catch {
@@ -2180,8 +2213,36 @@ public final class KernelLoop {
         log("[kernel] 计划未完成步骤已标记 blocked（\(reason)）")
     }
 
+    /// probe 尾部有多少字符可能是某个锚点标记的前缀（用于跨 chunk 暂存）。
+    private static func anchorPrefixSuffixLength(_ text: String) -> Int {
+        let markers = ["### [WORKING MEMORY]", "###[WORKING MEMORY]",
+                       "### [PLAN]", "###[PLAN]"]
+        var best = 0
+        for marker in markers {
+            let limit = min(marker.count, text.count)
+            for length in stride(from: limit, through: 1, by: -1) {
+                if marker.hasPrefix(String(text.suffix(length))) {
+                    best = max(best, length)
+                    break
+                }
+            }
+        }
+        return best
+    }
+
     private func noToolEvent(_ resp: LLMResponse) -> String {
         let content = resp.content.trimmingCharacters(in: .whitespacesAndNewlines)
+        // 模型把每轮注入的锚点提示（### [WORKING MEMORY] / ### [PLAN] + dynamic
+        // context）原样复述成回复——这是空转，不是答复，绝不能当 finalText 收下。
+        // 即便剥协议后残留几行 KB 说明，也按意图空转交给 intentStall 门收敛。
+        let anchorEchoMarkers = [
+            "### [WORKING MEMORY]", "###[WORKING MEMORY]",
+            "### [PLAN]", "###[PLAN]",
+        ]
+        // 正常答复绝不会包含这些内部锚点标记；一旦出现就是复述，直接判空转。
+        if anchorEchoMarkers.contains(where: { content.contains($0) }) {
+            return "intent"
+        }
         // 工具调用被截断：可见正文可能只是半截前言，不能当最终答复收下。
         if resp.truncated {
             emptyRetry += 1

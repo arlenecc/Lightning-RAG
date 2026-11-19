@@ -297,6 +297,30 @@ final class RegressionTests: XCTestCase {
         XCTAssertTrue(tail.content.isEmpty)
     }
 
+    /// 回归：模型复述的 `### [WORKING MEMORY]` 段不得被 l2Summary 当成回合摘要，
+    /// 否则折叠后随 digestLine 回注 <earlier_context>，诱发「折叠后复读不推进」。
+    func testL2SummaryDropsAnchorProtocolEcho() {
+        let echo = """
+        ### [WORKING MEMORY]
+        Current turn: 12
+        #Knowledgebase
+        2228chunksin5 file(s): 伊朗四千年.pdf, 病毒星球.pdf. 这些文档名是向量库的索引标识、不是磁盘文件路径。
+        Follow the knowledge-base strategy in the system prompt.
+        """
+        let summary = l2Summary(echo)
+        XCTAssertFalse(summary.contains("WORKING MEMORY"))
+        XCTAssertFalse(summary.contains("Knowledgebase"))
+        XCTAssertFalse(summary.contains("Current turn"))
+        // 全是协议复述且无工具名时应回退到无文本占位，而不是把协议文本当成果。
+        XCTAssertEqual(summary, "（无文本输出）")
+
+        // <summary> 里夹带锚点复述时同样要剥掉，保留真正的摘要正文。
+        let withTag = "<summary>已完成检索 ### [PLAN] Goal: 查找资料 Now: 继续</summary>"
+        let s2 = l2Summary(withTag)
+        XCTAssertTrue(s2.contains("已完成检索"))
+        XCTAssertFalse(s2.contains("Goal:"))
+    }
+
     /// 回归：几十个 <summary> 块被剥离后，块间换行不得在正文里累积成大段空白。
     func testSummaryStreamFilterCollapsesWhitespaceAroundSummaries() {
         var filter = SummaryStreamFilter()

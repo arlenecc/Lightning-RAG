@@ -1713,7 +1713,8 @@ public final class VectorStore: @unchecked Sendable {
     public func hybridSearch(vector: [Float], query: String, topK: Int,
                              sourceFilter: String? = nil,
                              sourceContains: String? = nil,
-                             rrfK: Int = 60, overfetch: Int = 2,
+                             rrfK: Int = 60, vectorWeight: Double = 0.7,
+                             overfetch: Int = 2,
                              ftsOverfetch: Int? = nil,
                              binary: BinaryCoarseOptions? = nil,
                              ann: ANNQueryOptions? = nil,
@@ -1825,12 +1826,16 @@ public final class VectorStore: @unchecked Sendable {
                 var vectorScores: [Int64: Double] = [:]
                 var ftsScores: [Int64: Double] = [:]
                 let k = Double(max(1, rrfK))
+                // Weighted RRF：向量路乘 w_vec、BM25 路乘 (1 - w_vec)。
+                // 权重和恒为 1；单路命中时分数量级为 w/(k+1)。
+                let wVec = min(max(vectorWeight, 0), 1)
+                let wFTS = 1.0 - wVec
                 for (rank, candidate) in vectorPool.enumerated() {
-                    rrfScores[candidate.0, default: 0] += 1.0 / (k + Double(rank + 1))
+                    rrfScores[candidate.0, default: 0] += wVec / (k + Double(rank + 1))
                     vectorScores[candidate.0] = candidate.1
                 }
                 for (rank, candidate) in ftsCandidates.enumerated() {
-                    rrfScores[candidate.0, default: 0] += 1.0 / (k + Double(rank + 1))
+                    rrfScores[candidate.0, default: 0] += wFTS / (k + Double(rank + 1))
                     ftsScores[candidate.0] = candidate.1
                 }
 

@@ -61,7 +61,8 @@ public final class ColBERTReaderService: @unchecked Sendable {
             topN: config.colbertTopN,
             useANN: config.colbertUseANN,
             lengthNorm: config.colbertLengthNorm,
-            queryPrune: config.colbertQueryPrune)
+            queryPrune: config.colbertQueryPrune,
+            rrfVectorWeight: config.ragRRFVectorWeight)
     }
 
     /// 由来源路径生成稳定的 doc_id 前缀（16 位十六进制，避免特殊字符干扰 LIKE）。

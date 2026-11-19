@@ -554,6 +554,7 @@ final class SearchEngine {
 
     func search(query: String, topN: Int = 5, coarse: Int = 50,
                 useANN: Bool = true, lengthNorm: Bool = false, queryPrune: Bool = true,
+                rrfVectorWeight: Double = 0.7,
                 nprobe: Int = ANNIndex.defaultNprobe,
                 rescore: Int = ANNIndex.defaultRescore, forceANN: Bool = false,
                 source: String? = nil,
@@ -604,11 +605,14 @@ final class SearchEngine {
         }
         timing?("vector_coarse", Date().timeIntervalSince(stage))
         stage = Date()
+        // Weighted RRF：向量路 w_vec、BM25 路 (1 - w_vec)，权重和恒为 1。
+        let wVec = min(max(rrfVectorWeight, 0), 1)
+        let wFTS = 1.0 - wVec
         for (rank, pair) in pairs.enumerated() {
             var c = candidates[pair.id] ?? Candidate(docID: pair.id)
             c.vectorRank = rank + 1
             c.vectorDistance = pair.distance
-            c.rrf += 1.0 / (rrfK + Double(rank + 1))
+            c.rrf += wVec / (rrfK + Double(rank + 1))
             candidates[pair.id] = c
         }
 
@@ -627,7 +631,7 @@ final class SearchEngine {
             var c = candidates[id] ?? Candidate(docID: id)
             c.bm25Rank = rank + 1
             c.bm25Score = row["score"]?.doubleValue ?? nil
-            c.rrf += 1.0 / (rrfK + Double(rank + 1))
+            c.rrf += wFTS / (rrfK + Double(rank + 1))
             candidates[id] = c
         }
 

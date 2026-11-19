@@ -57,6 +57,17 @@ final class RAGModeConfigTests: XCTestCase {
         XCTAssertTrue(colbert.colbertReaderEnabled)
     }
 
+    func testRRFPayloadWeightClampAndDerivedBM25() {
+        var config = AgentConfig()
+        XCTAssertEqual(config.ragRRFVectorWeight, 0.7)
+        XCTAssertEqual(config.ragRRFBM25Weight, 0.3, accuracy: 1e-9)
+        config.ragRRFVectorWeight = 5
+        config.migrate()
+        XCTAssertEqual(config.ragRRFVectorWeight, 0.7, "非法权重回落默认")
+        config.ragRRFVectorWeight = 0.3
+        XCTAssertEqual(config.ragRRFBM25Weight, 0.7, accuracy: 1e-9, "BM25 权重派生")
+    }
+
     func testModeRoundtripViaDictionary() throws {
         var config = AgentConfig()
         config.ragMode = "decision"
