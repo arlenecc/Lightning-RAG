@@ -2,14 +2,14 @@
 # 把 SwiftPM 产物打包成可分发的 Lightning-RAG.app。
 #
 # 用法：scripts/package-app.sh [debug|release]（默认 release）
-# 版本：VERSION 环境变量可覆盖，默认 1.4.2
+# 版本：VERSION 环境变量可覆盖，默认 1.4.3
 # 说明：应用本体不含任何依赖模型（potion 语义切片 / embedding / reranker 均不打进包），
 #       启动时通过模型自动下载流程补齐。
 # 产物：dist/Lightning-RAG.app（含 App 图标、运行时资源 bundle 与 llama 框架）
 set -euo pipefail
 
 CONFIG="${1:-release}"
-VERSION="${VERSION:-1.4.2}"
+VERSION="${VERSION:-1.4.3}"
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 PRODUCTS="$ROOT/.build/out/Products/$([[ "$CONFIG" == "release" ]] && echo Release || echo Debug)"

@@ -77,6 +77,8 @@ struct RAGManifestEntry: Codable, Sendable {
     var duplicateOf: String?
     /// 正文过短、已整体丢弃的来源。内容未变化时增量同步不再解析。
     var discarded: Bool? = nil
+    /// 正文 SimHash(64) 指纹（十六进制），供入库前近似副本排重。旧条目缺失。
+    var simhash: String? = nil
 }
 
 struct RAGManifest: Codable, Sendable {
@@ -2013,6 +2015,32 @@ public final class RAGEngine {
 
         var manifest = manifestStore.load()
         logFn("RAG: manifest 载入 \(manifest.count) 条")
+        // SimHash 近似副本索引：从已入库条目的指纹构建（一次构建，所有并发 worker 只读）。
+        let simhashIndex = SimHashDedupe.Index()
+        var simhashBackfill: [String: String] = [:]
+        for (key, entry) in manifest
+        where entry.complete != false && entry.duplicateOf == nil && entry.discarded != true {
+            if let fp = entry.simhash {
+                simhashIndex.insert(key: key, fingerprintHex: fp)
+            } else if !entry.mdPath.isEmpty,
+                      let md = try? String(contentsOfFile: entry.mdPath, encoding: .utf8),
+                      !md.isEmpty {
+                // 旧库升级：条目无 simhash 时从 markdown 缓存补算一次，回填 manifest。
+                let fp = SimHashDedupe.fingerprint(md)
+                simhashIndex.insert(key: key, fingerprintHex: fp)
+                simhashBackfill[key] = fp
+            }
+        }
+        if !simhashBackfill.isEmpty {
+            var updated: [String: RAGManifestEntry] = [:]
+            for (key, fp) in simhashBackfill {
+                guard var entry = manifest[key] else { continue }
+                entry.simhash = fp
+                manifest[key] = entry
+                updated[key] = entry
+            }
+            manifestStore.merge(updated: updated, removed: [])
+        }
         // 数据库被删除/重建但 manifest 还在时，增量逻辑会把所有文件当成
         // 「未变化」而跳过，知识库永久为空；此时必须全量重建。
         // 检索阅读模式用 colbert 库判断「索引是否为空」。
@@ -2198,6 +2226,7 @@ public final class RAGEngine {
                                 colbertReader: colbertRef,
                                 manifestStore: manifestStoreRef,
                                 manifestSnapshot: manifestSnapshot,
+                                simhashIndex: simhashIndex,
                                 signatureHash: signature,
                                 markdownDir: markdownDirRef,
                                 knowledgeBase: knowledgeBaseRef,
@@ -2415,6 +2444,7 @@ public final class RAGEngine {
         colbertReader: ColBERTReaderService?,
         manifestStore: ManifestStore,
         manifestSnapshot: [String: RAGManifestEntry],
+        simhashIndex: SimHashDedupe.Index,
         signatureHash: String,
         markdownDir: String,
         knowledgeBase: String,
@@ -2632,6 +2662,56 @@ public final class RAGEngine {
             }
             if isCancelled() || Task.isCancelled { throw AgentError.cancelled }
 
+            // SimHash 指纹（新文档才算）：入库前近似排重 + 写入 manifest 供后续同步复用。
+            let simhashFP = contentDigest == nil ? nil : SimHashDedupe.fingerprint(text)
+            // SimHash 近似副本排重（markdown 之后、切片入库之前）：
+            // 与「已经入库」的文档高度相似时直接写 tombstone 跳过，不再切片/向量化。
+            // 只对新文档（.owner）做；精确副本（.duplicate）上面已处理。
+            if let fp = simhashFP {
+                let cfg = SimHashDedupe.Config()
+                if let near = simhashIndex.nearest(fp, threshold: cfg.hammingThreshold),
+                   near.key != source,
+                   manifestSnapshot[near.key]?.duplicateOf == nil {
+                    // 内容复核：读已入库文档的 markdown 缓存算 3-gram Jaccard，
+                    // 剔除「指纹碰巧接近但正文不同」的误判。
+                    var isNearDuplicate = cfg.hammingThreshold == 0
+                    if !isNearDuplicate, cfg.verifyContent,
+                       let otherMD = manifestSnapshot[near.key]?.mdPath,
+                       !otherMD.isEmpty,
+                       let otherText = try? String(contentsOfFile: otherMD, encoding: .utf8) {
+                        let j = SimHashDedupe.jaccard(text, otherText, config: cfg)
+                        isNearDuplicate = j >= cfg.jaccardThreshold
+                        log("RAG: \(job.label) SimHash 命中 \(near.key)（距离 \(near.distance)，Jaccard \(String(format: "%.2f", j))）\(isNearDuplicate ? "，判重跳过" : "，内容复核未过，保留")")
+                    } else if !isNearDuplicate, cfg.verifyContent {
+                        // 无 mdPath（旧条目/缓存缺失）：用指纹汉明兜底仍需谨慎，
+                        // 保守起见不判重，避免误跳不同内容。
+                        isNearDuplicate = false
+                        log("RAG: \(job.label) SimHash 命中 \(near.key)（距离 \(near.distance)）但无 markdown 缓存可复核，保留")
+                    }
+                    if isNearDuplicate {
+                        let previous = manifestSnapshot[source]
+                        let marker = RAGManifestEntry(
+                            mtime: signature?.mtime ?? 0, size: signature?.size ?? 0,
+                            fingerprint: Self.sourceFingerprint(source, size: signature?.size),
+                            digest: textDigest, docName: file.relativePath, mdPath: "",
+                            ingestSignature: signatureHash, chunkCount: 0, complete: false,
+                            duplicateOf: near.key, simhash: fp)
+                        if let previous {
+                            _ = removeIndexedSource(source: source, entry: previous,
+                                                    store: store, colbertReader: colbertReader,
+                                                    markdownDir: markdownDir,
+                                                    knowledgeBase: knowledgeBase)
+                        }
+                        manifestStore.merge(updated: [source: marker], removed: [])
+                        outcome.skipped = true
+                        outcome.deduplicated = true
+                        let keepName = manifestSnapshot[near.key]?.docName ?? near.key
+                        log("RAG: \(job.label) 跳过（正文与 \(keepName) 近似重复，SimHash 距离 \(SimHashDedupe.hamming(fp, manifestSnapshot[near.key]?.simhash ?? fp) ?? 0)）")
+                        return outcome
+                    }
+                }
+            }
+
             if let colbertReader {
                 // 检索阅读模式：旁路接管切片/embedding/入库/检索/精排全流程，
                 // 改用 ColBERT 大分片多向量检索。top-1 分片进上下文供 LLM 总结，
@@ -2672,8 +2752,10 @@ public final class RAGEngine {
                         mdPath: mdPath,
                         ingestSignature: signatureHash,
                         chunkCount: count,
-                        complete: failedPages == 0)
+                        complete: failedPages == 0,
+                        simhash: simhashFP)
                     manifestStore.merge(updated: [source: entry], removed: [])
+                    if let simhashFP { simhashIndex.insert(key: source, fingerprintHex: simhashFP) }
                     outcome.processed = true
                     outcome.chunks = count
                     let pages = parsed.pageCount > 0 ? " / \(parsed.pageCount) 页" : ""
@@ -2778,8 +2860,10 @@ public final class RAGEngine {
                 mdPath: mdPath,
                 ingestSignature: signatureHash,
                 chunkCount: chunks.count,
-                complete: failedPages == 0
+                complete: failedPages == 0,
+                simhash: simhashFP
             )
+            if let simhashFP { simhashIndex.insert(key: source, fingerprintHex: simhashFP) }
             // 逐文件落盘：即使同步中途停止或进程退出，下次只重做未完成的文件。
             manifestStore.merge(updated: [source: entry], removed: [])
 
