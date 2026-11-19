@@ -337,7 +337,9 @@ final class AppViewModel: ObservableObject {
     private var syncTask: Task<Void, Never>?
     /// 多分区同步：当前分区同步 Task 与目标分区 id（供「停止同步」中断对应 engine）。
     private var zoneSyncTask: Task<Void, Never>?
-    private var zoneSyncEngineID: String?
+    @Published private(set) var zoneSyncEngineID: String?
+    /// 当前分区同步的展示文案（含进度），显示在设置面板工作目录区。
+    @Published var zoneSyncStatusText = ""
     /// 空闲内存回收：无前台活动 3 分钟后释放可重建的 OCR 权重。
     private var idleUnloadTask: Task<Void, Never>?
     /// 闲时摘要计时：需要比 OCR 回收更长的空闲窗口，避免和前台抢 GPU。
@@ -823,6 +825,8 @@ final class AppViewModel: ObservableObject {
                 self.plan = nil
                 self.isRunning = false
                 self.isSyncing = false
+                self.zoneSyncStatusText = ""
+                self.zoneSyncEngineID = nil
                 self.pendingToolIndices.removeAll()
                 self.toolEvents.removeAll()
                 self.cancelFlag.set(false)
@@ -2422,8 +2426,13 @@ final class AppViewModel: ObservableObject {
 
     /// 同步指定知识分区（多分区）：用该分区独立的 engine 做全链路同步。
     func syncZone(zoneID: String) {
-        guard let agent, let engine = agent.zoneEngines[zoneID],
-              !isSyncing, !isDeduplicating, !isBuildingColbertANN else { return }
+        guard let agent else { return }
+        guard let engine = agent.zoneEngines[zoneID] else {
+            appendLog("[rag] 知识分区同步失败：找不到分区 \(zoneID) 的引擎，请重新应用配置")
+            statusText = "分区引擎未就绪，请重新应用配置"
+            return
+        }
+        guard !isSyncing, !isDeduplicating, !isBuildingColbertANN else { return }
         if blockForMissingModels("知识分区同步") { return }
         let zoneName = agent.config.knowledgeZones.first { $0.id == zoneID }?.name ?? zoneID
         isSyncing = true
@@ -2431,7 +2440,8 @@ final class AppViewModel: ObservableObject {
         syncGeneration += 1
         let generation = syncGeneration
         statusText = "同步知识分区「\(zoneName)」…"
-        appendLog("[rag] 开始同步知识分区「\(zoneName)」")
+        zoneSyncStatusText = "准备同步（\(engine.knowledgeBase)）…"
+        appendLog("[rag] 开始同步知识分区「\(zoneName)」，源目录：\(engine.knowledgeBase)")
         cancelIdleUnload()
         // 与主库同步一致：分区大库同步前卸载本地 LLM/OCR 权重，避免 OCR/embedding
         // 与常驻 KV 争用 MLX 统一内存导致 OOM；结束后按同步前状态恢复并预热。
@@ -2442,21 +2452,127 @@ final class AppViewModel: ObservableObject {
         suspendModelsForSync()
         zoneSyncEngineID = zoneID
         let task = Task.detached(priority: .utility) { [weak self] in
-            let stats = await engine.ingest(log: { line in
+            let stats = await engine.ingest(force: false) { current, total, file in
+                Task { @MainActor [weak self] in
+                    guard let self, self.syncGeneration == generation else { return }
+                    let text = "分区「\(zoneName)」同步 \(current)/\(total) \(file)"
+                    self.statusText = text
+                    self.zoneSyncStatusText = text
+                }
+            } log: { line in
                 Task { @MainActor [weak self] in self?.appendLog(line) }
-            })
+            }
             await MainActor.run { [weak self] in
                 guard let self else { return }
                 self.zoneSyncTask = nil
                 self.zoneSyncEngineID = nil
-                guard self.syncGeneration == generation else { return }
+                // 即使 generation 已变（被新配置/新同步取代）也要复位 UI 状态，
+                // 否则按钮会永久停在「同步中」。
+                guard self.syncGeneration == generation else {
+                    self.isSyncing = false
+                    self.zoneSyncStatusText = ""
+                    return
+                }
                 self.isSyncing = false
                 let cancelled = stats.cancelled
-                self.statusText = cancelled
+                let doneText = cancelled
                     ? "分区「\(zoneName)」同步已停止"
                     : "分区「\(zoneName)」同步完成：\(stats.processed) 文件 / \(stats.chunks) 切片"
+                self.statusText = doneText
+                self.zoneSyncStatusText = doneText
                 self.appendLog("[rag] 分区「\(zoneName)」\(cancelled ? "同步已停止" : "同步完成")："
                     + "\(stats.processed) 文件，\(stats.chunks) 切片，错误 \(stats.errors.count)")
+                Task { await self.resumeModelsAfterSync(main: restoreMain, aux: restoreAux) }
+                self.refreshRAGStatus()
+                self.scheduleIdleUnload()
+            }
+        }
+        zoneSyncTask = task
+    }
+
+    /// 一键同步所有启用的知识分区：统一卸载一次模型，串行同步各分区（避免
+    /// embedding/OCR 争抢），全部完成后统一恢复一次，避免每分区都重载预热。
+    /// 单分区（未配置多分区）时退回原有单库同步路径。
+    func syncAllKnowledge(force: Bool) {
+        let zones = config.knowledgeZones.filter { $0.enabled }
+        guard zones.count > 1, let agent else {
+            syncKnowledgeBase(force: force)
+            return
+        }
+        guard !isSyncing, !isDeduplicating, !isBuildingColbertANN else { return }
+        if blockForMissingModels("知识库同步") { return }
+        if isRunning {
+            appendLog("[rag] 对话进行中，跳过本次同步")
+            return
+        }
+        let engines = zones.compactMap { zone -> (zone: KnowledgeZone, engine: RAGEngine)? in
+            guard let e = agent.zoneEngines[zone.id] else { return nil }
+            return (zone, e)
+        }
+        guard !engines.isEmpty else {
+            statusText = "知识分区引擎未就绪，请重新应用配置"
+            return
+        }
+        isSyncing = true
+        isStoppingSync = false
+        syncGeneration += 1
+        let generation = syncGeneration
+        cancelIdleUnload()
+        let restoreMain = mainModelLoaded || agent.llm is PreloadableLLMService
+        let restoreAux = config.auxEnabled
+            && (auxModelLoaded || agent.auxLLM is PreloadableLLMService)
+        Task { await self.stopSummaryIdleSession() }
+        suspendModelsForSync()
+        statusText = "同步 \(engines.count) 个知识分区…"
+        zoneSyncStatusText = "准备同步 \(engines.count) 个知识分区…"
+        appendLog("[rag] 一键同步开始：共 \(engines.count) 个知识分区（\(engines.map(\.zone.name).joined(separator: "、"))）")
+        let task = Task.detached(priority: .utility) { [weak self] in
+            var totalProcessed = 0
+            var totalChunks = 0
+            var allErrors: [String] = []
+            var anyCancelled = false
+            for (index, item) in engines.enumerated() {
+                if Task.isCancelled { anyCancelled = true; break }
+                let zoneName = item.zone.name
+                await MainActor.run { [weak self] in
+                    guard let self else { return }
+                    self.zoneSyncEngineID = item.zone.id
+                    self.zoneSyncStatusText = "[\(index + 1)/\(engines.count)] 分区「\(zoneName)」准备中…"
+                    self.statusText = "同步分区 \(index + 1)/\(engines.count)：\(zoneName)"
+                }
+                let stats = await item.engine.ingest(force: force) { current, total, file in
+                    Task { @MainActor [weak self] in
+                        guard let self, self.syncGeneration == generation else { return }
+                        let text = "[\(index + 1)/\(engines.count)] 分区「\(zoneName)」同步 \(current)/\(total) \(file)"
+                        self.statusText = text
+                        self.zoneSyncStatusText = text
+                    }
+                } log: { line in
+                    Task { @MainActor [weak self] in self?.appendLog(line) }
+                }
+                totalProcessed += stats.processed
+                totalChunks += stats.chunks
+                allErrors += stats.errors
+                if stats.cancelled { anyCancelled = true }
+                AgentLog.info("[rag] 分区「\(zoneName)」同步结束：\(stats.processed) 文件 / \(stats.chunks) 切片")
+                if stats.cancelled || Task.isCancelled { anyCancelled = true; break }
+            }
+            await MainActor.run { [weak self] in
+                guard let self else { return }
+                self.zoneSyncEngineID = nil
+                self.zoneSyncTask = nil
+                guard self.syncGeneration == generation else {
+                    self.isSyncing = false
+                    self.zoneSyncStatusText = ""
+                    return
+                }
+                self.isSyncing = false
+                let doneText = anyCancelled
+                    ? "知识分区同步已停止（\(totalProcessed) 文件 / \(totalChunks) 切片）"
+                    : "全部 \(engines.count) 个知识分区同步完成：\(totalProcessed) 文件 / \(totalChunks) 切片"
+                self.statusText = doneText
+                self.zoneSyncStatusText = doneText
+                self.appendLog("[rag] \(doneText)；错误 \(allErrors.count)")
                 Task { await self.resumeModelsAfterSync(main: restoreMain, aux: restoreAux) }
                 self.refreshRAGStatus()
                 self.scheduleIdleUnload()
@@ -3067,6 +3183,7 @@ final class AppViewModel: ObservableObject {
         guard isSyncing, !isStoppingSync else { return }
         isStoppingSync = true
         statusText = "正在停止同步…"
+        zoneSyncStatusText = "正在停止同步…"
         appendLog("用户请求停止知识库同步")
         // 内部标志让 RAG 在文件/embedding 批次边界退出；Task 取消让
         // SemanticChunker 等支持 Task.isCancelled 的步骤立即返回。

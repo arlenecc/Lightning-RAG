@@ -238,6 +238,7 @@ final class OCRLabState: ObservableObject {
         panel.allowedContentTypes = [.pdf, .image]
         panel.allowsMultipleSelection = false
         panel.canChooseDirectories = false
+        NSApp.activate(ignoringOtherApps: true)
         guard panel.runModal() == .OK, let url = panel.url else { return }
         load(url: url)
     }
@@ -334,6 +335,7 @@ final class OCRLabState: ObservableObject {
         if let markdownType = UTType(filenameExtension: "md") {
             panel.allowedContentTypes = [markdownType]
         }
+        NSApp.activate(ignoringOtherApps: true)
         guard panel.runModal() == .OK, let url = panel.url else { return }
         do {
             try result.markdown.write(to: url, atomically: true, encoding: .utf8)

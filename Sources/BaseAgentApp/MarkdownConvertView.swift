@@ -290,6 +290,7 @@ final class MarkdownConverterState: ObservableObject {
         panel.canCreateDirectories = false
         panel.prompt = "选择"
         panel.message = "可选择一个文件，或选择整个目录递归转换"
+        NSApp.activate(ignoringOtherApps: true)
         guard panel.runModal() == .OK, let url = panel.url else { return }
         sourceURL = url.standardizedFileURL
         currentFileName = ""
@@ -313,6 +314,7 @@ final class MarkdownConverterState: ObservableObject {
         panel.allowsMultipleSelection = false
         panel.canCreateDirectories = true
         panel.prompt = "选择保存目录"
+        NSApp.activate(ignoringOtherApps: true)
         guard panel.runModal() == .OK, let url = panel.url else { return }
         outputDirectory = url.standardizedFileURL
     }

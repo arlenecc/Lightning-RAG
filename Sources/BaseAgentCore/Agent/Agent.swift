@@ -574,14 +574,23 @@ public final class Agent: @unchecked Sendable {
             return try await ragEngine.searchWithCitations(query: query,
                                                            topK: topK, source: source)
         }
+        let started = Date()
+        AgentLog.info("[multi-zone] 联合检索开始 query=\(query.prefix(60)) topK=\(topK) "
+            + "挂载分区=\(zones.map(\.name).joined(separator: "、"))")
         // 并行检索各分区（每个 engine 有自己的 searchLock/ingest 状态）。
         let results = await withTaskGroup(of: MultiZoneRetrieval.ZoneResult?.self) { group in
             for zone in zones {
-                guard let engine = zoneEngines[zone.id] else { continue }
+                guard let engine = zoneEngines[zone.id] else {
+                    AgentLog.warning("[multi-zone] 分区 \(zone.name) 无对应 engine，跳过")
+                    continue
+                }
                 group.addTask {
+                    let zoneStarted = Date()
                     do {
                         let outcome = try await engine.searchWithCitations(
                             query: query, topK: max(topK, 10), source: source)
+                        AgentLog.info("[multi-zone] 分区 \(zone.name) 召回 \(outcome.citations.count) 条，"
+                            + "耗时 \(Int(Date().timeIntervalSince(zoneStarted) * 1000))ms")
                         return MultiZoneRetrieval.ZoneResult(zoneID: zone.id,
                                                              zoneName: zone.name,
                                                              citations: outcome.citations)
@@ -597,9 +606,13 @@ public final class Agent: @unchecked Sendable {
             return collected
         }
         guard !results.isEmpty else {
+            AgentLog.warning("[multi-zone] 所有分区均无结果，降级为默认库检索")
             return try await ragEngine.searchWithCitations(query: query, topK: topK, source: source)
         }
         let fused = MultiZoneRetrieval.fuse(results, topK: topK, rrfK: config.ragRRFK)
+        AgentLog.info("[multi-zone] RRF 融合完成：\(results.count) 个分区 → \(fused.count) 条，"
+            + "top1=\(fused.first.map { "\($0.source) \(String(format: "%.4f", $0.score))" } ?? "无")，"
+            + "总耗时 \(Int(Date().timeIntervalSince(started) * 1000))ms")
         return RAGRetrievalOutcome(context: MultiZoneRetrieval.primaryContext(fused),
                                    citations: fused)
     }
@@ -613,8 +626,12 @@ public final class Agent: @unchecked Sendable {
         guard zones.count > 1, zoneEngines.count > 1 else {
             return try await ragEngine.searchWithCitations(query: query, topK: topK, source: source)
         }
+        let started = Date()
+        AgentLog.info("[decision-multi] 两次判定联合检索开始 query=\(query.prefix(60)) "
+            + "挂载分区=\(zones.map(\.name).joined(separator: "、"))")
         guard let scorer = try? ragEngine.sharedDecisionScorer() else {
             // 判定模型不可用：降级为普通多分区联合检索。
+            AgentLog.warning("[decision-multi] 判定模型不可用，降级为普通多库联合检索")
             return try await multiZoneSearch(query: query, topK: topK, source: source)
         }
         // 对话状态：最近一条用户输入 + 当前问句。
@@ -632,6 +649,7 @@ public final class Agent: @unchecked Sendable {
             try await scorer.score(query: stateText, passages: zoneDescriptions,
                                    coreSentenceCount: 3, useCoreSentences: false)
         }
+        AgentLog.info("[decision-multi] ①选库判定完成：\(zip(zones, zoneScores).map { "\($0.0.name)=\(String(format: "%.3f", $0.1))" }.joined(separator: ", "))")
         var selected: [(zone: KnowledgeZone, weight: Double)] = []
         for (i, zone) in zones.enumerated() {
             let s = i < zoneScores.count ? zoneScores[i] : 0
@@ -655,6 +673,7 @@ public final class Agent: @unchecked Sendable {
                                                           source: source)) ?? []
                 return hits.isEmpty ? nil : (item.zone, item.weight, hits)
             }
+        AgentLog.info("[decision-multi] ②粗筛：\(coarseResults.map { "\($0.zone.name)=\($0.hits.count)" }.joined(separator: ", "))")
         guard !coarseResults.isEmpty else {
             return RAGRetrievalOutcome(context: "（知识库中未找到相关内容）", citations: [])
         }
@@ -677,14 +696,18 @@ public final class Agent: @unchecked Sendable {
         guard !fused20.isEmpty else {
             return RAGRetrievalOutcome(context: "（知识库中未找到相关内容）", citations: [])
         }
+        AgentLog.info("[decision-multi] ③加权 RRF 融合：\(fused20.count) 条候选进入判定")
         // ③ 第二次判定：按核心句评判 20 个候选，取 Top3（或 decisionTopN）。
         if Task.isCancelled { throw CancellationError() }
+        let scoreStarted = Date()
         let passages = fused20.map(\.text)
         let scores = try await RAGEngine.withTimeout(budget) {
             try await scorer.score(query: query, passages: passages,
                                    coreSentenceCount: self.config.decisionCoreSentenceCount,
                                    useCoreSentences: self.config.decisionUseCoreSentences)
         }
+        AgentLog.info("[decision-multi] ④核心句判定完成 \(scores.count) 条，"
+            + "耗时 \(Int(Date().timeIntervalSince(scoreStarted) * 1000))ms")
         let n = max(1, min(config.decisionTopN, fused20.count))
         let ranked = zip(fused20, scores).sorted { $0.1 > $1.1 }.prefix(n)
         let citations = ranked.enumerated().map { index, pair in
@@ -694,6 +717,9 @@ public final class Agent: @unchecked Sendable {
             c.isPrimary = index == 0
             return c
         }
+        AgentLog.info("[decision-multi] 完成：返回 Top\(citations.count) "
+            + "\(citations.map { "\($0.source):\(String(format: "%.3f", $0.score))" }.joined(separator: ", "))，"
+            + "总耗时 \(Int(Date().timeIntervalSince(started) * 1000))ms")
         return RAGRetrievalOutcome(context: MultiZoneRetrieval.primaryContext(citations),
                                    citations: citations)
     }

@@ -924,44 +924,51 @@ struct SettingsView: View {
                     Text("工作目录").font(.caption)
                     TextField("~/base-agent-workspace", text: $workspace)
                         .textFieldStyle(.roundedBorder)
-                    Button("选择…") { chooseDirectory($workspace, title: "选择工作目录") }
+                    Button("选择…") { chooseWorkspaceDirectory() }
                 }
                 ForEach($zoneRows) { $zone in
                     VStack(alignment: .leading, spacing: 4) {
+                        // 第一行：启用 + 设为默认 + 领域名 + 源目录 + 选择
                         HStack(spacing: 6) {
-                            Text("启用").font(.caption2)
-                            Toggle("", isOn: $zone.enabled).toggleStyle(.checkbox)
+                            Toggle("启用", isOn: $zone.enabled).toggleStyle(.checkbox)
+                                .font(.caption2)
                             Button(zone.isDefault ? "默认" : "设为默认") {
                                 setDefaultZone(zone.id)
                             }
-                            .buttonStyle(.borderless)
-                            .font(.caption2)
+                            .buttonStyle(.borderless).font(.caption2)
                             .disabled(zone.isDefault)
+                            TextField("领域名（如 法律）", text: $zone.name)
+                                .textFieldStyle(.roundedBorder)
+                                .frame(maxWidth: 120)
+                            TextField("源目录（留空=workspace/knowledge_base）", text: $zone.source)
+                                .textFieldStyle(.roundedBorder)
+                                .frame(maxWidth: .infinity)
+                            Button("选择…") { chooseZoneDirectory(zone.id) }
+                                .font(.caption2)
                             if !zone.isDefault {
                                 Button("删除") { removeZone(zone.id) }
                                     .buttonStyle(.borderless).font(.caption2)
                             }
-                            Text("源知识库").font(.caption2)
-                            TextField("领域名（如 法律、医学）", text: $zone.name)
-                                .textFieldStyle(.roundedBorder)
-                                .frame(maxWidth: 180)
                         }
+                        // 第二行：分区操作按钮 + 同步进度
+                        // 应用配置由窗口底部统一入口负责；同步知识在配置变化时
+                        // 会自行先应用，因此每行不再重复放「应用配置」。
                         HStack(spacing: 6) {
-                            Text("源目录").font(.caption2)
-                            TextField("留空 = workspace/knowledge_base", text: $zone.source)
-                                .textFieldStyle(.roundedBorder)
-                                .frame(maxWidth: .infinity)
-                            Button("选择…") {
-                                chooseDirectory(Binding(get: { zone.source },
-                                                        set: { zone.source = $0 }),
-                                                title: "选择 \(zone.name) 源目录")
+                            Button(model.zoneSyncEngineID == zone.id ? "同步中…" : "同步知识") {
+                                applyAndSyncZone(zone.id)
                             }
-                        }
-                        HStack(spacing: 6) {
-                            Button("应用配置") { applyAllConfig() }
-                            Button("同步知识") { applyAndSyncZone(zone.id) }
+                            .disabled(model.isSyncing)
                             Button("停止同步") { model.stopSync() }
+                                .disabled(model.zoneSyncEngineID != zone.id)
                             Button("向量去重") { model.dedupeZone(source: zone.source) }
+                                .disabled(model.isSyncing)
+                            if model.zoneSyncEngineID == zone.id && !model.zoneSyncStatusText.isEmpty {
+                                ProgressView().controlSize(.mini)
+                                Text(model.zoneSyncStatusText)
+                                    .font(.caption2).foregroundStyle(.secondary)
+                                    .lineLimit(1).truncationMode(.middle)
+                            }
+                            Spacer(minLength: 0)
                         }
                         .buttonStyle(.borderless)
                         .font(.caption2)
@@ -979,6 +986,24 @@ struct SettingsView: View {
             .padding(8)
         } label: {
             Text("工作目录配置").font(.headline)
+        }
+    }
+
+    /// 为指定分区选择源目录。用 id 定位行写回，避免 ForEach 临时 Binding 问题。
+    private func chooseZoneDirectory(_ id: String) {
+        let title = (zoneRows.first { $0.id == id }?.name ?? "知识库") + " 源目录"
+        let current = zoneRows.first { $0.id == id }?.source
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if let url = runOpenPanel({ panel in
+            panel.title = title
+            panel.canChooseFiles = false
+            panel.canChooseDirectories = true
+            panel.allowsMultipleSelection = false
+            if !current.isEmpty {
+                panel.directoryURL = URL(fileURLWithPath: (current as NSString).expandingTildeInPath)
+            }
+        }), let idx = zoneRows.firstIndex(where: { $0.id == id }) {
+            zoneRows[idx].source = url.path
         }
     }
 
@@ -1808,9 +1833,30 @@ struct SettingsView: View {
         }
     }
 
-    /// 应用配置后同步指定知识分区（分区有独立 engine 与存储目录）。
+    /// 配置签名：用于判断窗口内设置是否与已生效配置一致，避免「点同步」时
+    /// 无谓地重建 Agent（卸载/重载模型 + 取消在途同步）。
+    private func configSignature(_ config: AgentConfig) -> String {
+        guard let data = try? JSONSerialization.data(withJSONObject: config.export(),
+                                                      options: [.sortedKeys]) else { return "" }
+        return String(decoding: data, as: UTF8.self)
+    }
+
+    /// 同步指定知识分区（分区有独立 engine 与存储目录）。
+    /// 只有窗口配置确实变化时才 applyConfig；否则直接同步当前 Agent 的目标分区，
+    /// 避免重建 Agent 打断其它分区正在进行的同步。
     private func applyAndSyncZone(_ zoneID: String) {
+        // 有分区正在同步时拒绝新的同步请求：applyConfig 会重建 Agent 并取消
+        // 在途同步，导致「已同步一半的分区被中断、结果作废」。
+        if model.isSyncing {
+            statusMessage = "已有知识分区正在同步，请先点「停止同步」再同步其它分区"
+            return
+        }
         guard let config = buildConfig() else { return }
+        if configSignature(config) == configSignature(model.config) {
+            statusMessage = "正在同步知识分区…"
+            model.syncZone(zoneID: zoneID)
+            return
+        }
         statusMessage = "配置已应用，正在同步知识分区…"
         model.applyConfig(config) {
             model.syncZone(zoneID: zoneID)
@@ -2164,78 +2210,93 @@ struct SettingsView: View {
         }
     }
 
-    private func chooseDirectory(_ binding: Binding<String>, title: String) {
+    private func chooseWorkspaceDirectory() {
+        let current = workspace.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let url = runOpenPanel({ panel in
+            panel.title = "选择工作目录"
+            panel.canChooseFiles = false
+            panel.canChooseDirectories = true
+            panel.allowsMultipleSelection = false
+            if !current.isEmpty {
+                panel.directoryURL = URL(fileURLWithPath: (current as NSString).expandingTildeInPath)
+            }
+        }) { workspace = url.path }
+    }
+
+    /// 统一弹出 NSOpenPanel：先激活 App，否则设置窗口非前台时 modal 面板
+    /// 会被挡在后面/不出现在最前，表现为「点击选择没反应」。
+    @discardableResult
+    private func runOpenPanel(_ configure: (NSOpenPanel) -> Void) -> URL? {
         let panel = NSOpenPanel()
-        panel.title = title
-        panel.canChooseFiles = false
-        panel.canChooseDirectories = true
-        panel.allowsMultipleSelection = false
+        configure(panel)
+        NSApp.activate(ignoringOtherApps: true)
+        return panel.runModal() == .OK ? panel.url : nil
+    }
+
+    private func chooseDirectory(_ binding: Binding<String>, title: String) {
         let current = binding.wrappedValue.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !current.isEmpty {
-            panel.directoryURL = URL(fileURLWithPath: (current as NSString).expandingTildeInPath)
-        }
-        if panel.runModal() == .OK, let path = panel.url?.path {
-            binding.wrappedValue = path
-        }
+        if let url = runOpenPanel({ panel in
+            panel.title = title
+            panel.canChooseFiles = false
+            panel.canChooseDirectories = true
+            panel.allowsMultipleSelection = false
+            if !current.isEmpty {
+                panel.directoryURL = URL(fileURLWithPath: (current as NSString).expandingTildeInPath)
+            }
+        }) { binding.wrappedValue = url.path }
     }
 
     private func chooseFile(_ binding: Binding<String>, title: String) {
-        let panel = NSOpenPanel()
-        panel.title = title
-        panel.canChooseFiles = true
-        panel.canChooseDirectories = false
-        panel.allowsMultipleSelection = false
         let current = binding.wrappedValue.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !current.isEmpty {
-            panel.directoryURL = URL(fileURLWithPath: (current as NSString).expandingTildeInPath)
-                .deletingLastPathComponent()
-        }
-        if panel.runModal() == .OK, let path = panel.url?.path {
-            binding.wrappedValue = path
-        }
+        if let url = runOpenPanel({ panel in
+            panel.title = title
+            panel.canChooseFiles = true
+            panel.canChooseDirectories = false
+            panel.allowsMultipleSelection = false
+            if !current.isEmpty {
+                panel.directoryURL = URL(fileURLWithPath: (current as NSString).expandingTildeInPath)
+                    .deletingLastPathComponent()
+            }
+        }) { binding.wrappedValue = url.path }
     }
 
     /// GGUF 模型是单个文件：限制只能选 .gguf 文件。
     private func chooseGGUF(_ binding: Binding<String>, title: String) {
-        let panel = NSOpenPanel()
-        panel.title = title
-        panel.canChooseFiles = true
-        panel.canChooseDirectories = false
-        panel.allowsMultipleSelection = false
-        if #available(macOS 11.0, *) {
-            panel.allowedContentTypes = [UTType(filenameExtension: "gguf")]
-                .compactMap { $0 }
-        }
         let current = binding.wrappedValue.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !current.isEmpty {
-            panel.directoryURL = URL(fileURLWithPath: (current as NSString).expandingTildeInPath)
-                .deletingLastPathComponent()
-        }
-        if panel.runModal() == .OK, let path = panel.url?.path {
-            binding.wrappedValue = path
-        }
+        if let url = runOpenPanel({ panel in
+            panel.title = title
+            panel.canChooseFiles = true
+            panel.canChooseDirectories = false
+            panel.allowsMultipleSelection = false
+            if #available(macOS 11.0, *) {
+                panel.allowedContentTypes = [UTType(filenameExtension: "gguf")]
+                    .compactMap { $0 }
+            }
+            if !current.isEmpty {
+                panel.directoryURL = URL(fileURLWithPath: (current as NSString).expandingTildeInPath)
+                    .deletingLastPathComponent()
+            }
+        }) { binding.wrappedValue = url.path }
     }
 
     /// ONNX 模型既可以是单个 `.onnx` 文件，也可以是含 onnx 权重的目录：
     /// 允许用户二选一（优先选文件，选到目录则交给运行时按约定搜索）。
     private func chooseONNX(_ binding: Binding<String>, title: String) {
-        let panel = NSOpenPanel()
-        panel.title = title
-        panel.canChooseFiles = true
-        panel.canChooseDirectories = true
-        panel.allowsMultipleSelection = false
-        if #available(macOS 11.0, *) {
-            panel.allowedContentTypes = [UTType(filenameExtension: "onnx")]
-                .compactMap { $0 }
-        }
         let current = binding.wrappedValue.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !current.isEmpty {
-            panel.directoryURL = URL(fileURLWithPath: (current as NSString).expandingTildeInPath)
-                .deletingLastPathComponent()
-        }
-        if panel.runModal() == .OK, let url = panel.url {
-            binding.wrappedValue = url.path
-        }
+        if let url = runOpenPanel({ panel in
+            panel.title = title
+            panel.canChooseFiles = true
+            panel.canChooseDirectories = true
+            panel.allowsMultipleSelection = false
+            if #available(macOS 11.0, *) {
+                panel.allowedContentTypes = [UTType(filenameExtension: "onnx")]
+                    .compactMap { $0 }
+            }
+            if !current.isEmpty {
+                panel.directoryURL = URL(fileURLWithPath: (current as NSString).expandingTildeInPath)
+                    .deletingLastPathComponent()
+            }
+        }) { binding.wrappedValue = url.path }
     }
 
     /// 按 backend 选择模型路径：

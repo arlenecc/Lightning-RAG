@@ -64,10 +64,10 @@ struct BaseAgentDesktopApp: App {
                 Button("停止") { model.cancel() }
                     .keyboardShortcut(".", modifiers: [.command])
                     .disabled(!model.isRunning)
-                Button("同步知识库") { model.syncKnowledgeBase(force: false) }
+                Button("同步所有知识库") { model.syncAllKnowledge(force: false) }
                     .disabled(model.isRunning || model.isModelLoading
                         || model.isWarmingUp || model.isSyncing || model.isBuildingANN)
-                Button("强制全量同步") { model.syncKnowledgeBase(force: true) }
+                Button("强制全量同步") { model.syncAllKnowledge(force: true) }
                     .disabled(model.isRunning || model.isModelLoading
                         || model.isWarmingUp || model.isSyncing || model.isBuildingANN)
                 Button(model.isStoppingSync ? "正在停止同步…" : "停止知识库同步") {
@@ -146,7 +146,7 @@ struct MainView: View {
             ToolbarItemGroup(placement: .primaryAction) {
                 // 与配置窗口内「开始同步」一致的快捷入口：目录已配置时无需进设置。
                 Button {
-                    model.syncKnowledgeBase(force: false)
+                    model.syncAllKnowledge(force: false)
                 } label: {
                     Label("同步知识", systemImage: "arrow.triangle.2.circlepath")
                         .labelStyle(.titleAndIcon)
@@ -154,7 +154,7 @@ struct MainView: View {
                 .disabled(model.isRunning || model.isModelLoading
                     || model.isWarmingUp || model.isSyncing || model.isBuildingANN
                     || !model.missingDefaultModels.isEmpty)
-                .help("开始知识库同步（与配置窗口内「开始同步」一致）")
+                .help("一键同步所有启用的知识分区（未配置多分区时同步默认知识库）")
 
                 Button {
                     model.stopSync()
@@ -189,7 +189,7 @@ struct MainView: View {
             // 首启提醒：默认模型缺失时弹窗引导联网下载（可稍后，状态栏保留入口）。
             model.promptModelDownloadIfNeeded()
             if model.config.ragAutoIngest, model.missingDefaultModels.isEmpty {
-                model.syncKnowledgeBase(force: false)
+                model.syncAllKnowledge(force: false)
             }
         }
     }
@@ -539,7 +539,7 @@ struct MainView: View {
                     .truncationMode(.tail)
                 Spacer(minLength: 4)
                 Button {
-                    model.syncKnowledgeBase(force: false)
+                    model.syncAllKnowledge(force: false)
                 } label: {
                     Image(systemName: "arrow.triangle.2.circlepath")
                         .font(.caption)
@@ -550,7 +550,7 @@ struct MainView: View {
                     || !model.missingDefaultModels.isEmpty)
                 .help("增量同步知识库")
                 Button {
-                    model.syncKnowledgeBase(force: true)
+                    model.syncAllKnowledge(force: true)
                 } label: {
                     Image(systemName: "arrow.uturn.forward.circle")
                         .font(.caption)
