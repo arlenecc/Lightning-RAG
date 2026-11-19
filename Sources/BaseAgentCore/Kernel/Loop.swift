@@ -272,7 +272,7 @@ public final class KernelLoop {
 
         let resolved = session ?? Session(
             budget: ContextBudget(total: config.kernelMaxContextTokens),
-            rawTurns: config.kernelRawTurns == 0 ? 10 : config.kernelRawTurns,
+            rawTurns: config.kernelRawTurns == 0 ? 20 : config.kernelRawTurns,
             maxDigestLines: config.kernelMaxDigestLines == 0 ? 20 : config.kernelMaxDigestLines
         )
         self.session = resolved
@@ -285,7 +285,7 @@ public final class KernelLoop {
         // prefill 仍远短于整段历史，也避免了折叠处上下文断裂。
         // 周期不能超过 raw 窗口：超出时窗口每轮都滑动，等于每轮都重建。
         let configured = max(2,
-            config.kernelConsolidateEvery == 0 ? 8 : config.kernelConsolidateEvery)
+            config.kernelConsolidateEvery == 0 ? 18 : config.kernelConsolidateEvery)
         self.consolidateEvery = max(1, min(configured, max(1, resolved.rawTurns)))
         self.maxToolChars = config.kernelMaxToolChars == 0 ? 8_000 : config.kernelMaxToolChars
         self.ragHistoryChars = config.kernelRagHistoryChars

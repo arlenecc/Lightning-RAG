@@ -96,5 +96,47 @@ final class MultiZoneE2E: XCTestCase {
         agent.close()
     }
 
+    /// 验证 Agent 层联合检索确实跨多库召回（而非只查默认库）。
+    func testAgentMultiZoneSearchRecallsBothZones() async throws {
+        let root = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("mz-agent-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let lawDir = root.appendingPathComponent("law")
+        let medDir = root.appendingPathComponent("med")
+        try FileManager.default.createDirectory(at: lawDir, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: medDir, withIntermediateDirectories: true)
+        try String(repeating: "合同法违约责任条款与赔偿损失的详细规定，当事人应当履行义务。", count: 5)
+            .write(to: lawDir.appendingPathComponent("law.md"), atomically: true, encoding: .utf8)
+        try String(repeating: "医学临床诊断治疗方案与药物副作用的详细说明，患者需要遵医嘱。", count: 5)
+            .write(to: medDir.appendingPathComponent("med.md"), atomically: true, encoding: .utf8)
+
+        var config = AgentConfig()
+        config.workspace = root.path
+        config.knowledgeBase = lawDir.path
+        config.ragRerankEnabled = false
+        config.ragSemanticChunking = false
+        config.ragChunkSize = 200
+        config.knowledgeZones = [
+            KnowledgeZone(id: "law", name: "法律", source: lawDir.path, enabled: true, isDefault: true),
+            KnowledgeZone(id: "med", name: "医学", source: medDir.path, enabled: true),
+        ]
+        let agent = Agent(llm: UnloadedLLMService(), config: config, callbacks: NoopCallbacks())
+        XCTAssertEqual(agent.zoneEngines.count, 2)
+        for zone in config.knowledgeZones {
+            let stats = await agent.zoneEngines[zone.id]!.ingest()
+            XCTAssertEqual(stats.processed, 1, "\(zone.name) 应同步 1 文档")
+        }
+        // 联合检索（无 source）：应从两个分区都召回
+        let fused = try await agent.multiZoneSearch(query: "违约责任与临床治疗", topK: 6)
+        XCTAssertTrue(fused.citations.contains { $0.id.hasPrefix("law|") }, "应含法律分区")
+        XCTAssertTrue(fused.citations.contains { $0.id.hasPrefix("med|") }, "应含医学分区")
+        // 定向到某分区：只召回该分区
+        let scoped = try await agent.multiZoneSearch(query: "违约责任与临床治疗", topK: 6,
+                                                     source: "医学")
+        XCTAssertTrue(scoped.citations.allSatisfy { $0.id.hasPrefix("med|") },
+                      "source=分区名时应只查该分区")
+        agent.close()
+    }
+
     private final class NoopCallbacks: AgentCallbacks {}
 }

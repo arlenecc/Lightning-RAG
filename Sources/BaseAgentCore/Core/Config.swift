@@ -235,18 +235,18 @@ public struct AgentConfig: Sendable {
     public var kernelMaxContextTokens: Int = 30_000
     /// 稳定 raw 窗口：段内（两次 CONSOLIDATE 之间）保留最近 `kernelRawTurns` 个
     /// 已完成轮作为原文；溢出的旧轮**直接丢弃**，不再折成摘要回注上下文。
-    /// 默认 10 = 折叠周期 8 + 折叠时保留的 2 轮：段内最多正好 10 轮，
+    /// 默认 20 = 折叠周期 18 + 折叠时保留的 2 轮：段内最多正好 20 轮，
     /// 不会中途滑窗挤掉最老轮（那会让 KV 前缀每轮变化、反复全量 prefill）。
     /// 它同时也是 CONSOLIDATE 周期的上钳位（见 `Loop.swift` 构造）。
-    public var kernelRawTurns: Int = 10
-    /// 周期性主动折叠间隔（轮），默认 8。触发时摘掉旧历史并把每轮摘要行回注
+    public var kernelRawTurns: Int = 20
+    /// 周期性主动折叠间隔（轮），默认 18。触发时摘掉旧历史并把每轮摘要行回注
     /// `<earlier_context>`，**保留最近 2 轮原文**以防折叠处上下文断裂；KV 只
     /// 重建一次（完整历史已由 `onTurnFinished` 逐轮落盘，交给 L2 摘要 / L3 折叠
     /// 历史 / L4 长期记忆维护）。
     /// 实际生效周期 = `min(max(1, 本值), kernelRawTurns)`；配大于 rawTurns 会被钳住。
     /// **例外**：上下文占用超过最大上下文 90%（`ContextBudget.needsAutoShrink`）时
     /// 走 `foldToRewatermark` 收缩到回水线（触发线下 30 个百分点）。
-    public var kernelConsolidateEvery: Int = 8
+    public var kernelConsolidateEvery: Int = 18
     /// L1 工具结果字符上限。与 RAG 输出总上限（ragSearchMaxTotalChars=12000）
     /// 取较小值生效：默认 8000 让 RAG 结果不会被内核二次静默截断。
     public var kernelMaxToolChars: Int = 8_000

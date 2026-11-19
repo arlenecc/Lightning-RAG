@@ -355,8 +355,8 @@ public final class Agent: @unchecked Sendable {
             // 每新增一轮都会挤掉最老轮，KV cache 反复重建（“快两句又慢”）。
             // 挤出的旧轮直接丢弃、不回注摘要。
             rawTurns: max(8,
-                          config.kernelRawTurns == 0 ? 10 : config.kernelRawTurns,
-                          (config.kernelConsolidateEvery == 0 ? 8 : config.kernelConsolidateEvery) + 2),
+                          config.kernelRawTurns == 0 ? 20 : config.kernelRawTurns,
+                          (config.kernelConsolidateEvery == 0 ? 18 : config.kernelConsolidateEvery) + 2),
             maxDigestLines: config.kernelMaxDigestLines == 0 ? 20 : config.kernelMaxDigestLines
         )
 
@@ -574,12 +574,21 @@ public final class Agent: @unchecked Sendable {
             return try await ragEngine.searchWithCitations(query: query,
                                                            topK: topK, source: source)
         }
+        // source 语义：多分区时若 source 命中某分区名/id，视为「定向到该分区」；
+        // 否则视为单库文档名过滤（与联合检索冲突）予以忽略，改查全部分区。
+        let targetedZoneID: String? = {
+            guard let s = source else { return nil }
+            return zones.first { $0.id == s || $0.name == s }?.id
+        }()
+        let effectiveSource: String? = targetedZoneID == nil ? source : nil
+        let searchZones = targetedZoneID.map { id in zones.filter { $0.id == id } } ?? zones
         let started = Date()
         AgentLog.info("[multi-zone] 联合检索开始 query=\(query.prefix(60)) topK=\(topK) "
-            + "挂载分区=\(zones.map(\.name).joined(separator: "、"))")
+            + "分区=\(searchZones.map(\.name).joined(separator: "、"))"
+            + (source != nil ? " source=\(source!)（\(targetedZoneID == nil ? "文档过滤已忽略，查全部分区" : "定向分区")）" : ""))
         // 并行检索各分区（每个 engine 有自己的 searchLock/ingest 状态）。
         let results = await withTaskGroup(of: MultiZoneRetrieval.ZoneResult?.self) { group in
-            for zone in zones {
+            for zone in searchZones {
                 guard let engine = zoneEngines[zone.id] else {
                     AgentLog.warning("[multi-zone] 分区 \(zone.name) 无对应 engine，跳过")
                     continue
@@ -588,7 +597,7 @@ public final class Agent: @unchecked Sendable {
                     let zoneStarted = Date()
                     do {
                         let outcome = try await engine.searchWithCitations(
-                            query: query, topK: max(topK, 10), source: source)
+                            query: query, topK: max(topK, 10), source: effectiveSource)
                         AgentLog.info("[multi-zone] 分区 \(zone.name) 召回 \(outcome.citations.count) 条，"
                             + "耗时 \(Int(Date().timeIntervalSince(zoneStarted) * 1000))ms")
                         return MultiZoneRetrieval.ZoneResult(zoneID: zone.id,
@@ -654,6 +663,22 @@ public final class Agent: @unchecked Sendable {
         for (i, zone) in zones.enumerated() {
             let s = i < zoneScores.count ? zoneScores[i] : 0
             if s >= 0.4 { selected.append((zone, s)) }
+        }
+        // 只选中 0/1 个分区时保底扩展到得分最高的 2 个：多分区场景应体现
+        // 「联合检索」，避免判定阈值把范围收窄成单库（看起来像没启用多库）。
+        let rankedZones = zones.enumerated().sorted { i, j in
+            let si = i.offset < zoneScores.count ? zoneScores[i.offset] : 0
+            let sj = j.offset < zoneScores.count ? zoneScores[j.offset] : 0
+            return si > sj
+        }
+        if selected.count < 2, rankedZones.count > 1 {
+            var seen = Set(selected.map { $0.zone.id })
+            for candidate in rankedZones where seen.count < 2 {
+                if seen.contains(candidate.element.id) { continue }
+                let own = candidate.offset < zoneScores.count ? zoneScores[candidate.offset] : 0
+                selected.append((candidate.element, max(0.01, own)))
+                seen.insert(candidate.element.id)
+            }
         }
         if selected.isEmpty {
             // 全不达标时保守选全部（避免漏检），权重用各分区自己的判定分+0.01。
@@ -1230,9 +1255,35 @@ public final class Agent: @unchecked Sendable {
                 + "chars=\(prompt.count) dir=\(skill.directory)")
         }
 
-        // 知识库状态只读 RAGEngine 的快照：绝不在这里同步打开/扫描向量库。
+        // 知识库状态只读各 RAGEngine 的内存快照：绝不在这里同步打开/扫描向量库。
         // 千万级切片的库上 COUNT(*) 需要数分钟，会把首轮 LLM 调用卡住。
-        if let status = ragStatus() {
+        // 多分区时汇总所有启用分区，明确引导模型做跨库联合检索、不要按单一
+        // 文档名限定 source（否则只有默认库命中，其它库被过滤空）。
+        let mounted = config.mountedZones
+        if mounted.count > 1 {
+            var lines: [String] = ["# Knowledge base（\(mounted.count) 个已挂载知识分区，检索默认覆盖全部分区）"]
+            var totalChunks = 0
+            for zone in mounted {
+                guard let engine = zoneEngines[zone.id],
+                      let st = engine.cachedStatus(maxAge: .infinity) else { continue }
+                let chunks = Int(st["chunks_stored"]?.intValue ?? 0)
+                let sources = st["sources"]?.arrayValue?.compactMap(\.stringValue) ?? []
+                let cnt = Int(st["source_count"]?.intValue ?? sources.count)
+                totalChunks += chunks
+                let names = sources.prefix(5).map { ($0 as NSString).lastPathComponent }
+                    .joined(separator: ", ")
+                lines.append("- 分区【\(zone.name)】(id=\(zone.id))：\(chunks) 切片 / \(cnt) 文档"
+                    + (names.isEmpty ? "" : "（\(names)）"))
+            }
+            if totalChunks == 0 {
+                lines.append("（各分区尚无已索引内容，请先同步）")
+            }
+            lines.append(KNOWLEDGE_BASE_HINT)
+            lines.append("检索时不要传 source 限定到某个文档名——那会只查一个分区；"
+                + "默认跨全部分区联合检索并融合结果。")
+            lines.append("Follow the knowledge-base strategy in the system prompt.")
+            sections.append(lines.joined(separator: "\n"))
+        } else if let status = ragStatus() {
             let chunks = Int(status["chunks_stored"]?.intValue ?? 0)
             let sources = status["sources"]?.arrayValue?.compactMap(\.stringValue) ?? []
             let sourceCount = status["source_count"]?.intValue ?? sources.count
@@ -1248,8 +1299,6 @@ public final class Agent: @unchecked Sendable {
                 sections.append("# Knowledge base\nConfigured but empty. Use `rag_tools(op=\"ingest\")` to index.")
             }
         } else if FileManager.default.fileExists(atPath: ragEngine.indexDBPath) {
-            // 启动后状态快照还没生成（由 UI 在后台刷新）：先给一个无统计的轻提示，
-            // 仍可正常检索，不阻塞本轮。
             sections.append("# Knowledge base\nIndexed locally. " + KNOWLEDGE_BASE_HINT
                 + " Follow the knowledge-base strategy in the system prompt to retrieve passages.")
         }
