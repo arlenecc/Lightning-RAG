@@ -1663,11 +1663,16 @@ struct ThinkSplitter {
     }
 }
 
-/// 剥离 `<tool_call>...</tool_call>` 标记，避免结构化工具调用同时污染正文。
+/// 剥离工具调用标记，避免结构化工具调用同时污染正文。
+/// 支持两类方言：
+/// - `<tool_call>...</tool_call>`（Qwen / GLM4 / Spark / JSON）
+/// - `<function name="...">...</function>`（MiniCPM5 等裸 function 格式）
 struct ToolTagSplitter {
-    private let openTag = "<tool_call>"
-    private let closeTag = "</tool_call>"
-    private var inTool = false
+    private let toolCallOpen = "<tool_call>"
+    private let toolCallClose = "</tool_call>"
+    private let functionClose = "</function>"
+    /// 当前正在剥的闭合标签；nil 表示不在工具块内。
+    private var activeClose: String?
     private var buffer = ""
 
     mutating func feed(_ chunk: String) -> [String] {
@@ -1675,34 +1680,68 @@ struct ToolTagSplitter {
         var output: [String] = []
 
         while true {
-            let tag = inTool ? closeTag : openTag
-            if let range = buffer.range(of: tag) {
-                let before = String(buffer[..<range.lowerBound])
-                if !inTool, !before.isEmpty {
-                    output.append(before)
+            if let close = activeClose {
+                guard let range = buffer.range(of: close) else {
+                    // 保留可能被拆散的闭合标签前缀。
+                    let keep = close.count - 1
+                    if buffer.count > keep {
+                        buffer = String(buffer[buffer.index(buffer.endIndex,
+                                                            offsetBy: -keep)...])
+                    }
+                    break
                 }
                 buffer.removeSubrange(..<range.upperBound)
-                inTool.toggle()
+                activeClose = nil
             } else {
-                let keep = tag.count - 1
-                if buffer.count > keep {
-                    let split = buffer.index(buffer.endIndex, offsetBy: -keep)
-                    let ready = String(buffer[..<split])
-                    if !inTool, !ready.isEmpty {
-                        output.append(ready)
-                    }
-                    buffer = String(buffer[split...])
+                // 找最早的起始标签：<tool_call> 或 <function name=/<function=
+                let tcRange = buffer.range(of: toolCallOpen)
+                let fnRange = Self.functionOpenRange(in: buffer)
+                let chosen: (range: Range<String.Index>, close: String)?
+                switch (tcRange, fnRange) {
+                case (let a?, let b?):
+                    chosen = a.lowerBound <= b.lowerBound
+                        ? (a, toolCallClose) : (b, functionClose)
+                case (let a?, nil):
+                    chosen = (a, toolCallClose)
+                case (nil, let b?):
+                    chosen = (b, functionClose)
+                case (nil, nil):
+                    chosen = nil
                 }
-                break
+                guard let pick = chosen else {
+                    // 保留可能被拆散的起始标签前缀（最长的 "<function name=\"" 约 16 字符）。
+                    let keep = 18
+                    if buffer.count > keep {
+                        let split = buffer.index(buffer.endIndex, offsetBy: -keep)
+                        let ready = String(buffer[..<split])
+                        if !ready.isEmpty { output.append(ready) }
+                        buffer = String(buffer[split...])
+                    }
+                    break
+                }
+                let before = String(buffer[..<pick.range.lowerBound])
+                if !before.isEmpty { output.append(before) }
+                buffer.removeSubrange(..<pick.range.upperBound)
+                activeClose = pick.close
             }
         }
         return output
     }
 
+    /// 定位裸 `<function name="...">` 或 `<function=...>` 起始标签。
+    /// 只匹配带 name 属性的调用形式，避免把正文里的普通 XML `<function>` 误剥。
+    private static func functionOpenRange(in text: String) -> Range<String.Index>? {
+        guard let regex = try? NSRegularExpression(
+            pattern: #"<function(?:\s+name\s*=|=)[^>]*>"#) else { return nil }
+        let range = NSRange(text.startIndex..<text.endIndex, in: text)
+        guard let match = regex.firstMatch(in: text, options: [], range: range) else { return nil }
+        return Range(match.range, in: text)
+    }
+
     mutating func flush() -> [String] {
         let text = buffer
         buffer = ""
-        return inTool || text.isEmpty ? [] : [text]
+        return activeClose != nil || text.isEmpty ? [] : [text]
     }
 }
 

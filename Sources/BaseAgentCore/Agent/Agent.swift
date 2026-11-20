@@ -1442,16 +1442,17 @@ public final class Agent: @unchecked Sendable {
                 let sources = st["sources"]?.arrayValue?.compactMap(\.stringValue) ?? []
                 let cnt = Int(st["source_count"]?.intValue ?? sources.count)
                 totalChunks += chunks
-                let names = sources.prefix(5).map { ($0 as NSString).lastPathComponent }
-                    .joined(separator: ", ")
-                lines.append("- 分区【\(zone.name)】(id=\(zone.id))：\(chunks) 切片 / \(cnt) 文档"
-                    + (names.isEmpty ? "" : "（\(names)）"))
+                // 只给分区名与规模，不列文档名：文档名由 status 工具按需提供。
+                // 两处都列完整清单时，模型会把「知识库里有什么」复述两遍。
+                lines.append("- 分区【\(zone.name)】：\(chunks) 切片 / \(cnt) 文档")
             }
             if totalChunks == 0 {
                 lines.append("（各分区尚无已索引内容，请先同步）")
             }
             lines.append(KNOWLEDGE_BASE_HINT)
             lines.append("多分区默认跨全部分区联合检索，不要传 source 限定到单个文档名。")
+            lines.append("本段是内部检索上下文，勿复述给用户；用户问知识库清单时用 "
+                + "rag_tools(op=\"status\") 查真实数据并只回答一次。")
             sections.append(lines.joined(separator: "\n"))
         } else if let status = ragStatus() {
             let chunks = Int(status["chunks_stored"]?.intValue ?? 0)

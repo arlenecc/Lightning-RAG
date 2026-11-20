@@ -32,6 +32,12 @@ mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources" "$APP/Contents/Framewor
 
 cp "$BINARY" "$APP/Contents/MacOS/Lightning-RAG"
 
+# 去掉 Swift 调试符号：Release 二进制默认带完整符号表（本次实测 102M），
+# strip -x 保留动态链接所需的外部符号，仅移除本地/调试符号，可降到 ~59M。
+# 完整符号仍在 .build/out/Products/Release/Lightning-RAG.dSYM，需要调试时可用。
+echo " stripping 调试符号…"
+strip -x "$APP/Contents/MacOS/Lightning-RAG"
+
 # 三种运行时第三方资源 bundle（Cmlx metallib / Hub / Crypto 等）。
 # BaseAgent_BaseAgentCore.bundle 只装 potion 语义切片模型，不打进包，
 # 由启动时的模型自动下载流程补齐。

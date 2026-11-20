@@ -32,6 +32,9 @@ enum LocalToolCallParser {
         }
 
         collect("<tool_call>\\s*([\\s\\S]*?)\\s*</tool_call>")
+        // MiniCPM 等模型直接用 <function name=...>...</function>（无 <tool_call> 外层），
+        // 单独收集这类块，交给 callsFromXML 解析。
+        collect("(<function\\s+name=[\\s\\S]*?</function>)", group: 1)
         collect("```(?:json)?\\s*([\\s\\S]*?)```")
         if payloads.isEmpty, let value = JSONValue.parse(raw),
            value.objectValue != nil || value.arrayValue != nil {
@@ -189,7 +192,8 @@ enum LocalToolCallParser {
         guard !name.isEmpty, allowedNames.contains(name) else { return [] }
 
         var arguments: [String: JSONValue] = [:]
-        let pattern = #"<parameter(?:=|\s+name=)["']?([^"'>\s]+)["']?>\s*([\s\S]*?)\s*</parameter>"#
+        // Qwen 用 <parameter>，MiniCPM 用 <param>（值可能包在 CDATA 里）。
+        let pattern = #"<param(?:eter)?(?:=|\s+name=)["']?([^"'>\s]+)["']?>\s*([\s\S]*?)\s*</param(?:eter)?>"#
         if let regex = try? NSRegularExpression(pattern: pattern) {
             let range = NSRange(payload.startIndex..<payload.endIndex, in: payload)
             for match in regex.matches(in: payload, options: [], range: range) {
@@ -197,8 +201,12 @@ enum LocalToolCallParser {
                       let keyRange = Range(match.range(at: 1), in: payload),
                       let valueRange = Range(match.range(at: 2), in: payload) else { continue }
                 let key = String(payload[keyRange]).trimmingCharacters(in: .whitespacesAndNewlines)
-                let value = String(payload[valueRange])
+                var value = String(payload[valueRange])
                     .trimmingCharacters(in: .whitespacesAndNewlines)
+                // CDATA：<![CDATA[多行/特殊字符]]>
+                if value.hasPrefix("<![CDATA["), value.hasSuffix("]]>"), value.count >= 12 {
+                    value = String(value.dropFirst(9).dropLast(3))
+                }
                 guard !key.isEmpty else { continue }
                 arguments[key] = parseScalar(value)
             }
