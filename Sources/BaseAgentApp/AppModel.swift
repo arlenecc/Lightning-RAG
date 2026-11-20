@@ -2221,6 +2221,7 @@ final class AppViewModel: ObservableObject {
             showInfoAlert(title: "暂不能构建向量索引", message: "对话正在生成，请等本轮结束后再试。")
             return
         }
+        // 一次构建同时更新二值 ANN 与主向量 ANN（不再二选一）。
         cancelIdleUnload()
         isBuildingANN = true
         statusText = "正在读取向量索引状态…"
@@ -2247,11 +2248,9 @@ final class AppViewModel: ObservableObject {
                 }
                 return
             }
-            // 目标随签名覆盖率而定：覆盖完整 → 二值 ANN（bann），否则主 ANN。
-            let indexTarget = agent.ragEngine.resolvedANNIndexTarget()
-            let status = indexTarget == .binary
-                ? agent.ragEngine.binaryANNIndexStatus()
-                : agent.ragEngine.annIndexStatus()
+            // 一次构建同时更新二值 ANN 与主向量 ANN：分别读两者的状态、分别确认重建。
+            let binaryStatus = agent.ragEngine.binaryANNIndexStatus()
+            let denseStatus = agent.ragEngine.annIndexStatus()
             await MainActor.run { [weak self] in
                 guard let self else { return }
                 guard let current = self.agent, ObjectIdentifier(current) == target else {
@@ -2260,14 +2259,10 @@ final class AppViewModel: ObservableObject {
                     self.scheduleIdleUnload()
                     return
                 }
-                if let status {
-                    if indexTarget == .binary {
-                        self.binaryANNStatusText = status.summary
-                    } else {
-                        self.annStatusText = status.summary
-                    }
-                    // 已有索引：重建要丢弃现有索引并整库重跑，先确认。
-                    if status.blocks > 0, !self.confirmANNIndexRebuild(status, target: indexTarget) {
+                if let status = binaryStatus {
+                    self.binaryANNStatusText = status.summary
+                    if status.blocks > 0,
+                       !self.confirmANNIndexRebuild(status, target: .binary) {
                         self.isBuildingANN = false
                         self.statusText = "就绪"
                         self.appendLog("[rag] 已取消索引构建")
@@ -2275,14 +2270,24 @@ final class AppViewModel: ObservableObject {
                         return
                     }
                 }
-                self.performANNIndexBuild(agent: agent, target: target, indexTarget: indexTarget)
+                if let status = denseStatus {
+                    self.annStatusText = status.summary
+                    if status.blocks > 0,
+                       !self.confirmANNIndexRebuild(status, target: .dense) {
+                        self.isBuildingANN = false
+                        self.statusText = "就绪"
+                        self.appendLog("[rag] 已取消索引构建")
+                        self.scheduleIdleUnload()
+                        return
+                    }
+                }
+                self.performANNIndexBuild(agent: agent, target: target)
             }
         }
     }
 
     /// 用户确认后真正启动构建：进度写状态栏，逐块日志由引擎按 10s 限流输出。
-    private func performANNIndexBuild(agent: Agent, target: ObjectIdentifier,
-                                      indexTarget: RAGEngine.ANNIndexTarget) {
+    private func performANNIndexBuild(agent: Agent, target: ObjectIdentifier) {
         guard !isSyncing, !isDeduplicating, !isModelLoading, !isRunning, !isWarmingUp else {
             isBuildingANN = false
             showInfoAlert(title: "暂不能构建索引", message: "当前有任务正在进行，请稍后再试。")
@@ -2290,12 +2295,10 @@ final class AppViewModel: ObservableObject {
             scheduleIdleUnload()
             return
         }
-        let label = indexTarget == .binary ? "二值 ANN 索引" : "ANN 索引"
+        let label = "二值 ANN 与主向量 ANN 索引"
         cancelIdleUnload()
         isBuildingANN = true
-        statusText = indexTarget == .binary
-            ? "正在构建二值 ANN 索引…"
-            : "正在构建 ANN 索引…"
+        statusText = "正在构建二值 ANN 与主向量 ANN 索引…"
         appendLog("[rag] 开始构建\(label)：分块 IVF，块内 k-means + 量化；"
             + "构建期间知识检索与状态查询不受影响")
         Task.detached(priority: .utility) { [weak self] in
@@ -2320,14 +2323,17 @@ final class AppViewModel: ObservableObject {
                 }
                 return
             }
-            let result = agent.ragEngine.buildANNIndex { update in
-                Task { @MainActor [weak self] in
-                    guard let self, self.isBuildingANN else { return }
-                    self.statusText = update.message
-                }
-            } log: { line in
-                Task { @MainActor [weak self] in self?.appendLog(line) }
-            }
+            let result = agent.ragEngine.buildANNIndex(
+                progress: { update in
+                    Task { @MainActor [weak self] in
+                        guard let self, self.isBuildingANN else { return }
+                        self.statusText = update.message
+                    }
+                },
+                log: { line in
+                    Task { @MainActor [weak self] in self?.appendLog(line) }
+                },
+                targets: [.binary, .dense])
             await MainActor.run { [weak self] in
                 guard let self else { return }
                 self.isBuildingANN = false

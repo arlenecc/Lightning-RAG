@@ -3231,8 +3231,11 @@ public final class RAGEngine {
     /// 构建期间不持有 `searchLock`：只短暂持有 store 的写锁与 ingest 标志，
     /// 检索/状态查询可以并行执行。
     @discardableResult
+    /// 构建 ANN 索引。`targets` 为空时按当前配置自动选一个；
+    /// 传入多个（如 [.binary, .dense]）时依次构建全部，供「一个按钮更新所有索引」使用。
     public func buildANNIndex(progress: ((ANNBuildProgress) -> Void)? = nil,
-                              log: ((String) -> Void)? = nil) -> ANNBuildResult? {
+                              log: ((String) -> Void)? = nil,
+                              targets: [ANNIndexTarget] = []) -> ANNBuildResult? {
         let logFn: (String) -> Void = { message in
             if let log { log(message) } else { AgentLog.info(message) }
         }
@@ -3250,53 +3253,63 @@ public final class RAGEngine {
             annBuildLock.unlock()
         }
         cancelLock.lock(); cancelRequested = false; cancelLock.unlock()
-        return performANNBuild(progress: progress, log: logFn)
+        return performANNBuild(progress: progress, log: logFn, targets: targets)
     }
 
     /// 实际的构建流程。调用方必须已持有 ingest 标志。
     /// 不通过 `withStore` 取 `searchLock`，只依赖 store 自身的分块锁。
     @discardableResult
     private func performANNBuild(progress: ((ANNBuildProgress) -> Void)?,
-                                 log logFn: @escaping (String) -> Void) -> ANNBuildResult? {
+                                 log logFn: @escaping (String) -> Void,
+                                 targets: [ANNIndexTarget]) -> ANNBuildResult? {
         var lastLog = Date.distantPast
         let clusters = max(2, config.ragANNClusters)
         let clusterSize = max(1, config.ragANNClusterSize)
         do {
             let store = try ensureStore()
-            let target = annIndexTarget(for: store)
-            annBuildLock.lock()
-            annBuildTarget = target
-            annBuildLock.unlock()
-            let progressHandler: (ANNBuildProgress) -> Void = { [weak self] update in
-                self?.recordANNBuildProgress(update)
-                progress?(update)
-                // 每块日志限流：块粒度是 6 位数的切片量，逐块打印会刷屏。
-                guard Date().timeIntervalSince(lastLog) >= 10,
-                      update.stage == "blocks" else { return }
-                lastLog = Date()
-                logFn("RAG: \(update.message)")
+            // 未指定则按配置自动选一个（保持旧行为）；指定多个则依次全建。
+            let resolved = targets.isEmpty ? [annIndexTarget(for: store)] : targets
+            var combined: ANNBuildResult?
+            for target in resolved {
+                if Task.isCancelled || isCancelled { break }
+                annBuildLock.lock(); annBuildTarget = target; annBuildLock.unlock()
+                let progressHandler: (ANNBuildProgress) -> Void = { [weak self] update in
+                    self?.recordANNBuildProgress(update)
+                    progress?(update)
+                    guard Date().timeIntervalSince(lastLog) >= 10,
+                          update.stage == "blocks" else { return }
+                    lastLog = Date()
+                    logFn("RAG: \(update.message)")
+                }
+                let cancelled: () -> Bool = { [weak self] in
+                    Task.isCancelled || (self?.isCancelled ?? true)
+                }
+                let result: ANNBuildResult
+                switch target {
+                case .binary:
+                    result = try store.buildBinaryANNIndex(
+                        clusters: clusters, clusterSize: clusterSize,
+                        progress: progressHandler, isCancelled: cancelled)
+                case .dense:
+                    result = try store.buildANNIndex(
+                        clusters: clusters, clusterSize: clusterSize,
+                        progress: progressHandler, isCancelled: cancelled)
+                case .colbert:
+                    throw AgentError.storage("检索阅读模式请使用独立的向量索引构建")
+                }
+                logFn("RAG: \(result.summary)")
+                // 合并多个 target 的结果：切片数取首个有效值，摘要拼接、取消状态聚合。
+                if let existing = combined {
+                    var merged = existing
+                    merged.summary += "；" + result.summary
+                    merged.cancelled = merged.cancelled || result.cancelled
+                    combined = merged
+                } else {
+                    combined = result
+                }
             }
-            let cancelled: () -> Bool = { [weak self] in
-                Task.isCancelled || (self?.isCancelled ?? true)
-            }
-            let result: ANNBuildResult
-            switch target {
-            case .binary:
-                result = try store.buildBinaryANNIndex(
-                    clusters: clusters, clusterSize: clusterSize,
-                    progress: progressHandler, isCancelled: cancelled)
-            case .dense:
-                result = try store.buildANNIndex(
-                    clusters: clusters, clusterSize: clusterSize,
-                    progress: progressHandler, isCancelled: cancelled)
-            case .colbert:
-                // 普通 ANN 构建不会走到这里（ColBERT 走 buildColbertANN），
-                // 防御性抛错而非静默建错库。
-                throw AgentError.storage("检索阅读模式请使用独立的向量索引构建")
-            }
-            logFn("RAG: \(result.summary)")
             invalidateStatusCache()
-            return result
+            return combined
         } catch {
             logFn("RAG: ANN 索引构建失败：\(error.localizedDescription)")
             AgentLog.warning("RAG: ANN 索引构建失败: \(error.localizedDescription)")
@@ -3498,7 +3511,7 @@ public final class RAGEngine {
             logFn("RAG: 已请求停止，跳过自动 ANN 构建\(label)")
             return
         }
-        _ = performANNBuild(progress: nil, log: logFn)
+        _ = performANNBuild(progress: nil, log: logFn, targets: [])
     }
 
     // MARK: Search

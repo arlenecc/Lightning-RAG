@@ -723,13 +723,25 @@ public final class VectorStore: @unchecked Sendable {
     public func enqueueMissingVectors(limit: Int = 10_000) -> Int {
         lock.lock(); defer { lock.unlock() }
         guard rebuildReason == nil else { return 0 }
-        let rows = (try? db.query("""
+        // 两类缺口都要补：① 缺向量；② 二值粗筛开启时缺 bin 签名（有向量但没签名）。
+        // 只补①会让历史签名缺失的切片永远凑不齐 binaryRows==chunkRows，
+        // isComplete 恒为 false → ANN 目标退回 dense，二值 ANN 永远构建不了。
+        let missingVectorSQL = """
             SELECT c.rowid, c.source, c.chunk_index
             FROM \(Self.chunksTable) c
-            WHERE NOT EXISTS (SELECT 1 FROM \(Self.vectorTable) v WHERE v.rowid = c.rowid)
+            WHERE (
+                NOT EXISTS (SELECT 1 FROM \(Self.vectorTable) v WHERE v.rowid = c.rowid)
+            """
+        let missingSignatureSQL = binaryStorageEnabled ? """
+                OR NOT EXISTS (SELECT 1 FROM \(Self.binaryVectorTable) b WHERE b.rowid = c.rowid)
+            """ : ""
+        let tailSQL = """
+            )
               AND NOT EXISTS (SELECT 1 FROM \(Self.pendingTable) p WHERE p.rowid = c.rowid)
             LIMIT ?
-            """, [.int(Int64(max(1, limit)))])) ?? []
+            """
+        let rows = (try? db.query(missingVectorSQL + missingSignatureSQL + tailSQL,
+                                  [.int(Int64(max(1, limit)))])) ?? []
         guard !rows.isEmpty else { return 0 }
         var added = 0
         try? db.transaction {

@@ -583,7 +583,7 @@ struct SettingsView: View {
                 }
 
                 // Reranker 行：模型类型 / 本地路径之后是「启用重排序 + TopN +
-                // 候选池 + 阈值 + 二值粗筛 + 候选」，同样按可用宽度自动折行。
+                // 候选池 + 阈值」，同样按可用宽度自动折行。二值粗筛已移到向量库行。
                 ViewThatFits(in: .horizontal) {
                     HStack(spacing: 8) {
                         rerankerPathControls
@@ -609,6 +609,7 @@ struct SettingsView: View {
                     HStack(spacing: 8) {
                         vectorStorageControls
                         annToggles()
+                        binaryCoarseControls()
                         Spacer(minLength: 8)
                         vectorRebuildButtons()
                     }
@@ -616,6 +617,7 @@ struct SettingsView: View {
                         vectorStorageControls
                         HStack(spacing: 8) {
                             annToggles()
+                            binaryCoarseControls()
                             Spacer(minLength: 8)
                             vectorRebuildButtons()
                         }
@@ -1268,19 +1270,6 @@ struct SettingsView: View {
                 value: $rerankThreshold, in: 0...1, step: 0.05)
             .help("重排分数过滤阈值（0-1），默认 0.45 适配 jina；低于阈值的片段会被过滤，"
                 + "全部低于阈值时回退原排序。换 bge 等 reranker 时通常需要上调")
-        // 二值粗筛：并入重排序配置行末尾；开关关闭时候选数不可调，
-        // 主存储为 BIN 时该项自动停用。
-        Toggle("二值粗筛", isOn: $binaryCoarseEnabled)
-            .help("开启后先用二值向量召回候选，再按主向量余弦精排，"
-                + "最后与全文检索 RRF 融合；可用时取代 ANN，不可用时"
-                + "自动回退原流程。主存储为 BIN 时仅支持单阶段检索；"
-                + "已有库需要重新同步后才会生效。")
-        Stepper(value: $binaryCoarseCandidates, in: 50...1000, step: 50) {
-            Text("候选 \(binaryCoarseCandidates)")
-        }
-        .disabled(!binaryCoarseEnabled)
-        .help("第一阶段二值粗筛候选数：越大召回越稳、精排读取越多；"
-            + "默认 200，允许 50...1000。")
     }
 
     @ViewBuilder
@@ -1446,6 +1435,23 @@ struct SettingsView: View {
         Toggle("自动构建", isOn: $annAutoBuild)
             .help("同步完成后切片数达到阈值（默认 2 万）时自动构建/续建向量索引；"
                 + "关闭后只能手动点「构建/续建向量索引」")
+    }
+
+    /// 二值粗筛开关与第一阶段候选数（与向量库配置同一行，重建向量库按钮之前）。
+    @ViewBuilder
+    private func binaryCoarseControls() -> some View {
+        Toggle("二值粗筛", isOn: $binaryCoarseEnabled)
+            .font(.caption2)
+            .help("开启后先用二值向量召回候选，再按主向量余弦精排，"
+                + "最后与全文检索 RRF 融合；可用时取代 ANN，不可用时"
+                + "自动回退原流程。主存储为 BIN 时仅支持单阶段检索；"
+                + "已有库需要重新同步后才会生效。")
+        Stepper(value: $binaryCoarseCandidates, in: 50...1000, step: 50) {
+            Text("候选 \(binaryCoarseCandidates)").font(.caption2)
+        }
+        .disabled(!binaryCoarseEnabled)
+        .help("第一阶段二值粗筛候选数：越大召回越稳、精排读取越多；"
+            + "默认 200，允许 50...1000。")
     }
 
     @ViewBuilder
