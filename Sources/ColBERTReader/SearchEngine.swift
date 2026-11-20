@@ -538,6 +538,131 @@ final class SearchEngine {
         return Int(rows.first?["n"]?.intValue ?? 0)
     }
 
+    /// 多库联合检索-极速模式粗筛：ANN/vec0 + BM25 的 Weighted RRF，返回候选 doc_id
+    /// 及其 rrf 分（不做残差加载/MaxSim）。供跨库统一融合。
+    func coarseCandidates(query: String, coarse: Int = 20,
+                          rrfVectorWeight: Double = 0.7,
+                          source: String? = nil)
+        throws -> [(docID: String, rrf: Double, content: String,
+                    source: String, title: String)] {
+        guard !query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return [] }
+        let center = try colbert.queryVectors(query, prune: true).center
+        let coarseCount = max(1, coarse)
+        let fetchK = Self.coarseFetchK(coarse)
+        var candidates: [String: Candidate] = [:]
+        var coarseHits: [(rowID: Int64, score: Double, distance: Double?)] = []
+        let ann = self.ann
+        if ann.status().usable,
+           let found = ann.candidates(query: center, topK: fetchK,
+                                      nprobe: ANNIndex.defaultNprobe,
+                                      rescore: ANNIndex.defaultRescore,
+                                      knownStatus: ann.status()), !found.isEmpty {
+            coarseHits = found.map { ($0.rowID, $0.score, nil) }
+        }
+        if coarseHits.isEmpty {
+            let rows = try db.query("""
+                SELECT rowid, distance FROM doc_summary_vec
+                WHERE embedding MATCH ? AND k = ? ORDER BY distance
+                """, [.floats(center), .int(Int64(fetchK))])
+            for row in rows {
+                guard let rowID = row["rowid"]?.intValue else { continue }
+                coarseHits.append((rowID, 1.0 / (1.0 + (row["distance"]?.doubleValue ?? 2.0)),
+                                   row["distance"]?.doubleValue ?? nil))
+            }
+        }
+        let idByRow = try docIDsByRowID(coarseHits.map(\.rowID))
+        let wVec = min(max(rrfVectorWeight, 0), 1), wFTS = 1.0 - wVec
+        for (rank, item) in coarseHits.enumerated() {
+            guard let id = idByRow[item.rowID] else { continue }
+            var c = candidates[id] ?? Candidate(docID: id)
+            c.vectorRank = rank + 1; c.vectorDistance = item.distance
+            c.rrf += wVec / (rrfK + Double(rank + 1))
+            candidates[id] = c
+        }
+        for mode in ["AND", "OR"] {
+            let match = TextAnalysis.ftsQuery(query, mode: mode)
+            guard !match.isEmpty else { continue }
+            let rows = try db.query("""
+                SELECT doc_id, bm25(document_fts) AS score FROM document_fts
+                WHERE document_fts MATCH ? ORDER BY score LIMIT ?
+                """, [.text(match), .int(Int64(fetchK))])
+            if !rows.isEmpty {
+                for (rank, row) in rows.enumerated() {
+                    guard let id = row["doc_id"]?.stringValue else { continue }
+                    var c = candidates[id] ?? Candidate(docID: id)
+                    c.bm25Rank = rank + 1; c.bm25Score = row["score"]?.doubleValue ?? nil
+                    c.rrf += wFTS / (rrfK + Double(rank + 1))
+                    candidates[id] = c
+                }
+                break
+            }
+        }
+        var shortlist = Array(candidates.values.sorted {
+            $0.rrf != $1.rrf ? $0.rrf > $1.rrf : $0.docID < $1.docID
+        }.prefix(coarseCount))
+        if let source, !source.isEmpty {
+            let totalCap = Self.sourceCandidateLimit(coarse)
+            var seen = Set(shortlist.map(\.docID))
+            if totalCap > shortlist.count {
+                let escaped = Self.likePattern(source)
+                let rows = try db.query("""
+                    SELECT doc_id FROM document
+                    WHERE source LIKE ? ESCAPE '\\' OR title LIKE ? ESCAPE '\\'
+                    ORDER BY doc_id LIMIT ?
+                    """, [.text(escaped), .text(escaped), .int(Int64(totalCap - shortlist.count))])
+                for row in rows {
+                    guard let id = row["doc_id"]?.stringValue, seen.insert(id).inserted else { continue }
+                    shortlist.append(Candidate(docID: id))
+                    if shortlist.count >= totalCap { break }
+                }
+            }
+        }
+        return shortlist.compactMap { c in
+            guard let meta = try? loadMeta(c.docID) else { return nil }
+            return (c.docID, c.rrf, meta.content, meta.source, meta.title)
+        }
+    }
+
+    /// 多库联合检索-极速模式精排：对给定 doc_id 列表做残差加载 + MaxSim。
+    func rerankByDocIDs(query: String, docIDs: [String],
+                        lengthNorm: Bool = false) throws -> [SearchHit] {
+        guard !docIDs.isEmpty else { return [] }
+        let queryTokens = try colbert.queryVectors(query, prune: true).tokens
+        let data = try loadShortlistData(docIDs)
+        var hits: [SearchHit] = []
+        for docID in docIDs {
+            guard let meta = data.metas[docID] else { continue }
+            guard let record = data.residuals[docID],
+                  let score = try? ResidualCodec.maxSim(query: queryTokens, record: record,
+                                                        normalizeLength: lengthNorm) else {
+                // 未回填/残差损坏：BM25 兜底分（排位靠后）。
+                hits.append(SearchHit(docID: docID, title: meta.title,
+                                      source: meta.source, content: meta.content,
+                                      score: 0, vectorRank: nil, bm25Rank: nil, rrf: 0))
+                continue
+            }
+            hits.append(SearchHit(docID: docID, title: meta.title,
+                                  source: meta.source, content: meta.content,
+                                  score: score, vectorRank: nil, bm25Rank: nil, rrf: 0))
+        }
+        return hits.sorted { $0.score > $1.score }
+    }
+
+    /// 轻量正文命中探查（不加载模型）：对 document_fts 做 AND/OR MATCH，
+    /// 返回命中数（上限 cap）。供多库联合检索前判断「该库是否与问句相关」。
+    static func ftsHitCount(_ db: SQLiteDB, query: String, cap: Int = 8) -> Int {
+        guard cap > 0 else { return 0 }
+        for mode in ["AND", "OR"] {
+            let match = TextAnalysis.ftsQuery(query, mode: mode)
+            guard !match.isEmpty else { continue }
+            let rows = (try? db.query("""
+                SELECT doc_id FROM document_fts WHERE document_fts MATCH ? LIMIT ?
+                """, [.text(match), .int(Int64(cap))])) ?? []
+            if !rows.isEmpty { return rows.count }
+        }
+        return 0
+    }
+
     /// 已编码（有残差向量）的切片数（不依赖模型加载）。
     static func encodedChunkCount(_ db: SQLiteDB) throws -> Int {
         let rows = try db.query("SELECT COUNT(*) AS n FROM doc_residuals")

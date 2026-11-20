@@ -3814,6 +3814,96 @@ public final class RAGEngine {
         return scorer
     }
 
+    /// 确保极速模式引擎已加载模型（非默认分区启动时不预加载，这里按需补加载）。
+    public func ensureColbertLoaded() async {
+        guard let colbert = colbertService() else { return }
+        try? await colbert.preload()
+    }
+
+    /// 多库联合检索-极速模式粗筛。
+    public func colbertCoarse(query: String, coarse: Int = 20, source: String? = nil) async
+        -> [(docID: String, rrf: Double, content: String,
+            source: String, title: String)] {
+        guard let colbert = colbertService() else { return [] }
+        await ensureColbertLoaded()
+        return (try? colbert.coarseCandidates(query: query, coarse: coarse,
+                                              rrfVectorWeight: config.ragRRFVectorWeight,
+                                              source: source)) ?? []
+    }
+
+    /// 多库联合检索-极速模式按 doc_id 精排（返回与 ColBERTReaderHit 解耦的元组）。
+    public func colbertRerank(query: String, docIDs: [String]) async
+        -> [(docID: String, title: String, source: String, content: String, score: Double)] {
+        guard let colbert = colbertService() else { return [] }
+        await ensureColbertLoaded()
+        let hits = (try? colbert.rerankByDocIDs(query: query, docIDs: docIDs,
+                                                lengthNorm: config.colbertLengthNorm)) ?? []
+        return hits.map { ($0.docID, $0.title, $0.source, $0.content, $0.score) }
+    }
+
+    /// 多库联合检索-向量模式粗筛：embed + hybridSearch，不做 reranker。
+    /// 返回最多 topK 条候选（带 rrfScore/vectorScore/ftsScore），供跨库 RRF 融合。
+    public func coarseSearch(query: String, topK: Int,
+                             source: String? = nil) async throws -> [SearchHit] {
+        guard let embedding else { throw AgentError.storage("embedding 模型不可用") }
+        guard let store = try? ensureStore() else { return [] }
+        let queryVector = try await embedding.embedQuery(query)
+        let limit = max(1, min(topK, 20))
+        return try store.hybridSearch(
+            vector: queryVector, query: query, topK: limit,
+            sourceFilter: nil, sourceContains: source,
+            rrfK: config.ragRRFK, vectorWeight: config.ragRRFVectorWeight,
+            overfetch: config.ragVectorOverfetch,
+            ftsOverfetch: config.ragFTSOverfetch,
+            binary: nil, ann: nil, deadline: nil)
+    }
+
+    /// 多库联合检索-向量模式精排：对融合后的候选做 reranker 打分 + 阈值过滤。
+    /// reranker 共享无状态，可跨库一次性调用；失败降级按 rrfScore 排序。
+    /// 返回原始索引，供调用方把结果映射回跨库候选（避免按 text 反查串台）。
+    public func rerankHits(query: String, hits: [SearchHit], topK: Int) async
+        -> [(originalIndex: Int, hit: SearchHit)] {
+        guard !hits.isEmpty else { return [] }
+        let resultCount = max(1, min(topK, 20))
+        let indexed = hits.enumerated().map { (originalIndex: $0.offset, hit: $0.element) }
+        guard config.ragRerankEnabled, let reranker else {
+            return Array(indexed.sorted {
+                ($0.hit.rrfScore ?? $0.hit.score) > ($1.hit.rrfScore ?? $1.hit.score)
+            }.prefix(resultCount))
+        }
+        let documents = hits.map(\.text)
+        do {
+            let scores = try await Self.withTimeout(config.ragRerankTimeoutSeconds) {
+                try await reranker.rerank(query: query, documents: documents)
+            }
+            guard scores.count == hits.count else {
+                throw AgentError.storage("rerank 数量不符")
+            }
+            var scored = indexed
+            for i in scored.indices { scored[i].hit.score = scores[scored[i].originalIndex] }
+            let threshold = config.ragRerankThreshold
+            let filtered = scored.filter { $0.hit.score >= threshold }
+                .sorted { $0.hit.score > $1.hit.score }
+            return Array((filtered.isEmpty
+                ? scored.sorted { $0.hit.score > $1.hit.score } : filtered).prefix(resultCount))
+        } catch {
+            return Array(indexed.sorted {
+                ($0.hit.rrfScore ?? $0.hit.score) > ($1.hit.rrfScore ?? $1.hit.score)
+            }.prefix(min(resultCount, Self.rerankFallbackLimit)))
+        }
+    }
+
+    /// 轻量「该库是否与问句相关」探查（不加载模型）：
+    /// 极速模式查 colbert.db 的 document_fts，向量/决策模式查 index.sqlite 的 chunks_fts。
+    /// 返回命中数（上限 cap）。供多库联合检索前跳过零命中的无关库。
+    public func probeRelevance(query: String, cap: Int = 8) -> Int {
+        if config.colbertReaderEnabled {
+            return colbertService()?.ftsHitCount(query: query, cap: cap) ?? 0
+        }
+        guard let store = try? ensureMetadataStore() else { return 0 }
+        return (try? store.searchFTS(query: query, topK: cap).count) ?? 0
+    }
+
     /// 决策判定模式的 BM25 粗筛（供多分区联合检索复用）：只走 FTS。
     public func decisionCoarseFTS(query: String, topK: Int,
                                   source: String? = nil) throws -> [SearchHit] {

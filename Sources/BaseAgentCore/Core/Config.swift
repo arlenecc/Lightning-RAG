@@ -427,6 +427,10 @@ public struct AgentConfig: Sendable {
     public var decisionCoreSentenceCount: Int = 3
     /// 判定返回的相关切片数（3/5/10，默认 5）。
     public var decisionTopN: Int = 5
+    /// 多库联合检索是否启用判定模式（向量/极速模式共用）：
+    /// 启用则选库时用判定模型判定去哪些库、融合后再判定一次取 TopN；
+    /// 关闭则用 FTS 词法探查选库 + 各库原精排方案（reranker/MaxSim）。
+    public var multiZoneUseDecisionJudge: Bool = false
 
     /// 当前是否启用极速检索（兼容旧字段与三选一模式）。
     public var isColbertMode: Bool { ragMode == "colbert" }
@@ -762,6 +766,7 @@ public struct AgentConfig: Sendable {
         if let v = int("decision_top_n") {
             decisionTopN = [3, 5, 10].contains(v) ? v : 5
         }
+        if let v = bool("multi_zone_use_decision_judge") { multiZoneUseDecisionJudge = v }
         if let v = bool("colbert_reader_enabled") { colbertReaderEnabled = v }
         if let v = int("colbert_quant_bits") {
             colbertQuantBits = (v == 2) ? 2 : 4
@@ -1272,6 +1277,7 @@ public struct AgentConfig: Sendable {
             "decision_use_core_sentences": decisionUseCoreSentences,
             "decision_core_sentence_count": decisionCoreSentenceCount,
             "decision_top_n": decisionTopN,
+            "multi_zone_use_decision_judge": multiZoneUseDecisionJudge,
             "colbert_reader_enabled": colbertReaderEnabled,
             "colbert_quant_bits": colbertQuantBits,
             "colbert_coarse_candidates": colbertCoarseCandidates,

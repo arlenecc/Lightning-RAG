@@ -87,6 +87,24 @@ final class MultiZoneTests: XCTestCase {
         XCTAssertEqual(config.knowledgeZones.count, 2, "同源分区去重")
     }
 
+    /// 融合后候选必须保留 zoneID + 库内 localID，供「按来源路由精排」使用。
+    func testFuseCandidatesPreservesRoutingKeys() {
+        let c1 = MultiZoneRetrieval.ZoneCandidate(
+            zoneID: "law", zoneName: "法律", localID: "42",
+            text: "相同正文", source: "a.md", heading: "", rrfScore: 0.01, baseScore: 0.5)
+        let c2 = MultiZoneRetrieval.ZoneCandidate(
+            zoneID: "med", zoneName: "医学", localID: "42",
+            text: "相同正文", source: "b.md", heading: "", rrfScore: 0.01, baseScore: 0.6)
+        let fused = MultiZoneRetrieval.fuseCandidates([
+            .init(zoneID: "law", zoneName: "法律", candidates: [c1]),
+            .init(zoneID: "med", zoneName: "医学", candidates: [c2]),
+        ], topK: 10)
+        XCTAssertEqual(fused.count, 2, "不同库同 localID 不得被误合并")
+        XCTAssertTrue(fused.contains { $0.zoneID == "law" && $0.localID == "42" })
+        XCTAssertTrue(fused.contains { $0.zoneID == "med" && $0.localID == "42" })
+        XCTAssertTrue(fused.allSatisfy { $0.rrfScore > 0 }, "融合分须写入")
+    }
+
     func testFuseAppliesZoneWeight() {
         let c = RAGCitation(id: "1", rank: 1, source: "a.md", text: "x")
         let heavy = MultiZoneRetrieval.ZoneResult(zoneName: "A", citations: [c], weight: 1)

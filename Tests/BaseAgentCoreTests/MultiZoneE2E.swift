@@ -130,6 +130,12 @@ final class MultiZoneE2E: XCTestCase {
         let fused = try await agent.multiZoneSearch(query: "违约责任与临床治疗", topK: 6)
         XCTAssertTrue(fused.citations.contains { $0.id.hasPrefix("law|") }, "应含法律分区")
         XCTAssertTrue(fused.citations.contains { $0.id.hasPrefix("med|") }, "应含医学分区")
+        // 只问法律问题：前置选库应跳过医学库，结果不应含医学分区。
+        let lawOnly = try await agent.multiZoneSearch(query: "合同法违约责任赔偿", topK: 6)
+        XCTAssertTrue(lawOnly.citations.contains { $0.id.hasPrefix("law|") },
+                      "法律问题应召回法律库")
+        XCTAssertTrue(lawOnly.citations.allSatisfy { !$0.id.hasPrefix("med|") },
+                      "不相关的医学库应被前置选库跳过")
         // 定向到某分区：只召回该分区
         let scoped = try await agent.multiZoneSearch(query: "违约责任与临床治疗", topK: 6,
                                                      source: "医学")

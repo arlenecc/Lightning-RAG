@@ -583,47 +583,216 @@ public final class Agent: @unchecked Sendable {
         let effectiveSource: String? = targetedZoneID == nil ? source : nil
         let searchZones = targetedZoneID.map { id in zones.filter { $0.id == id } } ?? zones
         let started = Date()
+        // 前置选库：轻量 FTS 探查，零命中的无关库直接跳过（用户显式定向时不过滤）。
+        // 若全部零命中则保守查全部，避免分词差异导致漏检。
+        var selectedZones = searchZones
+        if targetedZoneID == nil {
+            let hits = Dictionary(uniqueKeysWithValues: searchZones.map { zone in
+                (zone.id, (zoneEngines[zone.id]?.probeRelevance(query: query) ?? 0) > 0)
+            })
+            let probed = searchZones.filter { hits[$0.id] == true }
+            if !probed.isEmpty { selectedZones = probed }
+            let probeDesc = searchZones.map { z in
+                z.name + "=" + (hits[z.id] == true ? "命中" : "跳过")
+            }.joined(separator: ", ")
+            let fallbackNote = probed.isEmpty ? "（全部零命中，保守查全部）" : ""
+            AgentLog.info("[multi-zone] 选库探查：\(probeDesc)\(fallbackNote)")
+        }
         AgentLog.info("[multi-zone] 联合检索开始 query=\(query.prefix(60)) topK=\(topK) "
-            + "分区=\(searchZones.map(\.name).joined(separator: "、"))"
-            + (source != nil ? " source=\(source!)（\(targetedZoneID == nil ? "文档过滤已忽略，查全部分区" : "定向分区")）" : ""))
-        // 并行检索各分区（每个 engine 有自己的 searchLock/ingest 状态）。
-        let results = await withTaskGroup(of: MultiZoneRetrieval.ZoneResult?.self) { group in
-            for zone in searchZones {
-                guard let engine = zoneEngines[zone.id] else {
-                    AgentLog.warning("[multi-zone] 分区 \(zone.name) 无对应 engine，跳过")
-                    continue
+            + "实际检索分区=\(selectedZones.map(\.name).joined(separator: "、"))"
+            + (source != nil ? " source=\(source!)（\(targetedZoneID == nil ? "文档过滤已忽略" : "定向分区")）" : ""))
+        // 判定模式选库：用判定模型决定去哪些库（对全部 searchZones 判定，
+        // 不先经过 FTS 过滤，避免词法漏检的库进不了判定候选）。失败则沿用 FTS 结果。
+        if config.multiZoneUseDecisionJudge, targetedZoneID == nil,
+           let scorer = try? ragEngine.sharedDecisionScorer() {
+            do {
+                let budget = config.ragQueryTimeoutSeconds == 0
+                    ? Double.greatestFiniteMagnitude : max(30, config.ragQueryTimeoutSeconds * 3)
+                let descriptions = searchZones.map { z in
+                    "知识分区【\(z.name)】：" +
+                        ((try? zoneEngines[z.id]?.listDocuments(limit: 6).names) ?? []).joined(separator: "、")
                 }
+                let scores = try await RAGEngine.withTimeout(budget) {
+                    try await scorer.score(query: "用户问句：\(query)", passages: descriptions,
+                                           coreSentenceCount: 3, useCoreSentences: false)
+                }
+                let ranked = zip(searchZones, scores).sorted { $0.1 > $1.1 }
+                let pickCount = min(max(1, config.decisionTopN), ranked.count)
+                let picked = ranked.prefix(pickCount).map(\.0)
+                if !picked.isEmpty { selectedZones = picked }
+                // 日志用判定名次对应的分区与分数，避免张冠李戴（M2）。
+                let desc = ranked.prefix(pickCount).map { pair in
+                    pair.0.name + "=" + String(format: "%.3f", pair.1)
+                }.joined(separator: ", ")
+                AgentLog.info("[multi-zone] 判定选库：\(desc)")
+            } catch {
+                AgentLog.warning("[multi-zone] 判定选库失败，沿用 FTS 选库：\(error.localizedDescription)")
+            }
+        }
+
+        let isColbert = config.colbertReaderEnabled
+        // 每库「只粗筛 20 条」（向量=coarseSearch / 极速=coarseCandidates），
+        // 返回带 zoneID 与库内原始 id 的中间候选，供跨库统一 RRF 融合。
+        let coarsePerZone = 20
+        let groups: [MultiZoneRetrieval.CandidateGroup] = await withTaskGroup(
+            of: MultiZoneRetrieval.CandidateGroup?.self) { group in
+            for zone in selectedZones {
+                guard let engine = zoneEngines[zone.id] else { continue }
                 group.addTask {
-                    let zoneStarted = Date()
                     do {
-                        let outcome = try await engine.searchWithCitations(
-                            query: query, topK: max(topK, 10), source: effectiveSource)
-                        AgentLog.info("[multi-zone] 分区 \(zone.name) 召回 \(outcome.citations.count) 条，"
-                            + "耗时 \(Int(Date().timeIntervalSince(zoneStarted) * 1000))ms")
-                        return MultiZoneRetrieval.ZoneResult(zoneID: zone.id,
-                                                             zoneName: zone.name,
-                                                             citations: outcome.citations)
+                        var candidates: [MultiZoneRetrieval.ZoneCandidate] = []
+                        if isColbert {
+                            let coarse = await engine.colbertCoarse(query: query,
+                                                                    coarse: coarsePerZone,
+                                                                    source: effectiveSource)
+                            candidates = coarse.map {
+                                MultiZoneRetrieval.ZoneCandidate(
+                                    zoneID: zone.id, zoneName: zone.name, localID: $0.docID,
+                                    text: $0.content, source: $0.source, heading: $0.title,
+                                    rrfScore: $0.rrf, baseScore: $0.rrf)
+                            }
+                        } else {
+                            let hits = try await engine.coarseSearch(query: query,
+                                                                     topK: coarsePerZone,
+                                                                     source: effectiveSource)
+                            candidates = hits.map { h in
+                                MultiZoneRetrieval.ZoneCandidate(
+                                    zoneID: zone.id, zoneName: zone.name,
+                                    localID: String(h.rowID), text: h.text,
+                                    source: h.source, heading: h.heading,
+                                    rrfScore: h.rrfScore ?? h.score,
+                                    baseScore: h.vectorScore ?? h.ftsScore ?? h.score)
+                            }
+                        }
+                        AgentLog.info("[multi-zone] 分区 \(zone.name) 粗筛 \(candidates.count) 条")
+                        return MultiZoneRetrieval.CandidateGroup(zoneID: zone.id,
+                                                                 zoneName: zone.name,
+                                                                 candidates: candidates)
                     } catch {
-                        AgentLog.warning("[multi-zone] 分区 \(zone.name) 检索失败："
+                        AgentLog.warning("[multi-zone] 分区 \(zone.name) 粗筛失败："
                             + error.localizedDescription)
                         return nil
                     }
                 }
             }
-            var collected: [MultiZoneRetrieval.ZoneResult] = []
-            for await result in group { if let result { collected.append(result) } }
+            var collected: [MultiZoneRetrieval.CandidateGroup] = []
+            for await g in group { if let g { collected.append(g) } }
             return collected
         }
-        guard !results.isEmpty else {
-            AgentLog.warning("[multi-zone] 所有分区均无结果，降级为默认库检索")
+        let validGroups = groups.filter { !$0.candidates.isEmpty }
+        guard !validGroups.isEmpty else {
+            AgentLog.warning("[multi-zone] 所有分区均无有效粗筛候选，降级为默认库检索")
             return try await ragEngine.searchWithCitations(query: query, topK: topK, source: source)
         }
-        let fused = MultiZoneRetrieval.fuse(results, topK: topK, rrfK: config.ragRRFK)
-        AgentLog.info("[multi-zone] RRF 融合完成：\(results.count) 个分区 → \(fused.count) 条，"
-            + "top1=\(fused.first.map { "\($0.source) \(String(format: "%.4f", $0.score))" } ?? "无")，"
+        let fused20 = Array(MultiZoneRetrieval.fuseCandidates(validGroups,
+                                                               topK: 20,
+                                                               rrfK: config.ragRRFK).prefix(20))
+        AgentLog.info("[multi-zone] 跨库 RRF 融合：\(groups.count) 分区 → \(fused20.count) 条候选，"
             + "总耗时 \(Int(Date().timeIntervalSince(started) * 1000))ms")
-        return RAGRetrievalOutcome(context: MultiZoneRetrieval.primaryContext(fused),
-                                   citations: fused)
+        guard !fused20.isEmpty else {
+            return RAGRetrievalOutcome(context: "（知识库中未找到相关内容）", citations: [])
+        }
+
+        // 汇总阶段：判定模式开启时用判定模型对候选核心句打分取 topN；
+        // 否则沿用各库原精排（向量 reranker 一次性；极速 MaxSim 按库路由）。
+        var citations: [RAGCitation] = []
+        var usedDecision = false
+        if config.multiZoneUseDecisionJudge,
+           let scorer = try? ragEngine.sharedDecisionScorer() {
+            do {
+                let budget = config.ragQueryTimeoutSeconds == 0
+                    ? Double.greatestFiniteMagnitude : max(30, config.ragQueryTimeoutSeconds * 3)
+                let passages = fused20.map { $0.text.isEmpty ? "（该分区无正文）" : $0.text }
+                let scores = try await RAGEngine.withTimeout(budget) {
+                    try await scorer.score(query: query, passages: passages,
+                                           coreSentenceCount: self.config.decisionCoreSentenceCount,
+                                           useCoreSentences: self.config.decisionUseCoreSentences)
+                }
+                // topK（工具契约）与 decisionTopN 取较小，尊重调用方的气泡数量。
+                let n = max(1, min(topK, config.decisionTopN, fused20.count))
+                let ranked = zip(fused20.indices, scores)
+                    .sorted { $0.1 > $1.1 ? true : ($0.1 == $1.1 && $0.0 < $1.0) }
+                    .prefix(n)
+                citations = ranked.enumerated().map { i, pair in
+                    let c = fused20[pair.0]
+                    return RAGCitation(id: "\(c.zoneID)|\(c.localID)", rank: i + 1,
+                                source: c.source.isEmpty ? c.zoneName : (c.source as NSString).lastPathComponent,
+                                heading: c.heading, text: passages[pair.0],
+                                score: pair.1, isPrimary: i == 0)
+                }
+                usedDecision = true
+                AgentLog.info("[multi-zone] 判定模式汇总：\(citations.count) 条，"
+                    + "耗时 \(Int(Date().timeIntervalSince(started) * 1000))ms")
+            } catch {
+                AgentLog.warning("[multi-zone] 判定汇总失败，降级到原精排：\(error.localizedDescription)")
+            }
+        }
+        if !usedDecision {
+            citations = isColbert
+                ? try await colbertFusedRerank(fused20, query: query, topK: topK)
+                : try await vectorFusedRerank(fused20, query: query, topK: topK)
+        }
+        return RAGRetrievalOutcome(context: MultiZoneRetrieval.primaryContext(citations),
+                                   citations: citations)
+    }
+
+    /// 向量模式融合后精排：reranker 共享无状态，对全部候选文本一次性打分取 topK。
+    private func vectorFusedRerank(_ fused: [MultiZoneRetrieval.ZoneCandidate],
+                                    query: String, topK: Int) async throws -> [RAGCitation] {
+        let hits = fused.map { c in
+            SearchHit(rowID: Int64(c.localID) ?? 0, text: c.text, source: c.source,
+                      chunkIndex: 0, heading: c.heading, score: c.baseScore,
+                      vectorScore: nil, ftsScore: nil, rrfScore: c.rrfScore, binaryScore: nil)
+        }
+        let reranked = await ragEngine.rerankHits(query: query, hits: hits, topK: topK)
+        return reranked.prefix(max(1, min(topK, config.decisionTopN, 10))).enumerated().map { i, item in
+            // 用精排保留的原始索引映射回跨库候选，避免按 text 反查导致重复正文串台。
+            let c = fused[item.originalIndex]
+            let h = item.hit
+            return RAGCitation(id: "\(c.zoneID)|\(c.localID)", rank: i + 1,
+                               source: h.source.isEmpty ? c.zoneName : (h.source as NSString).lastPathComponent,
+                               heading: h.heading, text: h.text, score: h.score, isPrimary: i == 0)
+        }
+    }
+
+    /// 极速模式融合后精排：按 zoneID 把候选路由回各库做 MaxSim，合并取 topK。
+    private func colbertFusedRerank(_ fused: [MultiZoneRetrieval.ZoneCandidate],
+                                     query: String, topK: Int) async throws -> [RAGCitation] {
+        struct Scored { let c: MultiZoneRetrieval.ZoneCandidate; let score: Double; let text: String }
+        var scored: [Scored] = []
+        let byZone = Dictionary(grouping: fused, by: \.zoneID)
+        for (zoneID, group) in byZone {
+            guard let engine = zoneEngines[zoneID] else {
+                scored += group.map { Scored(c: $0, score: $0.baseScore, text: $0.text) }
+                continue
+            }
+            do {
+                let hits = await engine.colbertRerank(query: query, docIDs: group.map(\.localID))
+                guard !hits.isEmpty else {
+                    AgentLog.warning("[multi-zone] 极速精排空结果 zone=\(zoneID)，用粗筛分兜底")
+                    scored += group.map { Scored(c: $0, score: $0.baseScore, text: $0.text) }
+                    continue
+                }
+                let scoreByID = Dictionary(uniqueKeysWithValues: hits.map { ($0.docID, $0.score) })
+                let textByID = Dictionary(uniqueKeysWithValues: hits.map { ($0.docID, $0.content) })
+                for c in group {
+                    // 未回填残差/精排失败会给 0 分，此时回退粗筛分避免排位丢失。
+                    let s = scoreByID[c.localID] ?? 0
+                    let finalScore = s > 0 ? s : c.baseScore
+                    scored.append(Scored(c: c, score: finalScore,
+                                         text: textByID[c.localID] ?? c.text))
+                }
+            } catch {
+                AgentLog.warning("[multi-zone] 极速精排失败 zone=\(zoneID)：\(error.localizedDescription)")
+                scored += group.map { Scored(c: $0, score: $0.baseScore, text: $0.text) }
+            }
+        }
+        let top = scored.sorted { $0.score > $1.score }.prefix(max(1, min(topK, config.decisionTopN, 10)))
+        return top.enumerated().map { i, s in
+            RAGCitation(id: "\(s.c.zoneID)|\(s.c.localID)", rank: i + 1,
+                        source: s.c.source.isEmpty ? s.c.zoneName : (s.c.source as NSString).lastPathComponent,
+                        heading: s.c.heading, text: s.text, score: s.score, isPrimary: i == 0)
+        }
     }
 
     /// 决策模式多分区检索：两次判定。
@@ -1279,9 +1448,7 @@ public final class Agent: @unchecked Sendable {
                 lines.append("（各分区尚无已索引内容，请先同步）")
             }
             lines.append(KNOWLEDGE_BASE_HINT)
-            lines.append("检索时不要传 source 限定到某个文档名——那会只查一个分区；"
-                + "默认跨全部分区联合检索并融合结果。")
-            lines.append("Follow the knowledge-base strategy in the system prompt.")
+            lines.append("多分区默认跨全部分区联合检索，不要传 source 限定到单个文档名。")
             sections.append(lines.joined(separator: "\n"))
         } else if let status = ragStatus() {
             let chunks = Int(status["chunks_stored"]?.intValue ?? 0)
@@ -1293,14 +1460,12 @@ public final class Agent: @unchecked Sendable {
                     .joined(separator: ", ")
                 if sourceCount > shown { names += " (and \(sourceCount - shown) more)" }
                 sections.append("# Knowledge base\n\(chunks) chunks in \(sourceCount) file(s): "
-                    + "\(names). " + KNOWLEDGE_BASE_HINT
-                    + " Follow the knowledge-base strategy in the system prompt.")
+                    + "\(names). " + KNOWLEDGE_BASE_HINT)
             } else {
                 sections.append("# Knowledge base\nConfigured but empty. Use `rag_tools(op=\"ingest\")` to index.")
             }
         } else if FileManager.default.fileExists(atPath: ragEngine.indexDBPath) {
-            sections.append("# Knowledge base\nIndexed locally. " + KNOWLEDGE_BASE_HINT
-                + " Follow the knowledge-base strategy in the system prompt to retrieve passages.")
+            sections.append("# Knowledge base\nIndexed locally. " + KNOWLEDGE_BASE_HINT)
         }
 
         let text = sections.joined(separator: "\n\n")

@@ -88,8 +88,8 @@ public enum SystemPromptLimits {
     /// L0 META-SOP 与 L1 索引常驻 system prompt 的字符上限。
     /// 二者直接占用 `ContextBudget` 的 system 分区，会等比压缩 rawCeiling，
     /// 因此必须硬封顶（L1 另受 ≤30 行约束，见 `MemoryDirectory.loadL1`）。
-    public static let maxSOPChars = 12_000
-    public static let maxL1Chars = 4_000
+    public static let maxSOPChars = 4_000
+    public static let maxL1Chars = 1_000
 }
 
 /// 后台事实抽取的系统提示词。

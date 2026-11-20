@@ -108,6 +108,10 @@ public final class MLXLLMService: LLMService, PreloadableLLMService,
     private let isolatedPoolLock = NSLock()
     /// 每个前缀最多保留的空闲副本数：并发路数上限 4，留 2 个足够周转。
     private static let maxIdleIsolatedCopies = 2
+    /// 预热时保留「未推进前缀 KV 快照」的最大 token 数。历史折叠/滑窗重建缓存时
+    /// 从这份快照复制，只 prefill 动态历史，避免重算整段 system+tools。
+    /// 快照是常驻 KV 副本，上限是「折叠重建速度」与「常驻内存翻倍」的取舍。
+    private static let warmupSnapshotMaxTokens = 10_240
 
     private func setActiveWarmup(_ task: Task<Void, Error>?) {
         warmupLock.lock(); activeWarmup = task; warmupLock.unlock()
@@ -1060,7 +1064,7 @@ public final class MLXLLMService: LLMService, PreloadableLLMService,
         // 保留一份未推进的前缀快照；历史折叠/滑窗需要重建时从它复制，
         // 只 prefill 动态历史，避免再次计算整段 system + tools。
         // 快照本身是常驻 KV：前缀过大时不再复制，避免内存直接翻倍。
-        if keepCount <= 8_192 {
+        if keepCount <= Self.warmupSnapshotMaxTokens {
             warmupCacheSnapshot = cache.map { $0.copy() }
             warmupStateSnapshot = wrapped.state
             warmupTokens = Array(tokens.prefix(keepCount))

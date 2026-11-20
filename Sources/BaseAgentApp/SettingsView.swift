@@ -142,6 +142,8 @@ struct SettingsView: View {
     @State private var colbertQueryPrune = true
     /// Weighted RRF 向量路权重（BM25 = 1 - 该值）；向量/极速模式共用。
     @State private var rrfVectorWeight: Double = 0.7
+    /// 多库联合检索是否用判定模型（向量/极速模式共用开关）。
+    @State private var multiZoneUseDecisionJudge = false
 
     /// 多知识分区配置行（UI 可增删）。
     private struct ZoneRow: Identifiable {
@@ -659,8 +661,9 @@ struct SettingsView: View {
                     .font(.caption2)
                     .foregroundStyle(.red)
                 }
-                // Weighted RRF 混合权重 + 向量库完备状态
+                // Weighted RRF 混合权重 + 多库判定开关 + 向量库完备状态
                 rrfWeightRow
+                multiZoneJudgeRow
                 vectorCompletenessRow
                 } // end if ragMode == vector
 
@@ -1082,8 +1085,9 @@ struct SettingsView: View {
                 }
                 Spacer(minLength: 8)
             }
-            // Weighted RRF 混合权重（向量粗筛 vs BM25 粗筛）
+            // Weighted RRF 混合权重（向量粗筛 vs BM25 粗筛）+ 多库判定开关
             rrfWeightRow
+            multiZoneJudgeRow
         }
     }
 
@@ -1145,6 +1149,14 @@ struct SettingsView: View {
             Spacer(minLength: 8)
         }
         .help("Weighted RRF：向量路与 BM25 路按权重融合名次（默认 7:3）")
+    }
+
+    /// 多库联合检索判定开关：向量/极速模式共用。
+    private var multiZoneJudgeRow: some View {
+        Toggle("多库联合检索使用判定模式", isOn: $multiZoneUseDecisionJudge)
+            .font(.caption2)
+            .help("启用后：选库时判定模型决定查哪些库，跨库 RRF 融合后再判定一次取 TopN；"
+                + "关闭则用 FTS 探查选库 + 各库原精排（reranker/MaxSim）")
     }
 
     /// 向量库完备状态行：向量/极速模式共用。不完备时显示「补做向量」按钮。
@@ -1735,6 +1747,7 @@ struct SettingsView: View {
         colbertLengthNorm = config.colbertLengthNorm
         colbertQueryPrune = config.colbertQueryPrune
         rrfVectorWeight = config.ragRRFVectorWeight
+        multiZoneUseDecisionJudge = config.multiZoneUseDecisionJudge
         zoneRows = config.knowledgeZones.map {
             ZoneRow(id: $0.id, name: $0.name, source: $0.source,
                     enabled: $0.enabled, isDefault: $0.isDefault)
@@ -2150,6 +2163,7 @@ struct SettingsView: View {
         config.colbertLengthNorm = colbertLengthNorm
         config.colbertQueryPrune = colbertQueryPrune
         config.ragRRFVectorWeight = min(max(rrfVectorWeight, 0.1), 0.9)
+        config.multiZoneUseDecisionJudge = multiZoneUseDecisionJudge
         config.knowledgeZones = zoneRows.map {
             KnowledgeZone(id: $0.id, name: $0.name, source: $0.source,
                           enabled: $0.enabled, isDefault: $0.isDefault)

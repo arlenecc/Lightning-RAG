@@ -54,10 +54,17 @@ public struct ColBERTReaderOptions: Sendable {
 /// 残差量化入库、检索召回与 MaxSim 精排全流程。模型下载由上层负责，
 /// 本引擎只从给定目录加载模型。
 public final class ColBERTReaderEngine {
+    /// 跨所有 engine 共享 ColBERT 模型：多知识分区各有独立 db，但加载同一份
+    /// model_int8.onnx 时只保留一份 ORTSession/arena，避免 N 库 N 份模型 OOM。
+    private static let sharedLock = NSLock()
+    private static var sharedModels: [String: ColBERT] = [:]
+    private static var sharedLoadingTasks: [String: Task<ColBERT, Error>] = [:]
+
     private let db: SQLiteDB
     private let modelDir: String
     private var colbert: ColBERT?
     private var searchEngine: SearchEngine?
+    private var didWarmup = false
 
     public init(dbPath: String, modelDir: String) throws {
         self.modelDir = modelDir
@@ -65,15 +72,38 @@ public final class ColBERTReaderEngine {
         try SearchEngine.createSchema(db)
     }
 
-    /// 从 `modelDir` 加载模型（幂等；已加载则直接返回）。
-    /// 并发加载由上层单飞（single-flight）保证；这里只在加载完成后
-    /// 以「先检查再赋值」的方式写入实例状态。
+    /// 从 `modelDir` 加载模型（幂等；同 modelDir 跨 engine 共享同一实例）。
     public func loadModel(threads: Int = 4) async throws {
         if colbert != nil { return }
-        let model = try await ColBERT.load(modelDir: modelDir, threads: threads)
-        if colbert == nil {
-            colbert = model
-            searchEngine = SearchEngine(db: db, colbert: model)
+        let model = try await Self.sharedColbert(modelDir: modelDir, threads: threads)
+        colbert = model
+        searchEngine = SearchEngine(db: db, colbert: model)
+    }
+
+    private static func sharedColbert(modelDir: String, threads: Int) async throws -> ColBERT {
+        sharedLock.lock()
+        if let cached = sharedModels[modelDir] { sharedLock.unlock(); return cached }
+        if let task = sharedLoadingTasks[modelDir] {
+            sharedLock.unlock()
+            return try await task.value
+        }
+        let task = Task<ColBERT, Error> {
+            try await ColBERT.load(modelDir: modelDir, threads: threads)
+        }
+        sharedLoadingTasks[modelDir] = task
+        sharedLock.unlock()
+        do {
+            let model = try await task.value
+            sharedLock.lock()
+            sharedModels[modelDir] = model
+            sharedLoadingTasks[modelDir] = nil
+            sharedLock.unlock()
+            return model
+        } catch {
+            sharedLock.lock()
+            sharedLoadingTasks[modelDir] = nil
+            sharedLock.unlock()
+            throw error
         }
     }
 
@@ -83,8 +113,9 @@ public final class ColBERTReaderEngine {
     /// （kernel 选择 / arena 分配 / 线程绑定）从首次检索挪到后台预加载阶段。
     /// 模型未加载时为空操作；推理失败不抛出，交由首次检索按需重试。
     public func warmupQueryEncoding() {
-        guard let colbert else { return }
+        guard let colbert, !didWarmup else { return }
         _ = try? colbert.queryVectors("检索预热 query warmup", prune: true)
+        didWarmup = true
     }
 
     /// 释放模型与数据库句柄：置 nil 让 ORTSession / tokenizer / SQLiteDB 经 ARC 立即回收，
@@ -207,6 +238,34 @@ public final class ColBERTReaderEngine {
     /// 全库切片总数（不依赖模型加载）。
     public func totalChunkCount() throws -> Int {
         try SearchEngine.totalChunkCount(db)
+    }
+
+    /// 轻量正文命中探查（不加载模型），供多库联合检索前判断是否相关。
+    public func ftsHitCount(query: String, cap: Int = 8) -> Int {
+        SearchEngine.ftsHitCount(db, query: query, cap: cap)
+    }
+
+    /// 多库联合检索-极速模式粗筛（粗筛模型走 queryVectors，无需完整检索）。
+    public func coarseCandidates(query: String, coarse: Int = 20,
+                                 rrfVectorWeight: Double = 0.7, source: String? = nil)
+        throws -> [(docID: String, rrf: Double, content: String,
+                    source: String, title: String)] {
+        guard let searchEngine else { return [] }
+        return try searchEngine.coarseCandidates(query: query, coarse: coarse,
+                                                 rrfVectorWeight: rrfVectorWeight,
+                                                 source: source)
+    }
+
+    /// 多库联合检索-极速模式按 doc_id 精排（MaxSim）。
+    public func rerankByDocIDs(query: String, docIDs: [String],
+                               lengthNorm: Bool = false) throws -> [ColBERTReaderHit] {
+        guard let searchEngine else { return [] }
+        let hits = try searchEngine.rerankByDocIDs(query: query, docIDs: docIDs,
+                                                    lengthNorm: lengthNorm)
+        return hits.enumerated().map { i, h in
+            ColBERTReaderHit(docID: h.docID, title: h.title, source: h.source,
+                             content: h.content, score: Double(h.score), rank: i + 1)
+        }
     }
 
     /// 检索并返回命中切片（含原文，供 UI 气泡展示）。

@@ -57,6 +57,18 @@ final class RAGModeConfigTests: XCTestCase {
         XCTAssertTrue(colbert.colbertReaderEnabled)
     }
 
+    func testMultiZoneDecisionJudgeFlagRoundtrip() throws {
+        var c = AgentConfig()
+        XCTAssertFalse(c.multiZoneUseDecisionJudge)
+        c.multiZoneUseDecisionJudge = true
+        let data = try JSONSerialization.data(withJSONObject: c.export())
+        let path = NSTemporaryDirectory() + "mzjudge-\(UUID().uuidString).json"
+        try data.write(to: URL(fileURLWithPath: path))
+        defer { try? FileManager.default.removeItem(atPath: path) }
+        XCTAssertTrue(AgentConfig.load(path).multiZoneUseDecisionJudge,
+                      "多库判定开关需可持久化")
+    }
+
     func testRRFPayloadWeightClampAndDerivedBM25() {
         var config = AgentConfig()
         XCTAssertEqual(config.ragRRFVectorWeight, 0.7)

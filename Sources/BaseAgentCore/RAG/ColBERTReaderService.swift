@@ -290,6 +290,28 @@ public final class ColBERTReaderService: @unchecked Sendable {
         (try? ensureEngineInstance().pendingEncodeCount()) ?? 0
     }
 
+    /// 轻量正文命中探查（不加载模型/下载），供多库联合检索前选库。
+    public func ftsHitCount(query: String, cap: Int = 8) -> Int {
+        (try? ensureEngineInstance().ftsHitCount(query: query, cap: cap)) ?? 0
+    }
+
+    /// 多库联合检索-极速模式粗筛。
+    public func coarseCandidates(query: String, coarse: Int = 20,
+                                 rrfVectorWeight: Double = 0.7, source: String? = nil)
+        throws -> [(docID: String, rrf: Double, content: String,
+                    source: String, title: String)] {
+        try ensureEngineInstance().coarseCandidates(query: query, coarse: coarse,
+                                                    rrfVectorWeight: rrfVectorWeight,
+                                                    source: source)
+    }
+
+    /// 多库联合检索-极速模式按 doc_id 精排（MaxSim）。
+    public func rerankByDocIDs(query: String, docIDs: [String],
+                               lengthNorm: Bool = false) throws -> [ColBERTReaderHit] {
+        try ensureEngineInstance().rerankByDocIDs(query: query, docIDs: docIDs,
+                                                   lengthNorm: lengthNorm)
+    }
+
     /// ColBERT 编码完备状态（不触发模型加载/下载）。
     public func encodingCompleteness() -> (total: Int, filled: Int, pending: Int) {
         (try? ensureEngineInstance().encodingCompleteness()) ?? (-1, 0, 0)

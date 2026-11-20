@@ -64,6 +64,61 @@ public enum MultiZoneRetrieval {
         }
     }
 
+    /// 跨库融合的中间候选：保留 zoneID + 库内原始 id，供「融合后按来源路由精排」。
+    public struct ZoneCandidate: Sendable {
+        public let zoneID: String
+        public let zoneName: String
+        /// 库内原始 id（向量=rowID 字符串，ColBERT=docID），不含分区前缀。
+        public let localID: String
+        public let text: String
+        public let source: String
+        public let heading: String
+        public var rrfScore: Double
+        /// 库内向量/BM25 粗筛分（供无精排降级时排序）。
+        public let baseScore: Double
+    }
+
+    /// 一库的粗筛候选组。
+    public struct CandidateGroup: Sendable {
+        public let zoneID: String
+        public let zoneName: String
+        public let weight: Double
+        public let candidates: [ZoneCandidate]
+        public init(zoneID: String, zoneName: String, weight: Double = 1,
+                    candidates: [ZoneCandidate]) {
+            self.zoneID = zoneID; self.zoneName = zoneName
+            self.weight = weight; self.candidates = candidates
+        }
+    }
+
+    /// 跨库粗筛候选 RRF 融合，返回带 zoneID 的中间候选（不丢库内 id）。
+    public static func fuseCandidates(_ groups: [CandidateGroup], topK: Int,
+                                      rrfK: Int = 60) -> [ZoneCandidate] {
+        guard topK > 0 else { return [] }
+        let k = Double(max(1, rrfK))
+        struct Entry { var candidate: ZoneCandidate; var score: Double }
+        var entries: [String: Entry] = [:]
+        for group in groups {
+            for (rank, c) in group.candidates.enumerated() {
+                let key = "\(group.zoneID)|\(c.localID)"
+                let contribution = max(0, group.weight) / (k + Double(rank + 1))
+                if var existing = entries[key] {
+                    existing.score += contribution
+                    entries[key] = existing
+                } else {
+                    entries[key] = Entry(candidate: c, score: contribution)
+                }
+            }
+        }
+        return entries.values.sorted { $0.score > $1.score }
+            .prefix(topK).map { entry in
+                // rrfScore 用融合后的总分覆盖；baseScore 保留原粗筛分。
+                var updated = entry.candidate
+                updated.rrfScore = entry.score
+                return updated
+            }
+    }
+
     /// 由融合后的 citations 生成进模型上下文的 top-1 文本。
     public static func primaryContext(_ citations: [RAGCitation]) -> String {
         guard let primary = citations.first(where: { $0.isPrimary }) ?? citations.first else {
