@@ -383,6 +383,10 @@ public final class Agent: @unchecked Sendable {
                     return try await defaultEngine.searchWithCitations(
                         query: query, topK: topK, source: source)
                 },
+                // outline 也要跨分区：默认库查不到《病毒星球》时遍历其它分区。
+                extraOutlineEngines: config.knowledgeZones.filter { $0.enabled }
+                    .compactMap { zoneEngineMap[$0.id] }
+                    .filter { $0 !== defaultEngine },
                 zoneSummaryProvider: {
                     let zones = config.knowledgeZones.filter { $0.enabled }
                     guard zones.count > 1 else { return [] }

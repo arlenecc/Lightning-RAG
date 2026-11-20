@@ -543,6 +543,7 @@ public final class MLXLLMService: LLMService, PreloadableLLMService,
                     /// 仅 `.glm4` 格式：上游 parser 会把零参数调用误拒，
                     /// 库在 rawTextPreview 里保留了原文，收尾时按 GLM47 恢复。
                     var glm4RejectedPreviews: [String] = []
+                    var rejectedTextPreviews: [String] = []
                     var usage: [String: Int] = [:]
 
                     for await generation in stream {
@@ -576,10 +577,15 @@ public final class MLXLLMService: LLMService, PreloadableLLMService,
                             // 先记录，流结束后再尝试文本解析兜底。
                             let name = rejected.toolName.map { "（工具：\($0)）" } ?? ""
                             rejectedDetail = name + (rejected.detail ?? rejected.reason.rawValue)
-                            // 严格限定 GLM4：其它格式的被拒事件行为完全不变。
+                            // GLM4 的零参数恢复沿用既有路径；其它格式的原文一并收集，
+                            // 供收尾时做通用文本兜底（MiniCPM 等裸 <function> 方言）。
                             if rejected.format == .glm4 {
                                 glm4RejectedPreviews.append(rejected.rawTextPreview)
+                            } else if !rejected.rawTextPreview.isEmpty {
+                                rejectedTextPreviews.append(rejected.rawTextPreview)
                             }
+                            AgentLog.info("[mlx] rejectedToolCall format=\(rejected.format) "
+                                + "tool=\(name) preview=\(String(rejected.rawTextPreview.prefix(120)))")
 
                         case .info(let info):
                             let promptTokens = cachedPromptTokens + info.promptTokenCount
@@ -620,11 +626,27 @@ public final class MLXLLMService: LLMService, PreloadableLLMService,
                     }
 
                     // 框架没解析出结构化 tool call 时，尝试从原始文本提取
-                    // <tool_call>{...}</tool_call> 或 JSON 围栏，避免直接失败。
+                    // <tool_call>{...}</tool_call> / 裸 <function> / JSON 围栏。
                     var finalCalls = collectedCalls
                     if finalCalls.isEmpty {
                         finalCalls = Self.extractTextToolCalls(
                             rawContent, allowedNames: allowedToolNames)
+                    }
+                    // MiniCPM 等方言被框架 reject 时，原文只在 rawTextPreview 里，
+                    // rawContent 未必含完整调用——从被拒原文再兜底一次。
+                    if finalCalls.isEmpty {
+                        for preview in rejectedTextPreviews {
+                            finalCalls.append(contentsOf: Self.extractTextToolCalls(
+                                preview, allowedNames: allowedToolNames))
+                        }
+                        if !finalCalls.isEmpty {
+                            AgentLog.info("[mlx] 从 rejected 原文恢复工具调用 "
+                                + "count=\(finalCalls.count)")
+                        }
+                    }
+                    // 诊断：本轮生成尾部与解析结果（排查新模型工具方言）。
+                    if finalCalls.isEmpty, !rawContent.isEmpty {
+                        AgentLog.info("[mlx] 工具调用诊断 rawTail=\(String(rawContent.suffix(300)))")
                     }
                     // 仅 GLM4：上游 GLM4ToolCallParser 要求至少一个 <arg_key>，
                     // Spark-X2.6 的零参数工具（<tool_call>name</tool_call>）会被
@@ -1280,6 +1302,9 @@ public final class MLXLLMService: LLMService, PreloadableLLMService,
         }
 
         collect("<tool_call>\\s*([\\s\\S]*?)\\s*</tool_call>")
+        // MiniCPM5 裸 <function name=...>...</function>（可能 tokenizer 吞空格 → <functionname=）。
+        // 收完整块交给 LocalToolCallParser.callsFromXML 解析（与 GGUF/ONNX 共用一套 XML 逻辑）。
+        collect("(<function(?:\\s*name\\s*=|=)[\\s\\S]*?</function>)")
         collect("```(?:json)?\\s*([\\s\\S]*?)```")
         if payloads.isEmpty, let value = JSONValue.parse(raw), value.objectValue != nil {
             payloads.append(raw)
@@ -1314,6 +1339,13 @@ public final class MLXLLMService: LLMService, PreloadableLLMService,
         // 一个 <arg_key>，零参数工具会解析失败，文本兜底里一并兼容。
         // GGUF / ONNX 侧通过 `LocalToolCallParser` 复用同一实现。
         for payload in payloads where !jsonHandled.contains(payload) {
+            // MiniCPM 裸 <function>/<param>：用共享的 XML 解析（含 CDATA、吞空格兼容）。
+            let xmlCalls = LocalToolCallParser.callsFromXML(payload, allowedNames: allowedNames)
+            if !xmlCalls.isEmpty {
+                calls.append(contentsOf: xmlCalls)
+                jsonHandled.insert(payload)
+                continue
+            }
             guard let call = LocalToolCallParser.glm4Payload(
                 payload, allowedNames: allowedNames) else { continue }
             calls.append(call)
@@ -1640,16 +1672,20 @@ struct ThinkSplitter {
                 buffer.removeSubrange(..<range.upperBound)
                 inThink.toggle()
             } else {
-                // 保留可能跨 chunk 的半截标签。
-                let keep = tag.count - 1
-                if buffer.count > keep {
-                    let split = buffer.index(buffer.endIndex, offsetBy: -keep)
-                    let ready = String(buffer[..<split])
-                    if !ready.isEmpty {
-                        output.append((inThink, ready))
-                    }
-                    buffer = String(buffer[split...])
+                // 仅当 buffer 尾部确实是 tag 的真前缀时才保留，否则整段吐出。
+                // 旧实现无条件保留 tag.count-1 个字符，会把普通正文（如
+                // "<function name=..."）切碎、工具 XML 片段漏进正文，且延迟到下个 chunk。
+                let maxKeep = min(tag.count - 1, buffer.count)
+                var keep = 0
+                for n in stride(from: maxKeep, through: 1, by: -1) {
+                    if String(buffer.suffix(n)) == String(tag.prefix(n)) { keep = n; break }
                 }
+                let split = buffer.index(buffer.endIndex, offsetBy: -keep)
+                let ready = String(buffer[..<split])
+                if !ready.isEmpty {
+                    output.append((inThink, ready))
+                }
+                buffer = String(buffer[split...])
                 break
             }
         }
@@ -1709,14 +1745,23 @@ struct ToolTagSplitter {
                     chosen = nil
                 }
                 guard let pick = chosen else {
-                    // 保留可能被拆散的起始标签前缀（最长的 "<function name=\"" 约 16 字符）。
-                    let keep = 18
-                    if buffer.count > keep {
-                        let split = buffer.index(buffer.endIndex, offsetBy: -keep)
-                        let ready = String(buffer[..<split])
-                        if !ready.isEmpty { output.append(ready) }
-                        buffer = String(buffer[split...])
+                    // 仅当 buffer 尾部确实是某个起始标签的真前缀时才保留，
+                    // 否则整段吐出（旧实现无条件保留 18 字符会切碎正文）。
+                    let candidates = ["<tool_call>", "<function"]
+                    var keep = 0
+                    for tag in candidates {
+                        let maxKeep = min(tag.count - 1, buffer.count)
+                        for n in stride(from: maxKeep, through: 1, by: -1) {
+                            if String(buffer.suffix(n)) == String(tag.prefix(n)) {
+                                keep = max(keep, n)
+                                break
+                            }
+                        }
                     }
+                    let split = buffer.index(buffer.endIndex, offsetBy: -keep)
+                    let ready = String(buffer[..<split])
+                    if !ready.isEmpty { output.append(ready) }
+                    buffer = String(buffer[split...])
                     break
                 }
                 let before = String(buffer[..<pick.range.lowerBound])

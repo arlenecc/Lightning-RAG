@@ -14,6 +14,7 @@ public enum AgentToolFactory {
                              skillRetriever: SkillRetriever,
                              checkpointCompressor: ((String) async -> String?)? = nil,
                              multiZoneSearch: RagSearchTool.SearchHandler? = nil,
+                             extraOutlineEngines: [RAGEngine] = [],
                              zoneSummaryProvider: RagStatusTool.ZoneSummaryProvider? = nil,
                              sopTracker: SOPReadTracker = SOPReadTracker()) -> ToolRegistry {
         let registry = ToolRegistry(config: config, callbacks: callbacks)
@@ -129,7 +130,7 @@ public enum AgentToolFactory {
                 ("search", RagSearchTool(config: config, callbacks: callbacks, registry: registry,
                                          engine: ragEngine, searchHandler: multiZoneSearch)),
                 ("outline", RagOutlineTool(config: config, callbacks: callbacks, registry: registry,
-                                           engine: ragEngine)),
+                                           engine: ragEngine, extraEngines: extraOutlineEngines)),
                 ("status", RagStatusTool(config: config, callbacks: callbacks, registry: registry,
                                          engine: ragEngine,
                                          zoneSummaryProvider: zoneSummaryProvider)),

@@ -34,7 +34,7 @@ enum LocalToolCallParser {
         collect("<tool_call>\\s*([\\s\\S]*?)\\s*</tool_call>")
         // MiniCPM 等模型直接用 <function name=...>...</function>（无 <tool_call> 外层），
         // 单独收集这类块，交给 callsFromXML 解析。
-        collect("(<function\\s+name=[\\s\\S]*?</function>)", group: 1)
+        collect("(<function(?:\\s*name\\s*=|=)[\\s\\S]*?</function>)", group: 1)
         collect("```(?:json)?\\s*([\\s\\S]*?)```")
         if payloads.isEmpty, let value = JSONValue.parse(raw),
            value.objectValue != nil || value.arrayValue != nil {
@@ -179,8 +179,8 @@ enum LocalToolCallParser {
 
     // MARK: - Qwen XML
 
-    private static func callsFromXML(_ payload: String,
-                                     allowedNames: Set<String>) -> [ToolCall] {
+    static func callsFromXML(_ payload: String,
+                             allowedNames: Set<String>) -> [ToolCall] {
         guard let functionRange = payload.range(
             of: #"<function(?:=|\s*name=)["']?([^"'>\s]+)"#, options: .regularExpression)
         else { return [] }

@@ -816,6 +816,13 @@ public final class KernelLoop {
                     || (!didWork && Self.looksLikeIntentOnly(resp.content))
                 if toolsEnabled, intentOnly {
                     intentStall += 1
+                    // 只有思考没有正文的意图空转（实测 MiniCPM5：工具结果后的
+                    // 收尾轮在 <think> 里把答案想完就 EOS，正文为空），下一轮必须
+                    // 关闭 thinking，否则同样的长思考原样再来一遍形成 3 次空转。
+                    // 与 retry 路径（726 行）的 forceNoThinking 处理保持一致。
+                    if resp.content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                        forceNoThinking = true
+                    }
                     // 空转场景也要保证计划面板有内容：多步任务模型零工具调用、
                     // 只描述计划，面板会一直空着，用户只看到「直接失败」。这里
                     // 补建最小计划（不拦截执行），让卡点可见、可恢复。

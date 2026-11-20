@@ -127,46 +127,68 @@ public final class RagOutlineTool: AgentTool {
     ])
 
     private let engine: RAGEngine
+    /// 其它挂载分区的引擎：默认库查不到 book_name 时遍历它们（多分区联合大纲）。
+    private let extraEngines: [RAGEngine]
 
     public init(config: AgentConfig,
                 callbacks: AgentCallbacks? = nil,
                 registry: ToolRegistry? = nil,
-                engine: RAGEngine) {
+                engine: RAGEngine,
+                extraEngines: [RAGEngine] = []) {
         self.engine = engine
+        self.extraEngines = extraEngines
     }
 
     public func run(_ args: [String: JSONValue]) async throws -> ToolResult {
         let name = args.trimmedString("book_name")
         if name.isEmpty {
             let list = engine.listDocuments(limit: 100)
-            guard list.total > 0 else {
+            let allLists = [list] + extraEngines.map { $0.listDocuments(limit: 100) }
+            let total = allLists.reduce(0) { $0 + $1.total }
+            guard total > 0 else {
                 return ragToolOK("知识库中还没有已索引文档。")
             }
-            var lines = ["已索引文档（共 \(list.total) 个）:"]
-            lines.append(contentsOf: list.names.map {
-                "  - \((($0 as NSString).lastPathComponent))"
-            })
-            if list.total > list.names.count {
-                lines.append("  …（仅显示前 \(list.names.count) 个）")
+            var lines = ["已索引文档（共 \(total) 个，跨 \(allLists.count) 个分区）:"]
+            for (i, l) in allLists.enumerated() {
+                if allLists.count > 1 {
+                    lines.append("  [分区 \(i + 1)]")
+                }
+                lines.append(contentsOf: l.names.map {
+                    "  - \((($0 as NSString).lastPathComponent))"
+                })
+                if l.total > l.names.count {
+                    lines.append("    …（该分区仅显示前 \(l.names.count) 个）")
+                }
             }
             return ragToolOK(lines.joined(separator: "\n"))
         }
 
-        switch engine.lookupDocument(name) {
-        case .notFound:
-            return .fail("未找到文档: \(name)")
-        case .ambiguous(let candidates):
-            var lines = ["匹配到多个文档（\(candidates.count) 个），请给 rag_tools(op=\"outline\") 传更完整的文档名:"]
-            for candidate in candidates.prefix(20) {
-                lines.append("  - \(candidate.docName)（ID: \(candidate.docID)）")
+        // 多分区：默认库查不到时遍历其它挂载分区（book 可能在非默认库，
+        // 如《病毒星球》在自然分区而默认库是社会分区）。
+        let candidates: [(RAGEngine, DocumentLookupResult)] = [(engine, engine.lookupDocument(name))]
+            + extraEngines.map { ($0, $0.lookupDocument(name)) }
+        var ambiguousLines: [String] = []
+        for (eng, lookup) in candidates {
+            switch lookup {
+            case .found(let record):
+                if let enriched = eng.getEnrichedOutline(for: record) {
+                    return ragToolOK(Self.format(enriched))
+                }
+                // 该分区有此文档但没有大纲，继续找其它分区。
+            case .ambiguous(let list):
+                ambiguousLines.append(contentsOf: list.prefix(20).map {
+                    "  - \($0.docName)（ID: \($0.docID)）"
+                })
+            case .notFound:
+                break
             }
-            return ragToolOK(lines.joined(separator: "\n"))
-        case .found(let record):
-            guard let enriched = engine.getEnrichedOutline(for: record) else {
-                return .fail("文档 \(record.docName) 没有可用大纲")
-            }
-            return ragToolOK(Self.format(enriched))
         }
+        if !ambiguousLines.isEmpty {
+            var lines = ["匹配到多个文档（\(ambiguousLines.count) 个），请给 rag_tools(op=\"outline\") 传更完整的文档名:"]
+            lines.append(contentsOf: ambiguousLines)
+            return ragToolOK(lines.joined(separator: "\n"))
+        }
+        return .fail("未找到文档: \(name)")
     }
 
     // MARK: - 输出
@@ -302,6 +324,8 @@ public final class RagStatusTool: AgentTool {
     }
 
     public func run(_ args: [String: JSONValue]) async throws -> ToolResult {
+        // 只查一次分区总览：标题的「默认库」标注与文末总览共用。
+        let zoneSummaries = zoneSummaryProvider?() ?? []
         let status = engine.status()
         let knowledgeBase = status["knowledge_base"]?.stringValue ?? ""
         let ragDir = status["rag_dir"]?.stringValue ?? ""
@@ -328,6 +352,28 @@ public final class RagStatusTool: AgentTool {
         let binaryANNNote = status["binary_ann_note"]?.stringValue ?? ""
         let binaryBackend = status["binary_backend"]?.stringValue ?? ""
         let annBypassed = status["ann_bypassed"]?.boolValue ?? false
+
+        // 多分区只返回简洁概览：每个分区的名字、规模与文档名，不再拼默认库的
+        // 一长串详细状态（切片数/向量后端/ANN 等只反映单库，多库下既冗长又易误导）。
+        if zoneSummaries.count > 1 {
+            var overview: [String] = ["知识库状态：\(zoneSummaries.count) 个分区（默认跨全部分区联合检索）"]
+            var totalChunks = 0
+            var totalDocs = 0
+            for s in zoneSummaries {
+                totalChunks += s.chunks
+                totalDocs += s.sources.count
+                overview.append("")
+                overview.append("【\(s.name)】\(s.chunks) 切片，\(s.sources.count) 文档")
+                for source in s.sources.prefix(10) {
+                    overview.append("  - \((source as NSString).lastPathComponent)")
+                }
+                if s.sources.count > 10 {
+                    overview.append("  …（仅显示前 10 个，共 \(s.sources.count) 个）")
+                }
+            }
+            overview.insert("合计：\(totalChunks) 切片 / \(totalDocs) 文档", at: 1)
+            return .ok(overview.joined(separator: "\n"))
+        }
 
         var lines: [String] = ["知识库状态:"]
         lines.append("  知识库目录: \(knowledgeBase.isEmpty ? "（未设置）" : knowledgeBase)")
@@ -409,19 +455,6 @@ public final class RagStatusTool: AgentTool {
         }
         if let error = status["error"]?.stringValue, !error.isEmpty {
             lines.append("  错误: \(error)")
-        }
-        // 多分区总览：让用户/模型一眼看到所有知识分区的领域名与规模。
-        if let provider = zoneSummaryProvider {
-            let summaries = provider()
-            if summaries.count > 1 {
-                lines.append("")
-                lines.append("知识分区总览（共 \(summaries.count) 个）：")
-                for s in summaries {
-                    let docs = s.sources.prefix(8).joined(separator: "、")
-                    lines.append("  - \(s.name)：\(s.chunks) 切片，\(s.sources.count) 文档"
-                        + (docs.isEmpty ? "" : "（\(docs)）"))
-                }
-            }
         }
         return .ok(lines.joined(separator: "\n"))
     }
