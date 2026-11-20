@@ -387,8 +387,11 @@ public final class Agent: @unchecked Sendable {
                     let zones = config.knowledgeZones.filter { $0.enabled }
                     guard zones.count > 1 else { return [] }
                     return zones.compactMap { zone in
-                        guard let e = zoneEngineMap[zone.id],
-                              let st = e.cachedStatus() else { return nil }
+                        guard let e = zoneEngineMap[zone.id] else { return nil }
+                        // 直接查真实状态而非缓存：缓存只在 AppModel 刷新后才有，
+                        // 若某分区从未被刷新（新配置/刚启动），cachedStatus 为 nil
+                        // 会让该分区从总览中静默消失，模型就会编造分区名与文档数。
+                        let st = e.status()
                         return (name: zone.name,
                                 chunks: st["chunks_stored"]?.intValue ?? 0,
                                 sources: st["sources"]?.arrayValue?.compactMap(\.stringValue) ?? [])

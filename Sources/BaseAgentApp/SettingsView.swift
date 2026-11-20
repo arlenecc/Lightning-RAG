@@ -964,7 +964,8 @@ struct SettingsView: View {
                             Button("停止同步") { model.stopSync() }
                                 .disabled(model.zoneSyncEngineID != zone.id)
                             Button("向量去重") { model.dedupeZone(source: zone.source) }
-                                .disabled(model.isSyncing)
+                                .disabled(model.isSyncing || ragMode == "colbert")
+                                .help(ragMode == "colbert" ? "极速检索模式无向量库，无需向量去重" : "清理本知识分区内的重复向量切片")
                             if model.zoneSyncEngineID == zone.id && !model.zoneSyncStatusText.isEmpty {
                                 ProgressView().controlSize(.mini)
                                 Text(model.zoneSyncStatusText)

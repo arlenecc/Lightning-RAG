@@ -2009,6 +2009,10 @@ final class AppViewModel: ObservableObject {
             showInfoAlert(title: "向量去重", message: "RAG 尚未就绪，请先在知识同步配置中应用配置。")
             return
         }
+        if agent.config.colbertReaderEnabled {
+            showInfoAlert(title: "向量去重", message: "极速检索模式没有向量库，无需向量去重。")
+            return
+        }
         if isSyncing {
             showInfoAlert(title: "暂不能向量去重", message: "知识同步正在进行，请等同步结束后再试。")
             return
@@ -3214,15 +3218,21 @@ final class AppViewModel: ObservableObject {
         // 用 ObjectIdentifier 判新旧实例，避免在并发闭包里捕获会变化的 agent 引用。
         let targetID = ObjectIdentifier(agent)
         let engine = agent.ragEngine
-        // 多分区：预取其它挂载分区缓存状态（cachedStatus 不查库，仅内存读），
-        // 用于状态栏显示总规模；首次未同步的分区没有缓存，按 0 计。
-        let zoneSummaries = agent.config.mountedZones.compactMap { zone -> (chunks: Int, sources: Int)? in
-            guard let ze = agent.zoneEngines[zone.id], ze !== engine,
-                  let st = ze.cachedStatus() else { return nil }
-            return (st["chunks_stored"]?.intValue ?? 0,
-                    st["source_count"]?.intValue ?? 0)
+        // 多分区：对每个挂载分区都在后台调一次 status() 写入各自的 statusSnapshot。
+        // 关键：Agent.dynamicContextPrompt() 只输出有快照的分区——若这里只用
+        // cachedStatus()，未刷新过的分区会被静默丢弃，模型只看得到默认库，
+        // 于是把「跟主库不匹配」误判为「知识库没覆盖」，跳过 RAG 直接走 web。
+        let zoneEngines = agent.config.mountedZones.compactMap { zone -> (name: String, engine: RAGEngine)? in
+            guard let ze = agent.zoneEngines[zone.id], ze !== engine else { return nil }
+            return (zone.name, ze)
         }
         Task.detached(priority: .utility) { [weak self] in
+            // 填充各分区快照（status 内部有缓存，重复调用不会反复查库）。
+            let zoneSummaries = zoneEngines.compactMap { item -> (chunks: Int, sources: Int)? in
+                let st = item.engine.status()
+                return (st["chunks_stored"]?.intValue ?? 0,
+                        st["source_count"]?.intValue ?? 0)
+            }
             let status = engine.status()
             let chunks = status["chunks_stored"]?.intValue ?? 0
             let backend = status["vector_backend"]?.stringValue ?? "sqlite"

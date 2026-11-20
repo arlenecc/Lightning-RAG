@@ -562,6 +562,10 @@ public final class RAGEngine {
 
     private let parserRegistry: DocumentParserRegistry
     private var embedding: EmbeddingProvider?
+    /// 后台回填专用调度器：与主 ingest 的临时调度器同样按吞吐/内存自适应子批，
+    /// 但实例独立（后台低优先级，不干扰主同步的子批状态）。
+    private var backfillScheduler: AdaptiveEmbeddingScheduler?
+    private let backfillSchedulerLock = NSLock()
     private var reranker: RerankProvider?
     private var store: VectorStore?
     /// 仅元数据用途的库连接（目录/摘要读写），不依赖 embedding。检索阅读模式下
@@ -1619,7 +1623,8 @@ public final class RAGEngine {
             backfillVectorBatch: { [weak self] limit, cancel in
                 guard let self, !self.config.isDecisionMode,
                       let store = try? self.ensureStore(),
-                      let embedding = self.currentEmbedding() else { return 0 }
+                      // 走自适应子批调度器（与主 ingest 同策略），而非原始 provider。
+                      let embedding = self.backfillEmbeddingScheduler() else { return 0 }
                 let pending = store.nextPendingTexts(limit: limit)
                 guard !pending.isEmpty else { return 0 }
                 let texts = pending.map(\.text)
@@ -1632,9 +1637,9 @@ public final class RAGEngine {
                 var signatures: [Data]? = nil
                 // 二值粗筛默认开启：回填也要生成签名，否则新切片永远缺 bin 行、
                 // binaryRows==chunkRows 守卫失败、二值粗筛被静默跳过。
+                // 调度器的签名接口返回可选（底层不支持时为 nil），需分别处理。
                 if store.binaryStorageEnabled,
-                   let signing = embedding as? EmbeddingBinarySigning {
-                    let output = try await signing.embedDocumentsWithSignatures(texts)
+                   let output = try await embedding.embedDocumentsWithSignatures(texts) {
                     vectors = output.vectors
                     signatures = output.signatures
                 } else {
@@ -1706,6 +1711,33 @@ public final class RAGEngine {
     private func currentEmbedding() -> EmbeddingProvider? {
         storeLock.lock(); defer { storeLock.unlock() }
         return embedding
+    }
+
+    /// 自适应子批参数（主 ingest 与后台回填共用同一套配置）。
+    private func makeEmbeddingOptions() -> AdaptiveEmbeddingScheduler.Options {
+        .init(minBatchSize: config.ragEmbeddingMinBatch,
+              maxBatchSize: config.ragEmbeddingMaxBatch,
+              initialBatchSize: config.ragEmbeddingInitialBatch,
+              step: config.ragEmbeddingBatchStep,
+              memoryLimitMB: Double(config.ragEmbeddingMemoryLimitMB),
+              throughputTolerance: config.ragEmbeddingThroughputTolerance,
+              probeBatches: config.ragEmbeddingProbeBatches,
+              probeSeconds: config.ragEmbeddingProbeSeconds,
+              tokenBudgetMin: config.ragEmbeddingTokenBudgetMin,
+              tokenBudgetMax: config.ragEmbeddingTokenBudgetMax,
+              initialTokenBudget: config.ragEmbeddingTokenBudgetInitial,
+              tokenBudgetStep: config.ragEmbeddingTokenBudgetStep)
+    }
+
+    /// 后台回填专用调度器（惰性创建，config 变化后重建）。
+    private func backfillEmbeddingScheduler() -> AdaptiveEmbeddingScheduler? {
+        backfillSchedulerLock.lock(); defer { backfillSchedulerLock.unlock() }
+        guard let base = embedding else { return nil }
+        if let scheduler = backfillScheduler { return scheduler }
+        let scheduler = AdaptiveEmbeddingScheduler(base: base,
+                                                   options: makeEmbeddingOptions())
+        backfillScheduler = scheduler
+        return scheduler
     }
 
     private func currentColbert() -> ColBERTReaderService? {
@@ -2133,18 +2165,7 @@ public final class RAGEngine {
         } else if let baseEmbedding = embedding {
             scheduler = AdaptiveEmbeddingScheduler(
                 base: baseEmbedding,
-                options: .init(minBatchSize: config.ragEmbeddingMinBatch,
-                               maxBatchSize: config.ragEmbeddingMaxBatch,
-                               initialBatchSize: config.ragEmbeddingInitialBatch,
-                               step: config.ragEmbeddingBatchStep,
-                               memoryLimitMB: Double(config.ragEmbeddingMemoryLimitMB),
-                               throughputTolerance: config.ragEmbeddingThroughputTolerance,
-                               probeBatches: config.ragEmbeddingProbeBatches,
-                               probeSeconds: config.ragEmbeddingProbeSeconds,
-                               tokenBudgetMin: config.ragEmbeddingTokenBudgetMin,
-                               tokenBudgetMax: config.ragEmbeddingTokenBudgetMax,
-                               initialTokenBudget: config.ragEmbeddingTokenBudgetInitial,
-                               tokenBudgetStep: config.ragEmbeddingTokenBudgetStep),
+                options: makeEmbeddingOptions(),
                 log: logFn)
         } else {
             stats.errors.append("embedding 模型不可用")
@@ -2991,6 +3012,12 @@ public final class RAGEngine {
 
     /// 扫描向量库并返回重复切片统计，不删除任何数据。
     public func previewVectorDedupe() throws -> VectorDedupPreview {
+        // 极速检索模式无向量库，不能打开 index.sqlite 做向量检查
+        // （否则维度占位值会被误判为配置变化而清 manifest）。
+        if config.colbertReaderEnabled {
+            AgentLog.info("[vector-dedupe] 极速检索模式无向量库，跳过去重扫描")
+            return VectorDedupPreview(totalChunks: 0, duplicateChunks: 0, affectedSources: 0)
+        }
         guard tryBeginIngest() else {
             throw AgentError.storage("另一个知识库任务正在进行，请稍后重试")
         }
@@ -3009,6 +3036,13 @@ public final class RAGEngine {
     /// 同时更新 manifest：仍有剩余切片的来源刷新 chunkCount；被完全清空的
     /// 副本写 `duplicateOf` tombstone，避免下次同步重新解析。
     public func deduplicateVectors() throws -> VectorDedupStats {
+        // 极速检索模式没有向量库：index.sqlite 只存元数据（dimension 等占位值），
+        // 这里若调 ensureStore 会被误判为「维度变化」而清空 manifest、触发全量重建。
+        // 直接返回空统计，绝不触碰向量库配置检查。
+        if config.colbertReaderEnabled {
+            AgentLog.info("[vector-dedupe] 极速检索模式无向量库，跳过向量去重")
+            return VectorDedupStats()
+        }
         guard tryBeginIngest() else {
             throw AgentError.storage("另一个知识库任务正在进行，请稍后重试")
         }

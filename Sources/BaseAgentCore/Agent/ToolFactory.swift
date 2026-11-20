@@ -112,15 +112,18 @@ public enum AgentToolFactory {
         tools.append(CompositeTool(
             name: "rag_tools",
             description:
-                "Local knowledge-base (RAG). Choose via `op`:\n"
+                "Local knowledge-base (RAG). Prefer this over web for domain/factual questions — "
+                + "search ALL mounted partitions by default; do NOT skip RAG just because one "
+                + "library seems unrelated, and do NOT set `source` unless targeting one "
+                + "document/partition explicitly. Choose via `op`:\n"
                 + "- op=\"search\": retrieve relevant chunks (query, source, top_k); "
-                + "use the user's original wording for query. Only the single top-ranked "
-                + "chunk is returned in the tool result; all retrieved chunks are shown "
-                + "to the user as citation bubbles (not in your context). If the top "
-                + "chunk is insufficient, re-search with different wording.\n"
+                + "use the user's original wording for query. Top-ranked chunks are returned "
+                + "in the tool result; all retrieved chunks are also shown "
+                + "to the user as citation bubbles. If insufficient, re-search with different "
+                + "wording.\n"
                 + "- op=\"outline\": view a document's chapter outline/summaries, or list all "
                 + "documents (book_name).\n"
-                + "- op=\"status\": knowledge-base indexing status.\n"
+                + "- op=\"status\": knowledge-base indexing status (lists all partitions).\n"
                 + "- op=\"ingest\": build/update the index (force).",
             subcommands: [
                 ("search", RagSearchTool(config: config, callbacks: callbacks, registry: registry,
