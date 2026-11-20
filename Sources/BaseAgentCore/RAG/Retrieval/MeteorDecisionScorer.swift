@@ -204,6 +204,66 @@ public final class MeteorDecisionScorer: @unchecked Sendable {
         }
     }
 
+    /// 通用二元判定：返回「true 选项」的概率（0~1）。
+    ///
+    /// 与相关性打分共用同一条前向链路（escape → chat template → hidden →
+    /// readout[0..<2] 点积 softmax），但 state/question 由调用方自由组装，
+    /// 供内核决策门（收尾拦截/计划评审）等场景复用。
+    public func judgeBinary(state: String, question: String,
+                            trueOption: String = "Yes / true",
+                            falseOption: String = "No / false",
+                            maxStateChars: Int = 3000) async throws -> Double {
+        try await load()
+        let clipped = state.count > maxStateChars ? String(state.prefix(maxStateChars)) : state
+        let safeState = Self.escape(clipped)
+        let safeQuestion = Self.escape(question)
+        let userText = """
+        State:
+        \(safeState)
+
+        Question: \(safeQuestion)
+        Options:
+        A: \(Self.escape(falseOption))
+        B: \(Self.escape(trueOption))
+
+        \(Self.closing)
+        """
+        let messages: [[String: any Sendable]] = [
+            ["role": "system", "content": Self.systemPrompt],
+            ["role": "user", "content": userText],
+        ]
+        let temperature = self.temperature
+        return try await containerPerform { ctx, readout in
+            let tokens = try ctx.tokenizer.applyChatTemplate(
+                messages: messages, tools: nil,
+                additionalContext: ["enable_thinking": false])
+            guard !tokens.isEmpty else {
+                throw AgentError.llm("判定 prompt tokenize 为空")
+            }
+            var state = LMOutput.State()
+            state[mtpEmitFlagKey] = true
+            let input = LMInput.Text(tokens: MLXArray(tokens).reshaped([1, tokens.count]))
+            let output = ctx.model(input, cache: nil, state: state)
+            guard let hidden = output.state?[mtpLastHiddenStatesKey],
+                  hidden.shape.count == 3 else {
+                throw AgentError.llm("决策模型未返回有效 hidden states")
+            }
+            let dim = hidden.shape[2]
+            guard readout.shape[1] == dim else {
+                throw AgentError.llm("决策模型 hidden 维度 \(dim) 与 readout 列 \(readout.shape[1]) 不符")
+            }
+            let last = hidden[0, tokens.count - 1, 0..<dim]
+            let pairWeights = readout[0..<2, 0..<readout.shape[1]] // A=false, B=true
+            let logits = matmul(pairWeights, last)
+            let stable = logits - max(logits)
+            let tempArray = MLXArray([Float(temperature)])
+            let exponent = exp(stable / tempArray)
+            let probs = exponent / sum(exponent)
+            MLX.eval(probs)
+            return Double(probs.asArray(Float.self)[1])
+        }
+    }
+
     /// 逐条判定（batch 失败时的 fallback）。
     private func scoreOne(query: String, passage: String) async throws -> Double {
         let messages = makeMessages(query: query, passage: passage)

@@ -245,6 +245,16 @@ public final class KernelLoop {
     /// 成果核验反思：已进行的核验轮数（0=尚未核验）与当前候选答复。
     private var reviewRounds = 0
     private var reviewCandidate = ""
+    // ---- 内核决策门（complete 收尾拦截 + plan_step 计划评审）----
+    /// 决策判定器（MeteorKernelJudge）。Agent 按配置装配；nil = 功能关闭，
+    /// 内核行为与未接入前完全一致。判定失败/超时由实现返回 nil，静默放行。
+    public var decisionJudge: KernelDecisionJudge?
+    /// 收尾拦截已触发次数（预算 = config.kernelDecisionGateMaxFinishBlocks）。
+    private var decisionFinishBlocks = 0
+    /// 计划评审提示已触发次数（预算 = config.kernelDecisionGateMaxPlanReviews）。
+    private var decisionPlanReviews = 0
+    /// 已评审过的计划标识（goal+stepCount），同一计划只评审一次。
+    private var decisionReviewedPlanKey = ""
     /// 成功返回过结果的调用签名：完全相同参数再发一次，结果不会变。
     /// 模型常「拿到 web_scan 结果却原样重发刷屏」，用它在 preset 阶段直接
     /// 拦截，强令基于已有结果作答或换参数，而不是等 4 次重复才终止。
@@ -1132,6 +1142,43 @@ public final class KernelLoop {
                     log("[kernel] 反思门：还有 \(openSteps.count) 步未完成，提醒继续")
                     continue
                 }
+                // ---- 内核决策门（complete）：收尾拦截 ----
+                // 模拟实验显示决策模型对「已收集信息是否足以完整回答」判定
+                // 6/6 全对：模型认为可以收尾时再问一次决策模型，不足则打回
+                // 继续调用工具补齐。判定失败/超时返回 nil → 静默放行；
+                // 成果核验轮（reviewRounds > 0）与预算耗尽后不再拦截。
+                // 注意：不要求 openSteps.isEmpty——内核会为任何工具任务代建
+                // 最小计划，模型收尾时常未 patch 状态，若要求计划闭合此门
+                // 几乎永不触发；开放步骤的「继续执行」提醒由反思门负责，
+                // 纯文字收尾（turnedTextAnswer）的质量由本门把关。
+                if toolsEnabled, didWork, hasToolSuccess,
+                   reviewRounds == 0,
+                   let judge = decisionJudge,
+                   decisionFinishBlocks < config.kernelDecisionGateMaxFinishBlocks {
+                    let sufficient = await judge.informationSufficient(
+                        task: userInput,
+                        evidence: summarizeToolResults(limit: 3))
+                    if sufficient == false {
+                        decisionFinishBlocks += 1
+                        // 提交本轮保持 KV cache 与 Session 历史前缀一致（与
+                        // 反思门同款），拦截提示作为下一轮 pending 注入。
+                        session.finishTurn(rec, assistantText: resp.content,
+                                           summary: l2Summary(resp.content),
+                                           rawContent: resp.rawContent)
+                        pending = """
+                        [System] 决策模型判定当前收集的信息可能不足以完整回答任务（第 \(decisionFinishBlocks)/\(config.kernelDecisionGateMaxFinishBlocks) 次拦截）。
+                        请继续调用工具补齐缺失信息（换关键词检索、读取其它来源、检查遗漏的必要数据点）；
+                        若确认无法获取，请在答复中明确说明缺失的部分与原因后再收尾，不要编造。
+                        """
+                        log("[kernel] 决策门：拦截收尾 "
+                            + "\(decisionFinishBlocks)/\(config.kernelDecisionGateMaxFinishBlocks)（信息不足）")
+                        continue
+                    }
+                    if sufficient == true {
+                        log("[kernel] 决策门：信息足够，放行收尾")
+                    }
+                }
+
                 // 成果核验反思：以从业 10 年的资深专家身份审视最终结果，质量
                 // 不达标最多打回 2 次完善。只在「多步任务 + 有实质工作」时开启
                 // ——轻量轮、单步工具操作、简单问答不核验，避免每次收尾白多一轮。
@@ -1325,6 +1372,45 @@ public final class KernelLoop {
                 hasToolSuccess = true
             }
 
+            // ---- 内核决策门（plan_step）：计划评审 ----
+            // 计划创建成功后评审每个未完成步骤是否必要；判「不必要」的步骤
+            // 注入一次建议性提示（不阻断计划创建与执行）。同一计划只评审
+            // 一次；判定失败/超时静默跳过。
+            var planReviewWarning: String?
+            let createdPlanThisTurn = toolCalls.enumerated().contains { idx, tc in
+                tc.name == "update_plan"
+                    && tc.arguments["op"]?.stringValue == "create"
+                    && idx < rawResults.count && rawResults[idx].success
+            }
+            if let judge = decisionJudge, createdPlanThisTurn,
+               let plan = session.getPlan(), !plan.steps.isEmpty {
+                let key = "\(plan.goal)|\(plan.steps.count)|"
+                    + plan.steps.map(\.title).joined(separator: "|")
+                if decisionPlanReviews < config.kernelDecisionGateMaxPlanReviews,
+                   key != decisionReviewedPlanKey {
+                    decisionReviewedPlanKey = key
+                    var unnecessary: [String] = []
+                    for step in plan.steps
+                    where step.status != "done" && step.status != "skipped" {
+                        if await judge.stepNecessary(goal: plan.goal,
+                                                     step: step.title) == false {
+                            unnecessary.append(step.title)
+                        }
+                    }
+                    if !unnecessary.isEmpty {
+                        decisionPlanReviews += 1
+                        planReviewWarning = """
+                        [System] 决策模型认为计划中以下步骤可能对目标并非必要：\(unnecessary.joined(separator: "；"))。
+                        请检查计划：删除纯复述性 / 无信息增量的步骤，补充缺失的关键步骤（信息来源、验证环节），
+                        用 update_plan(op="patch") 或重新 create 更新后继续执行。若确认该步骤必要，忽略本提示。
+                        """
+                        log("[kernel] 决策门：计划评审发现 \(unnecessary.count) 个可能不必要的步骤")
+                    } else {
+                        log("[kernel] 决策门：计划评审通过（\(plan.steps.count) 步均必要）")
+                    }
+                }
+            }
+
             // ---- 重复调用检测（成功调用也要管）----
             let sigs = toolCalls.map(callSig)
             if !sigs.isEmpty && sigs == lastCallSigs {
@@ -1410,8 +1496,9 @@ public final class KernelLoop {
                 [System] 你已经开始执行但 Session 中还没有执行计划（plan 为空）——后续多步任务将没有进度可跟踪。请立即用 update_plan(op='create', goal=..., steps=[...]) 把目标和已完成/待做步骤登记为计划；之后每完成一步用 update_plan(op='patch', step_id=..., status='done', note='结论') 更新进度。计划每轮回注，是跟踪推进的依据。
                 """)
             }
-            // 重复调用提醒必须在 pending 赋值前并入，否则会被整体覆盖。
+            // 重复调用/计划评审提醒必须在 pending 赋值前并入，否则会被整体覆盖。
             if let repeatWarning { parts.append(repeatWarning) }
+            if let planReviewWarning { parts.append(planReviewWarning) }
             pending = parts.joined(separator: "\n")
             _ = transition("continue")
         }
@@ -2399,6 +2486,9 @@ public final class KernelLoop {
         dynamicContextInjected = false
         repeatStreak = 0
         lastCallSigs.removeAll()
+        decisionFinishBlocks = 0
+        decisionPlanReviews = 0
+        decisionReviewedPlanKey = ""
         pendingSeed = nil
         resume = false
         state = .think

@@ -144,6 +144,8 @@ struct SettingsView: View {
     @State private var rrfVectorWeight: Double = 0.7
     /// 多库联合检索是否用判定模型（向量/极速模式共用开关）。
     @State private var multiZoneUseDecisionJudge = false
+    @State private var kernelDecisionGateEnabled = true
+    @State private var kernelDecisionGateThreshold = 0.6
 
     /// 多知识分区配置行（UI 可增删）。
     private struct ZoneRow: Identifiable {
@@ -229,10 +231,40 @@ struct SettingsView: View {
                 auxModelBlock
                 Divider()
                 runParametersRow
+                Divider()
+                kernelDecisionGateRow
             }
             .padding(8)
         } label: {
             Text("Agent 模型配置").font(.headline)
+        }
+    }
+
+    /// 内核决策门：收尾拦截 + 计划评审（决策模型判定）。
+    private var kernelDecisionGateRow: some View {
+        HStack(spacing: 14) {
+            Text("决策门")
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.secondary)
+            Toggle("启用内核决策门", isOn: $kernelDecisionGateEnabled)
+                .font(.caption2)
+                .help("收尾时决策模型判定「已收集信息是否足以完整回答任务」，不足则拦截要求补齐；"
+                    + "计划创建后评审「每个步骤是否必要合理」。判定失败/超时静默放行，不影响主流程。"
+                    + "复用「高级 RAG / 检索模式」中的决策模型，无需额外加载")
+            if kernelDecisionGateEnabled {
+                Picker("拦截阈值", selection: $kernelDecisionGateThreshold) {
+                    Text("0.4").tag(0.4)
+                    Text("0.5").tag(0.5)
+                    Text("0.6（默认）").tag(0.6)
+                    Text("0.7").tag(0.7)
+                    Text("0.8").tag(0.8)
+                    Text("0.9").tag(0.9)
+                }
+                .font(.caption2)
+                .frame(maxWidth: 170)
+                .help("判定不足/不必要概率高于该值才干预；越高越保守（更少拦截）")
+            }
+            Spacer(minLength: 8)
         }
     }
 
@@ -1755,6 +1787,8 @@ struct SettingsView: View {
         colbertQueryPrune = config.colbertQueryPrune
         rrfVectorWeight = config.ragRRFVectorWeight
         multiZoneUseDecisionJudge = config.multiZoneUseDecisionJudge
+        kernelDecisionGateEnabled = config.kernelDecisionGateEnabled
+        kernelDecisionGateThreshold = config.kernelDecisionGateThreshold
         zoneRows = config.knowledgeZones.map {
             ZoneRow(id: $0.id, name: $0.name, source: $0.source,
                     enabled: $0.enabled, isDefault: $0.isDefault)
@@ -2171,6 +2205,8 @@ struct SettingsView: View {
         config.colbertQueryPrune = colbertQueryPrune
         config.ragRRFVectorWeight = min(max(rrfVectorWeight, 0.1), 0.9)
         config.multiZoneUseDecisionJudge = multiZoneUseDecisionJudge
+        config.kernelDecisionGateEnabled = kernelDecisionGateEnabled
+        config.kernelDecisionGateThreshold = kernelDecisionGateThreshold
         config.knowledgeZones = zoneRows.map {
             KnowledgeZone(id: $0.id, name: $0.name, source: $0.source,
                           enabled: $0.enabled, isDefault: $0.isDefault)

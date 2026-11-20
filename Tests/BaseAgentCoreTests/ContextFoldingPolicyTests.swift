@@ -1,8 +1,16 @@
 import XCTest
 @testable import BaseAgentCore
 
-/// 折叠策略：每 8 轮保留最近 2 轮原文；段内禁止滑窗；只有占用 >90% 才回注摘要。
+/// 折叠策略：保留最近 2 轮原文；段内禁止滑窗；只有占用 >90% 才回注摘要。
+/// 折叠行为测试显式用 8 轮短周期（产品默认已改为 18 轮，测试仍验证折叠语义本身）。
 final class ContextFoldingPolicyTests: XCTestCase {
+
+    private func shortCycleConfig() -> AgentConfig {
+        var config = AgentConfig()
+        config.kernelConsolidateEvery = 8
+        config.kernelRawTurns = 10
+        return config
+    }
 
     private final class Captured: @unchecked Sendable {
         private let lock = NSLock()
@@ -68,16 +76,16 @@ final class ContextFoldingPolicyTests: XCTestCase {
 
     // MARK: - 配置与阈值
 
-    func testDefaultIntervalIsEightAndLoopHonorsIt() {
+    func testDefaultIntervalAndLoopHonorsIt() {
         let config = AgentConfig()
-        XCTAssertEqual(config.kernelConsolidateEvery, 8)
-        XCTAssertEqual(config.kernelRawTurns, 10,
-                       "8 轮周期 + 折叠保留 2 轮，段内才不会滑窗")
+        XCTAssertEqual(config.kernelConsolidateEvery, 18)
+        XCTAssertEqual(config.kernelRawTurns, 20,
+                       "18 轮周期 + 折叠保留 2 轮，段内才不会滑窗")
         let loop = KernelLoop(runtime: makeRuntime(Captured()),
                               config: config,
                               systemPrompt: { "SYS" },
                               maxTurns: 1)
-        XCTAssertEqual(loop.consolidateEvery, 8)
+        XCTAssertEqual(loop.consolidateEvery, 18)
     }
 
     func testReserveAndShrinkThresholdsAreIndependent() {
@@ -111,7 +119,7 @@ final class ContextFoldingPolicyTests: XCTestCase {
         session.appendDigest("stale-digest")
         let captured = Captured()
         let loop = KernelLoop(runtime: makeRuntime(captured),
-                              config: AgentConfig(),
+                              config: shortCycleConfig(),
                               systemPrompt: { "SYS" },
                               session: session,
                               hooks: RecordingHooks(captured),
@@ -195,7 +203,7 @@ final class ContextFoldingPolicyTests: XCTestCase {
         session.budget.setUsed("system", tokens: 25_000)
         let captured = Captured()
         let loop = KernelLoop(runtime: makeRuntime(captured),
-                              config: AgentConfig(),
+                              config: shortCycleConfig(),
                               systemPrompt: { "SYS" },
                               session: session,
                               hooks: RecordingHooks(captured),
@@ -217,7 +225,7 @@ final class ContextFoldingPolicyTests: XCTestCase {
         session.budget.setUsed("system", tokens: 28_000)
         let captured = Captured()
         let loop = KernelLoop(runtime: makeRuntime(captured),
-                              config: AgentConfig(),
+                              config: shortCycleConfig(),
                               systemPrompt: { "SYS" },
                               session: session,
                               hooks: RecordingHooks(captured),
@@ -266,7 +274,7 @@ final class ContextFoldingPolicyTests: XCTestCase {
         // 超长 system 把 raw 硬顶压到极小，模拟工具密集段越顶。
         let longSystem = String(repeating: "S", count: 12_000)
         let loop = KernelLoop(runtime: makeRuntime(captured),
-                              config: AgentConfig(),
+                              config: shortCycleConfig(),
                               systemPrompt: { longSystem },
                               session: session,
                               hooks: RecordingHooks(captured),
@@ -291,7 +299,7 @@ final class ContextFoldingPolicyTests: XCTestCase {
         }
         let captured = Captured()
         let loop = KernelLoop(runtime: makeRuntime(captured),
-                              config: AgentConfig(),
+                              config: shortCycleConfig(),
                               systemPrompt: { "SYS" },
                               session: session,
                               hooks: RecordingHooks(captured),

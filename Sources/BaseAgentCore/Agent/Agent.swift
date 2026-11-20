@@ -460,10 +460,18 @@ public final class Agent: @unchecked Sendable {
             log: { [weak self] line in self?.log(line) }
         )
         let hooks = AgentKernelHooks(agent: self)
-        return KernelLoop(runtime: runtime, config: config, callbacks: callbacks,
-                          systemPrompt: { [weak self] in self?.systemPrompt() ?? BASE_SYSTEM_PROMPT },
-                          dynamicContext: { [weak self] in self?.dynamicContextPrompt() ?? "" },
-                          session: session, hooks: hooks, maxTurns: maxIterations)
+        let kernelLoop = KernelLoop(runtime: runtime, config: config, callbacks: callbacks,
+                                    systemPrompt: { [weak self] in self?.systemPrompt() ?? BASE_SYSTEM_PROMPT },
+                                    dynamicContext: { [weak self] in self?.dynamicContextPrompt() ?? "" },
+                                    session: session, hooks: hooks, maxTurns: maxIterations)
+        // 内核决策门（收尾拦截 + 计划评审）：复用 RAG 决策模型单例（懒加载，
+        // 失败/未配置时 judge 返回 nil 静默放行），避免重复加载 0.8B 模型。
+        if config.kernelDecisionGateEnabled,
+           let scorer = try? ragEngine.sharedDecisionScorer() {
+            kernelLoop.decisionJudge = MeteorKernelJudge(
+                scorer: scorer, threshold: config.kernelDecisionGateThreshold)
+        }
+        return kernelLoop
     }()
 
     // MARK: 生命周期
@@ -1002,6 +1010,15 @@ public final class Agent: @unchecked Sendable {
         }
         llm = newLLM
         cachedDynamicContext = nil
+        // 换模型会丢弃 KV cache，下一轮必须全量 prefill 整个历史。
+        // 若历史较长（多次工具调用后轻松上万 token），弱模型首字节会到 40~80 秒。
+        // 这里按回水线折叠历史为摘要（保留最近 2 轮原文 + <earlier_context>），
+        // 既保留紧邻上下文又把首轮 prefill 压到最小；摘要行不调 LLM。
+        if session.turns.count > 4 {
+            let folded = session.foldToRewatermark(targetRatio: 0.35, keepingRecent: 2)
+            log("[context] 换模型后折叠历史 \(folded.count) 轮为摘要，"
+                + "保留最近 2 轮（避免首轮全量 prefill 历史）")
+        }
         invalidateKVCache()
     }
 

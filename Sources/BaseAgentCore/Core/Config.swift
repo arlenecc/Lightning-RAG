@@ -431,6 +431,16 @@ public struct AgentConfig: Sendable {
     /// 启用则选库时用判定模型判定去哪些库、融合后再判定一次取 TopN；
     /// 关闭则用 FTS 词法探查选库 + 各库原精排方案（reranker/MaxSim）。
     public var multiZoneUseDecisionJudge: Bool = false
+    /// 内核决策门（收尾拦截 + 计划评审）：启用后在收尾路径用决策模型判定
+    /// 「已收集信息是否足以完整回答」，计划创建后评审「每步是否必要合理」。
+    /// 判定失败/超时一律静默放行，不影响主流程。
+    public var kernelDecisionGateEnabled: Bool = true
+    /// 决策门拦截阈值（不足/不必要概率高于该值才触发干预）。
+    public var kernelDecisionGateThreshold: Double = 0.6
+    /// 单次会话内收尾拦截的最大次数（超过后放行，防止死循环）。
+    public var kernelDecisionGateMaxFinishBlocks: Int = 2
+    /// 每个计划创建后评审提示的最大次数。
+    public var kernelDecisionGateMaxPlanReviews: Int = 1
 
     /// 当前是否启用极速检索（兼容旧字段与三选一模式）。
     public var isColbertMode: Bool { ragMode == "colbert" }
@@ -767,6 +777,16 @@ public struct AgentConfig: Sendable {
             decisionTopN = [3, 5, 10].contains(v) ? v : 5
         }
         if let v = bool("multi_zone_use_decision_judge") { multiZoneUseDecisionJudge = v }
+        if let v = bool("kernel_decision_gate_enabled") { kernelDecisionGateEnabled = v }
+        if let v = double("kernel_decision_gate_threshold") {
+            kernelDecisionGateThreshold = min(max(0.4, v), 0.95)
+        }
+        if let v = int("kernel_decision_gate_max_finish_blocks") {
+            kernelDecisionGateMaxFinishBlocks = min(max(0, v), 5)
+        }
+        if let v = int("kernel_decision_gate_max_plan_reviews") {
+            kernelDecisionGateMaxPlanReviews = min(max(0, v), 3)
+        }
         if let v = bool("colbert_reader_enabled") { colbertReaderEnabled = v }
         if let v = int("colbert_quant_bits") {
             colbertQuantBits = (v == 2) ? 2 : 4
@@ -1278,6 +1298,10 @@ public struct AgentConfig: Sendable {
             "decision_core_sentence_count": decisionCoreSentenceCount,
             "decision_top_n": decisionTopN,
             "multi_zone_use_decision_judge": multiZoneUseDecisionJudge,
+            "kernel_decision_gate_enabled": kernelDecisionGateEnabled,
+            "kernel_decision_gate_threshold": kernelDecisionGateThreshold,
+            "kernel_decision_gate_max_finish_blocks": kernelDecisionGateMaxFinishBlocks,
+            "kernel_decision_gate_max_plan_reviews": kernelDecisionGateMaxPlanReviews,
             "colbert_reader_enabled": colbertReaderEnabled,
             "colbert_quant_bits": colbertQuantBits,
             "colbert_coarse_candidates": colbertCoarseCandidates,

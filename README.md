@@ -58,7 +58,7 @@ scripts/package-app.sh release && scripts/package-dmg.sh
 只产出单一形态：应用本体不含任何内置模型，potion 语义切片 / jina embedding /
 jina reranker 均在首次启动时从 hf-mirror 自动下载；主模型、辅助模型与 OCR 需在
 配置中指定本地模型路径。按「打包 App → 打包 DMG」顺序构建，产物为
-`dist/Lightning-RAG-1.4.6.dmg`（约 40MB）。版本号可通过 `VERSION` 环境变量或
+`dist/Lightning-RAG-1.4.7.dmg`（约 40MB）。版本号可通过 `VERSION` 环境变量或
 `package-dmg.sh` 的参数覆盖。
 
 测试覆盖（当前 1000+ 个 XCTest；真实模型 E2E 在本地权重存在时随每次测试自动运行，缺少权重或需要外网/GGUF 等环境的用例会跳过）：sqlite-vec 事务写入/回滚、两段式 KNN、二值签名编码与 LSB-first 位打包、
@@ -129,7 +129,9 @@ HTML 与 Office 解析另有专项覆盖：HTML 保存页的本地 iframe / fram
 
 **自定义 system prompt**：首次启动会在 `<workspace>/assets/system_prompt.txt` 写出内置的 `BASE_SYSTEM_PROMPT`；之后每次启动读取该文件并替换内置提示词，可直接用文本编辑器调整模型行为规则，**重启（或重新应用配置）后生效**（会话期间保持不变，以免 system 前缀抖动使 KV cache 反复重建）。文件内容空白或不可读时本次回退内置提示词，且不会覆盖文件。它替换的是协议主体，L0 META-SOP 与 L1 全局索引仍按多级记忆机制追加在其后；轻量轮（纯寒暄/能力问询）使用内核的极简提示，不受该文件影响。内置提示词中的 `<summary>` 标签、`rag_tools(op="outline")` 起手式、工具状态词等是内核回注与测试的硬依赖，建议在原文基础上调整，不要整段删除。
 
-**v1.4.6（当前）**：MiniCPM 兼容、多库工具与状态简化。MiniCPM5 工具调用全链路兼容（裸 `<function>/<paramname>`、CDATA、tokenizer 吞空格；真机实测首轮即正确调用）；修复 thinking 模型"想完就 EOS 正文为空"导致的 3 次意图空转（空正文意图轮自动关闭 thinking）；`rag_tools(op="outline")` 改为跨全部分区查书/列文档（非默认库的书也能命中，含全角冒号书名）；`rag_tools(op="status")` 多库时只返回简洁概览（各分区名字/切片/文档，不再拼默认库详情）；框架拒绝的工具原文纳入文本兜底并加诊断日志；新增 MiniCPM 真机/端到端、outline/status 跨分区回归测试。
+**v1.4.7（当前）**：工具 XML 正文净化、换模型提速、内核决策门（代码就绪）。新增 `ContentSanitizer` 跨 chunk 累积净化器，彻底剥离 MiniCPM 裸 `<function>` 与 Qwen/GLM4/Spark 的 `<tool_call>` XML，真机双模型验证（MiniCPM/Qwen）正文无残留、工具调用正常；换主模型时按回水线折叠长历史为摘要，避免首轮全量 prefill 导致的 40~80 秒卡顿；修正在途空转与 repeated 调用诊断。内核决策门（complete 收尾拦截 + plan_step 计划评审）代码与测试已入库（7 项测试通过），默认配置开启但 Agent 层尚未装配 judge，本版不生效、静默放行。折叠策略测试断言更新为 18/20 轮。
+
+**v1.4.6**：MiniCPM 兼容、多库工具与状态简化。MiniCPM5 工具调用全链路兼容（裸 `<function>/<paramname>`、CDATA、tokenizer 吞空格；真机实测首轮即正确调用）；修复 thinking 模型"想完就 EOS 正文为空"导致的 3 次意图空转；`rag_tools(op="outline")` 改为跨全部分区查书/列文档；`rag_tools(op="status")` 多库时只返回简洁概览；框架拒绝的工具原文纳入文本兜底并加诊断日志。
 
 **v1.4.5**：知识库状态真实性与检索优先级修复。修复问「知识库里有什么」时模型编造分区名/文档数的问题——`rag_tools(op="status")` 的多分区总览改为直接查真实库（不依赖 UI 缓存），所有挂载分区都写入 status 快照，动态上下文不再静默丢弃未刷新的分区。强化"先 RAG 后联网"：KB HINT/内置 BASE/自定义 prompt/rag_tools 描述统一为"领域性问题先用 rag_tools 跨全部分区检索，无命中才 web_search"，修正过时 top1 描述与 source 矛盾。向量回填改用自适应子批调度器（与主 ingest 同策略，签名同步生成）；修复极速模式点"向量去重"误开向量库导致清空 manifest 的问题。
 

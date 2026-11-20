@@ -536,7 +536,7 @@ public final class MLXLLMService: LLMService, PreloadableLLMService,
                         + "common=\(common) transcript=\(sessionTranscript.count)")
 
                     var thinkSplitter = ThinkSplitter(startInThink: probe.startInThink)
-                    var toolSplitter = ToolTagSplitter()
+                    var contentSanitizer = ContentSanitizer()
                     var rawContent = probe.generationPrefix
                     var collectedCalls: [ToolCall] = []
                     var rejectedDetail: String?
@@ -560,7 +560,7 @@ public final class MLXLLMService: LLMService, PreloadableLLMService,
                                         ))
                                     }
                                 } else {
-                                    for visible in toolSplitter.feed(piece.text) where !visible.isEmpty {
+                                    for visible in contentSanitizer.feed(piece.text) where !visible.isEmpty {
                                         continuation.yield(LLMStreamEvent(
                                             kind: .content,
                                             content: visible
@@ -613,7 +613,7 @@ public final class MLXLLMService: LLMService, PreloadableLLMService,
                                 LLMStreamEvent(kind: .reasoning, content: piece.text)
                             ]
                         } else {
-                            events = toolSplitter.feed(piece.text).map {
+                            events = contentSanitizer.feed(piece.text).map {
                                 LLMStreamEvent(kind: .content, content: $0)
                             }
                         }
@@ -621,7 +621,7 @@ public final class MLXLLMService: LLMService, PreloadableLLMService,
                             continuation.yield(event)
                         }
                     }
-                    for visible in toolSplitter.flush() where !visible.isEmpty {
+                    for visible in contentSanitizer.flush() where !visible.isEmpty {
                         continuation.yield(LLMStreamEvent(kind: .content, content: visible))
                     }
 
@@ -1699,6 +1699,63 @@ struct ThinkSplitter {
     }
 }
 
+/// 增量内容净化器：跨 chunk 累积正文，只放行"确定安全"的部分。
+/// MiniCPM5 的 tokenizer 把 `<function name="x">` 切成 `<function name` / `="x">` 等碎块，
+/// 且 `<function...>` 与其 `</function>` 之间可能夹杂 reasoning piece，逐 chunk 的状态机
+/// 无法可靠识别起始标签。这里改为：累积内容 → 剥掉完整工具块 → 只输出最后一个未完成
+/// `<` 之前的安全文本，未闭合的标签尾巴留在 buffer 等后续 chunk 补齐。
+struct ContentSanitizer {
+    private var buffer = ""
+
+    mutating func feed(_ chunk: String) -> [String] {
+        buffer += chunk
+        let cleaned = ToolTagSplitter.stripFunctionBlocks(buffer)
+        // 若有未闭合的工具起始标签（<function...> / <tool_call>），整段留在 buffer
+        // 等 </function> 到达后一起剥掉，绝不提前放行。
+        if Self.hasUnclosedToolTag(cleaned) {
+            buffer = cleaned
+            return []
+        }
+        // 普通正文：若尾部有未闭合的 '<'（半截标签），留 buffer 等下一 chunk。
+        guard let lastLt = cleaned.lastIndex(of: "<") else {
+            let out = cleaned
+            buffer = ""
+            return out.isEmpty ? [] : [out]
+        }
+        let afterLt = cleaned[cleaned.index(after: lastLt)...]
+        if afterLt.contains(">") {
+            let out = cleaned
+            buffer = ""
+            return out.isEmpty ? [] : [out]
+        }
+        let safe = String(cleaned[..<lastLt])
+        buffer = String(cleaned[lastLt...])
+        return safe.isEmpty ? [] : [safe]
+    }
+
+    mutating func flush() -> [String] {
+        var cleaned = ToolTagSplitter.stripFunctionBlocks(buffer)
+        // flush 时若仍有未闭合工具标签，把半截标签整段丢弃，不泄漏到正文。
+        if Self.hasUnclosedToolTag(cleaned) { cleaned = "" }
+        buffer = ""
+        return cleaned.isEmpty ? [] : [cleaned]
+    }
+
+    /// 是否含未闭合的工具标签起始（<function...> 或 <tool_call>）。
+    private static func hasUnclosedToolTag(_ text: String) -> Bool {
+        func hasUnclosed(_ open: String, _ close: String) -> Bool {
+            var searchStart = text.startIndex
+            while let r = text.range(of: open, range: searchStart..<text.endIndex) {
+                let after = text.index(after: r.lowerBound)
+                if text.range(of: close, range: after..<text.endIndex) == nil { return true }
+                searchStart = r.upperBound
+            }
+            return false
+        }
+        return hasUnclosed("<function", "</function>") || hasUnclosed("<tool_call", "</tool_call>")
+    }
+}
+
 /// 剥离工具调用标记，避免结构化工具调用同时污染正文。
 /// 支持两类方言：
 /// - `<tool_call>...</tool_call>`（Qwen / GLM4 / Spark / JSON）
@@ -1770,8 +1827,31 @@ struct ToolTagSplitter {
                 activeClose = pick.close
             }
         }
-        return output
+        // 兜底：流式状态机可能因跨 chunk 边界漏剥完整的工具块，输出前再统一清一遍，
+        // 确保任何 <function>...</function> 都不污染对话正文。
+        return output.map { Self.stripFunctionBlocks($0) }
     }
+
+    /// 剥掉文本里完整的工具调用 XML 块：
+    /// - MiniCPM 裸 `<function ...>...</function>`
+    /// - Qwen / GLM4 / Spark 的 `<tool_call>...</tool_call>`（JSON / arg_key 方言）
+    static func stripToolBlocks(_ text: String) -> String {
+        var result = text
+        for pattern in [
+            #"<function(?:\s*name\s*=|=)[^>]*>[\s\S]*?</function>"#,
+            #"<tool_call>[\s\S]*?</tool_call>"#,
+        ] {
+            guard let regex = try? NSRegularExpression(
+                pattern: pattern, options: [.dotMatchesLineSeparators]) else { continue }
+            let range = NSRange(result.startIndex..<result.endIndex, in: result)
+            result = regex.stringByReplacingMatches(in: result, options: [], range: range,
+                                                   withTemplate: "")
+        }
+        return result
+    }
+
+    /// 兼容旧名（ToolTagSplitter 内部调用）。
+    static func stripFunctionBlocks(_ text: String) -> String { stripToolBlocks(text) }
 
     /// 定位裸 `<function name="...">` 或 `<function=...>` 起始标签。
     /// 只匹配带 name 属性的调用形式，避免把正文里的普通 XML `<function>` 误剥。
@@ -1786,7 +1866,9 @@ struct ToolTagSplitter {
     mutating func flush() -> [String] {
         let text = buffer
         buffer = ""
-        return activeClose != nil || text.isEmpty ? [] : [text]
+        guard activeClose == nil, !text.isEmpty else { return [] }
+        let cleaned = Self.stripFunctionBlocks(text)
+        return cleaned.isEmpty ? [] : [cleaned]
     }
 }
 
