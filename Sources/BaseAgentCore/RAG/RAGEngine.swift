@@ -594,6 +594,20 @@ public final class RAGEngine {
     /// 决策判定模型打分器（懒加载，与检索阅读模式互斥）。
     private var decisionScorer: MeteorDecisionScorer?
     private let decisionLock = NSLock()
+    /// 决策模型运行时自下载状态回调（UI 进度）。构造 scorer 前设置即可生效。
+    public var decisionModelDownloadHandler: (@Sendable (String) -> Void)? {
+        get {
+            decisionLock.lock()
+            defer { decisionLock.unlock() }
+            return decisionModelDownloadHandlerStorage
+        }
+        set {
+            decisionLock.lock()
+            decisionModelDownloadHandlerStorage = newValue
+            decisionLock.unlock()
+        }
+    }
+    private nonisolated(unsafe) var decisionModelDownloadHandlerStorage: (@Sendable (String) -> Void)?
     /// 后台任务（回填排空 / ANN 构建完成）状态变化时回调，供 UI 刷新完备状态。
     public var onBackgroundStatusChanged: (() -> Void)?
 
@@ -3856,7 +3870,11 @@ public final class RAGEngine {
     private func ensureDecisionScorer() throws -> MeteorDecisionScorer {
         decisionLock.lock(); defer { decisionLock.unlock() }
         if let scorer = decisionScorer { return scorer }
-        let scorer = MeteorDecisionScorer(modelDir: resolvedDecisionModelPath())
+        let scorer = MeteorDecisionScorer(
+            modelDir: resolvedDecisionModelPath(),
+            autoDownload: config.autoDownloadMissingModels,
+            downloadRepo: MeteorDecisionScorer.defaultDownloadRepo,
+            downloadStatusHandler: decisionModelDownloadHandler)
         decisionScorer = scorer
         return scorer
     }

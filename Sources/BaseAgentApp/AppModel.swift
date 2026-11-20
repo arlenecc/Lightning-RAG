@@ -740,6 +740,13 @@ final class AppViewModel: ObservableObject {
                 self.refreshRAGStatus()
             }
         }
+        // 决策模型运行时自下载进度（在任何 scorer 构造前设置）。
+        newAgent.ragEngine.decisionModelDownloadHandler = { [weak self] text in
+            DispatchQueue.main.async {
+                self?.statusText = text
+                self?.appendLog("[decision] \(text)")
+            }
+        }
         // 知识图谱抽取/关键词提取复用辅助模型实例。
         newAgent.ragEngine.auxLLM = newAgent.auxLLM
         agent = newAgent
@@ -1106,6 +1113,13 @@ final class AppViewModel: ObservableObject {
             DispatchQueue.main.async {
                 self?.statusText = text
                 self?.appendLog("[colbert] \(text)")
+            }
+        }
+        // 决策模型运行时自下载状态同样上抛状态栏（缺 readout 时按需补齐）。
+        agent.ragEngine.decisionModelDownloadHandler = { [weak self] text in
+            DispatchQueue.main.async {
+                self?.statusText = text
+                self?.appendLog("[decision] \(text)")
             }
         }
         let outcome = await agent.ragEngine.preloadAuxiliaryModels()

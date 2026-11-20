@@ -422,17 +422,21 @@ public struct RequiredModel: Sendable, Equatable, Identifiable {
     /// GGUF 的 tokenizer 内嵌在权重里，目录下载不带 tokenizer 文件，
     /// 这类模型必须为 false，否则会被永远判定缺失。
     public let requiresTokenizer: Bool
+    /// 除权重/tokenizer 外还必须存在的文件（如决策模型的 readout.safetensors）。
+    public let requiredFileNames: Set<String>
 
     public init(kind: String, repo: String, directory: URL,
                 subpath: String? = nil,
                 allowedWeightNames: Set<String>? = nil,
-                requiresTokenizer: Bool = true) {
+                requiresTokenizer: Bool = true,
+                requiredFileNames: Set<String> = []) {
         self.kind = kind
         self.repo = repo
         self.directory = directory
         self.subpath = subpath
         self.allowedWeightNames = allowedWeightNames
         self.requiresTokenizer = requiresTokenizer
+        self.requiredFileNames = requiredFileNames
     }
 }
 
@@ -543,7 +547,34 @@ public enum RequiredModelCatalog {
                 allowedWeightNames: ["model_int8.onnx"],
                 requiresTokenizer: true))
         }
+        if decisionModelRequired(config) {
+            // 决策模型（内核决策门 / RAG 判定模式）：固定从 v1.5 仓库下载，
+            // 落点与 RAGEngine.resolvedDecisionModelPath() 同源，保证下载后能加载。
+            // 就绪判定必须有 readout.safetensors（决策头，运行时的硬性前置）。
+            out.append(RequiredModel(
+                kind: "决策模型",
+                repo: "\(HFModelDownloader.repoOwner)/PKU-KCL-Meteor-v1.5-0.8B-mlx-int4",
+                directory: decisionModelDirectory(for: config),
+                requiresTokenizer: true,
+                requiredFileNames: ["readout.safetensors"]))
+        }
         return out
+    }
+
+    /// 是否需要决策模型：内核决策门开启，或 RAG 使用判定模式。
+    public static func decisionModelRequired(_ config: AgentConfig) -> Bool {
+        config.kernelDecisionGateEnabled
+            || config.ragMode == "decision"
+            || config.multiZoneUseDecisionJudge
+    }
+
+    /// 决策模型目录：与 RAGEngine.resolvedDecisionModelPath() 完全同源
+    /// （绝对路径原样返回，相对路径按 workspace 解析）。
+    public static func decisionModelDirectory(for config: AgentConfig) -> URL {
+        let p = config.decisionModelPath.trimmingCharacters(in: .whitespacesAndNewlines)
+        if p.hasPrefix("/") { return URL(fileURLWithPath: p, isDirectory: true) }
+        return URL(fileURLWithPath: config.workspace, isDirectory: true)
+            .appendingPathComponent(p, isDirectory: true)
     }
 
     /// 检索阅读模式模型的下载/加载目录（与运行时加载目录同源）。
@@ -605,6 +636,12 @@ public enum RequiredModelCatalog {
     public static func isComplete(_ model: RequiredModel) -> Bool {
         guard isComplete(model.directory, allowedWeightNames: model.allowedWeightNames)
         else { return false }
+        // 决策模型等的必需附属文件（如 readout.safetensors）：缺失或空文件都算未完成，
+        // 否则 backbone 在、readout 不在时会误判就绪，加载时才失败。
+        for name in model.requiredFileNames {
+            let url = model.directory.appendingPathComponent(name)
+            guard HFModelDownloader.fileSize(at: url) >= 4_096 else { return false }
+        }
         return !model.requiresTokenizer || hasTokenizerFile(in: model.directory)
     }
 

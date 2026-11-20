@@ -118,8 +118,8 @@ final class HFModelDownloaderTests: XCTestCase {
         let potion = try! XCTUnwrap(all.first { $0.kind == "语义切片" })
         XCTAssertEqual(potion.repo, "arlenecc/potion-multilingual-128M-onnx")
         XCTAssertEqual(potion.subpath, "int4")
-        let potionReady = RequiredModelCatalog.isComplete(potion)
-        XCTAssertEqual(missing.count, all.count - (potionReady ? 1 : 0))
+        let readyCount = all.filter { RequiredModelCatalog.isComplete($0) }.count
+        XCTAssertEqual(missing.count, all.count - readyCount)
 
         // 目录里出现权重 + tokenizer.json 即视为就绪（与 registry 同源判定）。
         let embedding = try! XCTUnwrap(

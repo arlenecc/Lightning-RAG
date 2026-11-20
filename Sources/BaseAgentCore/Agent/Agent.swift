@@ -467,9 +467,12 @@ public final class Agent: @unchecked Sendable {
         // 内核决策门（收尾拦截 + 计划评审）：复用 RAG 决策模型单例（懒加载，
         // 失败/未配置时 judge 返回 nil 静默放行），避免重复加载 0.8B 模型。
         if config.kernelDecisionGateEnabled,
-           let scorer = try? ragEngine.sharedDecisionScorer() {
+           let scorer = try? ragEngine.sharedDecisionScorer(),
+           scorer.isModelAvailable {
             kernelLoop.decisionJudge = MeteorKernelJudge(
                 scorer: scorer, threshold: config.kernelDecisionGateThreshold)
+        } else if config.kernelDecisionGateEnabled {
+            log("[decision-gate] 决策模型文件不可用，决策门未启用（静默放行）")
         }
         return kernelLoop
     }()

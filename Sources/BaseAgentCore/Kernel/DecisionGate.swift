@@ -26,6 +26,10 @@ public final class MeteorKernelJudge: KernelDecisionJudge, @unchecked Sendable {
     /// 来自 config.kernelDecisionGateThreshold（默认 0.6，可调 0.4-0.95）。
     /// 阈值越高拦截越保守（越少误拦，但漏拦增多）。
     private let threshold: Double
+    /// 判定失败（模型缺失/加载失败/超时）后整个会话禁用决策门：
+    /// 首次打一条 WARN 便于排查，后续静默放行，避免每轮收尾刷同一条告警。
+    private let lock = NSLock()
+    private var disabled = false
 
     public init(scorer: MeteorDecisionScorer, timeoutSeconds: Double = 10,
                 threshold: Double = 0.6) {
@@ -34,16 +38,27 @@ public final class MeteorKernelJudge: KernelDecisionJudge, @unchecked Sendable {
         self.threshold = threshold
     }
 
-    /// 统一执行：超时/异常 → nil（静默放行），并记录告警便于排查。
+    /// 统一执行：超时/异常 → nil（静默放行）；首次失败后本次会话不再尝试。
     private func judge(_ label: String,
                        state: String, question: String) async -> Double? {
+        lock.lock()
+        let isDisabled = disabled
+        lock.unlock()
+        if isDisabled { return nil }
         do {
             let value = try await withTimeout(seconds: timeoutSeconds) {
                 try await self.scorer.judgeBinary(state: state, question: question)
             }
             return value
         } catch {
-            AgentLog.warning("[decision-gate] \(label) 判定失败，静默放行：\(error.localizedDescription)")
+            lock.lock()
+            let firstFailure = !disabled
+            disabled = true
+            lock.unlock()
+            if firstFailure {
+                AgentLog.warning("[decision-gate] \(label) 判定失败，决策门已禁用（后续静默放行）："
+                    + error.localizedDescription)
+            }
             return nil
         }
     }
