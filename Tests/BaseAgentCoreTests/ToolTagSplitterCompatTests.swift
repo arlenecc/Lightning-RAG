@@ -30,6 +30,13 @@ final class ToolTagSplitterCompatTests: XCTestCase {
         XCTAssertEqual(splitAll([raw]), "说明文字结束")
     }
 
+    /// MiniCPM5 真实输出：tokenizer 吞空格 → <paramname=..>，整块仍须从正文剥离。
+    func testMiniCPMNoSpaceParamStripped() {
+        let raw = "说明<function name=\"rag_tools\">"
+            + "<paramname=\"op\">status</param></function>结束"
+        XCTAssertEqual(splitAll([raw]), "说明结束")
+    }
+
     func testMiniCPMFunctionAcrossChunks() {
         let out = splitAll([
             "开头<fun",

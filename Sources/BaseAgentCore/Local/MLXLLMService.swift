@@ -1732,7 +1732,7 @@ struct ToolTagSplitter {
     /// 只匹配带 name 属性的调用形式，避免把正文里的普通 XML `<function>` 误剥。
     private static func functionOpenRange(in text: String) -> Range<String.Index>? {
         guard let regex = try? NSRegularExpression(
-            pattern: #"<function(?:\s+name\s*=|=)[^>]*>"#) else { return nil }
+            pattern: #"<function(?:\s*name\s*=|=)[^>]*>"#) else { return nil }
         let range = NSRange(text.startIndex..<text.endIndex, in: text)
         guard let match = regex.firstMatch(in: text, options: [], range: range) else { return nil }
         return Range(match.range, in: text)

@@ -20,6 +20,15 @@ final class MiniCPMToolCallTests: XCTestCase {
         XCTAssertEqual(calls.first?.arguments["query"]?.stringValue, "气候变化的影响")
     }
 
+    /// MiniCPM5 真实输出：tokenizer 吞掉标签名后的空格 → <paramname="op">。
+    func testNoSpaceAfterParamTag() {
+        let raw = "<function name=\"rag_tools\"><paramname=\"op\">status</param></function>"
+        let calls = LocalToolCallParser.extract(raw: raw, allowedNames: allowed)
+        XCTAssertEqual(calls.count, 1)
+        XCTAssertEqual(calls.first?.name, "rag_tools")
+        XCTAssertEqual(calls.first?.arguments["op"]?.stringValue, "status")
+    }
+
     func testCDATAValue() {
         let raw = "<function name=\"web_scan\">"
             + "<param name=\"url\"><![CDATA[https://example.com/a?x=1&y=2]]></param>"

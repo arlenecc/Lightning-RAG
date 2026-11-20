@@ -182,18 +182,20 @@ enum LocalToolCallParser {
     private static func callsFromXML(_ payload: String,
                                      allowedNames: Set<String>) -> [ToolCall] {
         guard let functionRange = payload.range(
-            of: #"<function(?:=|\s+name=)["']?([^"'>\s]+)"#, options: .regularExpression)
+            of: #"<function(?:=|\s*name=)["']?([^"'>\s]+)"#, options: .regularExpression)
         else { return [] }
         let functionText = String(payload[functionRange])
         let name = functionText
-            .replacingOccurrences(of: #"<function(?:=|\s+name=)["']?"#,
+            .replacingOccurrences(of: #"<function(?:=|\s*name=)["']?"#,
                                   with: "", options: .regularExpression)
             .trimmingCharacters(in: CharacterSet(charactersIn: "<>\"' "))
         guard !name.isEmpty, allowedNames.contains(name) else { return [] }
 
         var arguments: [String: JSONValue] = [:]
         // Qwen 用 <parameter>，MiniCPM 用 <param>（值可能包在 CDATA 里）。
-        let pattern = #"<param(?:eter)?(?:=|\s+name=)["']?([^"'>\s]+)["']?>\s*([\s\S]*?)\s*</param(?:eter)?>"#
+        // MiniCPM5 tokenizer 会吞掉标签名后的空格，实际输出 <paramname="op">（无空格）；
+        // 用 \s* 允许零到多空白，同时保留 Qwen 的 <parameter=op> 形式。
+        let pattern = #"<param(?:eter)?\s*(?:name\s*=|=)["']?([^"'>\s]+)["']?>\s*([\s\S]*?)\s*</param(?:eter)?>"#
         if let regex = try? NSRegularExpression(pattern: pattern) {
             let range = NSRange(payload.startIndex..<payload.endIndex, in: payload)
             for match in regex.matches(in: payload, options: [], range: range) {
