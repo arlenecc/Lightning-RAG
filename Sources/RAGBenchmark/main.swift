@@ -389,6 +389,18 @@ func writeJSON(normal: PhaseMetrics, colbert: PhaseMetrics,
 @main
 struct RAGBenchmark {
     static func main() async {
+        // --llm-bench 子命令：推理基线测量（阶段 0，见 .trae/documents/mlx-gguf-inference-analysis.md）
+        if let benchIndex = CommandLine.arguments.firstIndex(of: "--llm-bench") {
+            let rest = Array(CommandLine.arguments[(benchIndex + 1)...])
+            do {
+                try await LLMBench.run(rest)
+            } catch {
+                fputs("LLMBench 失败：\(error)\n", stderr)
+                exit(1)
+            }
+            exit(0)
+        }
+
         guard let options = parseArguments() else {
             exit(1)
         }

@@ -1,5 +1,46 @@
 import Foundation
 
+// MARK: - 决策打分日志（供用户对照调整阈值）
+
+/// 每次决策模型打分都输出一条可读日志：分数、生效阈值、判定结果、问句与候选摘要。
+/// 用户可在日志里搜索 `[decision]` 直接看到「概率是多少、阈值是多少、为什么放行/拦截」，
+/// 从而决定把设置窗口里的哪个阈值调高或调低。
+enum DecisionScoreLog {
+    /// 截断长文本，避免一条日志把 state/evidence 全文刷出来。
+    static func brief(_ text: String, limit: Int = 80) -> String {
+        let flat = text.replacingOccurrences(of: "\n", with: " ")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return flat.count <= limit ? flat : String(flat.prefix(limit)) + "…"
+    }
+
+    /// 二元判定（judgeBinary，返回 true 选项概率 0~1）。
+    /// - passed 语义由调用方给出：true=放行/通过，false=拦截。
+    static func binary(label: String, prob: Double, threshold: Double,
+                        passed: Bool, question: String = "", subject: String = "") {
+        var line = "[decision] \(label) prob=\(String(format: "%.3f", prob)) "
+            + "thr=\(String(format: "%.2f", threshold)) "
+            + "→ \(passed ? "PASS" : "BLOCK")"
+        if !subject.isEmpty { line += " target=\(brief(subject, limit: 40))" }
+        if !question.isEmpty { line += " q=\"\(brief(question))\"" }
+        AgentLog.info(line)
+    }
+
+    /// 多候选打分（score，相对相关性分数）。打印每个候选分数与选中项。
+    static func ranked(label: String, names: [String], scores: [Double],
+                       threshold: Double? = nil, picked: String = "",
+                       question: String = "", extra: String = "") {
+        let pairs = zip(names, scores).prefix(20).map {
+            "\($0.0)=\(String(format: "%.3f", $0.1))"
+        }.joined(separator: ", ")
+        var line = "[decision] \(label) scores=[\(pairs)]"
+        if let threshold { line += " thr=\(String(format: "%.2f", threshold))" }
+        if !picked.isEmpty { line += " picked=\(brief(picked, limit: 40))" }
+        if !extra.isEmpty { line += " \(extra)" }
+        if !question.isEmpty { line += " q=\"\(brief(question))\"" }
+        AgentLog.info(line)
+    }
+}
+
 // MARK: - 内核决策门（complete 收尾拦截 + plan_step 计划评审）
 
 /// 内核决策判定协议。返回 nil 表示判定不可用（模型未配置/加载失败/超时），
@@ -79,7 +120,10 @@ public final class MeteorKernelJudge: KernelDecisionJudge, @unchecked Sendable {
                 + "(A: unnecessary or redundant, B: necessary and reasonable)") else {
             return nil
         }
-        return prob >= planThreshold
+        let passed = prob >= planThreshold
+        DecisionScoreLog.binary(label: "plan_step", prob: prob, threshold: planThreshold,
+                                passed: passed, question: goal, subject: step)
+        return passed
     }
 
     public func informationSufficient(task: String, evidence: String) async -> Bool? {
@@ -94,7 +138,10 @@ public final class MeteorKernelJudge: KernelDecisionJudge, @unchecked Sendable {
                 + "(A: insufficient, more information is needed, B: sufficient)") else {
             return nil
         }
-        return prob >= finishThreshold
+        let passed = prob >= finishThreshold
+        DecisionScoreLog.binary(label: "complete", prob: prob, threshold: finishThreshold,
+                                passed: passed, question: task)
+        return passed
     }
 }
 
@@ -183,7 +230,15 @@ public final class MeteorSkillJudge: SkillDecisionJudge, @unchecked Sendable {
             guard let best = scores.indices.max(by: { scores[$0] < scores[$1] }) else { return nil }
             // score 是相对相关性分数，用是否显著高于均值判断"至少有一个合适"。
             let mean = scores.reduce(0, +) / Double(scores.count)
-            return scores[best] > 0 && scores[best] >= mean ? best : -1
+            let chosen = scores[best] > 0 && scores[best] >= mean ? best : -1
+            DecisionScoreLog.ranked(
+                label: "skill_pick", names: candidates.map(\.name), scores: scores,
+                picked: chosen >= 0 ? candidates[chosen].name : "(none)",
+                question: question,
+                extra: "best=\(String(format: "%.3f", scores[best])) "
+                    + "mean=\(String(format: "%.3f", mean)) criterion=best>0&best>=mean "
+                    + "(skill thr=\(String(format: "%.2f", threshold)) 不作用于多技能选取)")
+            return chosen
         } catch {
             lock.lock(); let first = !disabled; disabled = true; lock.unlock()
             if first {
@@ -203,7 +258,10 @@ public final class MeteorSkillJudge: SkillDecisionJudge, @unchecked Sendable {
                                   question: "Is this skill appropriate and useful for the user question "
                                     + "given the conversation state? "
                                     + "(A: no, not appropriate, B: yes, appropriate)") else { return nil }
-        return p >= threshold
+        let passed = p >= threshold
+        DecisionScoreLog.binary(label: "skill_fit", prob: p, threshold: threshold,
+                                passed: passed, question: question, subject: skill.name)
+        return passed
     }
 }
 

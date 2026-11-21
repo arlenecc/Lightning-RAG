@@ -364,6 +364,10 @@ final class AppViewModel: ObservableObject {
     private var didFirstFlush = false
     /// 本轮是否已把游离 `</think>` 之前的思考从正文搬到思考区。
     private var didReclassifyStrayThink = false
+    /// 本条流式消息的正文（含已 flush 到气泡的部分）是否出现过 '<'。
+    /// `</think>` 必然含 '<'；未出现过就绝无可能需要重分类，可跳过每 token 的
+    /// 「整段正文拼接 + 全文扫描」O(n²) 开销。一旦出现则保持 true（标签可能跨 chunk）。
+    private var streamingSawAngleBracket = false
     private var ragStatusRefreshing = false
     private var configGeneration = 0
     /// `applyConfig { sync }` 路径：记住应用配置前已加载的模型，同步结束后再恢复。
@@ -692,6 +696,7 @@ final class AppViewModel: ObservableObject {
         flushScheduled = false
         didFirstFlush = false
         didReclassifyStrayThink = false
+        streamingSawAngleBracket = false
         summaryFilter.reset()
     }
 
@@ -1224,7 +1229,10 @@ final class AppViewModel: ObservableObject {
                 self.pendingToolIndices.removeAll()
                 self.plan = nil
                 self.clearStreamingState()
-                self.agent?.reset()
+                // 保留冻结的 system+tools 前缀：清空后下一轮直接命中预热 KV 快照
+                // （MLX prefix-reuse / GGUF 主对话前缀恢复），只 prefill 新问句，
+                // 不必重跑 7~8k token 的整段 prefill。
+                self.agent?.reset(keepSystemPrefix: true)
                 self.cancelFlag.set(false)
                 // 清空对话后不应残留无人值守状态。
                 self.unattendedFlag.set(false)
@@ -1234,7 +1242,7 @@ final class AppViewModel: ObservableObject {
                 self.tokenSpeed = 0
                 self.statusText = "就绪"
                 self.refreshRAGStatus()
-                self.appendLog("对话已清空")
+                self.appendLog("对话已清空（上下文已复位，保留 system 预热 KV 前缀以加速下一轮）")
                 self.scheduleIdleUnload()
             }
         }
@@ -1841,7 +1849,10 @@ final class AppViewModel: ObservableObject {
         guard streamingID != nil else { return }
         // `<summary>` 是内核协议标签：正文照常进对话，摘要转进思考区。
         let parts = summaryFilter.feed(text)
-        if !parts.content.isEmpty { contentBuffer += parts.content }
+        if !parts.content.isEmpty {
+            if parts.content.contains("<") { streamingSawAngleBracket = true }
+            contentBuffer += parts.content
+        }
         if !parts.summary.isEmpty { reasoningBuffer += parts.summary }
         reclassifyStrayThinking()
         if !parts.content.isEmpty || !parts.summary.isEmpty {
@@ -1853,6 +1864,9 @@ final class AppViewModel: ObservableObject {
     /// 模型跳过 `<think>` 起始标签、直接输出思考并以 `</think>` 收尾时，
     /// 把标签之前的正文改判为思考，避免思考过程停留在对话气泡里。
     private func reclassifyStrayThinking() {
+        // 未出现过 '<' → 不可能有 </think>；普通正文（绝大多数 token）直接跳过，
+        // 省掉每 token 一次「整段正文拼接 + 全文扫描」的 O(n²) 开销。
+        guard streamingSawAngleBracket else { return }
         guard let id = streamingID,
               let index = chatItems.firstIndex(where: { $0.id == id }) else { return }
         let combined = chatItems[index].content + contentBuffer
@@ -1910,7 +1924,12 @@ final class AppViewModel: ObservableObject {
     /// 流结束时取出过滤器里尚未闭合的残留内容。
     private func finishSummaryFilter() {
         let tail = summaryFilter.finish()
-        if !tail.content.isEmpty { contentBuffer += tail.content }
+        if !tail.content.isEmpty {
+            if tail.content.contains("<") { streamingSawAngleBracket = true }
+            contentBuffer += tail.content
+            // 残留内容也可能含游离 </think>，流结束前补一次重分类。
+            reclassifyStrayThinking()
+        }
         if !tail.summary.isEmpty { reasoningBuffer += tail.summary }
     }
 

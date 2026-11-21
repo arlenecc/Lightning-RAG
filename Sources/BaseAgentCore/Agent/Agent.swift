@@ -563,7 +563,7 @@ public final class Agent: @unchecked Sendable {
         }
     }
 
-    public func reset() {
+    public func reset(keepSystemPrefix: Bool = false) {
         session.reset()
         kernel.resetRuntimeState()
         PlanStore.clear(config)
@@ -573,16 +573,24 @@ public final class Agent: @unchecked Sendable {
         // Session.turnIndex 归零后，若不同步复位节流标记，
         // `turn >= lastTidy + 8` 会长期为 false → 清空对话后整理再也不跑。
         markMemoryTidyDone(turn: 0)
-        // 清空对话 = 新段起点：重新读 L0/L1，别沿用上一段的冻结前缀。
-        requestSystemLock.lock()
-        requestSystemPrompt = nil
-        systemFoldEpoch = 0
-        frozenSystemEpoch = -1
-        requestSystemLock.unlock()
+        if !keepSystemPrefix {
+            // 普通清空（配置重载等）：重新读 L0/L1，别沿用上一段的冻结前缀。
+            requestSystemLock.lock()
+            requestSystemPrompt = nil
+            systemFoldEpoch = 0
+            frozenSystemEpoch = -1
+            requestSystemLock.unlock()
+        }
+        // keepSystemPrefix=true 时保持冻结的 system 前缀逐字节不变，
+        // 下一轮 prompt 才能命中预热 KV 快照（prefix-reuse / 主对话快照恢复），
+        // 避免清空对话后反而整段重跑 7~8k token prefill。
+        // L0/L1 文件若真的变了，buildStaticSystemPrompt 的签名缓存会照常
+        // 在折叠边界更新并重新预热，不会让模型用过期 system。
         clearFinishedTurnSnapshot()
         sopReadTracker.reset()
         // 清空对话后 Session 已重置，但本地 LLM 仍持有旧会话的 KV cache；
         // 不失效会让下一轮继续复用已经“被清空”的历史。
+        // 注意：invalidate 只丢弃会话 KV，不清预热 system+tools 前缀快照。
         invalidateKVCache()
     }
 
@@ -672,6 +680,11 @@ public final class Agent: @unchecked Sendable {
                     pair.0.name + "=" + String(format: "%.3f", pair.1)
                 }.joined(separator: ", ")
                 AgentLog.info("[multi-zone] 判定选库：\(desc)")
+                DecisionScoreLog.ranked(
+                    label: "zone_select", names: searchZones.map(\.name), scores: scores,
+                    picked: picked.map(\.name).joined(separator: ","),
+                    question: query,
+                    extra: "topN=\(config.decisionTopN) 无及格线(按分数排序)")
             } catch {
                 AgentLog.warning("[multi-zone] 判定选库失败，沿用 FTS 选库：\(error.localizedDescription)")
             }
@@ -769,6 +782,11 @@ public final class Agent: @unchecked Sendable {
                                 score: pair.1, isPrimary: i == 0)
                 }
                 usedDecision = true
+                DecisionScoreLog.ranked(
+                    label: "zone_fusion_decision",
+                    names: fused20.map { $0.zoneName + "/" + ($0.source as NSString).lastPathComponent },
+                    scores: scores, question: query,
+                    extra: "取 Top\(n)/\(fused20.count) 无及格线(按分数排序)")
                 AgentLog.info("[multi-zone] 判定模式汇总：\(citations.count) 条，"
                     + "耗时 \(Int(Date().timeIntervalSince(started) * 1000))ms")
             } catch {
@@ -879,6 +897,10 @@ public final class Agent: @unchecked Sendable {
                                    progress: nil)
         }
         AgentLog.info("[decision-multi] ①选库判定完成：\(zip(zones, zoneScores).map { "\($0.0.name)=\(String(format: "%.3f", $0.1))" }.joined(separator: ", "))")
+        DecisionScoreLog.ranked(
+            label: "zone_select_strict", names: zones.map(\.name), scores: zoneScores,
+            threshold: 0.4, question: query,
+            extra: "及格线=0.40 保底至少选2库")
         var selected: [(zone: KnowledgeZone, weight: Double)] = []
         for (i, zone) in zones.enumerated() {
             let s = i < zoneScores.count ? zoneScores[i] : 0
@@ -952,6 +974,11 @@ public final class Agent: @unchecked Sendable {
                                    useCoreSentences: self.config.decisionUseCoreSentences,
                                    progress: nil)
         }
+        DecisionScoreLog.ranked(
+            label: "zone_core_decision",
+            names: fused20.map { ($0.source as NSString).lastPathComponent },
+            scores: scores, question: query,
+            extra: "取 Top\(max(1, min(config.decisionTopN, fused20.count))) 无及格线(按分数排序)")
         AgentLog.info("[decision-multi] ④核心句判定完成 \(scores.count) 条，"
             + "耗时 \(Int(Date().timeIntervalSince(scoreStarted) * 1000))ms")
         let n = max(1, min(config.decisionTopN, fused20.count))
@@ -1414,6 +1441,15 @@ public final class Agent: @unchecked Sendable {
     }
 
     private func takeRequestSystemPrompt() -> String? {
+        requestSystemLock.lock(); defer { requestSystemLock.unlock() }
+        return requestSystemPrompt
+    }
+
+    /// 测试用：模拟段内冻结 system 前缀，以及读取当前冻结值。
+    func freezeSystemPrefixForTesting() {
+        freezeRequestSystemPrompt(force: true)
+    }
+    func frozenSystemPrefixForTesting() -> String? {
         requestSystemLock.lock(); defer { requestSystemLock.unlock() }
         return requestSystemPrompt
     }

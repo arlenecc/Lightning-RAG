@@ -225,6 +225,14 @@ public struct AgentConfig: Sendable {
         return max(8_192, min(maxContextTokens, cap))
     }
 
+    /// 上下文窗口使用率（0~100）。totalTokens 是本轮 prompt + 生成 token 之和，
+    /// 即 KV cache 实际占用；钳制到 0~100，避免模型上报略超窗口时显示 >100%。
+    public func contextUsagePercent(totalTokens: Int) -> Int {
+        let window = effectiveMainContextTokens
+        guard window > 0, totalTokens > 0 else { return 0 }
+        return min(100, max(0, Int((Double(totalTokens) / Double(window) * 100).rounded())))
+    }
+
     /// 实际生效的辅助模型上下文：min(配置上下文, KV 硬上限)。
     public var effectiveAuxContextTokens: Int {
         let cap = auxKvCacheMaxTokens > 0 ? auxKvCacheMaxTokens : auxMaxContextTokens

@@ -243,44 +243,52 @@ struct SettingsView: View {
         }
     }
 
-    /// 决策阈值 Picker（0.4–0.9，0.5 为默认）。
+    /// 决策阈值档位：0.30 ~ 0.95，每 0.05 一档（0.50 为默认）。
+    private static let decisionThresholdSteps: [Double] = (6...19).map { Double($0) * 0.05 }
+
+    /// 决策阈值 Picker。用数组下标绑定，避免 Double 浮点相等导致选中项丢失。
     private func decisionThresholdPicker(_ title: String, selection: Binding<Double>,
                                          help: String) -> some View {
-        Picker(title, selection: selection) {
-            Text("0.4").tag(0.4)
-            Text("0.5（默认）").tag(0.5)
-            Text("0.6").tag(0.6)
-            Text("0.7").tag(0.7)
-            Text("0.8").tag(0.8)
-            Text("0.9").tag(0.9)
+        let steps = Self.decisionThresholdSteps
+        let closestIndex = steps.indices.min {
+            abs(steps[$0] - selection.wrappedValue) < abs(steps[$1] - selection.wrappedValue)
+        } ?? 4
+        return Picker(title, selection: Binding(
+            get: { closestIndex },
+            set: { index in
+                guard steps.indices.contains(index) else { return }
+                selection.wrappedValue = steps[index]
+            })) {
+            ForEach(steps.indices, id: \.self) { index in
+                Text(String(format: "%.2f", steps[index])).tag(index)
+            }
         }
         .font(.caption2)
-        .frame(maxWidth: 280)
+        .frame(width: 110)
         .help(help)
     }
 
-    /// 内核决策门与技能判定：三个独立阈值分别可调。
+    /// 决策门一行：启用开关 + 计划完整性/执行完成度/技能符合度三个阈值。
     private var kernelDecisionGateRow: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            HStack(spacing: 14) {
-                Text("决策门")
-                    .font(.caption.weight(.semibold))
-                    .foregroundStyle(.secondary)
-                Toggle("启用内核决策门与技能判定", isOn: $kernelDecisionGateEnabled)
-                    .font(.caption2)
-                    .help("收尾时决策模型判定「信息是否足以完整回答」，计划创建后评审「每步是否必要合理」；"
-                        + "技能检索/加载/摘要注入前也由决策模型判定是否合适。判定失败/超时静默放行。"
-                        + "复用「高级 RAG / 检索模式」中的决策模型，无需额外加载")
-                Spacer(minLength: 8)
-            }
+        HStack(spacing: 10) {
+            Text("决策门")
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.secondary)
+            Toggle("启用", isOn: $kernelDecisionGateEnabled)
+                .font(.caption2)
+                .toggleStyle(.checkbox)
+                .help("收尾时决策模型判定「信息是否足以完整回答」，计划创建后评审「每步是否必要合理」；"
+                    + "技能检索/加载/摘要注入前也由决策模型判定是否合适。判定失败/超时静默放行。"
+                    + "复用「高级 RAG / 检索模式」中的决策模型，无需额外加载")
             if kernelDecisionGateEnabled {
-                decisionThresholdPicker("执行完成度", selection: $kernelFinishGateThreshold,
-                    help: "收尾拦截阈值：信息不足概率高于该值才拦截补工具；越高越保守（越少拦截）")
                 decisionThresholdPicker("计划完整性", selection: $kernelPlanReviewThreshold,
                     help: "计划步骤评审阈值：步骤不必要概率高于该值才提示修订；越高越保守（越少提示）")
-                decisionThresholdPicker("技能判定", selection: $skillDecisionGateThreshold,
+                decisionThresholdPicker("执行完成度", selection: $kernelFinishGateThreshold,
+                    help: "收尾拦截阈值：信息不足概率高于该值才拦截补工具；越高越保守（越少拦截）")
+                decisionThresholdPicker("技能符合度", selection: $skillDecisionGateThreshold,
                     help: "技能加载/摘要注入判定阈值：不合适概率高于该值才拦截；越高越保守（越少拦截）")
             }
+            Spacer(minLength: 4)
         }
     }
 

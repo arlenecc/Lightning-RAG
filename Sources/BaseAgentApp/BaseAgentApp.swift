@@ -129,6 +129,7 @@ struct MainView: View {
     /// 待发送的图片等附件；随首条用户消息传给多模态后端。
     @State private var attachments: [AttachmentItem] = []
     @State private var showAttachmentPicker = false
+    @State private var showClearConversationConfirm = false
 
     var body: some View {
         // 左侧 3/4：对话区从窗口顶部到底部，tokens 与输入区固定在底部；
@@ -144,6 +145,29 @@ struct MainView: View {
         .frame(minWidth: 1100, minHeight: 700)
         .toolbar {
             ToolbarItemGroup(placement: .primaryAction) {
+                // 主动清空对话：丢掉不断累积的历史，直接接着缓存的 system 预热
+                // KV 前缀开新对话，避免上下文越积越多导致每轮 prefill 变慢。
+                Button {
+                    showClearConversationConfirm = true
+                } label: {
+                    Label("清空对话", systemImage: "trash")
+                        .labelStyle(.titleAndIcon)
+                }
+                .disabled(model.isModelLoading || model.isWarmingUp)
+                .help("清空当前对话与上下文；保留已预热的系统提示 KV 缓存，下一轮只 prefill 新问句，恢复推理速度")
+                .confirmationDialog(
+                    "清空当前对话？",
+                    isPresented: $showClearConversationConfirm,
+                    titleVisibility: .visible
+                ) {
+                    Button("清空对话", role: .destructive) {
+                        model.resetConversation()
+                    }
+                    Button("取消", role: .cancel) {}
+                } message: {
+                    Text("会清空对话窗口与累积的上下文（不会删除知识库与记忆文件）。系统提示的 KV 缓存会保留，下一轮可立即恢复速度。")
+                }
+
                 // 与配置窗口内「开始同步」一致的快捷入口：目录已配置时无需进设置。
                 Button {
                     model.syncAllKnowledge(force: false)
@@ -694,10 +718,12 @@ struct MainView: View {
 
             Text(tokenSummary)
                 .font(.caption2)
-                .foregroundStyle(.secondary)
+                .foregroundStyle(contextUsagePercent >= 85 ? Color.orange : Color.secondary)
                 .frame(maxWidth: .infinity)
                 .multilineTextAlignment(.center)
                 .padding(.top, 6)
+                .help("上下文占用 = 本轮 prompt + 已生成 token 占实际生效上下文窗口的比例；"
+                    + "接近上限时内核会折叠历史或重建上下文")
 
             // 待发送附件缩略图；用户可在发送前逐个移除。
             if !attachments.isEmpty {
@@ -843,12 +869,22 @@ struct MainView: View {
                 || model.isBuildingANN)
     }
 
+    /// 当前上下文窗口使用率（分母为实际生效的主模型上下文窗口）。
+    private var contextUsagePercent: Int {
+        model.config.contextUsagePercent(totalTokens: model.totalTokens)
+    }
+
     private var tokenSummary: String {
-        if model.tokenSpeed > 0 {
-            return "\(model.totalTokens) tokens · "
+        var text = model.tokenSpeed > 0
+            ? "\(model.totalTokens) tokens · "
                 + String(format: "%.1f", model.tokenSpeed) + " tok/s"
+            : "\(model.totalTokens) tokens"
+        let window = model.config.effectiveMainContextTokens
+        if window > 0, model.totalTokens > 0 {
+            text += " · 上下文 \(contextUsagePercent)%"
+                + "（\(model.totalTokens)/\(window)）"
         }
-        return "\(model.totalTokens) tokens"
+        return text
     }
 
     private func chatBubble(_ item: ChatItem) -> some View {

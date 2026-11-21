@@ -623,11 +623,17 @@ public enum AgentLog {
     /// 当前日志文件句柄与日期（只在 queue 内访问，天然串行）。
     nonisolated(unsafe) private static var logHandle: FileHandle?
     nonisolated(unsafe) private static var logDate: String = ""
+    /// 复用 DateFormatter（创建成本高，旧实现每条日志新建两个）。
+    /// 所有调用都在 info() 的 queue.sync 内，串行访问无需额外加锁。
+    nonisolated(unsafe) private static let dayFormatter: DateFormatter = {
+        let f = DateFormatter(); f.dateFormat = "yyyyMMdd"; return f
+    }()
+    nonisolated(unsafe) private static let timeFormatter: DateFormatter = {
+        let f = DateFormatter(); f.dateFormat = "HH:mm:ss"; return f
+    }()
 
     private static func appendToFile(_ line: String) {
-        let f = DateFormatter()
-        f.dateFormat = "yyyyMMdd"
-        let day = f.string(from: Date())
+        let day = dayFormatter.string(from: Date())
         if day != logDate || logHandle == nil {
             try? FileManager.default.createDirectory(at: logDirectory,
                                                      withIntermediateDirectories: true)
@@ -671,8 +677,6 @@ public enum AgentLog {
     public static func error(_ message: String) { info("ERROR \(message)") }
 
     private static func timestamp() -> String {
-        let f = DateFormatter()
-        f.dateFormat = "HH:mm:ss"
-        return f.string(from: Date())
+        timeFormatter.string(from: Date())
     }
 }

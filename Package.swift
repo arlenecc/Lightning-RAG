@@ -45,8 +45,8 @@ let package = Package(
         // llama.cpp 官方 XCFramework：进程内 GGUF 加载（LLM / VLM / Embedding）
         .binaryTarget(
             name: "llama",
-            url: "https://github.com/ggml-org/llama.cpp/releases/download/b11815/llama-b11815-xcframework.zip",
-            checksum: "a7d14f886fc7d15edcf505b84ddba2e05c1bf2222a8dc6d7bcf57b7810aa7174"
+            url: "https://github.com/ggml-org/llama.cpp/releases/download/b12602/llama-b12602-xcframework.zip",
+            checksum: "8dd3a69339f80f622bcac6ca8592509ee201473e66cda0aefc3ed22578789bbb"
         ),
         // CGPDF C 级 API 的 Swift shim：提取扫描页内嵌整页 JPEG（跳过栅格化）
         .target(

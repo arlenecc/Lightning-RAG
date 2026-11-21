@@ -4091,6 +4091,11 @@ public final class RAGEngine {
                     }
                 })
         }
+        DecisionScoreLog.ranked(
+            label: "rag_decision",
+            names: coarse.map { ($0.source as NSString).lastPathComponent },
+            scores: scores, question: query,
+            extra: "topN=\(max(1, max(topK, config.decisionTopN))) 无及格线(按分数排序)")
         // 3) 按判定分排序，取 TopN（top_k 与配置 decisionTopN 取较大者，保证工具契约）。
         // 同分按 BM25 原始名次稳定排序，避免并列时结果抖动。
         let n = max(1, max(topK, config.decisionTopN))

@@ -46,6 +46,12 @@ public final class LlamaCppLLMService: LLMService, PreloadableLLMService,
     /// 隔离请求（知识图谱抽取）每片 system 前缀相同，恢复快照后只需
     /// prefill 切片正文；混合 SSM（无法按位置裁剪）同样适用。
     private var warmupStateData: Data?
+    /// 主对话专用的 system+tools 前缀状态快照（与 isolated 的 warmupStateData 分离，
+    /// 避免两类请求交替时互相顶掉）。折叠/取消调用 invalidateKVCache() 时**不清**，
+    /// 下一轮 rebuild 可恢复，省掉 7~8k token 的整段 prefill。
+    private var mainPrefixStateData: Data?
+    private var mainPrefixTokens: [llama_token] = []
+    private var mainPrefixSignature = ""
     /// `llama_memory_seq_rm` 是否可用。llama.h 明确：partial sequence 裁剪
     /// 在 hybrid/recurrent memory 上会返回 false（只有删除整个序列才保证
     /// 成功）。Qwen3.5 等混合 SSM 模型因此每轮生成后的 `trim` 都会走到
@@ -148,6 +154,9 @@ public final class LlamaCppLLMService: LLMService, PreloadableLLMService,
         warmupToolsKey = nil
         warmupTokens = []
         warmupStateData = nil
+        mainPrefixStateData = nil
+        mainPrefixTokens = []
+        mainPrefixSignature = ""
         // 换模型后要重新探测：旧实例是混合 SSM，新实例可能是标准 attention。
         seqRmSupported = true
         lock.unlock()
@@ -194,10 +203,42 @@ public final class LlamaCppLLMService: LLMService, PreloadableLLMService,
 
             let loaded = try ensureLoadedLocked()
             try warmupLocked(loaded: loaded, systemPrompt: systemPrompt, tools: tools)
-            // 不在公共 warmup 里抓快照：主模型的对话前缀可能上万 token，
-            // 常驻一份 KV 字节副本会明显多占内存，而主模型不会走隔离请求。
-            // 快照只为隔离请求（知识图谱抽取）按需生成，见 run()。
+            // 主对话前缀快照：折叠/清空历史会 invalidateKVCache() 丢掉会话 KV，
+            // 旧实现下一轮只能整段重建（实测 7~8k token prefill 需 7~8s）。
+            // 这里在内存恰好停在预热前缀时抓一份字节快照，供 rebuild 时恢复。
+            // 只在 ≤8_192 token 时抓，避免常驻内存过大；与 isolated 快照分离。
+            let signature = Self.mainPrefixSignature(
+                modelPath: modelPath, contextWindow: contextWindow,
+                kvInt8: kvInt8, flashAttention: flashAttention,
+                systemPrompt: systemPrompt, toolsKey: Self.toolsKey(tools))
+            // warmupLocked 可能因前缀过短（<32）或模板不支持而跳过预热，
+            // 此时 warmupTokens 为空/陈旧，绝不能抓快照（否则恢复空状态污染 KV）。
+            if !warmupTokens.isEmpty, warmupTokens.count <= 8_192,
+               warmupSystemPrompt == systemPrompt,
+               Self.toolsKey(tools) == warmupToolsKey,
+               cachedTokens == warmupTokens,
+               let snapshot = Self.captureSequenceState(context: loaded.context) {
+                mainPrefixStateData = snapshot
+                mainPrefixTokens = warmupTokens
+                mainPrefixSignature = signature
+                AgentLog.info("[gguf-warmup] 主对话前缀快照 tokens=\(warmupTokens.count)")
+            }
         }
+    }
+
+    /// 快照签名：模型/context/KV 量化/FA/system/tools 任一变化都必须失效。
+    /// 用完整内容做 FNV-1a，避免长度相同但内容不同的 system/tools 误命中。
+    private static func mainPrefixSignature(modelPath: String, contextWindow: Int,
+                                            kvInt8: Bool, flashAttention: Bool,
+                                            systemPrompt: String, toolsKey: String) -> String {
+        let raw = [modelPath, String(contextWindow), String(kvInt8), String(flashAttention),
+                   systemPrompt, toolsKey].joined(separator: "|")
+        var hash: UInt64 = 0xcbf29ce484222325
+        for byte in raw.utf8 {
+            hash ^= UInt64(byte)
+            hash = hash &* 0x100000001b3
+        }
+        return String(hash, radix: 16)
     }
 
     /// 预填充 system + tools 前缀（调用方需持有 gate 与 lock）。
@@ -323,13 +364,9 @@ public final class LlamaCppLLMService: LLMService, PreloadableLLMService,
                 return
             }
 
-            let basePrompt = try LlamaCppPromptRenderer.render(
-                template: model.chatTemplate,
-                model: model,
-                messages: messages,
-                tools: tools,
-                enableThinking: enableThinking,
-                addGenerationPrompt: false)
+            // 只渲染一次带 generation prompt 的完整 prompt。
+            // 旧实现额外渲染 addGenerationPrompt:false 的版本并计算 generationPrefix，
+            // 但两者结果从未被使用（纯 CPU 浪费：7~8k token 模板的第二次 Jinja 渲染）。
             let prompt = try LlamaCppPromptRenderer.render(
                 template: model.chatTemplate,
                 model: model,
@@ -338,8 +375,6 @@ public final class LlamaCppLLMService: LLMService, PreloadableLLMService,
                 enableThinking: enableThinking,
                 addGenerationPrompt: true)
             let tokens = try model.tokenize(prompt, addSpecial: true)
-            let generationPrefix = LlamaCppPromptRenderer.generationPrefix(
-                full: prompt, base: basePrompt)
             guard !tokens.isEmpty else {
                 throw AgentError.llm("GGUF prompt 为空")
             }
@@ -399,6 +434,34 @@ public final class LlamaCppLLMService: LLMService, PreloadableLLMService,
                 }
             }
             let reuseAllowed = kvReuse && !isolated
+            // 主对话折叠/取消后 cachedTokens 被 invalidateKVCache() 清空，旧实现
+            // 下一轮只能整段重建（7~8k token prefill 实测 7~8s）。这里在会话缓存
+            // 为空、且签名/前缀都匹配时恢复预热快照，让后续自然走 append 增量。
+            // 恢复失败或任一条件不满足 → 保持原状，回退到既有 rebuild 路径。
+            let mainSignature = Self.mainPrefixSignature(
+                modelPath: modelPath, contextWindow: contextWindow,
+                kvInt8: kvInt8, flashAttention: flashAttention,
+                systemPrompt: systemPrompt, toolsKey: toolsKey)
+            if reuseAllowed, cachedTokens.isEmpty,
+               let snapshot = mainPrefixStateData,
+               mainSignature == mainPrefixSignature,
+               !mainPrefixTokens.isEmpty,
+               tokens.count > mainPrefixTokens.count,
+               Array(tokens.prefix(mainPrefixTokens.count)) == mainPrefixTokens {
+                llama_memory_clear(loaded.memory, true)
+                if Self.restoreSequenceState(snapshot, context: loaded.context) {
+                    cachedTokens = mainPrefixTokens
+                    cachedToolsKey = toolsKey
+                    AgentLog.info("[gguf-kv] 主对话恢复前缀快照 tokens=\(mainPrefixTokens.count) "
+                        + "只 prefill \(tokens.count - mainPrefixTokens.count)")
+                } else {
+                    // 恢复失败：清账目，让既有 rebuild 路径整段重建（不破坏正确性）。
+                    cachedTokens = []
+                    cachedToolsKey = nil
+                    mainPrefixStateData = nil
+                    AgentLog.warning("[gguf-kv] 主对话快照恢复失败，回退整段重建")
+                }
+            }
             if !reuseAllowed && !restoredPrefix {
                 // 关闭复用或一次性请求：丢弃上一轮缓存并整段重建，
                 // 避免把其它分片/会话的 KV 当作当前 prompt 的前缀。
@@ -635,7 +698,9 @@ public final class LlamaCppLLMService: LLMService, PreloadableLLMService,
             minP: minP, repetitionPenalty: repetitionPenalty)
         let sampler = LlamaCppSampler(vocabSize: model.vocabSize, config: sampling)
         var thinkSplitter = ThinkSplitter(startInThink: startInThink)
-        var toolSplitter = ToolTagSplitter()
+        // 与 MLX 侧同源的跨 chunk 内容净化器：MiniCPM5 把 <function ...> 切成碎块，
+        // 旧 ToolTagSplitter 逐 chunk 匹配不到完整起始标签，XML 会泄漏到正文。
+        var contentSanitizer = ContentSanitizer()
         var decoder = LlamaCppUTF8StreamDecoder()
         var rawContent = ""
         var generated: [llama_token] = []
@@ -650,7 +715,7 @@ public final class LlamaCppLLMService: LLMService, PreloadableLLMService,
                             kind: .reasoning, content: piece.text))
                     }
                 } else {
-                    for visible in toolSplitter.feed(piece.text) where !visible.isEmpty {
+                    for visible in contentSanitizer.feed(piece.text) where !visible.isEmpty {
                         continuation.yield(LLMStreamEvent(
                             kind: .content, content: visible))
                     }
@@ -685,13 +750,13 @@ public final class LlamaCppLLMService: LLMService, PreloadableLLMService,
                             kind: .reasoning, content: piece.text))
                     }
                 } else {
-                    for visible in toolSplitter.feed(piece.text) where !visible.isEmpty {
+                    for visible in contentSanitizer.feed(piece.text) where !visible.isEmpty {
                         continuation.yield(LLMStreamEvent(
                             kind: .content, content: visible))
                     }
                 }
             }
-            for visible in toolSplitter.flush() where !visible.isEmpty {
+            for visible in contentSanitizer.flush() where !visible.isEmpty {
                 continuation.yield(LLMStreamEvent(kind: .content, content: visible))
             }
         } catch {
@@ -865,6 +930,9 @@ public final class LlamaCppLLMService: LLMService, PreloadableLLMService,
         }
     }
 
+    /// toolsKey 用于 KV 前缀签名：必须与工具内容逐字节一致，
+    /// 任何基于 count/身份的缓存都可能在 MCP 动态变更时误判并破坏 KV 复用。
+    /// 保持每次精确序列化（成本 ~0.1ms，远小于其守护的正确性）。
     private static func toolsKey(_ tools: [JSONValue]) -> String {
         tools.map { $0.jsonString() }.joined(separator: "\n")
     }

@@ -1709,6 +1709,14 @@ struct ContentSanitizer {
 
     mutating func feed(_ chunk: String) -> [String] {
         buffer += chunk
+        // 短路：绝大多数 token 是普通正文（不含 '<'）。此时不可能有工具标签或
+        // 半截标签，直接放行，跳过正则匹配与全 buffer 扫描。只有出现 '<' 才走
+        // 完整检测，避免长输出下每 token 的 O(buffer) 字符串操作。
+        if !buffer.contains("<") {
+            let out = buffer
+            buffer = ""
+            return out.isEmpty ? [] : [out]
+        }
         let cleaned = ToolTagSplitter.stripFunctionBlocks(buffer)
         // 若有未闭合的工具起始标签（<function...> / <tool_call>），整段留在 buffer
         // 等 </function> 到达后一起剥掉，绝不提前放行。
@@ -1835,14 +1843,18 @@ struct ToolTagSplitter {
     /// 剥掉文本里完整的工具调用 XML 块：
     /// - MiniCPM 裸 `<function ...>...</function>`
     /// - Qwen / GLM4 / Spark 的 `<tool_call>...</tool_call>`（JSON / arg_key 方言）
+    /// 预编译一次：流式净化器每收到一个 token chunk 都会调用本方法，
+    /// 旧实现每次重建两条 NSRegularExpression（长输出下是显著 CPU 开销）。
+    private static let toolBlockRegexes: [NSRegularExpression] = [
+        #"<function(?:\s*name\s*=|=)[^>]*>[\s\S]*?</function>"#,
+        #"<tool_call>[\s\S]*?</tool_call>"#,
+    ].compactMap {
+        try? NSRegularExpression(pattern: $0, options: [.dotMatchesLineSeparators])
+    }
+
     static func stripToolBlocks(_ text: String) -> String {
         var result = text
-        for pattern in [
-            #"<function(?:\s*name\s*=|=)[^>]*>[\s\S]*?</function>"#,
-            #"<tool_call>[\s\S]*?</tool_call>"#,
-        ] {
-            guard let regex = try? NSRegularExpression(
-                pattern: pattern, options: [.dotMatchesLineSeparators]) else { continue }
+        for regex in Self.toolBlockRegexes {
             let range = NSRange(result.startIndex..<result.endIndex, in: result)
             result = regex.stringByReplacingMatches(in: result, options: [], range: range,
                                                    withTemplate: "")
@@ -1855,9 +1867,11 @@ struct ToolTagSplitter {
 
     /// 定位裸 `<function name="...">` 或 `<function=...>` 起始标签。
     /// 只匹配带 name 属性的调用形式，避免把正文里的普通 XML `<function>` 误剥。
+    private static let functionOpenRegex = try? NSRegularExpression(
+        pattern: #"<function(?:\s*name\s*=|=)[^>]*>"#)
+
     private static func functionOpenRange(in text: String) -> Range<String.Index>? {
-        guard let regex = try? NSRegularExpression(
-            pattern: #"<function(?:\s*name\s*=|=)[^>]*>"#) else { return nil }
+        guard let regex = Self.functionOpenRegex else { return nil }
         let range = NSRange(text.startIndex..<text.endIndex, in: text)
         guard let match = regex.firstMatch(in: text, options: [], range: range) else { return nil }
         return Range(match.range, in: text)
