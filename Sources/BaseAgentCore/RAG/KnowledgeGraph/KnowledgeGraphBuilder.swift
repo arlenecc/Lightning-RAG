@@ -95,14 +95,24 @@ public final class KnowledgeGraphBuilder {
     // MARK: - 全量构建
 
     public func build(progress: ((Int, Int, String) -> Void)? = nil,
-                      log: ((String) -> Void)? = nil) async throws -> BuildStats {
+                      log: ((String) -> Void)? = nil,
+                      extraChunkRefs: [KnowledgeGraphStore.ChunkListItem] = []) async throws -> BuildStats {
         try store.markBuildState(.building)
         try store.prepareExtractionCache(version: Self.extractionCacheVersion)
         store.pruneSummaryCache()
         await store.loadTokenCounter()
 
-        let chunkRefs = try store.listChunkRefs()
-        log?("[kg] 开始抽取知识图谱，共 \(chunkRefs.count) 个切片")
+        // extraChunkRefs 非空时代表调用方提供了完整的跨库/跨模式切片集合
+        // （含默认库自身切片，id 带 zone 前缀），此时不再重复读本地 chunks 表。
+        let chunkRefs: [KnowledgeGraphStore.ChunkListItem]
+        if extraChunkRefs.isEmpty {
+            chunkRefs = try store.listChunkRefs()
+            log?("[kg] 开始抽取知识图谱，共 \(chunkRefs.count) 个切片")
+        } else {
+            var seen = Set<String>()
+            chunkRefs = extraChunkRefs.filter { seen.insert($0.id).inserted }
+            log?("[kg] 开始抽取知识图谱，共 \(chunkRefs.count) 个切片（跨分区/跨模式聚合源）")
+        }
         let extractStart = Date()
         var (entityAcc, relationAcc, stats) = try await extractAll(
             chunkRefs, progress: progress, log: log)
@@ -121,7 +131,9 @@ public final class KnowledgeGraphBuilder {
             + String(format: "%.1fs", Date().timeIntervalSince(finalizeStart)))
 
         // 原子替换：此前的数据库/快照在失败时保持可用。
-        try store.replaceAll(entities: finalizedEntities, relationships: finalizedRelations)
+        // 外部源（跨分区/colbert）切片原文一并落库，供实体/关系 source_ids 反查归因。
+        try store.replaceAll(entities: finalizedEntities, relationships: finalizedRelations,
+                             externalChunks: extraChunkRefs)
 
         let targets = store.vectorTargets(entities: finalizedEntities,
                                           relationships: finalizedRelations)

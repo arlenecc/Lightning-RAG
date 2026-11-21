@@ -103,6 +103,23 @@ public final class KnowledgeGraphStore: @unchecked Sendable {
         );
         CREATE INDEX IF NOT EXISTS idx_kg_vectors_target ON \(Self.kgVectorsTable)(target_type, target_id);
 
+        -- 跨分区 / 极速模式图谱抽取的切片原文：这些切片的 id 带 zone 前缀，
+        -- 不在本地 chunks 表，实体/关系的 source_ids 指向这里才能反查归因。
+        CREATE TABLE IF NOT EXISTS kg_external_chunks (
+            id TEXT PRIMARY KEY,
+            text TEXT NOT NULL,
+            source TEXT NOT NULL DEFAULT '',
+            heading TEXT NOT NULL DEFAULT ''
+        );
+
+        -- 检索关键词缓存：同一 query 不必每次跑辅助模型抽取（检索热路径）。
+        CREATE TABLE IF NOT EXISTS kg_keyword_cache (
+            query TEXT PRIMARY KEY,
+            high_level TEXT NOT NULL,
+            low_level TEXT NOT NULL,
+            updated_at REAL NOT NULL
+        );
+
         CREATE TABLE IF NOT EXISTS \(Self.vectorRowidsTable) (
             rowid INTEGER PRIMARY KEY AUTOINCREMENT,
             target_type TEXT NOT NULL,
@@ -349,12 +366,15 @@ public final class KnowledgeGraphStore: @unchecked Sendable {
                                [.text(chunkID)]))?.stringValue
     }
 
-    /// 优先按 chunk id（断点续跑），再按内容哈希（跨重建复用同一正文的抽取结果）。
+    /// 优先按 chunk id（断点续跑，但必须内容哈希一致，否则正文改写会复用过期结果），
+    /// 再按内容哈希（跨重建复用同一正文的抽取结果）。
     public func cachedExtraction(chunkID: String, contentHash: String) -> String? {
         lock.lock(); defer { lock.unlock() }
-        if let hit = try? db.scalar("""
-        SELECT output FROM \(Self.extractionCacheTable) WHERE chunk_id = ?
-        """, [.text(chunkID)]).stringValue {
+        if !contentHash.isEmpty,
+           let hit = try? db.scalar("""
+           SELECT output FROM \(Self.extractionCacheTable)
+           WHERE chunk_id = ? AND content_hash = ?
+           """, [.text(chunkID), .text(contentHash)]).stringValue {
             return hit
         }
         guard !contentHash.isEmpty else { return nil }
@@ -626,7 +646,9 @@ public final class KnowledgeGraphStore: @unchecked Sendable {
     }
 
     /// 原子替换全部实体/关系（全量构建成功后才落地，失败不影响旧图谱）。
-    public func replaceAll(entities: [KGEntity], relationships: [KGRelationship]) throws {
+    /// externalChunks 为跨分区/极速模式抽取用的外部切片原文，供 source_ids 反查。
+    public func replaceAll(entities: [KGEntity], relationships: [KGRelationship],
+                           externalChunks: [ChunkListItem] = []) throws {
         lock.lock(); defer { lock.unlock() }
         try db.transaction {
             try deleteAllVectorsLocked()
@@ -634,6 +656,13 @@ public final class KnowledgeGraphStore: @unchecked Sendable {
             try db.execute("DELETE FROM \(Self.relationshipsTable)")
             // 全量重建后由调用方重新标记成功的切片，旧标记先清空。
             try db.execute("DELETE FROM \(Self.processedChunksTable)")
+            try db.execute("DELETE FROM kg_external_chunks")
+            for chunk in externalChunks {
+                try db.execute("INSERT OR REPLACE INTO kg_external_chunks(id,text,source,heading) "
+                               + "VALUES(?,?,?,?)",
+                               [.text(chunk.id), .text(chunk.text),
+                                .text(chunk.source), .text(chunk.heading)])
+            }
             for entity in entities { try writeEntityLocked(entity) }
             for rel in relationships { try writeRelationshipLocked(rel) }
         }
@@ -892,6 +921,56 @@ public final class KnowledgeGraphStore: @unchecked Sendable {
         return out
     }
 
+    /// 检索关键词缓存（query 精确匹配；LLM 抽取约 1.5s，热路径必须缓存）。
+    public func cachedKeywords(for query: String) -> (high: [String], low: [String])? {
+        lock.lock(); defer { lock.unlock() }
+        guard let rows = try? db.query("SELECT high_level, low_level FROM kg_keyword_cache WHERE query = ?",
+                                       [.text(query)]),
+              let row = rows.first,
+              let highB64 = row["high_level"]?.stringValue,
+              let lowB64 = row["low_level"]?.stringValue,
+              let highData = Data(base64Encoded: highB64),
+              let lowData = Data(base64Encoded: lowB64),
+              let high = try? JSONDecoder().decode([String].self, from: highData),
+              let low = try? JSONDecoder().decode([String].self, from: lowData) else { return nil }
+        return (high, low)
+    }
+
+    public func cacheKeywords(query: String, high: [String], low: [String]) {
+        guard let highJSON = try? JSONEncoder().encode(high).base64EncodedString(),
+              let lowJSON = try? JSONEncoder().encode(low).base64EncodedString() else { return }
+        lock.lock(); defer { lock.unlock() }
+        try? db.execute("""
+        INSERT INTO kg_keyword_cache(query, high_level, low_level, updated_at)
+        VALUES(?,?,?,?) ON CONFLICT(query) DO UPDATE SET
+            high_level = excluded.high_level, low_level = excluded.low_level,
+            updated_at = excluded.updated_at
+        """, [.text(query), .text(highJSON), .text(lowJSON), .double(Date().timeIntervalSince1970)])
+    }
+
+    /// 图谱重建后关键词缓存仍有效（只依赖 query 文本），但保留容量上限防止无限增长。
+    public func pruneKeywordCache(limit: Int = 2000) {
+        lock.lock(); defer { lock.unlock() }
+        try? db.execute("""
+        DELETE FROM kg_keyword_cache WHERE query NOT IN
+            (SELECT query FROM kg_keyword_cache ORDER BY updated_at DESC LIMIT ?)
+        """, [.int(Int64(limit))])
+    }
+
+    /// 外部源（跨分区/极速模式）切片列表，供增量哈希比对使用。
+    public func listExternalChunkRefs() -> [ChunkListItem] {
+        lock.lock(); defer { lock.unlock() }
+        guard let rows = try? db.query("SELECT id, text, source, heading FROM kg_external_chunks") else {
+            return []
+        }
+        return rows.compactMap { row in
+            guard let id = row["id"]?.stringValue, let text = row["text"]?.stringValue else { return nil }
+            return ChunkListItem(id: id, text: text,
+                                 source: row["source"]?.stringValue ?? "",
+                                 heading: row["heading"]?.stringValue ?? "")
+        }
+    }
+
     public func chunkRefs(ids: [String]) throws -> [ChunkRef] {
         guard !ids.isEmpty else { return [] }
         lock.lock(); defer { lock.unlock() }
@@ -901,11 +980,26 @@ public final class KnowledgeGraphStore: @unchecked Sendable {
         while offset < ids.count {
             let batch = Array(ids[offset..<min(offset + 400, ids.count)])
             let placeholders = Array(repeating: "?", count: batch.count).joined(separator: ",")
-            let rows = try db.query("""
+            let args: [SQLValue] = batch.map { .text($0) }
+            // 本地 chunks 表不存在（纯图谱库/测试库）时容错，继续查外部表。
+            if let rows = try? db.query("""
             SELECT id, text, source, heading FROM \(VectorStore.chunksTable)
             WHERE id IN (\(placeholders))
-            """, batch.map { .text($0) })
-            for row in rows {
+            """, args) {
+                for row in rows {
+                    guard let cid = row["id"]?.stringValue else { continue }
+                    out.append(ChunkRef(id: cid,
+                                        text: row["text"]?.stringValue ?? "",
+                                        source: row["source"]?.stringValue ?? "",
+                                        heading: row["heading"]?.stringValue ?? ""))
+                }
+            }
+            // 跨分区 / 极速模式的外部切片（带 zone 前缀 id）不在本地 chunks 表。
+            let external = try db.query("""
+            SELECT id, text, source, heading FROM kg_external_chunks
+            WHERE id IN (\(placeholders))
+            """, args)
+            for row in external {
                 guard let cid = row["id"]?.stringValue else { continue }
                 out.append(ChunkRef(id: cid,
                                     text: row["text"]?.stringValue ?? "",

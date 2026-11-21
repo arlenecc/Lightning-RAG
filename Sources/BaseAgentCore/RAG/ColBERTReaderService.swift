@@ -252,6 +252,14 @@ public final class ColBERTReaderService: @unchecked Sendable {
         return try engine.totalChunkCount()
     }
 
+    /// 全库切片正文（供知识图谱抽取，不加载模型）。
+    public func listAllChunkTexts() throws -> [(id: String, text: String, source: String, heading: String)] {
+        let engine = try ensureEngineInstance()
+        opLock.lock()
+        defer { opLock.unlock() }
+        return try engine.listAllChunkTexts()
+    }
+
     /// 预加载模型并常驻，让首次检索不再现加载。
     public func preload() async throws {
         let engine = try await ensureEngine()

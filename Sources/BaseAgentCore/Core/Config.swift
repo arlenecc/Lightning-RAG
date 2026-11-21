@@ -417,6 +417,9 @@ public struct AgentConfig: Sendable {
     public var ragMode: String = "vector"
     /// 决策模型后端：mlx-lm / mlx-vlm / gguf。
     public var decisionModelBackend: String = "mlx-vlm"
+    /// 决策模型种类：meteor（readout 头）或 valen（MixerHead）。决定 scorer 后端，
+    /// 影响内核决策门、RAG 决策检索与技能判定。
+    public var decisionModelKind: String = "meteor"
     /// 决策模型目录（相对 workspace 或绝对路径）。
     public var decisionModelPath: String = "models/PKU-KCL-Meteor-0.8B-mlx-int4"
     /// BM25 粗筛候选数（20/50/100，默认 50）。
@@ -435,12 +438,27 @@ public struct AgentConfig: Sendable {
     /// 「已收集信息是否足以完整回答」，计划创建后评审「每步是否必要合理」。
     /// 判定失败/超时一律静默放行，不影响主流程。
     public var kernelDecisionGateEnabled: Bool = true
-    /// 决策门拦截阈值（不足/不必要概率高于该值才触发干预）。
-    public var kernelDecisionGateThreshold: Double = 0.6
+    /// 执行完成度（收尾拦截）阈值：信息不足概率 ≥ 该值才拦截。
+    /// 默认 0.5：模拟对比显示 0.5 相对 0.6 拦截更准（B 18/18 且拦截后均成功）。
+    public var kernelFinishGateThreshold: Double = 0.5
+    /// 计划完整性（步骤评审）阈值：步骤不必要概率 ≥ 该值才提示修订。
+    public var kernelPlanReviewThreshold: Double = 0.5
+    /// 旧版统一阈值字段：保留兼容，读写转发到执行完成度阈值。
+    /// 新配置请用 kernelFinishGateThreshold / kernelPlanReviewThreshold 分开控制。
+    public var kernelDecisionGateThreshold: Double {
+        get { kernelFinishGateThreshold }
+        set { kernelFinishGateThreshold = newValue }
+    }
     /// 单次会话内收尾拦截的最大次数（超过后放行，防止死循环）。
     public var kernelDecisionGateMaxFinishBlocks: Int = 2
     /// 每个计划创建后评审提示的最大次数。
     public var kernelDecisionGateMaxPlanReviews: Int = 1
+    /// 技能加载判定：技能检索结果在加载使用前，由决策模型根据问句/对话状态
+    /// 判定选哪一个（多技能）或是否合适（单技能）；不合适禁止加载。
+    /// 判定失败/超时静默放行。
+    public var skillDecisionGateEnabled: Bool = true
+    /// 技能判定阈值（合适/相关概率 ≥ 阈值才加载）。默认 0.5，与内核决策门一致。
+    public var skillDecisionGateThreshold: Double = 0.5
 
     /// 当前是否启用极速检索（兼容旧字段与三选一模式）。
     public var isColbertMode: Bool { ragMode == "colbert" }
@@ -765,6 +783,7 @@ public struct AgentConfig: Sendable {
         if let v = bool("rag_verify_fingerprint") { ragVerifyFingerprint = v }
         if let v = string("rag_mode") { ragMode = v }
         if let v = string("decision_model_backend") { decisionModelBackend = v }
+        if let v = string("decision_model_kind") { decisionModelKind = v }
         if let v = string("decision_model_path") { decisionModelPath = v }
         if let v = int("decision_coarse_candidates") {
             decisionCoarseCandidates = [20, 50, 100].contains(v) ? v : 50
@@ -778,14 +797,25 @@ public struct AgentConfig: Sendable {
         }
         if let v = bool("multi_zone_use_decision_judge") { multiZoneUseDecisionJudge = v }
         if let v = bool("kernel_decision_gate_enabled") { kernelDecisionGateEnabled = v }
+        // 旧键 kernel_decision_gate_threshold 兼容：只作为执行完成度阈值的后备。
         if let v = double("kernel_decision_gate_threshold") {
-            kernelDecisionGateThreshold = min(max(0.4, v), 0.95)
+            kernelFinishGateThreshold = min(max(0.4, v), 0.95)
+        }
+        if let v = double("kernel_finish_gate_threshold") {
+            kernelFinishGateThreshold = min(max(0.4, v), 0.95)
+        }
+        if let v = double("kernel_plan_review_threshold") {
+            kernelPlanReviewThreshold = min(max(0.4, v), 0.95)
         }
         if let v = int("kernel_decision_gate_max_finish_blocks") {
             kernelDecisionGateMaxFinishBlocks = min(max(0, v), 5)
         }
         if let v = int("kernel_decision_gate_max_plan_reviews") {
             kernelDecisionGateMaxPlanReviews = min(max(0, v), 3)
+        }
+        if let v = bool("skill_decision_gate_enabled") { skillDecisionGateEnabled = v }
+        if let v = double("skill_decision_gate_threshold") {
+            skillDecisionGateThreshold = min(max(0.4, v), 0.95)
         }
         if let v = bool("colbert_reader_enabled") { colbertReaderEnabled = v }
         if let v = int("colbert_quant_bits") {
@@ -1053,6 +1083,9 @@ public struct AgentConfig: Sendable {
         if !["mlx-lm", "mlx-vlm", "gguf"].contains(decisionModelBackend) {
             decisionModelBackend = "mlx-vlm"
         }
+        if !["meteor", "valen"].contains(decisionModelKind) {
+            decisionModelKind = "meteor"
+        }
         if ![20, 50, 100].contains(decisionCoarseCandidates) { decisionCoarseCandidates = 50 }
         if ![3, 5].contains(decisionCoreSentenceCount) { decisionCoreSentenceCount = 3 }
         if ![3, 5, 10].contains(decisionTopN) { decisionTopN = 5 }
@@ -1292,6 +1325,7 @@ public struct AgentConfig: Sendable {
             "rag_verify_fingerprint": ragVerifyFingerprint,
             "rag_mode": ragMode,
             "decision_model_backend": decisionModelBackend,
+            "decision_model_kind": decisionModelKind,
             "decision_model_path": decisionModelPath,
             "decision_coarse_candidates": decisionCoarseCandidates,
             "decision_use_core_sentences": decisionUseCoreSentences,
@@ -1299,9 +1333,13 @@ public struct AgentConfig: Sendable {
             "decision_top_n": decisionTopN,
             "multi_zone_use_decision_judge": multiZoneUseDecisionJudge,
             "kernel_decision_gate_enabled": kernelDecisionGateEnabled,
-            "kernel_decision_gate_threshold": kernelDecisionGateThreshold,
+            "kernel_decision_gate_threshold": kernelFinishGateThreshold,
+            "kernel_finish_gate_threshold": kernelFinishGateThreshold,
+            "kernel_plan_review_threshold": kernelPlanReviewThreshold,
             "kernel_decision_gate_max_finish_blocks": kernelDecisionGateMaxFinishBlocks,
             "kernel_decision_gate_max_plan_reviews": kernelDecisionGateMaxPlanReviews,
+            "skill_decision_gate_enabled": skillDecisionGateEnabled,
+            "skill_decision_gate_threshold": skillDecisionGateThreshold,
             "colbert_reader_enabled": colbertReaderEnabled,
             "colbert_quant_bits": colbertQuantBits,
             "colbert_coarse_candidates": colbertCoarseCandidates,

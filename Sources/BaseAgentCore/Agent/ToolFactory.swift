@@ -16,6 +16,8 @@ public enum AgentToolFactory {
                              multiZoneSearch: RagSearchTool.SearchHandler? = nil,
                              extraOutlineEngines: [RAGEngine] = [],
                              zoneSummaryProvider: RagStatusTool.ZoneSummaryProvider? = nil,
+                             skillJudge: SkillDecisionJudge? = nil,
+                             skillContextProvider: (() -> (question: String, state: String))? = nil,
                              sopTracker: SOPReadTracker = SOPReadTracker()) -> ToolRegistry {
         let registry = ToolRegistry(config: config, callbacks: callbacks)
         registry.session = session
@@ -96,14 +98,17 @@ public enum AgentToolFactory {
                 + "- op=\"list\": list all saved skills (no arguments).",
             subcommands: [
                 ("search", SkillSearchTool(config: config, callbacks: callbacks, registry: registry,
-                                           index: skillIndex)),
+                                           index: skillIndex, judge: skillJudge,
+                                           contextProvider: skillContextProvider)),
                 ("list", SkillListTool(config: config, callbacks: callbacks, registry: registry,
                                        index: skillIndex)),
                 ("semantic_search", SkillSemanticSearchTool(
                     config: config, callbacks: callbacks, registry: registry,
-                    retriever: skillRetriever)),
+                    retriever: skillRetriever, judge: skillJudge,
+                    contextProvider: skillContextProvider)),
                 ("load", SkillLoadTool(config: config, callbacks: callbacks, registry: registry,
-                                       retriever: skillRetriever, index: skillIndex)),
+                                       retriever: skillRetriever, index: skillIndex,
+                                       judge: skillJudge, contextProvider: skillContextProvider)),
                 ("save", SkillSaveTool(config: config, callbacks: callbacks, registry: registry,
                                        manager: skillManager, retriever: skillRetriever,
                                        index: skillIndex)),

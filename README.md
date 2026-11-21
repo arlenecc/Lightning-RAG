@@ -58,7 +58,7 @@ scripts/package-app.sh release && scripts/package-dmg.sh
 只产出单一形态：应用本体不含任何内置模型，potion 语义切片 / jina embedding /
 jina reranker 均在首次启动时从 hf-mirror 自动下载；主模型、辅助模型与 OCR 需在
 配置中指定本地模型路径。按「打包 App → 打包 DMG」顺序构建，产物为
-`dist/Lightning-RAG-1.4.7.dmg`（约 40MB）。版本号可通过 `VERSION` 环境变量或
+`dist/Lightning-RAG-1.4.8.dmg`（约 40MB）。版本号可通过 `VERSION` 环境变量或
 `package-dmg.sh` 的参数覆盖。
 
 测试覆盖（当前 1000+ 个 XCTest；真实模型 E2E 在本地权重存在时随每次测试自动运行，缺少权重或需要外网/GGUF 等环境的用例会跳过）：sqlite-vec 事务写入/回滚、两段式 KNN、二值签名编码与 LSB-first 位打包、
@@ -129,7 +129,9 @@ HTML 与 Office 解析另有专项覆盖：HTML 保存页的本地 iframe / fram
 
 **自定义 system prompt**：首次启动会在 `<workspace>/assets/system_prompt.txt` 写出内置的 `BASE_SYSTEM_PROMPT`；之后每次启动读取该文件并替换内置提示词，可直接用文本编辑器调整模型行为规则，**重启（或重新应用配置）后生效**（会话期间保持不变，以免 system 前缀抖动使 KV cache 反复重建）。文件内容空白或不可读时本次回退内置提示词，且不会覆盖文件。它替换的是协议主体，L0 META-SOP 与 L1 全局索引仍按多级记忆机制追加在其后；轻量轮（纯寒暄/能力问询）使用内核的极简提示，不受该文件影响。内置提示词中的 `<summary>` 标签、`rag_tools(op="outline")` 起手式、工具状态词等是内核回注与测试的硬依赖，建议在原文基础上调整，不要整段删除。
 
-**v1.4.7（当前）**：工具 XML 正文净化、换模型提速、内核决策门（代码就绪）。新增 `ContentSanitizer` 跨 chunk 累积净化器，彻底剥离 MiniCPM 裸 `<function>` 与 Qwen/GLM4/Spark 的 `<tool_call>` XML，真机双模型验证（MiniCPM/Qwen）正文无残留、工具调用正常；换主模型时按回水线折叠长历史为摘要，避免首轮全量 prefill 导致的 40~80 秒卡顿；修正在途空转与 repeated 调用诊断。内核决策门（complete 收尾拦截 + plan_step 计划评审）代码与测试已入库（7 项测试通过），默认配置开启但 Agent 层尚未装配 judge，本版不生效、静默放行。折叠策略测试断言更新为 18/20 轮。
+**v1.4.8（当前）**：决策模型自动下载、技能判定、知识图谱多源融合与阈值拆分。决策模型缺失自动从 HF 下载（`arlenecc/PKU-KCL-Meteor-v1.5-0.8B-mlx-int4`，启动清单 + 运行时兜底双保险）；技能检索选择/加载/摘要注入三条路径全部接入决策模型判定，不合适技能禁止使用，判定失败静默放行；决策门三阈值（计划完整性/执行完成度/技能判定）独立配置并在设置窗口可调；知识图谱抽取覆盖向量/极速模式全部知识分区，统一聚合到一张图谱并融合增强各检索模式；新增 Valen 决策模型后端（与 Meteor 统一 `BinaryDecisionScoring` 协议）；修复外部切片反查、缓存内容哈希校验、关键词缓存与融合预算。
+
+**v1.4.7**：工具 XML 正文净化、换模型提速与决策模型降级。`ContentSanitizer` 跨 chunk 累积净化器彻底剥离 MiniCPM `<function>` 与 Qwen/GLM4/Spark `<tool_call>` XML（真机双模型验证）；换主模型时折叠长历史为摘要避免首轮 40~80 秒卡顿；决策门失败后会话内禁用避免刷 WARN，决策模型不可用时不装配 judge。
 
 **v1.4.6**：MiniCPM 兼容、多库工具与状态简化。MiniCPM5 工具调用全链路兼容（裸 `<function>/<paramname>`、CDATA、tokenizer 吞空格；真机实测首轮即正确调用）；修复 thinking 模型"想完就 EOS 正文为空"导致的 3 次意图空转；`rag_tools(op="outline")` 改为跨全部分区查书/列文档；`rag_tools(op="status")` 多库时只返回简洁概览；框架拒绝的工具原文纳入文本兜底并加诊断日志。
 

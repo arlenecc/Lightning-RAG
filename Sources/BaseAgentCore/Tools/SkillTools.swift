@@ -59,12 +59,19 @@ public final class SkillSearchTool: AgentTool {
     ])
 
     private let index: SkillIndex
+    /// 决策模型判定器：检索结果在返回模型加载使用前，按问句/对话状态筛选。
+    private let judge: SkillDecisionJudge?
+    private let contextProvider: (() -> (question: String, state: String))?
 
     public init(config: AgentConfig,
                 callbacks: AgentCallbacks? = nil,
                 registry: ToolRegistry? = nil,
-                index: SkillIndex? = nil) {
+                index: SkillIndex? = nil,
+                judge: SkillDecisionJudge? = nil,
+                contextProvider: (() -> (question: String, state: String))? = nil) {
         self.index = index ?? SkillIndex(workspace: config.workspace)
+        self.judge = judge
+        self.contextProvider = contextProvider
     }
 
     public func run(_ args: [String: JSONValue]) async throws -> ToolResult {
@@ -76,10 +83,24 @@ public final class SkillSearchTool: AgentTool {
         let query = args.trimmedString("query")
         guard !query.isEmpty else { return .fail("缺少参数: query") }
         let topK = args.boundedInt("top_k", default: 3, range: 1...5)
-        let results = index.search(query: query, topK: topK)
+        var results = index.search(query: query, topK: topK)
         let names = results.map(\.name).joined(separator: ",")
         AgentLog.info("[skill] 关键词检索 query=\(String(query.prefix(80))) top=\(topK) "
             + "hits=\(results.count) names=\(names)")
+        // 决策判定：多技能选一个、单技能判合适性；不合适禁止返回给模型加载。
+        if let judge, !results.isEmpty, let ctx = contextProvider?() {
+            let candidates = results.map { (name: $0.name, description: $0.description, tags: $0.tags) }
+            if let picked = await judge.pickSkill(question: ctx.question,
+                                                  conversationState: ctx.state,
+                                                  candidates: candidates) {
+                if picked < 0 || picked >= results.count {
+                    AgentLog.info("[skill] 判定结果：无合适技能，拦截加载")
+                    return .ok("根据当前问句和对话状态，没有合适的技能需要使用。")
+                }
+                results = [results[picked]]
+                AgentLog.info("[skill] 判定选中 name=\(results[0].name)")
+            }
+        }
         if results.isEmpty {
             return .ok("找不到匹配的技能。")
         }
@@ -170,26 +191,46 @@ public final class SkillSemanticSearchTool: AgentTool {
     ])
 
     private let retriever: SkillRetriever
+    private let judge: SkillDecisionJudge?
+    private let contextProvider: (() -> (question: String, state: String))?
 
     public init(config: AgentConfig,
                 callbacks: AgentCallbacks? = nil,
                 registry: ToolRegistry? = nil,
-                retriever: SkillRetriever? = nil) {
+                retriever: SkillRetriever? = nil,
+                judge: SkillDecisionJudge? = nil,
+                contextProvider: (() -> (question: String, state: String))? = nil) {
         self.retriever = retriever ?? SkillRetriever(
             workspace: config.workspace,
             embedding: LocalModelFactory.shared.makeEmbedding(config: config))
+        self.judge = judge
+        self.contextProvider = contextProvider
     }
 
     public func run(_ args: [String: JSONValue]) async throws -> ToolResult {
         let query = args.trimmedString("query")
         guard !query.isEmpty else { return .fail("缺少参数: query") }
         let topK = args.boundedInt("top_k", default: 3, range: 1...5)
-        let skills = await retriever.retrieve(query: query, topK: topK)
+        var skills = await retriever.retrieve(query: query, topK: topK)
         let hitText = skills.map {
             "\($0.name)(\(String(format: "%.3f", $0.score)))"
         }.joined(separator: ",")
         AgentLog.info("[skill] 语义检索 query=\(String(query.prefix(80))) top=\(topK) "
             + "hits=\(skills.count) \(hitText)")
+        // 决策判定：同关键词检索——多技能选一、单技能判合适性。
+        if let judge, !skills.isEmpty, let ctx = contextProvider?() {
+            let candidates = skills.map { (name: $0.name, description: $0.description, tags: $0.tags) }
+            if let picked = await judge.pickSkill(question: ctx.question,
+                                                  conversationState: ctx.state,
+                                                  candidates: candidates) {
+                if picked < 0 || picked >= skills.count {
+                    AgentLog.info("[skill] 判定结果：无合适技能，拦截加载")
+                    return .ok("根据当前问句和对话状态，没有合适的技能需要使用。")
+                }
+                skills = [skills[picked]]
+                AgentLog.info("[skill] 判定选中 name=\(skills[0].name)")
+            }
+        }
         guard !skills.isEmpty else {
             return .ok("找不到匹配的技能。")
         }
@@ -229,19 +270,36 @@ public final class SkillLoadTool: AgentTool {
 
     private let retriever: SkillRetriever
     private let index: SkillIndex
+    private let judge: SkillDecisionJudge?
+    private let contextProvider: (() -> (question: String, state: String))?
 
     public init(config: AgentConfig,
                 callbacks: AgentCallbacks? = nil,
                 registry: ToolRegistry? = nil,
                 retriever: SkillRetriever? = nil,
-                index: SkillIndex? = nil) {
+                index: SkillIndex? = nil,
+                judge: SkillDecisionJudge? = nil,
+                contextProvider: (() -> (question: String, state: String))? = nil) {
         self.retriever = retriever ?? SkillRetriever(workspace: config.workspace)
         self.index = index ?? SkillIndex(workspace: config.workspace)
+        self.judge = judge
+        self.contextProvider = contextProvider
     }
 
     public func run(_ args: [String: JSONValue]) async throws -> ToolResult {
         let rawPath = args.trimmedString("path")
         guard !rawPath.isEmpty else { return .fail("缺少参数: path") }
+        // 兜底判定：即使模型跳过 search 直接 load，也要按问句/对话状态判定是否合适。
+        if let judge, let ctx = contextProvider?(),
+           let skill = index.listAll().first(where: { $0.path == rawPath }) {
+            let candidate = (name: skill.name, description: skill.description, tags: skill.tags)
+            if let ok = await judge.isAppropriate(question: ctx.question,
+                                                  conversationState: ctx.state,
+                                                  skill: candidate), !ok {
+                AgentLog.info("[skill] load 判定不合适，禁止加载 name=\(skill.name)")
+                return .fail("根据当前问句和对话状态，该技能不合适，已禁止加载使用。")
+            }
+        }
         guard !(rawPath as NSString).isAbsolutePath,
               !(rawPath as NSString).pathComponents.contains("..") else {
             return .fail("path 必须是技能目录相对路径")

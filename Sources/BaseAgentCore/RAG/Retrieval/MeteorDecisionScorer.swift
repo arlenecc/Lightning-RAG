@@ -3,6 +3,34 @@ import MLX
 import MLXLMCommon
 import MLXVLM
 
+/// 决策模型打分抽象：Meteor（readout 头）与 Valen（MixerHead）共通的接口，
+/// 供 RAG 相关性打分、技能判定与内核决策门按配置切换后端。
+public protocol BinaryDecisionScoring: AnyObject, Sendable {
+    /// 模型与专用权重是否已加载。
+    var isReady: Bool { get }
+
+    /// 决策门专用权重是否齐全（无需加载，如 readout/decision_head safetensors）。
+    var isModelAvailable: Bool { get }
+
+    /// 通用二元判定：返回「true 选项」的概率（0~1）。
+    func judgeBinary(state: String, question: String,
+                     trueOption: String, falseOption: String,
+                     maxStateChars: Int) async throws -> Double
+
+    /// 对一批文本切片判定与 query 的相关性分数（0~1，越高越相关）。
+    func score(query: String, passages: [String], coreSentenceCount: Int,
+               useCoreSentences: Bool, progress: ((Int, Int) -> Void)?) async throws -> [Double]
+}
+
+extension BinaryDecisionScoring {
+    /// 两参便捷判定（默认选项文案与截断长度，与 Meteor 语义一致）。
+    public func judgeBinary(state: String, question: String) async throws -> Double {
+        try await judgeBinary(state: state, question: question,
+                              trueOption: "Yes / true", falseOption: "No / false",
+                              maxStateChars: 3000)
+    }
+}
+
 /// PKU-KCL-Meteor 决策模型打分器。
 ///
 /// 模型不是生成式 LLM，而是「Qwen3.5 language backbone + readout head」：
@@ -14,7 +42,7 @@ import MLXVLM
 /// 通过 mtpEmitFlagKey / mtpLastHiddenStatesKey 从 LMOutput.State 取 hidden。
 /// 已用模型自带 baseline.json 验证：top-1 与基线一致（因果 mask 使置信度略低，
 /// 但排序正确，满足「选最相关的 N 个切片」的用途）。
-public final class MeteorDecisionScorer: @unchecked Sendable {
+public final class MeteorDecisionScorer: BinaryDecisionScoring, @unchecked Sendable {
     private let lock = NSLock()
     private var container: ModelContainer?
     private var readout: MLXArray?

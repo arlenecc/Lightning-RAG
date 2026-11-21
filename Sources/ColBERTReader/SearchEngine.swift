@@ -538,6 +538,19 @@ final class SearchEngine {
         return Int(rows.first?["n"]?.intValue ?? 0)
     }
 
+    /// 全库切片文本（供知识图谱逐片抽取）。doc_id 作稳定 id、
+    /// title 作章节上下文、source 作来源；只取正文，不加载模型。
+    static func listAllChunkTexts(_ db: SQLiteDB) throws -> [(id: String, text: String, source: String, heading: String)] {
+        let rows = try db.query("SELECT doc_id, content, source, title FROM document ORDER BY rowid")
+        return rows.compactMap { row in
+            guard let id = row["doc_id"]?.stringValue,
+                  let text = row["content"]?.stringValue, !text.isEmpty else { return nil }
+            return (id: id, text: text,
+                    source: row["source"]?.stringValue ?? "",
+                    heading: row["title"]?.stringValue ?? "")
+        }
+    }
+
     /// 多库联合检索-极速模式粗筛：ANN/vec0 + BM25 的 Weighted RRF，返回候选 doc_id
     /// 及其 rrf 分（不做残差加载/MaxSim）。供跨库统一融合。
     func coarseCandidates(query: String, coarse: Int = 20,

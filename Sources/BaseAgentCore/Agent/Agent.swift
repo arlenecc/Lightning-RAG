@@ -226,6 +226,9 @@ public final class Agent: @unchecked Sendable {
     public let skills: SkillManager
     public let skillIndex: SkillIndex
     public let skillRetriever: SkillRetriever
+    /// 技能加载判定器（复用决策模型；nil = 判定不可用，全部放行）。
+    /// 供自动注入摘要与 skill_tools 检索/加载两条路径共用。
+    private let skillJudge: SkillDecisionJudge?
     public let ragEngine: RAGEngine
     /// 多知识分区：默认分区即 ragEngine；其余挂载分区各一个独立 engine（共享模型）。
     /// key = zone.id，value 为对应分区的 engine；默认分区的 id 也在此表中指向 ragEngine。
@@ -307,6 +310,7 @@ public final class Agent: @unchecked Sendable {
                 callbacks: AgentCallbacks,
                 toolRegistry: ToolRegistry? = nil,
                 skills: SkillManager? = nil,
+                skillJudgeOverride: SkillDecisionJudge? = nil,
                 baseSystemPrompt: String = BASE_SYSTEM_PROMPT) {
         self.baseSystemPrompt = baseSystemPrompt
         self.config = config
@@ -359,6 +363,17 @@ public final class Agent: @unchecked Sendable {
                           (config.kernelConsolidateEvery == 0 ? 18 : config.kernelConsolidateEvery) + 2),
             maxDigestLines: config.kernelMaxDigestLines == 0 ? 20 : config.kernelMaxDigestLines
         )
+        // 技能加载判定器：测试可注入；正常路径复用决策模型单例，
+        // 模型不可用/配置关闭时 nil，全部放行。
+        if let skillJudgeOverride {
+            self.skillJudge = skillJudgeOverride
+        } else {
+            let skillScorer = config.skillDecisionGateEnabled
+                ? try? ragEngine.sharedDecisionScorer() : nil
+            self.skillJudge = skillScorer?.isModelAvailable == true
+                ? MeteorSkillJudge(scorer: skillScorer!,
+                                   threshold: config.skillDecisionGateThreshold) : nil
+        }
 
         if let toolRegistry {
             self.tools = toolRegistry
@@ -369,6 +384,15 @@ public final class Agent: @unchecked Sendable {
             var multiZoneSearchForward: RagSearchTool.SearchHandler?
             let defaultEngine = self.ragEngine
             let zoneEngineMap = self.zoneEngines
+            let capturedSession = self.session
+            let skillJudge = self.skillJudge
+            let skillContextProvider: (() -> (question: String, state: String))? = skillJudge == nil
+                ? nil : {
+                    let question = capturedSession.turns.last?.prompt ?? ""
+                    let plan = capturedSession.getPlan()
+                    let state = plan.map { "Plan: \($0.goal)" } ?? ""
+                    return (question, state)
+                }
             self.tools = AgentToolFactory.build(
                 config: config, callbacks: callbacks, session: self.session,
                 ragEngine: self.ragEngine, skillManager: self.skills,
@@ -401,6 +425,8 @@ public final class Agent: @unchecked Sendable {
                                 sources: st["sources"]?.arrayValue?.compactMap(\.stringValue) ?? [])
                     }
                 },
+                skillJudge: skillJudge,
+                skillContextProvider: skillContextProvider,
                 sopTracker: sharedSOPTracker)
             multiZoneSearchForward = { [weak self] query, topK, source in
                 guard let self else {
@@ -462,7 +488,7 @@ public final class Agent: @unchecked Sendable {
         let hooks = AgentKernelHooks(agent: self)
         let kernelLoop = KernelLoop(runtime: runtime, config: config, callbacks: callbacks,
                                     systemPrompt: { [weak self] in self?.systemPrompt() ?? BASE_SYSTEM_PROMPT },
-                                    dynamicContext: { [weak self] in self?.dynamicContextPrompt() ?? "" },
+                                    dynamicContext: { [weak self] in await self?.dynamicContextPrompt() ?? "" },
                                     session: session, hooks: hooks, maxTurns: maxIterations)
         // 内核决策门（收尾拦截 + 计划评审）：复用 RAG 决策模型单例（懒加载，
         // 失败/未配置时 judge 返回 nil 静默放行），避免重复加载 0.8B 模型。
@@ -470,7 +496,9 @@ public final class Agent: @unchecked Sendable {
            let scorer = try? ragEngine.sharedDecisionScorer(),
            scorer.isModelAvailable {
             kernelLoop.decisionJudge = MeteorKernelJudge(
-                scorer: scorer, threshold: config.kernelDecisionGateThreshold)
+                scorer: scorer,
+                planThreshold: config.kernelPlanReviewThreshold,
+                finishThreshold: config.kernelFinishGateThreshold)
         } else if config.kernelDecisionGateEnabled {
             log("[decision-gate] 决策模型文件不可用，决策门未启用（静默放行）")
         }
@@ -632,7 +660,8 @@ public final class Agent: @unchecked Sendable {
                 }
                 let scores = try await RAGEngine.withTimeout(budget) {
                     try await scorer.score(query: "用户问句：\(query)", passages: descriptions,
-                                           coreSentenceCount: 3, useCoreSentences: false)
+                                           coreSentenceCount: 3, useCoreSentences: false,
+                                           progress: nil)
                 }
                 let ranked = zip(searchZones, scores).sorted { $0.1 > $1.1 }
                 let pickCount = min(max(1, config.decisionTopN), ranked.count)
@@ -724,7 +753,8 @@ public final class Agent: @unchecked Sendable {
                 let scores = try await RAGEngine.withTimeout(budget) {
                     try await scorer.score(query: query, passages: passages,
                                            coreSentenceCount: self.config.decisionCoreSentenceCount,
-                                           useCoreSentences: self.config.decisionUseCoreSentences)
+                                           useCoreSentences: self.config.decisionUseCoreSentences,
+                                           progress: nil)
                 }
                 // topK（工具契约）与 decisionTopN 取较小，尊重调用方的气泡数量。
                 let n = max(1, min(topK, config.decisionTopN, fused20.count))
@@ -750,8 +780,10 @@ public final class Agent: @unchecked Sendable {
                 ? try await colbertFusedRerank(fused20, query: query, topK: topK)
                 : try await vectorFusedRerank(fused20, query: query, topK: topK)
         }
-        return RAGRetrievalOutcome(context: MultiZoneRetrieval.primaryContext(citations),
-                                   citations: citations)
+        let outcome = RAGRetrievalOutcome(context: MultiZoneRetrieval.primaryContext(citations),
+                                          citations: citations)
+        // 统一图谱（跨分区聚合抽取）融合：仅增强 context，不改变融合后的跨库 citations。
+        return await ragEngine.mergedWithKnowledgeGraph(outcome, query: query, source: source)
     }
 
     /// 向量模式融合后精排：reranker 共享无状态，对全部候选文本一次性打分取 topK。
@@ -843,7 +875,8 @@ public final class Agent: @unchecked Sendable {
         let budget = timeout == 0 ? Double.greatestFiniteMagnitude : max(30, timeout * 3)
         let zoneScores = try await RAGEngine.withTimeout(budget) {
             try await scorer.score(query: stateText, passages: zoneDescriptions,
-                                   coreSentenceCount: 3, useCoreSentences: false)
+                                   coreSentenceCount: 3, useCoreSentences: false,
+                                   progress: nil)
         }
         AgentLog.info("[decision-multi] ①选库判定完成：\(zip(zones, zoneScores).map { "\($0.0.name)=\(String(format: "%.3f", $0.1))" }.joined(separator: ", "))")
         var selected: [(zone: KnowledgeZone, weight: Double)] = []
@@ -916,7 +949,8 @@ public final class Agent: @unchecked Sendable {
         let scores = try await RAGEngine.withTimeout(budget) {
             try await scorer.score(query: query, passages: passages,
                                    coreSentenceCount: self.config.decisionCoreSentenceCount,
-                                   useCoreSentences: self.config.decisionUseCoreSentences)
+                                   useCoreSentences: self.config.decisionUseCoreSentences,
+                                   progress: nil)
         }
         AgentLog.info("[decision-multi] ④核心句判定完成 \(scores.count) 条，"
             + "耗时 \(Int(Date().timeIntervalSince(scoreStarted) * 1000))ms")
@@ -932,8 +966,10 @@ public final class Agent: @unchecked Sendable {
         AgentLog.info("[decision-multi] 完成：返回 Top\(citations.count) "
             + "\(citations.map { "\($0.source):\(String(format: "%.3f", $0.score))" }.joined(separator: ", "))，"
             + "总耗时 \(Int(Date().timeIntervalSince(started) * 1000))ms")
-        return RAGRetrievalOutcome(context: MultiZoneRetrieval.primaryContext(citations),
-                                   citations: citations)
+        let outcome = RAGRetrievalOutcome(context: MultiZoneRetrieval.primaryContext(citations),
+                                          citations: citations)
+        // 跨分区判定模式同样融合统一图谱上下文。
+        return await ragEngine.mergedWithKnowledgeGraph(outcome, query: query, source: source)
     }
 
     public func close() {
@@ -1037,6 +1073,25 @@ public final class Agent: @unchecked Sendable {
 
     public func history() -> [ChatMessage] {
         session.buildMessages(systemPrompt: systemPrompt())
+    }
+
+    /// 聚合所有挂载知识分区的图谱抽取源切片（含极速模式的 colbert.db）。
+    /// id 与 source 加 zone 前缀，避免跨库同名切片/来源冲突；统一喂给默认库的图谱
+    /// 构建，实现多分区知识在一个图谱里融合。
+    public func allZonesKnowledgeGraphSourceChunks() -> [KnowledgeGraphStore.ChunkListItem] {
+        var out: [KnowledgeGraphStore.ChunkListItem] = []
+        var seen = Set<String>()
+        for zone in config.mountedZones {
+            guard let engine = zoneEngines[zone.id] else { continue }
+            for chunk in engine.knowledgeGraphSourceChunks() {
+                let taggedID = "\(zone.id)|\(chunk.id)"
+                guard seen.insert(taggedID).inserted else { continue }
+                out.append(KnowledgeGraphStore.ChunkListItem(
+                    id: taggedID, text: chunk.text,
+                    source: "\(zone.name)/\(chunk.source)", heading: chunk.heading))
+            }
+        }
+        return out
     }
 
     // MARK: 主入口
@@ -1422,7 +1477,7 @@ public final class Agent: @unchecked Sendable {
     /// 由 `KernelLoop` 追加到当前轮 user 消息尾部，而不是放进 system 消息：
     /// 这样动态内容只影响提示词尾部，前面的大段历史仍能命中 KV cache。
     /// 同一次用户请求内缓存一次，避免每轮工具循环都改写前缀。
-    public func dynamicContextPrompt() -> String {
+    public func dynamicContextPrompt() async -> String {
         if let cachedDynamicContext { return cachedDynamicContext }
         var sections: [String] = []
 
@@ -1441,14 +1496,22 @@ public final class Agent: @unchecked Sendable {
         if !lastUserText.isEmpty, let matched = skills.matchScored(lastUserText),
            matched.score >= 3 {
             let skill = matched.skill
-            var prompt = skill.body
-            if prompt.count > SystemPromptLimits.maxSkillPromptChars {
-                prompt = String(prompt.prefix(SystemPromptLimits.maxSkillPromptChars))
-                    + "\n…（已截断，用 skill_tools(op=\"load\") 读取完整技能内容）"
+            // 自动注入也走决策模型判定：关键词命中只是词面信号，需按用户问句与
+            // 对话状态确认该技能确实合适，避免把不相关的摘要技能塞进上下文。
+            let allowed = await shouldInjectAutoSkill(skill, question: lastUserText)
+            if allowed {
+                var prompt = skill.body
+                if prompt.count > SystemPromptLimits.maxSkillPromptChars {
+                    prompt = String(prompt.prefix(SystemPromptLimits.maxSkillPromptChars))
+                        + "\n…（已截断，用 skill_tools(op=\"load\") 读取完整技能内容）"
+                }
+                sections.append("# Active skill: \(skill.name)\n\(prompt)")
+                AgentLog.info("[skill] 自动注入 name=\(skill.name) score=\(matched.score) "
+                    + "chars=\(prompt.count) dir=\(skill.directory)")
+            } else {
+                AgentLog.info("[skill] 判定不合适，跳过自动注入 name=\(skill.name) "
+                    + "score=\(matched.score)")
             }
-            sections.append("# Active skill: \(skill.name)\n\(prompt)")
-            AgentLog.info("[skill] 自动注入 name=\(skill.name) score=\(matched.score) "
-                + "chars=\(prompt.count) dir=\(skill.directory)")
         }
 
         // 知识库状态只读各 RAGEngine 的内存快照：绝不在这里同步打开/扫描向量库。
@@ -1499,6 +1562,30 @@ public final class Agent: @unchecked Sendable {
         let text = sections.joined(separator: "\n\n")
         cachedDynamicContext = text
         return text
+    }
+
+    /// 自动注入摘要技能的判定：判定不可用（judge=nil / 返回 nil）时放行。
+    func shouldInjectAutoSkill(_ skill: Skill, question: String) async -> Bool {
+        await Self.evaluateAutoSkillInjection(judge: skillJudge, skill: skill,
+                                              question: question,
+                                              conversationState: currentPlanState())
+    }
+
+    private func currentPlanState() -> String {
+        session.getPlan().map { "Plan: \($0.goal)" } ?? ""
+    }
+
+    /// 纯逻辑版（便于独立验证）：judge 缺失/判定返回 nil 一律放行。
+    static func evaluateAutoSkillInjection(judge: SkillDecisionJudge?,
+                                           skill: Skill, question: String,
+                                           conversationState: String) async -> Bool {
+        guard let judge else { return true }
+        guard let fit = await judge.isAppropriate(
+            question: question, conversationState: conversationState,
+            skill: (name: skill.name, description: skill.description, tags: skill.tags)) else {
+            return true
+        }
+        return fit
     }
 
     private func ragStatus() -> [String: JSONValue]? {

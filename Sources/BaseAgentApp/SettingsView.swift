@@ -126,7 +126,7 @@ struct SettingsView: View {
     @State private var embeddingTokenBudgetStep = 512
     /// 默认信任 mtime + 大小；开启后为「保留时间戳的同尺寸改动」再校验内容指纹。
     @State private var verifyFingerprint = false
-    /// RAG 检索策略（知识图谱能力）。
+    /// 知识图谱融合策略（配置字段仍为 ragRetrievalStrategy）。
     @State private var retrievalStrategy: RAGRetrievalStrategy = .naive
     @State private var showAdvanced = false
     /// RAG MCP 服务（Streamable HTTP）：监听范围 / 端口（运行中时锁定）。
@@ -145,7 +145,9 @@ struct SettingsView: View {
     /// 多库联合检索是否用判定模型（向量/极速模式共用开关）。
     @State private var multiZoneUseDecisionJudge = false
     @State private var kernelDecisionGateEnabled = true
-    @State private var kernelDecisionGateThreshold = 0.6
+    @State private var kernelFinishGateThreshold = 0.5
+    @State private var kernelPlanReviewThreshold = 0.5
+    @State private var skillDecisionGateThreshold = 0.5
 
     /// 多知识分区配置行（UI 可增删）。
     private struct ZoneRow: Identifiable {
@@ -160,6 +162,7 @@ struct SettingsView: View {
     // MARK: RAG 模式三选一 + 决策判定
     @State private var ragMode = "vector"
     @State private var decisionModelBackend = "mlx-vlm"
+    @State private var decisionModelKind = "meteor"
     @State private var decisionModelPath = "models/PKU-KCL-Meteor-0.8B-mlx-int4"
     @State private var decisionCoarseCandidates = 50
     @State private var decisionUseCoreSentences = true
@@ -240,31 +243,44 @@ struct SettingsView: View {
         }
     }
 
-    /// 内核决策门：收尾拦截 + 计划评审（决策模型判定）。
+    /// 决策阈值 Picker（0.4–0.9，0.5 为默认）。
+    private func decisionThresholdPicker(_ title: String, selection: Binding<Double>,
+                                         help: String) -> some View {
+        Picker(title, selection: selection) {
+            Text("0.4").tag(0.4)
+            Text("0.5（默认）").tag(0.5)
+            Text("0.6").tag(0.6)
+            Text("0.7").tag(0.7)
+            Text("0.8").tag(0.8)
+            Text("0.9").tag(0.9)
+        }
+        .font(.caption2)
+        .frame(maxWidth: 280)
+        .help(help)
+    }
+
+    /// 内核决策门与技能判定：三个独立阈值分别可调。
     private var kernelDecisionGateRow: some View {
-        HStack(spacing: 14) {
-            Text("决策门")
-                .font(.caption.weight(.semibold))
-                .foregroundStyle(.secondary)
-            Toggle("启用内核决策门", isOn: $kernelDecisionGateEnabled)
-                .font(.caption2)
-                .help("收尾时决策模型判定「已收集信息是否足以完整回答任务」，不足则拦截要求补齐；"
-                    + "计划创建后评审「每个步骤是否必要合理」。判定失败/超时静默放行，不影响主流程。"
-                    + "复用「高级 RAG / 检索模式」中的决策模型，无需额外加载")
-            if kernelDecisionGateEnabled {
-                Picker("拦截阈值", selection: $kernelDecisionGateThreshold) {
-                    Text("0.4").tag(0.4)
-                    Text("0.5").tag(0.5)
-                    Text("0.6（默认）").tag(0.6)
-                    Text("0.7").tag(0.7)
-                    Text("0.8").tag(0.8)
-                    Text("0.9").tag(0.9)
-                }
-                .font(.caption2)
-                .frame(maxWidth: 170)
-                .help("判定不足/不必要概率高于该值才干预；越高越保守（更少拦截）")
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 14) {
+                Text("决策门")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                Toggle("启用内核决策门与技能判定", isOn: $kernelDecisionGateEnabled)
+                    .font(.caption2)
+                    .help("收尾时决策模型判定「信息是否足以完整回答」，计划创建后评审「每步是否必要合理」；"
+                        + "技能检索/加载/摘要注入前也由决策模型判定是否合适。判定失败/超时静默放行。"
+                        + "复用「高级 RAG / 检索模式」中的决策模型，无需额外加载")
+                Spacer(minLength: 8)
             }
-            Spacer(minLength: 8)
+            if kernelDecisionGateEnabled {
+                decisionThresholdPicker("执行完成度", selection: $kernelFinishGateThreshold,
+                    help: "收尾拦截阈值：信息不足概率高于该值才拦截补工具；越高越保守（越少拦截）")
+                decisionThresholdPicker("计划完整性", selection: $kernelPlanReviewThreshold,
+                    help: "计划步骤评审阈值：步骤不必要概率高于该值才提示修订；越高越保守（越少提示）")
+                decisionThresholdPicker("技能判定", selection: $skillDecisionGateThreshold,
+                    help: "技能加载/摘要注入判定阈值：不合适概率高于该值才拦截；越高越保守（越少拦截）")
+            }
         }
     }
 
@@ -712,7 +728,7 @@ struct SettingsView: View {
                 DisclosureGroup("高级设置", isExpanded: $showAdvanced) {
                     VStack(alignment: .leading, spacing: 10) {
                         HStack(spacing: 8) {
-                            Text("RAG检索策略").font(.caption)
+                            Text("知识图谱融合策略").font(.caption)
                             Picker("", selection: Binding(
                                 get: { model.knowledgeGraphBuilt ? retrievalStrategy : .naive },
                                 set: { retrievalStrategy = $0 }
@@ -1131,6 +1147,13 @@ struct SettingsView: View {
         VStack(alignment: .leading, spacing: 10) {
             HStack(spacing: 8) {
                 Text("决策模型").font(.caption)
+                Picker("", selection: $decisionModelKind) {
+                    Text("Meteor (readout)").tag("meteor")
+                    Text("Valen (MixerHead)").tag("valen")
+                }
+                .labelsHidden().frame(width: 150)
+                .help("决策模型后端种类，影响内核决策门、RAG 决策检索与技能判定；"
+                    + "Valen 路径默认指向外置 SSD 目录")
                 Picker("", selection: $decisionModelBackend) {
                     Text("MLX-LM").tag("mlx-lm")
                     Text("MLX-VLM").tag("mlx-vlm")
@@ -1788,13 +1811,16 @@ struct SettingsView: View {
         rrfVectorWeight = config.ragRRFVectorWeight
         multiZoneUseDecisionJudge = config.multiZoneUseDecisionJudge
         kernelDecisionGateEnabled = config.kernelDecisionGateEnabled
-        kernelDecisionGateThreshold = config.kernelDecisionGateThreshold
+        kernelFinishGateThreshold = config.kernelFinishGateThreshold
+        kernelPlanReviewThreshold = config.kernelPlanReviewThreshold
+        skillDecisionGateThreshold = config.skillDecisionGateThreshold
         zoneRows = config.knowledgeZones.map {
             ZoneRow(id: $0.id, name: $0.name, source: $0.source,
                     enabled: $0.enabled, isDefault: $0.isDefault)
         }
         ragMode = config.ragMode
         decisionModelBackend = config.decisionModelBackend
+        decisionModelKind = config.decisionModelKind
         decisionModelPath = config.decisionModelPath
         decisionCoarseCandidates = config.decisionCoarseCandidates
         decisionUseCoreSentences = config.decisionUseCoreSentences
@@ -2189,6 +2215,7 @@ struct SettingsView: View {
         config.colbertReaderEnabled = (config.ragMode == "colbert")
         config.decisionModelBackend = ["mlx-lm", "mlx-vlm", "gguf"].contains(decisionModelBackend)
             ? decisionModelBackend : "mlx-vlm"
+        config.decisionModelKind = (decisionModelKind == "valen") ? "valen" : "meteor"
         config.decisionModelPath = decisionModelPath.trimmingCharacters(in: .whitespacesAndNewlines)
         config.decisionCoarseCandidates = [20, 50, 100].contains(decisionCoarseCandidates)
             ? decisionCoarseCandidates : 50
@@ -2206,7 +2233,9 @@ struct SettingsView: View {
         config.ragRRFVectorWeight = min(max(rrfVectorWeight, 0.1), 0.9)
         config.multiZoneUseDecisionJudge = multiZoneUseDecisionJudge
         config.kernelDecisionGateEnabled = kernelDecisionGateEnabled
-        config.kernelDecisionGateThreshold = kernelDecisionGateThreshold
+        config.kernelFinishGateThreshold = kernelFinishGateThreshold
+        config.kernelPlanReviewThreshold = kernelPlanReviewThreshold
+        config.skillDecisionGateThreshold = skillDecisionGateThreshold
         config.knowledgeZones = zoneRows.map {
             KnowledgeZone(id: $0.id, name: $0.name, source: $0.source,
                           enabled: $0.enabled, isDefault: $0.isDefault)

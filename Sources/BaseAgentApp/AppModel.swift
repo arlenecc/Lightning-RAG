@@ -2729,14 +2729,20 @@ final class AppViewModel: ObservableObject {
                 }
                 return
             }
-            let stats = await agent.ragEngine.buildKnowledgeGraph(auxLLM: agent.auxLLM) { current, total, message in
-                Task { @MainActor [weak self] in
-                    guard let self, self.isBuildingKG else { return }
-                    self.statusText = total > 0 ? "\(message) \(current)/\(total)" : message
-                }
-            } log: { line in
-                Task { @MainActor [weak self] in self?.appendLog(line) }
-            }
+            // 聚合所有挂载分区 + 极速模式 colbert.db 的切片，统一抽取到一张图谱。
+            let sourceChunks = agent.allZonesKnowledgeGraphSourceChunks()
+            let stats = await agent.ragEngine.buildKnowledgeGraph(
+                auxLLM: agent.auxLLM,
+                progress: { current, total, message in
+                    Task { @MainActor [weak self] in
+                        guard let self, self.isBuildingKG else { return }
+                        self.statusText = total > 0 ? "\(message) \(current)/\(total)" : message
+                    }
+                },
+                log: { line in
+                    Task { @MainActor [weak self] in self?.appendLog(line) }
+                },
+                extraChunkRefs: sourceChunks)
             await MainActor.run { [weak self] in
                 guard let self else { return }
                 self.isBuildingKG = false

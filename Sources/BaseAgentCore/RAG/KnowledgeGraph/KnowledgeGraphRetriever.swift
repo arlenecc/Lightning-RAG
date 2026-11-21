@@ -80,14 +80,20 @@ public final class KnowledgeGraphRetriever {
 
         // 1) 关键词抽取（失败回退：直接用原 query）。
         let keywordStarted = Date()
-        let keywords: KGKeywords
+        var keywords = KGKeywords(highLevel: [trimmed], lowLevel: [trimmed])
         if strategy.usesKnowledgeGraph {
-            let llmStarted = Date()
-            keywords = (try? await builder.extractKeywords(query: trimmed))
-                ?? KGKeywords(highLevel: [trimmed], lowLevel: [trimmed])
-            keywordLLMSeconds = Date().timeIntervalSince(llmStarted)
-        } else {
-            keywords = KGKeywords(highLevel: [trimmed], lowLevel: [trimmed])
+            if let cached = kgStore.cachedKeywords(for: trimmed) {
+                // 热路径：同一 query 复用关键词，省掉约 1.5s 的辅助模型抽取。
+                keywords = KGKeywords(highLevel: cached.high, lowLevel: cached.low)
+                keywordLLMSeconds = 0
+            } else {
+                let llmStarted = Date()
+                let extracted = (try? await builder.extractKeywords(query: trimmed))
+                    ?? KGKeywords(highLevel: [trimmed], lowLevel: [trimmed])
+                kgStore.cacheKeywords(query: trimmed, high: extracted.highLevel,
+                                      low: extracted.lowLevel)
+                keywordLLMSeconds = Date().timeIntervalSince(llmStarted)
+            }
         }
         keywordSeconds = Date().timeIntervalSince(keywordStarted)
 

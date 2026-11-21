@@ -240,6 +240,11 @@ public final class ColBERTReaderEngine {
         try SearchEngine.totalChunkCount(db)
     }
 
+    /// 全库切片正文（供知识图谱抽取，不加载模型）。
+    public func listAllChunkTexts() throws -> [(id: String, text: String, source: String, heading: String)] {
+        try SearchEngine.listAllChunkTexts(db)
+    }
+
     /// 轻量正文命中探查（不加载模型），供多库联合检索前判断是否相关。
     public func ftsHitCount(query: String, cap: Int = 8) -> Int {
         SearchEngine.ftsHitCount(db, query: query, cap: cap)

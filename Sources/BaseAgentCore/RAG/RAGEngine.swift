@@ -591,8 +591,8 @@ public final class RAGEngine {
     /// 后台回填必须全局串行，避免并发 forward 触发 Metal 竞态。
     private static let backfillEmbeddingGate = AsyncSemaphore(value: 1)
 
-    /// 决策判定模型打分器（懒加载，与检索阅读模式互斥）。
-    private var decisionScorer: MeteorDecisionScorer?
+    /// 决策判定模型打分器（懒加载，与检索阅读模式互斥；后端由 config.decisionModelKind 决定）。
+    private var decisionScorer: (any BinaryDecisionScoring)?
     private let decisionLock = NSLock()
     /// 决策模型运行时自下载状态回调（UI 进度）。构造 scorer 前设置即可生效。
     public var decisionModelDownloadHandler: (@Sendable (String) -> Void)? {
@@ -1157,6 +1157,11 @@ public final class RAGEngine {
         (ragDir as NSString).appendingPathComponent("knowledge_graph.snapshot.json")
     }
 
+    /// 测试用：获取图谱 store（验证外部切片反查/增量哈希等内部状态）。
+    func testKnowledgeGraphStore() throws -> KnowledgeGraphStore {
+        try ensureKnowledgeGraphStore()
+    }
+
     /// 懒加载知识图谱存储层（独立 SQLite 连接 + embedding）。
     private func ensureKnowledgeGraphStore() throws -> KnowledgeGraphStore {
         kgLock.lock(); defer { kgLock.unlock() }
@@ -1207,13 +1212,61 @@ public final class RAGEngine {
         return (built: built, entities: entities, relationships: relationships)
     }
 
+    /// 把知识图谱检索到的实体/关系上下文融合进主检索结果（用于极速/决策模式）。
+    /// 主召回与 citations 保持不变，图谱 context 作为增强前缀附加；图谱不可用时原样返回。
+    public func mergedWithKnowledgeGraph(_ outcome: RAGRetrievalOutcome,
+                                         query: String,
+                                         source: String?) async -> RAGRetrievalOutcome {
+        guard config.ragRetrievalStrategy.usesKnowledgeGraph else { return outcome }
+        guard let kg = try? await knowledgeGraphSearch(query: query, source: source,
+                                                       chunksInContext: false),
+              !kg.context.isEmpty else { return outcome }
+        let merged = """
+        \(kg.context)
+
+        【本库检索结果】
+        \(outcome.context)
+        """
+        // 图谱 context（默认上限 3000 token）+ 主检索 context 可能超预算，
+        // 统一走既有 condense（按章节 map-reduce 压缩），避免挤占回答模型上下文。
+        let condensed = await condenseIfNeeded(merged)
+        return RAGRetrievalOutcome(context: condensed, citations: outcome.citations)
+    }
+
+    /// 本库可作为知识图谱抽取输入的全部切片。
+    /// 极速模式（colbert.db document 表）与向量/决策模式（index.sqlite chunks 表）
+    /// 都覆盖；多分区聚合由 Agent 层遍历 zoneEngines 后合并。
+    public func knowledgeGraphSourceChunks() -> [KnowledgeGraphStore.ChunkListItem] {
+        if config.colbertReaderEnabled,
+           let service = try? colbertService(),
+           let rows = try? service.listAllChunkTexts() {
+            return rows.map {
+                KnowledgeGraphStore.ChunkListItem(id: $0.id, text: $0.text,
+                                                  source: $0.source, heading: $0.heading)
+            }
+        }
+        guard let db = try? SQLiteDatabase(path: indexDBPath, readOnly: true) else { return [] }
+        defer { db.close() }
+        var out: [KnowledgeGraphStore.ChunkListItem] = []
+        try? db.stream("SELECT id, text, source, heading FROM \(VectorStore.chunksTable) "
+                       + "ORDER BY source, chunk_index") { row in
+            guard let id = row.text(0), let text = row.text(1), !text.isEmpty else { return true }
+            out.append(KnowledgeGraphStore.ChunkListItem(id: id, text: text,
+                                                         source: row.text(2) ?? "",
+                                                         heading: row.text(3) ?? ""))
+            return true
+        }
+        return out
+    }
+
     /// 构建知识图谱：后台用辅助模型在已完成切片上抽取实体/关系，聚合入库，
     /// 随后建 SwiftGraph 并落快照。weight 随证据重算（不保留旧标量）。
     @discardableResult
     public func buildKnowledgeGraph(
         auxLLM: LLMService? = nil,
         progress: ((Int, Int, String) -> Void)? = nil,
-        log: ((String) -> Void)? = nil
+        log: ((String) -> Void)? = nil,
+        extraChunkRefs: [KnowledgeGraphStore.ChunkListItem] = []
     ) async -> KnowledgeGraphBuilder.BuildStats {
         var stats = KnowledgeGraphBuilder.BuildStats()
         var priorState: KnowledgeGraphStore.BuildState?
@@ -1237,7 +1290,8 @@ public final class RAGEngine {
                                                 limits: kgExtractionLimits,
                                                 format: config.ragKGExtractionFormat,
                                                 maxConcurrency: config.ragKGMaxConcurrency)
-            stats = try await builder.build(progress: progress, log: log)
+            stats = try await builder.build(progress: progress, log: log,
+                                            extraChunkRefs: extraChunkRefs)
             kgLock.lock()
             kgGraph = graph
             kgLock.unlock()
@@ -1280,7 +1334,10 @@ public final class RAGEngine {
               store.buildState() == .complete else { return }
         // 已有切片被改写/删除时，增量无法撤回旧证据，只能整体重建。
         guard let refs = try? store.listChunkRefs() else { return }
-        let current = Dictionary(uniqueKeysWithValues: refs.map {
+        // 多分区/极速模式构建的图谱其切片带 zone 前缀、存于外部切片表，
+        // 增量比对必须把它们一并纳入，否则裸 id 与前缀 id 不匹配会误判全部切片被删。
+        let allRefs = refs + store.listExternalChunkRefs()
+        let current = Dictionary(uniqueKeysWithValues: allRefs.map {
             ($0.id, KnowledgeGraphBuilder.contentHash($0.text))
         })
         let processed = store.processedChunkHashes()
@@ -1288,6 +1345,10 @@ public final class RAGEngine {
             invalidateKnowledgeGraph(reason: "已有切片被修改或删除")
             return
         }
+        // 跨分区/极速模式的图谱由手动全量构建生成；增量更新器只认本地 chunks 表，
+        // 无法安全处理带 zone 前缀的外部切片，跳过增量以免重复抽取/误改图。
+        // 外部切片变化会通过上面的 hash 比对被检测为 stale，提示用户重建。
+        if !store.listExternalChunkRefs().isEmpty { return }
         guard let llm = auxLLM else { return }
         guard let (_, graph) = try? ensureKnowledgeGraph() else { return }
         let builder = KnowledgeGraphBuilder(store: store, graph: graph, llm: llm,
@@ -3865,16 +3926,32 @@ public final class RAGEngine {
         return (config.workspace as NSString).appendingPathComponent(p)
     }
 
-    public func sharedDecisionScorer() throws -> MeteorDecisionScorer { try ensureDecisionScorer() }
+    public func sharedDecisionScorer() throws -> any BinaryDecisionScoring {
+        try ensureDecisionScorer()
+    }
 
-    private func ensureDecisionScorer() throws -> MeteorDecisionScorer {
+    private func ensureDecisionScorer() throws -> any BinaryDecisionScoring {
         decisionLock.lock(); defer { decisionLock.unlock() }
         if let scorer = decisionScorer { return scorer }
-        let scorer = MeteorDecisionScorer(
-            modelDir: resolvedDecisionModelPath(),
-            autoDownload: config.autoDownloadMissingModels,
-            downloadRepo: MeteorDecisionScorer.defaultDownloadRepo,
-            downloadStatusHandler: decisionModelDownloadHandler)
+        let configuredPath = resolvedDecisionModelPath()
+        let scorer: any BinaryDecisionScoring
+        if config.decisionModelKind == "valen" {
+            // 配置路径未指向 Valen 权重（仍是 Meteor 默认路径）时回退 Valen 默认目录。
+            let valenDefault = ValenDecisionScorer.defaultModelDir
+            let dir = FileManager.default.fileExists(
+                atPath: (configuredPath as NSString)
+                    .appendingPathComponent("decision_head.safetensors"))
+                ? configuredPath : valenDefault
+            scorer = ValenDecisionScorer(modelDir: dir)
+        } else {
+            scorer = MeteorDecisionScorer(
+                modelDir: configuredPath,
+                autoDownload: config.autoDownloadMissingModels,
+                downloadRepo: MeteorDecisionScorer.defaultDownloadRepo,
+                // 已持 decisionLock，必须读 storage 而非加锁 getter（NSLock 非递归，
+                // 经 getter 会同锁自死锁——启动卡死根因，见 debug-app-startup-hang.md）。
+                downloadStatusHandler: decisionModelDownloadHandlerStorage)
+        }
         decisionScorer = scorer
         return scorer
     }
@@ -4070,8 +4147,9 @@ public final class RAGEngine {
             branch = "decision"
             let outcome = try await decisionSearch(query: query, topK: topK,
                                                    source: source, timeout: timeout)
-            citationCount = outcome.citations.count
-            return outcome
+            let merged = await mergedWithKnowledgeGraph(outcome, query: query, source: source)
+            citationCount = merged.citations.count
+            return merged
         }
         // 检索阅读模式：旁路接管检索召回 + 精排，改用 ColBERT 大分片多向量检索。
         // top-1 分片进上下文供 LLM 总结（由 ColBERTReaderService 格式化），
@@ -4089,11 +4167,15 @@ public final class RAGEngine {
                     try await colbert.search(query: query, source: source, topK: topK)
                 }
                 if outcome.citations.isEmpty {
-                    return RAGRetrievalOutcome(context: "（知识库中未找到相关内容）",
-                                               citations: [])
+                    // 本库无命中仍给图谱一次机会（实体/关系可能来自其它分区）。
+                    let kgOnly = await mergedWithKnowledgeGraph(
+                        RAGRetrievalOutcome(context: "（知识库中未找到相关内容）", citations: []),
+                        query: query, source: source)
+                    return kgOnly
                 }
-                citationCount = outcome.citations.count
-                return outcome
+                let merged = await mergedWithKnowledgeGraph(outcome, query: query, source: source)
+                citationCount = merged.citations.count
+                return merged
             } catch is RerankTimeout {
                 AgentLog.error("[colbert] 检索阅读检索超时（\(Int(budget))s）")
                 throw AgentError.timeout(
@@ -4201,7 +4283,16 @@ public final class RAGEngine {
             return nil
         }
         // 新进程/未同步时切片库可能尚未打开，图谱检索需要按来源反查原文。
-        guard let store = try? ensureStore() else { return nil }
+        // 极速/决策模式用 metadata-only 连接（与入库路径同源），避免与 colbert
+        // 模式已开的 metadata store 双连接冲突；两种连接都能查 chunks 做原文反查。
+        let store: VectorStore
+        if config.colbertReaderEnabled || config.isDecisionMode {
+            guard let s = try? ensureMetadataStore() else { return nil }
+            store = s
+        } else {
+            guard let s = try? ensureStore() else { return nil }
+            store = s
+        }
         let builder = KnowledgeGraphBuilder(store: kgStore, graph: kgGraph, llm: auxLLM,
                                             limits: kgExtractionLimits,
                                             format: config.ragKGExtractionFormat,

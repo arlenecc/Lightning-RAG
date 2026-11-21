@@ -192,7 +192,7 @@ public final class KernelLoop {
     private let config: AgentConfig
     private let systemPrompt: () -> String
     /// 动态上下文（工作记忆/检查点/技能/知识库状态），追加到当前轮 user 消息尾部。
-    private let dynamicContext: () -> String
+    private let dynamicContext: () async -> String
     private let hooks: KernelHooks
 
     private var schemasCache: [JSONValue]?
@@ -269,7 +269,7 @@ public final class KernelLoop {
                 config: AgentConfig,
                 callbacks: AgentCallbacks? = nil,
                 systemPrompt: @escaping () -> String,
-                dynamicContext: @escaping () -> String = { "" },
+                dynamicContext: @escaping () async -> String = { "" },
                 session: Session? = nil,
                 hooks: KernelHooks? = nil,
                 maxTurns: Int = 0) {
@@ -592,7 +592,7 @@ public final class KernelLoop {
             // 快速吃满 raw 窗口并触发提前折叠。只在首个 THINK 轮注入：后续轮
             // 模型在历史里能看到首轮那份；已注入的轮原样保留（KV 对齐铁律），
             // 由 beginUserRequest()/resetRuntimeState() 在新请求时重置。
-            let dynamic = dynamicContext()
+            let dynamic = await dynamicContext()
             if !dynamic.isEmpty && !dynamicContextInjected {
                 userText += "\n\n" + dynamic
                 dynamicContextInjected = true
