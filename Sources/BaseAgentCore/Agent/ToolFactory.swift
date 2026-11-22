@@ -144,7 +144,9 @@ public enum AgentToolFactory {
                                          zoneSummaryProvider: zoneSummaryProvider)),
                 ("ingest", RagIngestTool(config: config, callbacks: callbacks, registry: registry,
                                          engine: ragEngine)),
-            ]))
+            ],
+            // 模型偶尔漏传 op：带 query 时按检索处理，避免直接报 unknown op。
+            queryDefaultOp: "search"))
 
         // 定时任务：任务清单落盘到 workspace，ScheduleRunner 由 App 启动。
         let scheduleStore = ScheduleStore(

@@ -1320,8 +1320,7 @@ final class AppViewModel: ObservableObject {
 
     func send(_ input: String, images: [Data] = []) {
         let text = input.trimmingCharacters(in: .whitespacesAndNewlines)
-        // 模型加载/预热期间不再丢弃用户输入：寒暄/能力问询在内核本地直答
-        // （零 GPU，启动即有响应）；正式任务排队，MLXLLMService.chatStream
+        // 模型加载/预热期间不再丢弃用户输入：请求排队，MLXLLMService.chatStream
         // 等预热结束后直接复用刚建好的 system+tools 前缀。
         guard !text.isEmpty || !images.isEmpty, !isRunning, let agent else { return }
         // 知识同步 / 向量去重 / ANN 构建期间不再静默丢弃输入。

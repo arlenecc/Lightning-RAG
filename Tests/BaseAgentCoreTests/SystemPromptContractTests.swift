@@ -64,15 +64,6 @@ final class SystemPromptContractTests: XCTestCase {
         }
     }
 
-    /// 公理标题虽与 `looksLikeSystemPromptEcho` 的 markers 不完全同字，但 SOP 全文
-    /// 复述会命中 >600 字的长度兜底；这里锁住两端都不失效。
-    func testL0SOPStillRecognizedAsPromptEcho() {
-        XCTAssertTrue(MEMORY_MANAGEMENT_SOP.contains("核心公理"))
-        XCTAssertTrue(MEMORY_MANAGEMENT_SOP.contains("行动验证"))
-        XCTAssertTrue(MEMORY_MANAGEMENT_SOP.contains("神圣不可删改"))
-        XCTAssertTrue(KernelLoop.looksLikeSystemPromptEcho(MEMORY_MANAGEMENT_SOP))
-    }
-
     func testL1KeepsRulesMarker() {
         XCTAssertTrue(DEFAULT_GLOBAL_MEM_INSIGHT.contains("[RULES]"))
         XCTAssertTrue(DEFAULT_GLOBAL_MEM_INSIGHT.contains("global_mem.txt"))

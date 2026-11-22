@@ -169,19 +169,6 @@ public final class SkillManager {
         "这", "那", "我", "你", "请", "先", "再", "做", "用", "要", "能",
     ])
 
-    /// 纯寒暄/感谢/告别：连工具都不需要，直接文本回复。
-    public static func isGreeting(_ text: String) -> Bool {
-        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return true }
-        if trimmed.contains("\n") { return false }
-        let greetingPattern =
-            "^(你好|您好|hi|hello|hey|嗨|哈喽|早上好|上午好|中午好|下午好|晚上好|晚安|"
-            + "在吗|在不在|谢谢|多谢|感谢|thanks|thank you|再见|拜拜|bye|"
-            + "好的|好|行|可以|嗯|哦|ok|okay)[呀啊哈呢吧嘛！!。.，,~～\\s]*$"
-        return trimmed.range(of: greetingPattern,
-                             options: [.regularExpression, .caseInsensitive]) != nil
-    }
-
     /// 用户是否在纠正上一轮的做法（仅用于技能学习信号，不影响对话路由）。
     public static func isCorrectiveFeedback(_ text: String) -> Bool {
         let lower = text.lowercased()
@@ -224,59 +211,6 @@ public final class SkillManager {
         return !(hasQuestion && !hasInstruction)
     }
 
-    /// 能力/身份问询：「你能做什么」「有哪些工具/能力」「介绍一下自己」等。
-    ///
-    /// 答案由内核按真实注册的 tool schema 本地生成，不调用任何工具、也不问模型
-    /// （轻量轮看不到工具 schema，让模型猜只会得到空泛套话）。与 `isGreeting`
-    /// 同级走轻量通道（无工具 schema、maxTurns=2、不输出 summary）；否则模型会
-    /// 为了「列出可用技能 / 知识库文档 / RAG 索引状态」连调多个工具，并在每轮
-    /// `<summary>` 里反复写「工具调用已完成」的元陈述，实测每轮拖 7-8s。
-    public static func isCapabilityQuery(_ text: String) -> Bool {
-        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty, !trimmed.contains("\n"), trimmed.count <= 40 else {
-            return false
-        }
-        let lower = trimmed.lowercased()
-        // 夹带具体动作/对象的请求不是能力问询（「你能帮我查下这个文件吗」）。
-        let taskVerbs = [
-            "查一下", "查下", "查查", "搜一下", "搜下", "读一下", "读下", "打开",
-            "写一下", "写下", "改一下", "改下", "分析", "总结", "生成", "下载",
-            "执行", "运行", "编译", "翻译", "整理", "读取", "写入", "列出文件",
-            "处理", "找一个", "找个", "推荐", "适合", "用哪个", "用来",
-            "fix", "debug", "write", "read", "open", "search for", "look up",
-        ]
-        if taskVerbs.contains(where: { lower.contains($0) }) { return false }
-        // 知识库/分区/文档的具体内容问句必须走 LLM+RAG，不能本地直答工具清单。
-        // 「社会分区具体有什么」「知识库里有哪些文档」曾因「会/有什么」被误判为能力问询。
-        let ragObjects = ["知识库", "分区", "文档", "切片", "索引", "书", "资料"]
-        if ragObjects.contains(where: { trimmed.contains($0) }) { return false }
-        // 带「调用/用法/支持/失败/记录/参数」等修饰的工具问句是任务，不是能力问询。
-        let toolTaskModifiers = ["调用", "用法", "失败", "记录", "参数", "历史", "执行", "列表里",
-                                 "支持联网", "支持文件", "支持图片", "支持搜索"]
-        if toolTaskModifiers.contains(where: { trimmed.contains($0) }) { return false }
-        // 「能/会/可以」前必须有主语边界（句首或「你/您/请问/你都」），
-        // 否则「社会分区有什么」中的「会」会误命中。
-        // 「有哪些/有什么」只在直接跟能力词（≤2 字衬字）时算能力问询；
-        // 「列出/介绍」只在「列出工具」这类裸宾语时命中，带任务修饰的上面已排除。
-        let pattern =
-            "(^|[你您]|请问|你都)(能|会|可以).{0,6}(什么|啥|哪些|干啥|做啥)|"
-            + "(有哪些|有什么|支持哪些|支持的?)(你)?的?(可用)?(能力|功能|工具|技能|本领|用途)|"
-            + "^(列出|列一下|介绍)(你)?的?(能力|功能|工具|技能|本领|用途)$|"
-            + "(你的|您的)(能力|功能|工具|技能).{0,3}(有哪些|有什么)|"
-            + "(能力|功能|工具|技能)(清单|列表|范围|概览)|"
-            + "有什么(知识库|记忆)|"
-            + "你是谁|你是什么|介绍(一下|下)?(你|自己|你自己)|"
-            + "what can you|what are your|who are you|capabilities|features"
-        // `range(of:.regularExpression)` 对非法正则会静默返回 nil（不抛错），
-        // 因此这里用 NSRegularExpression 显式校验，避免括号不配对时判定恒为 false。
-        guard let regex = try? NSRegularExpression(pattern: pattern,
-                                                   options: .caseInsensitive) else {
-            return false
-        }
-        let range = NSRange(trimmed.startIndex..., in: trimmed)
-        return regex.firstMatch(in: trimmed, range: range) != nil
-    }
-
     /// 寒暄、感谢、身份询问与短问询：不进入技能固化统计。
     ///
     /// 只放行「明显不需要计划」的短文本；含动作动词的请求一律按任务处理。
@@ -284,7 +218,6 @@ public final class SkillManager {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return true }
         if trimmed.contains("\n") { return false }
-        if isGreeting(trimmed) { return true }
 
         let lower = trimmed.lowercased()
         let actionWords = [

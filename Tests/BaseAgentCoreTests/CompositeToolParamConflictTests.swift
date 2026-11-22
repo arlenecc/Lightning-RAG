@@ -50,6 +50,20 @@ final class CompositeToolParamConflictTests: XCTestCase {
         }
     }
 
+    /// `rag_tools` 漏传 op 但带 query 时应推断为 search；空 query 不推断。
+    func testRagToolsInfersSearchFromQuery() {
+        let agent = makeAgent()
+        defer { agent.close() }
+        guard let rag = agent.tools.get("rag_tools") as? CompositeTool else {
+            return XCTFail("缺少 rag_tools")
+        }
+        XCTAssertEqual(rag.resolvedOp(["query": .string("水的密码")]), "search")
+        XCTAssertEqual(rag.resolvedOp(["query": .string("   ")]), "")
+        XCTAssertEqual(rag.resolvedOp(["op": .string("status"), "query": .string("水的密码")]),
+                       "status")
+        XCTAssertEqual(rag.resolvedOp(["op": .string("outline")]), "outline")
+    }
+
     /// `skill_tools` 的 op 枚举必须完整，且 `list` 是真实可路由的动作。
     func testSkillToolsListOpIsExposedAndRunnable() async throws {
         let agent = makeAgent()

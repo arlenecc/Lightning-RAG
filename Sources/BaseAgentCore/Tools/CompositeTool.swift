@@ -6,13 +6,16 @@ import Foundation
 /// `file_tools`），但内部仍复用原有 `AgentTool` 实现，行为零变化。
 /// - `run` 按 `op` 分发到对应子工具，并把 `op` 之外的参数原样透传。
 /// - `shouldConfirm` 同样按 `op` 转发，保留原工具的确认语义（fail-closed 由 registry 统一处理）。
-/// - `op` 为空时若配置了 `defaultOp` 则走默认动作（如 `web_scan` 默认 `scan`），否则报错。
+/// - `op` 为空时若配置了 `defaultOp` 则走默认动作（如 `web_scan` 默认 `scan`）；
+///   配置了 `queryDefaultOp` 且参数带非空 `query` 时走该动作（如 rag_tools 默认 search）。
 public final class CompositeTool: AgentTool {
     public let name: String
     public let description: String
     public let parameters: JSONValue
     /// `op` 缺失时使用的默认动作；nil 表示必填。
     public let defaultOp: String?
+    /// `op` 缺失但带非空 `query` 时使用的默认动作；nil 表示不推断。
+    public let queryDefaultOp: String?
 
     /// 组合工具独占的参数键：分发前会被删除，子工具不得声明同名参数。
     private static let reservedKeys: Set<String> = ["op"]
@@ -32,10 +35,12 @@ public final class CompositeTool: AgentTool {
     public init(name: String,
                 description: String,
                 subcommands: [(op: String, tool: AgentTool)],
-                defaultOp: String? = nil) {
+                defaultOp: String? = nil,
+                queryDefaultOp: String? = nil) {
         self.name = name
         self.description = description
         self.defaultOp = defaultOp
+        self.queryDefaultOp = queryDefaultOp
 
         var map: [String: AgentTool] = [:]
         var order: [String] = []
@@ -93,6 +98,9 @@ public final class CompositeTool: AgentTool {
 
     public func run(_ args: [String: JSONValue]) async throws -> ToolResult {
         let op = resolvedOp(args)
+        if inferredFromQuery(args, op: op) {
+            AgentLog.warning("[tool] \(name): 缺少 op，已按 query 推断为 \(op)")
+        }
         guard let tool = subcommands[op] else {
             return .fail(
                 "unknown op: \"\(op)\"（可用: \(orderedOps.joined(separator: "/"))）")
@@ -107,10 +115,26 @@ public final class CompositeTool: AgentTool {
         return rest
     }
 
-    private func resolvedOp(_ args: [String: JSONValue]) -> String {
+    /// 解析实际动作：显式 op > query 推断 > defaultOp。internal 供回归测试直接校验。
+    func resolvedOp(_ args: [String: JSONValue]) -> String {
         let raw = (args["op"]?.stringValue ?? "")
             .trimmingCharacters(in: .whitespacesAndNewlines)
-        return raw.isEmpty ? (defaultOp ?? "") : raw
+        if !raw.isEmpty { return raw }
+        if let queryDefaultOp, hasQuery(args) { return queryDefaultOp }
+        return defaultOp ?? ""
+    }
+
+    private func hasQuery(_ args: [String: JSONValue]) -> Bool {
+        let query = (args["query"]?.stringValue ?? "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return !query.isEmpty
+    }
+
+    /// `op` 确实由 query 推断而来（用于运行期提醒），避免把 defaultOp 也当成推断。
+    private func inferredFromQuery(_ args: [String: JSONValue], op: String) -> Bool {
+        let raw = (args["op"]?.stringValue ?? "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return raw.isEmpty && queryDefaultOp != nil && op == queryDefaultOp && hasQuery(args)
     }
 
     private func resolvedTool(_ args: [String: JSONValue]) -> AgentTool? {

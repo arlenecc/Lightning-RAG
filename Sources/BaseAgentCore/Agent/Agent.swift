@@ -1192,7 +1192,6 @@ public final class Agent: @unchecked Sendable {
         // 只有非寒暄/简单问询才进入技能固化统计；是否真正提示还要看本轮
         // 是否用过计划（见本次 run 末尾），避免简单查询被提示保存技能。
         let skillCandidate: Skill? = SkillManager.isTrivialRequest(userInput)
-            || SkillManager.isCapabilityQuery(userInput)
             ? nil
             : skills.recordRequest(userInput)
 
@@ -1205,14 +1204,11 @@ public final class Agent: @unchecked Sendable {
         }
 
         // 任务边界：已收尾的旧计划清空；未收尾的注入一次性判断提示。
-        // 寒暄轮/能力问询轮既不触碰计划，也不提供任何工具——直接文本回复。
-        let isGreeting = SkillManager.isGreeting(userInput)
-        let lightweightTurn = isGreeting || SkillManager.isCapabilityQuery(userInput)
         if session.getPlan() == nil, let stored = PlanStore.load(config) {
             session.setPlan(stored)
         }
-        noteSkillLearningSignal(userInput, lightweight: lightweightTurn)
-        if session.getPlan() != nil, !lightweightTurn {
+        noteSkillLearningSignal(userInput)
+        if session.getPlan() != nil {
             if session.planOpenSteps().isEmpty {
                 session.clearPlan()
                 PlanStore.clear(config)
@@ -1230,12 +1226,12 @@ public final class Agent: @unchecked Sendable {
         }
         callbacks.onPlanUpdated(session.getPlan())
 
-        // 本轮是否真正创建/更新过计划：寒暄、简单问询、单次查询不会变，
+        // 本轮是否真正创建/更新过计划：简单问询、单次查询不会变，
         // 因此不触发技能固化建议。
         let planRevisionBefore = session.planRevision
-        kernel.maxTurns = lightweightTurn ? 2 : maxIterations
+        kernel.maxTurns = maxIterations
         var result = await kernel.run(userInput, resume: false,
-                                      emitFinished: false, toolsEnabled: !lightweightTurn,
+                                      emitFinished: false,
                                       images: images)
         // distillRequested 是「本段内调用过 start_long_term_update」；
         // 自动续跑会重置它，因此必须在门面层跨段累计。
@@ -1282,8 +1278,7 @@ public final class Agent: @unchecked Sendable {
                     + (segments == autoContinueMax
                        ? "这是最后一次续跑：不要再调用工具，立即基于已有结果给出最终答复。"
                        : "请继续执行计划中的剩余步骤；不要询问用户是否继续。"),
-                    resume: true, emitFinished: false,
-                    toolsEnabled: !lightweightTurn)
+                    resume: true, emitFinished: false)
             } else {
                 log("[agent] 模型提前收尾但计划未完成（\(open)），自动续跑 "
                     + "\(segments)/\(autoContinueMax)")
@@ -1297,8 +1292,7 @@ public final class Agent: @unchecked Sendable {
                 result = await kernel.run(
                     "[System] 上一条回复被判定为提前收尾，已自动续跑。"
                     + "请按上面的指示处理计划中的剩余步骤；不要询问用户是否继续。",
-                    resume: true, emitFinished: false,
-                    toolsEnabled: !lightweightTurn)
+                    resume: true, emitFinished: false)
             }
             distillRequested = distillRequested || result.distilled
             carry = kernel.failureSnapshot()
@@ -1381,10 +1375,10 @@ public final class Agent: @unchecked Sendable {
         // 卡在 run 返回前，直接拉长「本轮结束 → 用户可再发送」的间隔。
         scheduleArchive()
 
-        // 寒暄/能力问询跳过事实抽取与蒸馏，但**记忆维护仍要跑**：它消费的是
-        // 持久化队列，否则这些轮归档的 session 会一直挂在队列里等不到提炼。
+        // 记忆维护消费的是持久化队列，即使本轮内容很少也要跑，
+        // 否则归档的 session 会一直挂在队列里等不到提炼。
         fireFinished(text: text, distillRequested: distillRequested,
-                     substantive: substantive, isGreeting: lightweightTurn)
+                     substantive: substantive)
         callbacks.onFinished()
         return text
     }
@@ -1696,8 +1690,7 @@ public final class Agent: @unchecked Sendable {
 
     /// 只有计划仍在进行时用户追加的消息才算「引导」；计划已完成则重置，
     /// 避免下一轮寒暄或新任务继承旧信号。
-    private func noteSkillLearningSignal(_ input: String, lightweight: Bool) {
-        guard !lightweight else { return }
+    private func noteSkillLearningSignal(_ input: String) {
         guard let plan = session.getPlan(), !session.planOpenSteps().isEmpty else {
             session.resetSkillLearningSignal()
             return
@@ -1718,11 +1711,10 @@ public final class Agent: @unchecked Sendable {
     /// memory graph。既不逐轮跑、也绝不回退主模型，因此不会与前台抢 GPU。
     /// 其它后台工作（历史提炼 / 记忆整理 / L4 蒸馏）仍按原策略执行。
     func fireFinished(text: String, distillRequested: Bool? = nil,
-                      substantive: Bool = true,
-                      isGreeting: Bool = false) {
+                      substantive: Bool = true) {
         let user = lastUserText.trimmingCharacters(in: .whitespacesAndNewlines)
-        // 寒暄/能力问询不做蒸馏；此处只判断本轮是否值得做 L4 经验蒸馏。
-        let substantiveTurn = !isGreeting && user.count >= 6 && text.count >= 8
+        // 只判断本轮是否值得做 L4 经验蒸馏。
+        let substantiveTurn = user.count >= 6 && text.count >= 8
 
         // 改进7：待提炼队列是**持久化**的，寒暄轮、辅助模型暂不可用、后台任务
         // 被下一次 run 取消等情况都不会丢，本轮或下一轮重新拾起即可。
@@ -1730,7 +1722,7 @@ public final class Agent: @unchecked Sendable {
         // 改进8：至少 8 轮做一次整理建议（与折叠周期对齐），
         // 后台用辅助引擎产出建议、不改记忆文件。
         let tidyEvery = max(8, config.kernelConsolidateEvery)
-        let shouldTidy = !isGreeting && session.currentTurn >= readLastMemoryTidyTurn() + tidyEvery
+        let shouldTidy = session.currentTurn >= readLastMemoryTidyTurn() + tidyEvery
         let shouldDistill = substantiveTurn && substantive
             && (distillRequested ?? kernel.distillRequested)
         // 事实抽取必须满足：有辅助模型（唯一允许的模型）+ 距上次成功 ≥4h

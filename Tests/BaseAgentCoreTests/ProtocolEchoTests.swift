@@ -43,13 +43,4 @@ final class ProtocolEchoTests: XCTestCase {
         let text = "知识库里有 12 个文档，涵盖lys三主题。"
         XCTAssertEqual(stripSummaryTags(text), text)
     }
-
-    /// 复述锚点协议被识别为「像系统提示回显」（轻量轮据此改用本地兜底）。
-    func testAnchorEchoDetectedAsPromptEcho() {
-        XCTAssertTrue(KernelLoop.looksLikeSystemPromptEcho(
-            "###[PLAN]\nGoal:xxx\n- [▶]1. 调用工具\n\nNow:1. 调用工具"))
-        XCTAssertTrue(KernelLoop.looksLikeSystemPromptEcho(
-            "### [WORKING MEMORY]\nCurrent turn: 2"))
-        XCTAssertFalse(KernelLoop.looksLikeSystemPromptEcho("你好，有什么可以帮你？"))
-    }
 }

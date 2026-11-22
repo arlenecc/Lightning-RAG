@@ -436,6 +436,7 @@ public final class ValenDecisionScorer: @unchecked Sendable {
         var results = [Double](repeating: 0, count: passages.count)
         for (i, passage) in passages.enumerated() {
             if Task.isCancelled { break }
+            // 分片打分：query-aware 相似度取 top 3~5，追求速度；与全文核心句算法分开。
             let text = useCoreSentences
                 ? CharacterNgramBM25.coreSentences(query: query, text: passage,
                                                    count: max(1, coreSentenceCount)).joined(separator: " ")
@@ -457,7 +458,9 @@ public final class ValenDecisionScorer: @unchecked Sendable {
                             trueOption: String = "Yes / true",
                             falseOption: String = "No / false",
                             maxStateChars: Int = 3000) async throws -> Double {
-        let clipped = state.count > maxStateChars ? String(state.prefix(maxStateChars)) : state
+        // 整段判定：与 Meteor 一致，抛开问句按全文核心句压缩（不同于分片相似度选取）。
+        let clipped = CoreOpinionExtractor.prepareForScoring(
+            state, maxChars: maxStateChars)
         let probs = try await decideQuestion(
             state: clipped,
             question: ValenQuestion(

@@ -136,12 +136,12 @@ final class KernelDecisionGateTests: XCTestCase {
 
         // 两次拦截后第三次文本放行。
         XCTAssertEqual(judge.completeCalls.count, 2,
-                       "预算内应收尾判定 2 次（第 3 轮预算耗尽直接放行）")
+                       "预算内应判定 2 次（生成前 + 收尾），第 3 轮预算耗尽直接放行")
         XCTAssertTrue(model.userPrompts.contains {
             $0.contains("决策模型判定当前收集的信息可能不足")
         }, "拦截提示应作为 pending 注入下一轮 user 提示")
-        // 首轮工具 + 2 次被拦文本 + 1 次放行文本 = 4 次调用。
-        XCTAssertEqual(model.callCount, 4)
+        // 首轮工具 → 生成前拦截（不产生草稿）→ 1 次文本被收尾门拦截 → 1 次放行文本 = 3 次调用。
+        XCTAssertEqual(model.callCount, 3)
     }
 
     /// 信息足够：判定放行，不额外消耗轮次。

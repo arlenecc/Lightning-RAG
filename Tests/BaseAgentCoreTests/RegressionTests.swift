@@ -364,25 +364,6 @@ final class RegressionTests: XCTestCase {
         XCTAssertFalse(SkillManager.isTrivialRequest("修复这个文件的编译错误"))
         XCTAssertFalse(SkillManager.isTrivialRequest("你好，帮我分析这个项目"))
     }
-
-    func testGreetingClassificationForToolFreeRounds() {
-        for text in ["你好", "你好呀！", "谢谢", "thanks", "在吗", "再见~", "好的", "嗯呢"] {
-            XCTAssertTrue(SkillManager.isGreeting(text), "应为寒暄: \(text)")
-        }
-        for text in ["你好，帮我分析这个项目", "查一下 index.sqlite 有多少行",
-                     "把测试跑一遍", "写个快速排序"] {
-            XCTAssertFalse(SkillManager.isGreeting(text), "不应视为寒暄: \(text)")
-        }
-    }
-
-    func testCapabilityQueryDoesNotSwallowConcreteSkillTask() {
-        XCTAssertTrue(SkillManager.isCapabilityQuery("你能做什么"))
-        XCTAssertTrue(SkillManager.isCapabilityQuery("你有哪些功能"))
-        XCTAssertFalse(SkillManager.isCapabilityQuery("你有哪些技能可以处理 PDF"),
-            "带具体任务的技能问询不能走无工具轻量通道")
-        XCTAssertFalse(SkillManager.isCapabilityQuery("帮我找一个处理简历的技能"),
-            "带任务动作的问询不能走无工具轻量通道")
-    }
 }
 
 private final class CountingVLM: VLMService {

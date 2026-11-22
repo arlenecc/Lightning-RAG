@@ -49,7 +49,20 @@ public protocol KernelDecisionJudge: AnyObject, Sendable {
     /// 计划步骤是否必要合理（true=必要；false=可能不必要/多余；nil=不可用）。
     func stepNecessary(goal: String, step: String) async -> Bool?
     /// 已收集信息是否足以完整回答任务（true=足够；false=不足；nil=不可用）。
+    /// `evidence` 是最终交给生成模型的材料（工具结果原文 + 会话状态），
+    /// 实现方不得再截断或摘要——被裁掉的部分可能正是判定依据。
     func informationSufficient(task: String, evidence: String) async -> Bool?
+    /// 带草稿答案的判定：生成前传空串（只判材料是否足够），生成后兜底时传候选答案。
+    func informationSufficient(task: String, evidence: String, draft: String) async -> Bool?
+}
+
+extension KernelDecisionJudge {
+    /// 默认忽略草稿，兼容只实现两参版本的判定器。
+    public func informationSufficient(
+        task: String, evidence: String, draft: String
+    ) async -> Bool? {
+        await informationSufficient(task: task, evidence: evidence)
+    }
 }
 
 /// 基于决策模型打分器的内核判定实现（Meteor/Valen 任一后端均可注入）。
@@ -93,14 +106,18 @@ public final class MeteorKernelJudge: KernelDecisionJudge, @unchecked Sendable {
     /// 统一执行：异常/超时 → nil（静默放行）。
     /// 超时只在连续达到上限后禁用；确定性错误立即禁用。
     private func judge(_ label: String,
-                       state: String, question: String) async -> Double? {
+                       state: String, question: String,
+                       maxStateChars: Int = 3000) async -> Double? {
         lock.lock()
         let isDisabled = disabled
         lock.unlock()
         if isDisabled { return nil }
         do {
             let value = try await withTimeout(seconds: timeoutSeconds) {
-                try await self.scorer.judgeBinary(state: state, question: question)
+                try await self.scorer.judgeBinary(
+                    state: state, question: question,
+                    trueOption: "Yes / true", falseOption: "No / false",
+                    maxStateChars: maxStateChars)
             }
             lock.lock()
             consecutiveTimeouts = 0
@@ -153,15 +170,43 @@ public final class MeteorKernelJudge: KernelDecisionJudge, @unchecked Sendable {
     }
 
     public func informationSufficient(task: String, evidence: String) async -> Bool? {
-        let state = """
-        User task: \(task)
+        await informationSufficient(task: task, evidence: evidence, draft: "")
+    }
 
-        Collected tool results (evidence):
-        \(evidence)
-        """
-        guard let prob = await judge("complete", state: state, question:
-            "Is the collected evidence sufficient to fully answer the user's task? "
-                + "(A: insufficient, more information is needed, B: sufficient)") else {
+    public func informationSufficient(
+        task: String, evidence: String, draft: String
+    ) async -> Bool? {
+        let trimmedDraft = draft.trimmingCharacters(in: .whitespacesAndNewlines)
+        let state: String
+        let question: String
+        if trimmedDraft.isEmpty {
+            state = """
+            User task: \(task)
+
+            Material given to the answer model:
+            \(evidence)
+            """
+            question =
+                "Is this material sufficient to fully answer the user's task? "
+                + "(A: insufficient, more information is needed, B: sufficient)"
+        } else {
+            state = """
+            User task: \(task)
+
+            Draft answer (candidate response, not yet shown to the user):
+            \(trimmedDraft)
+
+            Material given to the answer model:
+            \(evidence)
+            """
+            question =
+                "Is the draft answer complete, accurate, and supported by the material for "
+                + "the user's task? (A: incomplete or unsupported, needs more work, B: sufficient)"
+        }
+        // 判定输入就是生成的输入：材料与草稿都必须完整送入，任何截断都会让
+        // 「证据是否足够」的结论偏离真实生成条件。
+        guard let prob = await judge("complete", state: state, question: question,
+                                     maxStateChars: Int.max) else {
             return nil
         }
         let passed = prob >= finishThreshold

@@ -95,8 +95,7 @@ final class KVCacheEffectivenessTests: XCTestCase {
         try await service.warmup(systemPrompt: agent.systemPrompt(),
                                  tools: agent.dispatcher.schemas())
 
-        // 不用「介绍你自己」：它会命中能力问询快速通道（toolsEnabled=false），
-        // 与 warmup 的全量工具前缀不一致，测的就不是 KV 复用了。
+        // 用普通问答验证跨轮 KV 复用（前缀应稳定为 system+tools）。
         _ = await agent.run("用一句话说明什么是 KV 缓存，不要调用任何工具。")
         _ = await agent.run("接着回答：1+1 等于几？只回答数字。")
         _ = await agent.run("再回答：2+2 等于几？只回答数字。")

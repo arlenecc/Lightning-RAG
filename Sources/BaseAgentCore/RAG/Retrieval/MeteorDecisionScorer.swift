@@ -215,6 +215,9 @@ public final class MeteorDecisionScorer: BinaryDecisionScoring, @unchecked Senda
         try await load()
         guard !passages.isEmpty else { return [] }
         let prepared = passages.map { text -> String in
+            // 分片打分场景：query-aware，只取与查询最相似的 3~5 句即可代表该分片，
+            // 追求最快处理几十个分片。与 judgeBinary 的「全文核心句」算法完全不同，
+            // 这里必须保持 CharacterNgramBM25（相似度排序），不可换成融合提取器。
             useCoreSentences
                 ? CharacterNgramBM25.coreSentences(query: query, text: text,
                                                     count: max(1, coreSentenceCount)).joined(separator: " ")
@@ -347,7 +350,10 @@ public final class MeteorDecisionScorer: BinaryDecisionScoring, @unchecked Senda
                             falseOption: String = "No / false",
                             maxStateChars: Int = 3000) async throws -> Double {
         try await load()
-        let clipped = state.count > maxStateChars ? String(state.prefix(maxStateChars)) : state
+        // 整段文本判定：抛开问句，直接提取代表全文的核心句（两算法各 top10 去重），
+        // 与分片打分的 query-aware 相似度选取是完全不同的机制，不可混用。
+        let clipped = CoreOpinionExtractor.prepareForScoring(
+            state, maxChars: maxStateChars)
         let safeState = Self.escape(clipped)
         let safeQuestion = Self.escape(question)
         let userText = """
