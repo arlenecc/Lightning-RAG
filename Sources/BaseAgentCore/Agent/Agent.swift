@@ -1508,7 +1508,8 @@ public final class Agent: @unchecked Sendable {
         return text
     }
 
-    /// 动态上下文（工作记忆、当天事实、检查点、命中技能、知识库状态）。
+    /// 动态上下文（命中技能、知识库状态）。工作检查点由 `anchorPrompt` 每轮注入，
+    /// 不在这里重复。
     ///
     /// 由 `KernelLoop` 追加到当前轮 user 消息尾部，而不是放进 system 消息：
     /// 这样动态内容只影响提示词尾部，前面的大段历史仍能命中 KV cache。
@@ -1517,13 +1518,8 @@ public final class Agent: @unchecked Sendable {
         if let cachedDynamicContext { return cachedDynamicContext }
         var sections: [String] = []
 
-        // 检查点常驻注入：优先 Session（本轮工具实时更新），其次持久化文件。
-        let checkpoint = session.getKeyInfo().isEmpty
-            ? CheckpointStore.readPersisted(config)
-            : session.getKeyInfo()
-        if !checkpoint.isEmpty {
-            sections.append("# Working checkpoint\n\(checkpoint.prefix(4_000))")
-        }
+        // 工作检查点不在这里注入：Session.anchorPrompt 每轮已带 <key_info>，
+        // 再放一份会让首个请求重复占两份 token。
 
         // 命中技能：截断并提示用 skill_tools(op="load") 读全文。
         // 至少 3 分才注入：名称命中(3) 或关键词/tags 命中(2)+描述，

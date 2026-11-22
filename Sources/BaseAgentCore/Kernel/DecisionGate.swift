@@ -69,10 +69,15 @@ public final class MeteorKernelJudge: KernelDecisionJudge, @unchecked Sendable {
     /// 执行完成度（收尾拦截）阈值：true（信息足够）概率 < 该值才拦截。
     /// 来自 config.kernelFinishGateThreshold（默认 0.5，可调 0.4-0.95）。
     private let finishThreshold: Double
-    /// 判定失败（模型缺失/加载失败/超时）后整个会话禁用决策门：
-    /// 首次打一条 WARN 便于排查，后续静默放行，避免每轮收尾刷同一条告警。
+    /// 判定失败后的降级策略：
+    /// - 超时：本轮放行、下轮重试；连续 3 次才禁用（避免每轮都白等 10s）；
+    /// - 模型缺失/加载失败等确定性错误：立即禁用。
+    /// 禁用后本会话静默放行，只保留一条 WARN 便于排查。
     private let lock = NSLock()
     private var disabled = false
+    private var consecutiveTimeouts = 0
+    /// 连续超时达到该次数即禁用，防止 GPU 长期被占用时每轮都阻塞 10s。
+    private let maxConsecutiveTimeouts = 3
 
     /// - Parameters:
     ///   - threshold: 兼容旧调用，作为两个阈值的共同默认；显式传 plan/finish 时以显式值为准。
@@ -85,7 +90,8 @@ public final class MeteorKernelJudge: KernelDecisionJudge, @unchecked Sendable {
         self.finishThreshold = finishThreshold ?? threshold
     }
 
-    /// 统一执行：超时/异常 → nil（静默放行）；首次失败后本次会话不再尝试。
+    /// 统一执行：异常/超时 → nil（静默放行）。
+    /// 超时只在连续达到上限后禁用；确定性错误立即禁用。
     private func judge(_ label: String,
                        state: String, question: String) async -> Double? {
         lock.lock()
@@ -96,15 +102,35 @@ public final class MeteorKernelJudge: KernelDecisionJudge, @unchecked Sendable {
             let value = try await withTimeout(seconds: timeoutSeconds) {
                 try await self.scorer.judgeBinary(state: state, question: question)
             }
+            lock.lock()
+            consecutiveTimeouts = 0
+            lock.unlock()
             return value
         } catch {
             lock.lock()
-            let firstFailure = !disabled
-            disabled = true
+            let wasDisabled = disabled
+            var warnTimeout = false
+            var disableNow = false
+            if error is DecisionTimeoutError {
+                consecutiveTimeouts += 1
+                if consecutiveTimeouts >= maxConsecutiveTimeouts {
+                    disabled = true
+                    disableNow = true
+                } else {
+                    warnTimeout = (consecutiveTimeouts == 1)
+                }
+            } else {
+                disabled = true
+                disableNow = true
+            }
             lock.unlock()
-            if firstFailure {
+
+            if disableNow && !wasDisabled {
                 AgentLog.warning("[decision-gate] \(label) 判定失败，决策门已禁用（后续静默放行）："
                     + error.localizedDescription)
+            } else if warnTimeout {
+                AgentLog.warning("[decision-gate] \(label) 判定超时（\(timeoutSeconds)s），本轮放行并保留决策门，"
+                    + "下一轮重试（连续 \(maxConsecutiveTimeouts) 次才禁用）")
             }
             return nil
         }
@@ -265,7 +291,13 @@ public final class MeteorSkillJudge: SkillDecisionJudge, @unchecked Sendable {
     }
 }
 
-/// 带超时的任务执行：超时抛出 `AgentError.llm`。
+/// 判定超时：与模型缺失/加载失败区分开——超时可重试，不直接禁用决策门。
+struct DecisionTimeoutError: LocalizedError {
+    let seconds: Double
+    var errorDescription: String? { "决策判定超时（\(seconds)s）" }
+}
+
+/// 带超时的任务执行：超时抛出 `DecisionTimeoutError`。
 /// 注意：超时不会真正取消底层前向（模型调用不可取消），只是不再等待其结果，
 /// 由调用方按失败处理；底层任务会被等待到自然结束并丢弃结果。
 private func withTimeout<T: Sendable>(seconds: Double,
@@ -274,7 +306,7 @@ private func withTimeout<T: Sendable>(seconds: Double,
         group.addTask { try await body() }
         group.addTask {
             try await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
-            throw AgentError.llm("决策判定超时（\(seconds)s）")
+            throw DecisionTimeoutError(seconds: seconds)
         }
         guard let first = try await group.next() else {
             throw AgentError.llm("决策判定任务组异常结束")

@@ -469,13 +469,17 @@ final class AppViewModel: ObservableObject {
             appendLog("[model] 辅助模型未启用，启动时不加载")
         }
         if missingDefaultModels.isEmpty {
-            Task {
+            // 启动期 GPU 仲裁：主模型 preload + 全量前缀预热（实测 40~55s）是
+            // 启动阶段最重的 GPU 任务，Embedding/Reranker/ColBERT 的 preload 与
+            // 向量回填会同时抢 GPU，互相拖慢且造成 token 间抖动。
+            // 让后台预加载等主预热结束再启动；主模型不预加载/加载失败/配置切换时
+            // 这个 Task 会立即结束，不会把 RAG 预加载永久卡住。
+            let mainPreloadTask = Task {
                 await preloadModels(main: shouldPreloadMain,
                                     aux: config.auxEnabled)
             }
-            // Embedding / Reranker 与主模型是否预加载无关：检索首问同样需要它们。
             Task {
-                await preloadRAGModels()
+                await preloadRAGModels(waitForMainPreload: mainPreloadTask)
             }
         } else {
             // 默认模型缺失：预加载必然失败，等下载补齐后由用户重新触发加载。
@@ -1110,7 +1114,7 @@ final class AppViewModel: ObservableObject {
     ///
     /// 首次检索现场加载 ONNX session 实测 10~15s；失败只记录日志，不阻塞启动，
     /// 下次检索仍会按需加载并重试。
-    func preloadRAGModels() async {
+    func preloadRAGModels(waitForMainPreload: Task<Void, Never>? = nil) async {
         guard let agent else { return }
         let generation = configGeneration
         // 检索阅读模式模型下载状态上抛到状态栏（几百 MB 下载不再「静默」）。
@@ -1127,6 +1131,10 @@ final class AppViewModel: ObservableObject {
                 self?.appendLog("[decision] \(text)")
             }
         }
+        // handler 注入不占 GPU，先做；真正抢 GPU 的权重加载与回填等主预热结束。
+        // 等待期间若配置被切换，generation 校验会让本次预加载整体作废。
+        if let waitForMainPreload { await waitForMainPreload.value }
+        guard configGeneration == generation else { return }
         let outcome = await agent.ragEngine.preloadAuxiliaryModels()
         guard configGeneration == generation else { return }
         if !outcome.loaded.isEmpty {
@@ -1150,6 +1158,15 @@ final class AppViewModel: ObservableObject {
             if generation == nil || configGeneration == generation {
                 isWarmingUp = false
             }
+            service.setWarmupProgressHandler(nil)
+        }
+        // 把后端预热 stage 上抛到状态栏：静态「预热中…」换成可读阶段，
+        // 让 40~55s 的窗口不再像卡死。
+        service.setWarmupProgressHandler { [weak self] text in
+            DispatchQueue.main.async {
+                guard let self, self.isWarmingUp else { return }
+                self.statusText = text
+            }
         }
         statusText = "模型预热中…"
         // MCP 工具清单会进入 system 前缀，预热前先等连接完成。
@@ -1160,6 +1177,13 @@ final class AppViewModel: ObservableObject {
                                      tools: agent.dispatcher.schemas())
             guard generation == nil || configGeneration == generation else { return }
             appendLog("[model] 主模型预热结束")
+            // 决策模型（0.8B）冷加载 + 首次前向要十几秒，空闲时先预热，
+            // 避免首个判定撞上 10s 超时（门一旦失败会整场静默放行）。
+            if config.kernelDecisionGateEnabled,
+               let scorer = try? agent.ragEngine.sharedDecisionScorer(),
+               scorer.isModelAvailable {
+                Task { await scorer.warmup() }
+            }
             // 预热期间已排队的用户请求此时开始生成，状态切回「思考中…」；
             // 否则直接就绪。旧实现固定睡 1.2s 只为让中间状态可见。
             statusText = isRunning ? "思考中…" : "就绪"

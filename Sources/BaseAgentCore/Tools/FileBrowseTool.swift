@@ -10,9 +10,11 @@ import Foundation
 public final class FileListTool: AgentTool {
     public let name = "file_list"
     public let description =
-        "List directory entries inside the workspace (read-only). Returns per-entry "
-        + "type (dir/), size and last-modified time. Optional glob filter (e.g. *.swift) "
-        + "and recursive mode with depth cap. Hidden entries (dot-prefixed) are skipped."
+        "List directory entries inside the workspace (read-only). Returns ALL entries "
+        + "with per-entry type (dir/), size and last-modified time — no entry-count cap; "
+        + "the caller decides whether to narrow (glob) or truncate. Optional glob filter "
+        + "(e.g. *.swift) and recursive mode with depth cap. Hidden entries (dot-prefixed) "
+        + "are skipped."
     /// 只读操作，不需要确认。
     public let destructive = false
 
@@ -30,14 +32,13 @@ public final class FileListTool: AgentTool {
                 "max_depth": ToolSupport.numberProperty(
                     "Max recursion depth when recursive=true (default 3)."),
                 "max_entries": ToolSupport.numberProperty(
-                    "Max entries to return (default 500)."),
+                    "Optional caller-side cap: only set this if you want fewer entries. "
+                    + "Omit for the complete list."),
             ],
             required: [])
     }
 
-    /// 单次枚举的默认/硬上限：防止把巨型目录树整棵倒进上下文。
-    static let defaultMaxEntries = 500
-    static let hardMaxEntries = 5_000
+    /// 默认全量输出：不设条目数上限，是否截断完全由调用方决定（显式传 max_entries）。
     static let defaultMaxDepth = 3
     static let hardMaxDepth = 8
 
@@ -56,10 +57,8 @@ public final class FileListTool: AgentTool {
                 Int(ToolSupport.optionalDouble(args, "max_depth")
                     ?? Double(Self.defaultMaxDepth)),
                 Self.hardMaxDepth)
-            let maxEntries = min(
-                Int(ToolSupport.optionalDouble(args, "max_entries")
-                    ?? Double(Self.defaultMaxEntries)),
-                Self.hardMaxEntries)
+            // 调用方显式传 max_entries 才截断；不传则全量输出（不再有默认/硬上限）。
+            let maxEntries = Int(ToolSupport.optionalDouble(args, "max_entries") ?? 0)
 
             let root = try ToolSupport.resolveWorkspacePath(path, workspace: config.workspace)
             var isDirectory: ObjCBool = false
@@ -95,7 +94,7 @@ public final class FileListTool: AgentTool {
             if !recursive {
                 for item in try FileManager.default.contentsOfDirectory(
                     at: URL(fileURLWithPath: root), includingPropertiesForKeys: nil) {
-                    guard lines.count < maxEntries else { truncated = true; break }
+                    if maxEntries > 0, lines.count >= maxEntries { truncated = true; break }
                     var isDir: ObjCBool = false
                     _ = FileManager.default.fileExists(atPath: item.path, isDirectory: &isDir)
                     if let line = fmt(item, isDir: isDir.boolValue) { lines.append(line) }
@@ -106,7 +105,7 @@ public final class FileListTool: AgentTool {
                     includingPropertiesForKeys: [.isDirectoryKey],
                     options: [.skipsHiddenFiles])
                 while let item = enumerator?.nextObject() as? URL {
-                    if lines.count >= maxEntries { truncated = true; break }
+                    if maxEntries > 0, lines.count >= maxEntries { truncated = true; break }
                     let depth = (enumerator?.level ?? 0)
                     if depth > maxDepth { enumerator?.skipDescendants(); continue }
                     let isDir = (try? item.resourceValues(forKeys: [.isDirectoryKey]))?
@@ -120,8 +119,8 @@ public final class FileListTool: AgentTool {
             }
             var output = lines.joined(separator: "\n")
             if truncated {
-                output += "\n… [结果超过 \(maxEntries) 条已截断；可用 glob 收窄范围，"
-                    + "或对子目录单独调用]"
+                output += "\n… [已按调用方设定的 max_entries=\(maxEntries) 截断；"
+                    + "省略该参数可获取完整列表]"
             }
             return .ok(output)
         } catch {

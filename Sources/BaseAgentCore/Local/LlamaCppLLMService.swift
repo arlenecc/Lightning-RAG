@@ -28,6 +28,19 @@ public final class LlamaCppLLMService: LLMService, PreloadableLLMService,
     /// 是否让 llama.cpp 强制启用 Flash Attention（可与 q8_0 KV 叠加）。
     private let flashAttention: Bool
 
+    /// 前缀 KV 快照上限：与 MLXLLMService.warmupSnapshotMaxTokens 对齐。
+    /// 实测 system+13 工具前缀 8387 token，旧的 8192 会让 GGUF 跳过快照，
+    /// 折叠/清空后只能重跑整段 prefill。
+    private static let prefixSnapshotMaxTokens = 10_240
+    /// 预热进度回调（UI 状态栏）。
+    private var warmupProgressHandler: (@Sendable (String) -> Void)?
+
+    public func setWarmupProgressHandler(_ handler: (@Sendable (String) -> Void)?) {
+        lock.lock()
+        warmupProgressHandler = handler
+        lock.unlock()
+    }
+
     private let gate = AsyncGate()
     private let lock = NSLock()
     private var loaded: Loaded?
@@ -202,18 +215,49 @@ public final class LlamaCppLLMService: LLMService, PreloadableLLMService,
             defer { lock.unlock() }
 
             let loaded = try ensureLoadedLocked()
-            try warmupLocked(loaded: loaded, systemPrompt: systemPrompt, tools: tools)
-            // 主对话前缀快照：折叠/清空历史会 invalidateKVCache() 丢掉会话 KV，
-            // 旧实现下一轮只能整段重建（实测 7~8k token prefill 需 7~8s）。
-            // 这里在内存恰好停在预热前缀时抓一份字节快照，供 rebuild 时恢复。
-            // 只在 ≤8_192 token 时抓，避免常驻内存过大；与 isolated 快照分离。
+            let toolsKey = Self.toolsKey(tools)
             let signature = Self.mainPrefixSignature(
                 modelPath: modelPath, contextWindow: contextWindow,
                 kvInt8: kvInt8, flashAttention: flashAttention,
-                systemPrompt: systemPrompt, toolsKey: Self.toolsKey(tools))
+                systemPrompt: systemPrompt, toolsKey: toolsKey)
+
+            // 折叠/清空对话后 invalidateKVCache() 会清掉会话 KV；若主对话前缀
+            // 字节快照仍在且签名一致，直接恢复它即可让缓存重新停在预热前缀，
+            // 跳过 warmupLocked 的整段 7~8k token prefill（实测省 ~50s）。
+            // 恢复失败或条件不满足时保持原状，回退到既有全量预热路径。
+            var restored = false
+            if cachedTokens.isEmpty,
+               let snapshot = mainPrefixStateData,
+               signature == mainPrefixSignature,
+               !mainPrefixTokens.isEmpty,
+               systemPrompt == warmupSystemPrompt,
+               toolsKey == warmupToolsKey {
+                llama_memory_clear(loaded.memory, true)
+                if Self.restoreSequenceState(snapshot, context: loaded.context) {
+                    cachedTokens = mainPrefixTokens
+                    cachedToolsKey = toolsKey
+                    restored = true
+                    warmupProgressHandler?("模型预热中… 复用已有前缀快照（跳过全量 prefill）")
+                    AgentLog.info("[gguf-warmup] 恢复主对话前缀快照 tokens=\(mainPrefixTokens.count) "
+                        + "（跳过全量 prefill）")
+                } else {
+                    mainPrefixStateData = nil
+                    cachedTokens = []
+                    cachedToolsKey = nil
+                    AgentLog.warning("[gguf-warmup] 前缀快照恢复失败，回退全量预热")
+                }
+            }
+            if !restored {
+                try warmupLocked(loaded: loaded, systemPrompt: systemPrompt, tools: tools)
+            }
+            // 主对话前缀快照：折叠/清空历史会 invalidateKVCache() 丢掉会话 KV，
+            // 旧实现下一轮只能整段重建（实测 7~8k token prefill 需 7~8s）。
+            // 这里在内存恰好停在预热前缀时抓一份字节快照，供 rebuild 时恢复。
+            // 只在 ≤上限 token 时抓，避免常驻内存过大；与 isolated 快照分离。
             // warmupLocked 可能因前缀过短（<32）或模板不支持而跳过预热，
             // 此时 warmupTokens 为空/陈旧，绝不能抓快照（否则恢复空状态污染 KV）。
-            if !warmupTokens.isEmpty, warmupTokens.count <= 8_192,
+            if !restored, !warmupTokens.isEmpty,
+               warmupTokens.count <= Self.prefixSnapshotMaxTokens,
                warmupSystemPrompt == systemPrompt,
                Self.toolsKey(tools) == warmupToolsKey,
                cachedTokens == warmupTokens,
@@ -249,9 +293,10 @@ public final class LlamaCppLLMService: LLMService, PreloadableLLMService,
                               tools: [JSONValue]) throws {
         let toolsKey = Self.toolsKey(tools)
         // 前缀签名一致且缓存里仍完整保留该前缀 → 无需再 prefill。
-        // 折叠/清空历史后 invalidation 会清掉 cachedTokens，此时条件
-        // 不成立，warmup 必须重跑：GGUF 没有可复制的 KV 快照，重跑
-        // 前缀正是让下一轮 mode=append 只算增量的唯一途径。
+        // 折叠/清空历史后 invalidation 会清掉 cachedTokens：顶层 warmup()
+        // 会先尝试恢复 mainPrefixStateData 字节快照（成功则不会走到这里）；
+        // 恢复失败或签名变化时，重跑前缀仍是让下一轮 mode=append
+        // 只算增量的可靠兜底。
         if systemPrompt == warmupSystemPrompt,
            toolsKey == warmupToolsKey,
            !warmupTokens.isEmpty,
@@ -297,6 +342,7 @@ public final class LlamaCppLLMService: LLMService, PreloadableLLMService,
             AgentLog.warning("[gguf-warmup] 跳过：前缀 token 数 \(tokens.count) 不适合预热")
             return
         }
+        warmupProgressHandler?("模型预热中… 计算 system 前缀 \(tokens.count) tokens")
         llama_memory_clear(loaded.memory, true)
         try LlamaCppContext.decode(tokens: tokens,
                                    context: loaded.context,
@@ -409,7 +455,7 @@ public final class LlamaCppLLMService: LLMService, PreloadableLLMService,
                 }
                 if warmupStateData == nil, warmupToolsKey == toolsKey,
                    !warmupTokens.isEmpty, cachedTokens == warmupTokens,
-                   warmupTokens.count <= 8_192 {
+                   warmupTokens.count <= Self.prefixSnapshotMaxTokens {
                     // 仅在内存恰好停在前缀（刚预热完）时抓快照，
                     // 避免把上轮生成的位置一并存进去导致恢复后错位。
                     warmupStateData = Self.captureSequenceState(context: loaded.context)

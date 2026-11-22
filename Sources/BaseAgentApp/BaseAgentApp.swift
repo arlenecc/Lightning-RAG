@@ -865,8 +865,11 @@ struct MainView: View {
             && ((input.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
                  && attachments.isEmpty)
                 || !model.missingDefaultModels.isEmpty
-                || model.isModelLoading || model.isWarmingUp || model.isSyncing
+                || model.isModelLoading || model.isSyncing
                 || model.isBuildingANN)
+        // 注意：isWarmingUp 不在此拦截。send() 内部已支持预热期排队，
+        // 寒暄/能力问询还能本地直答零 GPU 立即响应；正式任务在
+        // chatStream 里等预热结束后直接复用刚建好的前缀。
     }
 
     /// 当前上下文窗口使用率（分母为实际生效的主模型上下文窗口）。

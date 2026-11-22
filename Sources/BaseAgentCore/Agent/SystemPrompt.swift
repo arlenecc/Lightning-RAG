@@ -4,7 +4,8 @@ import Foundation
 ///
 /// `Agent.systemPrompt()` 把本常量 + L0 `memory_management_sop` + L1
 /// `global_mem_insight.txt` 拼成最终 system 消息（按内容签名缓存，保证 KV 前缀稳定）。
-/// 工作记忆、当天事实、命中技能等**动态**段由 `dynamicContextPrompt()` 追加到 user 尾部。
+/// 命中技能、知识库状态等**动态**段由 `dynamicContextPrompt()` 追加到 user 尾部；
+/// 工作检查点由 `Session.anchorPrompt()` 每轮以 `<key_info>` 注入。
 ///
 /// 精简原则：每段语义只出现一次。`<summary>` 标签、`rag_tools(op="outline")` 起手、
 /// 工具状态词、语义检索原话、确认白名单是内核/测试的硬依赖，压缩措辞但不可删除。
@@ -89,7 +90,7 @@ public enum SystemPromptLimits {
     /// L0 META-SOP 与 L1 索引常驻 system prompt 的字符上限。
     /// 二者直接占用 `ContextBudget` 的 system 分区，会等比压缩 rawCeiling，
     /// 因此必须硬封顶（L1 另受 ≤30 行约束，见 `MemoryDirectory.loadL1`）。
-    public static let maxSOPChars = 4_000
+    public static let maxSOPChars = 3_000
     public static let maxL1Chars = 1_000
 }
 

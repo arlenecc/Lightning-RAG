@@ -675,7 +675,7 @@ public final class Session: @unchecked Sendable {
     }
 
     /// 产出本轮发给模型的完整消息列表（已过 L1/L3）。
-    /// `systemPrompt` 含「静态协议 + 动态上下文（工作记忆/当天事实/检查点）」，位于消息头部；
+    /// `systemPrompt` 含「静态协议 + 动态上下文（命中技能/知识库状态）」，位于消息头部；
     /// 段内 `extraDigest` 不变时头部恒定 → 前缀 KV 复用。仅当动态上下文或 CONSOLIDATE 后的
     /// `extraDigest` 变化，头部才改变 → 该轮 KV 失效一次。注意：API 每轮都重发**完整**消息列表
     /// （无「仅追加新内容」模式），KV 复用是提供方基于前缀匹配的优化，而非跳过旧内容。

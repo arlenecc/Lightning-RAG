@@ -191,7 +191,7 @@ public final class KernelLoop {
     private let callbacks: AgentCallbacks
     private let config: AgentConfig
     private let systemPrompt: () -> String
-    /// 动态上下文（工作记忆/检查点/技能/知识库状态），追加到当前轮 user 消息尾部。
+    /// 动态上下文（命中技能/知识库状态），追加到当前轮 user 消息尾部。
     private let dynamicContext: () async -> String
     private let hooks: KernelHooks
 
@@ -587,7 +587,7 @@ public final class KernelLoop {
             var userText = session.anchorPrompt(extra: pending)
             // 动态上下文只加在 user 消息尾部：system 与历史前缀保持不变，
             // 本地 KV cache 才能跨轮复用。
-            // 动态上下文（工作记忆/检查点/命中技能/KB 说明）按「一次用户请求」
+            // 动态上下文（命中技能/KB 说明）按「一次用户请求」
             // 冻结，同一段内逐轮注入只是把同一份 ~7.5k 字符重复写进历史，
             // 快速吃满 raw 窗口并触发提前折叠。只在首个 THINK 轮注入：后续轮
             // 模型在历史里能看到首轮那份；已注入的轮原样保留（KV 对齐铁律），

@@ -64,6 +64,8 @@ public final class MLXLLMService: LLMService, PreloadableLLMService,
     /// prefill 好的前缀；否则并发 prefill 会踩踏 GPU 并让首轮全量重建。
     private let warmupLock = NSLock()
     private var activeWarmup: Task<Void, Error>?
+    /// 预热进度回调（UI 状态栏）；只在 warmup 关键 stage 调用。
+    private var warmupProgressHandler: (@Sendable (String) -> Void)?
 
     /// 会话级生成硬屏障：同一 service（同一 KV cache/会话）内，新一轮 prefill
     /// 必须等上一轮 generation Task 真正退出才能开始。此前只靠"Agent 串行驱动"
@@ -915,6 +917,12 @@ public final class MLXLLMService: LLMService, PreloadableLLMService,
                                          enableThinking: enableThinking)
     }
 
+    public func setWarmupProgressHandler(_ handler: (@Sendable (String) -> Void)?) {
+        warmupLock.lock()
+        warmupProgressHandler = handler
+        warmupLock.unlock()
+    }
+
     /// 用稳定 system prompt（含工具清单）预热 KV cache。
     ///
     /// 只做 prefill、不进入解码；缓存的是正式请求的第一段前缀，因此不能包含
@@ -955,9 +963,11 @@ public final class MLXLLMService: LLMService, PreloadableLLMService,
             return
         }
         let warmupStarted = Date()
-        func stage(_ name: String) {
+        let progress = warmupProgressHandler
+        func stage(_ name: String, label: String) {
             AgentLog.info("[mlx-warmup] stage=\(name) "
                 + "ms=\(Int(Date().timeIntervalSince(warmupStarted) * 1000))")
+            progress?(label)
         }
         // 预热失败/取消时不能留下旧缓存，否则正式请求会接着旧前缀生成。
         invalidateKVCache()
@@ -1026,7 +1036,7 @@ public final class MLXLLMService: LLMService, PreloadableLLMService,
                     + "\(keepCount)/\(renderedA.count) tokens")
             }
         }
-        stage("render")
+        stage("render", label: "模型预热中… 渲染前缀 1/3")
         guard keepCount >= 32, keepCount <= contextWindow - 1024 else {
             AgentLog.warning("[mlx-warmup] 跳过：前缀 token 数 \(keepCount) 不适合预热")
             return
@@ -1047,7 +1057,7 @@ public final class MLXLLMService: LLMService, PreloadableLLMService,
         // 因此预热必须把 GPU 工作真正做完再返回。
         // 1) 强制求值：让「已 prefill」的 KV 状态不再是欠条。
         eval(cache.flatMap { $0.state })
-        stage("prefill-eval")
+        stage("prefill-eval", label: "模型预热中… 计算 system 前缀 2/3（最耗时）")
 
         // 2) 牺牲性 decode：从「已 prefill 的 system 前缀缓存」复制一份，追加
         //    一小段 user 形状的 token 再 decode 两步——编译的是首轮真实形状
@@ -1074,6 +1084,7 @@ public final class MLXLLMService: LLMService, PreloadableLLMService,
             eval(decodeCache.flatMap { $0.state })
             AgentLog.info("[mlx-warmup] decode kernel 预热 shape=\(extra.count) "
                 + "steps=\(steps)")
+            progress?("模型预热中… 编译解码 kernel 3/3")
         } catch {
             // kernel 预热失败不该让整个预热失效：主前缀缓存仍可用。
             AgentLog.info("[mlx-warmup] decode kernel 预热跳过：\(error.localizedDescription)")

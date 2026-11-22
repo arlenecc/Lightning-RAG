@@ -20,6 +20,9 @@ public protocol BinaryDecisionScoring: AnyObject, Sendable {
     /// 对一批文本切片判定与 query 的相关性分数（0~1，越高越相关）。
     func score(query: String, passages: [String], coreSentenceCount: Int,
                useCoreSentences: Bool, progress: ((Int, Int) -> Void)?) async throws -> [Double]
+
+    /// 预热：加载模型并跑一次最小前向，把加载与 kernel 编译从首个真实调用里挪走。
+    func warmup() async
 }
 
 extension BinaryDecisionScoring {
@@ -29,6 +32,9 @@ extension BinaryDecisionScoring {
                               trueOption: "Yes / true", falseOption: "No / false",
                               maxStateChars: 3000)
     }
+
+    /// 默认不预热（无自有加载开销的后端可直接使用）。
+    public func warmup() async {}
 }
 
 /// PKU-KCL-Meteor 决策模型打分器。
@@ -184,6 +190,20 @@ public final class MeteorDecisionScorer: BinaryDecisionScoring, @unchecked Senda
         self.readout = readout
         self.container = container
         lock.unlock()
+    }
+
+    /// 预热：加载权重/容器并跑一次最小前向（触发 Metal kernel 编译）。
+    /// 失败只记日志，不影响后续真实调用的错误处理。
+    public func warmup() async {
+        let t0 = Date()
+        do {
+            try await load()
+            _ = try await judgeBinary(state: "warmup", question: "warmup")
+            let ms = Int(Date().timeIntervalSince(t0) * 1000)
+            AgentLog.info("[decision] 决策模型预热完成 ms=\(ms)")
+        } catch {
+            AgentLog.info("[decision] 决策模型预热失败（不影响后续判定）：\(error.localizedDescription)")
+        }
     }
 
     /// 对一批文本切片判定与 query 的相关性分数（0~1，越高越相关）。

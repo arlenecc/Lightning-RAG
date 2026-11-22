@@ -9,7 +9,9 @@ import Foundation
 /// `<workspace>/.agent/working_checkpoint.json`：文件天然跨会话存活，
 /// 同时也能被 `start_long_term_update` 读取并作为蒸馏材料。
 enum CheckpointStore {
-    static let maxKeyInfo = 4_000
+    /// 便签每轮都会回注，上限直接决定每轮固定开销（2000 字符 ≈ 1.2~1.5k token）。
+    /// 超长先请辅助模型压缩，仍超长则保头保尾。
+    static let maxKeyInfo = 2_000
 
     static func path(_ config: AgentConfig) -> String {
         ToolSupport.stateFile("working_checkpoint.json", workspace: config.workspace)
@@ -17,6 +19,16 @@ enum CheckpointStore {
 
     static func read(_ config: AgentConfig) -> String {
         readRecord(config)?.text ?? ""
+    }
+
+    /// 头尾截断到 ``maxKeyInfo``，显式标注中间省略。压缩器不可用或历史文件
+    /// 超长（旧上限 4000）时用它兜底，保证每轮回注的固定开销可控。
+    static func clamp(_ text: String) -> String {
+        guard text.count > maxKeyInfo else { return text }
+        let marker = "\n[…中间已省略]\n"
+        let head = Int(Double(maxKeyInfo) * 0.6)
+        let tail = max(200, maxKeyInfo - head - marker.count)
+        return String(text.prefix(head)) + marker + String(text.suffix(tail))
     }
 
     /// 仅返回标记了 `persist=true` 的跨会话检查点。
@@ -31,7 +43,7 @@ enum CheckpointStore {
               let text = raw["key_info"]?.stringValue else {
             return nil
         }
-        return (text, raw["persist"]?.boolValue ?? false)
+        return (clamp(text), raw["persist"]?.boolValue ?? false)
     }
 
     static func write(_ text: String, persist: Bool, config: AgentConfig) throws {
@@ -103,8 +115,7 @@ public final class UpdateWorkingCheckpointTool: AgentTool {
                    !compressed.isEmpty, compressed.count <= CheckpointStore.maxKeyInfo {
                     text = compressed
                 } else {
-                    text = String(text.prefix(2_600)) + "\n[…中间已省略]\n"
-                        + String(text.suffix(1_200))
+                    text = CheckpointStore.clamp(text)
                 }
             }
 
@@ -198,24 +209,15 @@ public final class StartLongTermUpdateTool: AgentTool {
             "status": .string("DISTILL_READY"),
             "turn": .int(turn),
             "focus": .string(focus),
-            "transcript": .string(String(transcript.suffix(3_000))),
+            "transcript": .string(String(transcript.suffix(1_800))),
             // 注入上下文：L0 META-SOP 与整份 L1 已常驻 system prompt（在其后），
             // 这里再回一份 L1 当前全文，供同步 patch 时精确匹配 old。
             "l1_current": .string(l1),
             "prompt": .string(MEMORY_PURIFY_PROMPT),
-            "next": .array([
-                .string("先 file_tools(op=\"read\") 读 memory/global_mem.txt 与相关 xxx_sop.md 现状（先读后patch）"),
-                .string("按 L0 决策树归类：环境特异性事实 → file_tools(op=\"patch\") 追加到 memory/global_mem.txt"),
-                .string("特定任务技术/坑 → file_tools(op=\"patch\") 追加或新建 memory/xxx_sop.md"),
-                .string("每次 L2/L3 变更后，用 file_tools(op=\"patch\") 同步 L1 索引行（只放关键词/名称，≤30 行）"),
-            ]),
-            "rules": .array([
-                .string("只写经工具验证成功的信息；禁止写入推测、临时状态、通用常识、易重建细节"),
-                .string("合并重复、压缩冗述，不堆叠流水账；不得把模型推测记作用户要求"),
-                .string("memory/ 下只能 file_tools(op=\"patch\") 少量追加，禁止 file_tools(op=\"write\") 覆盖与 code_run 批量改写"),
-                .string("无提纯价值则跳过，不要为了调用而调用"),
-            ]),
+            // 详细四步已由 L0 决策树覆盖，只留一行指针，避免 payload 被截断成非法 JSON。
+            "next": .string(
+                "按 L0 决策树先 read 再 patch：事实 → memory/global_mem.txt，任务坑 → memory/xxx_sop.md，改完同步 L1；memory/ 禁止 write 覆盖"),
         ])
-        return .ok(compactJSON(payload, maxChars: 3_600))
+        return .ok(compactJSON(payload, maxChars: 4_000))
     }
 }

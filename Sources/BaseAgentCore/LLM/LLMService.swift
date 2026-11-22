@@ -120,6 +120,13 @@ public protocol PreloadableLLMService: AnyObject {
 /// 复用（从快照复制前缀、只 prefill 变化段）处理。
 public protocol WarmupLLMService: AnyObject {
     func warmup(systemPrompt: String, tools: [JSONValue]) async throws
+    /// 预热阶段进度（可选）。默认空实现，后端按需在关键 stage 上报；
+    /// 调用方可用它把静态「预热中…」换成可读的阶段文案。
+    func setWarmupProgressHandler(_ handler: (@Sendable (String) -> Void)?)
+}
+
+public extension WarmupLLMService {
+    func setWarmupProgressHandler(_ handler: (@Sendable (String) -> Void)?) {}
 }
 
 /// 持有跨轮 KV cache 的本地 LLM：历史被折叠/回滚时丢弃缓存。
