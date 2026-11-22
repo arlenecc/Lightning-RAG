@@ -891,13 +891,18 @@ public final class KernelLoop {
                             ? "\n可直接照抄这一条：long_memory({\"op\": \"search\", "
                                 + "\"query\": \"\(Self.jsonExampleString(userInput))\"})。"
                             : ""
+                        // 已有 RAG 成功结果时，把「立即调用工具/检索」前置步骤标 done，
+                        // 否则模型一直看着 ▶ doing 的「先取数据」，反复声称拿到了数据却不作答。
+                        if didWork, hasToolSuccess, hasSuccessfulRagResult() {
+                            completeStalledRagPlan()
+                        }
                         pending = """
                         [System] 上一条回复只是描述了你打算做什么，没有发出任何工具调用，任务没有任何进展。
                         历史里此前「我要创建计划」「现在开始执行第一步」之类的文字都是无效回复，不要复述它们。
                         注意：<summary>…</summary> 只是内部摘要，既不是给用户的答复，也不能代替工具调用。
                         本轮**禁止输出 `<summary>` 标签**，也不要输出任何正文。
                         现在**跳过 update_plan**，不要再创建计划、不要复述任务、不要输出「我需要」「让我」「现在开始」这类文字。
-                        直接发出一个真实工具调用去获取所需信息，然后基于工具返回结果作答。\(urlExample)\(kbExample)\(skillExample)\(fileExample)\(memoryExample)
+                        \(hasSuccessfulRagResult() ? "[System] 知识库检索已完成，前置数据已就绪：现在直接基于上方 RAG 结果给出最终答复，不要再调用任何工具。" : "直接发出一个真实工具调用去获取所需信息，然后基于工具返回结果作答。")\(urlExample)\(kbExample)\(skillExample)\(fileExample)\(memoryExample)
                         可用工具：\(toolList)。
                         本轮只输出工具调用本身，不要输出其它解释文字。
                         """
@@ -1306,9 +1311,25 @@ public final class KernelLoop {
                         + "换 URL、用 rag_tools(op=\"search\") / ask_user 等），不要原样重发。")
                     continue
                 }
+                // 知识库内容问句：历史已有 RAG 命中时禁止过早转 web_search。
+                // 只有 RAG 检索 ≥2 次仍判信息不足才允许联网补充（用户要实时信息除外）。
+                if tc.name == "web_search",
+                   !Self.looksLikeKnowledgeBaseQuestion(userInput),
+                   Self.looksLikeDocumentContentQuestion(userInput),
+                   hasSuccessfulRagResult(), ragSearchCount < 2 {
+                    let hint = "[System] 已检索到该书/文档的切片（见上方工具结果）。"
+                        + "优先基于 RAG 结果直接作答，不要转 web_search；"
+                        + "仅当已检索 \(ragSearchCount) 次仍确认信息不足时，才可联网补充。"
+                    preset[i] = .fail("知识库已有相关内容，暂不转联网。\(hint)")
+                    log("[kernel] 拦截过早 web_search：RAG 已命中，检索 \(ragSearchCount) 次")
+                    pending = (pending.isEmpty ? "" : pending + "\n\n") + hint
+                    continue
+                }
                 switch (tc.name, tcOp) {
                 case ("rag_tools", "outline"):
-                    liveCount = 0
+                    // 不再重置检索计数：outline 反复调用会把「每次 outline 后
+                    // ≤3 次 search」的预算无限刷新，实测同一任务检索 5 次仍不够，
+                    // 每轮多付 6~12s prefill。计数只在 beginRequest/reset 时归零。
                     executeCalls.append(tc)
                 case ("rag_tools", "search"):
                     if liveCount >= maxRagSearchesPerOutline {
@@ -2032,6 +2053,46 @@ public final class KernelLoop {
         return markers.contains { text.contains($0) }
     }
 
+    /// 问「某本书/文档讲什么」：问句不含「知识库」字样，但本质是从已索引文档
+    /// 提取内容，不属于需要联网的实时信息。这类问句禁止在 RAG 有结果时转 web_search。
+    static func looksLikeDocumentContentQuestion(_ text: String) -> Bool {
+        let lower = text.lowercased()
+        let contentMarkers = ["讲什么", "主要内容", "主要讲", "概述", "简介", "写了什么",
+                              "说的是什么", "讲的内容", "什么内容", "总结", "介绍"]
+        guard contentMarkers.contains(where: { lower.contains($0) }) else { return false }
+        // 带明确联网词时仍允许联网（用户主动要实时/外部信息）。
+        let webMarkers = ["网址", "链接", "最新", "实时", "今天", "网页", "http"]
+        return !webMarkers.contains(where: { lower.contains($0) })
+    }
+
+    /// 本次请求里是否已有成功的 RAG 检索结果（历史 turns 的 toolResults）。
+    private func hasSuccessfulRagResult() -> Bool {
+        session.turns.contains { turn in
+            turn.toolResults.contains { result in
+                result.name == "rag_tools"
+                    && !result.content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                    && !result.content.hasPrefix("ERROR")
+                    && !result.content.contains("success=false")
+            }
+        }
+    }
+
+    /// 意图空转且已有 RAG 结果时，把「立即调用工具」这类前置步骤标 done，
+    /// 避免模型被锚在 ▶ doing 反复说"先取数据"却不作答。
+    private func completeStalledRagPlan() {
+        guard var plan = session.getPlan() else { return }
+        var changed = false
+        for i in plan.steps.indices where plan.steps[i].status != "done" {
+            let note = plan.steps[i].note
+            if note.contains("调用工具") || note.contains("获取真实数据")
+                || note.contains("检索") || note.contains("web_scan") {
+                plan.steps[i].status = "done"
+                changed = true
+            }
+        }
+        if changed { session.setPlan(plan) }
+    }
+
     /// 用户是否在问长期记忆（「你还记得…」「我之前说过…」「我的偏好」）。
     /// 弱工具调用模型会反复说「需要调用 long_memory」却发不出调用；
     /// 意图空转门据此给出可照抄参数，并在耗尽时由内核代查一次。
@@ -2264,13 +2325,16 @@ public final class KernelLoop {
 
     /// 最近几条工具结果的紧凑汇总，用于失败/耗尽时让用户看到已取得的进展。
     /// HTML 开头的结果先转可见文本，避免汇总里全是 `<!DOCTYPE>`/字体清单。
-    private func summarizeToolResults(limit: Int = 3) -> String {
+    /// 决策门证据摘要：原来每条只截 180 字 + 只看最后 3 条，导致已 RAG 命中的
+    /// 正文被砍成开头几个词，决策模型误判「信息不足」→ 触发多轮无效检索/web 补搜。
+    /// 放宽到每条 600 字 / 最后 5 条：决策门本就是短判定，多 2k 字符成本极低。
+    private func summarizeToolResults(limit: Int = 5) -> String {
         func preview(_ content: String) -> String {
             let trimmed = content.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard trimmed.hasPrefix("<") else { return String(trimmed.prefix(180)) }
-            let text = ToolSupport.htmlToText(trimmed, maxChars: 4_000)
+            guard trimmed.hasPrefix("<") else { return String(trimmed.prefix(600)) }
+            let text = ToolSupport.htmlToText(trimmed, maxChars: 6_000)
                 .trimmingCharacters(in: .whitespacesAndNewlines)
-            return String((text.isEmpty ? trimmed : text).prefix(180))
+            return String((text.isEmpty ? trimmed : text).prefix(600))
         }
         let highlights = session.turns
             .flatMap { $0.toolResults }

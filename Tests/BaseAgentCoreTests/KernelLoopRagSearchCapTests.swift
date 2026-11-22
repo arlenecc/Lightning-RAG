@@ -160,9 +160,9 @@ final class KernelLoopRagSearchCapTests: XCTestCase {
         let searchExecuted = executed.filter {
             $0.name == "rag_tools" && $0.arguments["op"]?.stringValue == "search"
         }
-        // 两轮 outline 各重置一次预算，每段最多 3 次 → 共应执行 6 次。
-        XCTAssertEqual(searchExecuted.count, 6,
-                       "两次 outline 应各允许 3 次检索（预算被重置）")
+        // outline 不再重置预算：整个请求最多 3 次 search，避免同一任务检索 5+ 次。
+        XCTAssertEqual(searchExecuted.count, 3,
+                       "outline 不得重置检索预算，全程仍受 3 次上限约束")
         XCTAssertEqual(executed.filter {
             $0.name == "rag_tools" && $0.arguments["op"]?.stringValue == "outline"
         }.count, 2)

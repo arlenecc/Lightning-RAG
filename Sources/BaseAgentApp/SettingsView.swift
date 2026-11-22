@@ -237,8 +237,6 @@ struct SettingsView: View {
                 Divider()
                 runParametersRow
                 Divider()
-                memoryHierarchyRow
-                Divider()
                 kernelDecisionGateRow
             }
             .padding(8)
@@ -481,26 +479,14 @@ struct SettingsView: View {
                     in: 0...32_768, step: 512)
                 .help("MLX 全局内存硬上限（含权重/KV/buffer）；"
                     + "0 = 自动取 min(物理内存 65%, 9.6GB)。误配可能导致 OOM")
+            Toggle("多级记忆管理", isOn: $memoryHierarchyInSystemPrompt)
+                .toggleStyle(.checkbox)
+                .help("勾选后 L0 META-SOP 与 L1 索引常驻 system prompt；"
+                    + "默认关闭，每轮省约 2.6k 字符上下文。关闭不影响 memory 文件与记忆工具")
             Spacer(minLength: 8)
             Button("应用配置") { applyAPIConfig() }
                 .disabled(model.isSyncing || model.isDeduplicating || model.isBuildingANN
                     || model.isModelLoading || model.isRunning || model.isWarmingUp)
-        }
-        .font(.caption)
-    }
-
-    /// 记忆管理（L0-L4）：是否把 L0 META-SOP 与 L1 索引常驻 system prompt。
-    private var memoryHierarchyRow: some View {
-        HStack(spacing: 10) {
-            Text("多级记忆管理")
-                .font(.caption.weight(.semibold))
-                .foregroundStyle(.secondary)
-            Toggle("常驻 L0/L1 到 system prompt", isOn: $memoryHierarchyInSystemPrompt)
-                .toggleStyle(.checkbox)
-                .help("默认关闭：L0 META-SOP 与 L1 索引不写入 system prompt，"
-                    + "每轮省约 2.6k 字符上下文。关闭不影响 memory 文件、"
-                    + "working checkpoint 与 start_long_term_update（工具会内联分类要点并返回 L1 全文）")
-            Spacer(minLength: 8)
         }
         .font(.caption)
     }
