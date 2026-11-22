@@ -79,9 +79,13 @@ final class BatchAntiHallucinationTests: XCTestCase {
     /// system prompt 内置常量含大批量任务范式与完成判定规则。
     func testSystemPromptHasBatchProtocol() throws {
         XCTAssertTrue(BASE_SYSTEM_PROMPT.contains("大批量任务"))
-        XCTAssertTrue(BASE_SYSTEM_PROMPT.contains("禁止逐文件调用工具"))
-        XCTAssertTrue(BASE_SYSTEM_PROMPT.contains("只有脚本输出明确的完成计数"))
-        XCTAssertTrue(BASE_SYSTEM_PROMPT.contains("禁止凭记忆编造中文路径"))
+        XCTAssertTrue(BASE_SYSTEM_PROMPT.contains("禁止逐文件调工具"))
+        XCTAssertTrue(BASE_SYSTEM_PROMPT.contains("只有脚本计数等于总数"))
+        XCTAssertTrue(BASE_SYSTEM_PROMPT.contains("禁止编造中文路径"))
+        // 语义等价性：清单落盘、超时、逐批推进、计数校验四条规则仍完整。
+        for keyword in ["code_run", "JSONL", "timeout=120", "逐批推进", "剩余 K"] {
+            XCTAssertTrue(BASE_SYSTEM_PROMPT.contains(keyword), "批量规则缺失: \(keyword)")
+        }
     }
 }
 
