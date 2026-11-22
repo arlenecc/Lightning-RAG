@@ -877,17 +877,17 @@ struct MainView: View {
         model.config.contextUsagePercent(totalTokens: model.totalTokens)
     }
 
+    /// 解码速率 + 上下文占用；token 数已在上下文占用里显示（N/窗口），不再重复。
     private var tokenSummary: String {
-        var text = model.tokenSpeed > 0
-            ? "\(model.totalTokens) tokens · "
-                + String(format: "%.1f", model.tokenSpeed) + " tok/s"
-            : "\(model.totalTokens) tokens"
+        var parts: [String] = []
+        if model.tokenSpeed > 0 {
+            parts.append(String(format: "%.1f", model.tokenSpeed) + " tok/s")
+        }
         let window = model.config.effectiveMainContextTokens
         if window > 0, model.totalTokens > 0 {
-            text += " · 上下文 \(contextUsagePercent)%"
-                + "（\(model.totalTokens)/\(window)）"
+            parts.append("上下文 \(contextUsagePercent)%（\(model.totalTokens)/\(window)）")
         }
-        return text
+        return parts.joined(separator: " · ")
     }
 
     private func chatBubble(_ item: ChatItem) -> some View {

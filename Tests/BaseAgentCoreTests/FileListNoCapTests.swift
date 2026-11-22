@@ -1,11 +1,11 @@
 import XCTest
 @testable import BaseAgentCore
 
-/// file_tools(op="list") 默认全量输出，不再有内置条目数上限；
-/// 只有调用方显式传 max_entries 才截断。
+/// file_tools(op="list") 分批返回：默认第 1 批 100 条，报告总数与批次数，
+/// 可指定 batch 逐批获取全量，避免多文件目录一次撑爆上下文。
 final class FileListNoCapTests: XCTestCase {
     private final class PlainLLM: LLMService {
-        let identifier = "list-nocap"
+        let identifier = "list-batch"
         let supportsTools = false
         let contextWindow = 4096
         func chatStream(messages: [ChatMessage], tools: [JSONValue],
@@ -14,12 +14,11 @@ final class FileListNoCapTests: XCTestCase {
         }
     }
 
-    private func makeTool() throws -> (FileListTool, URL) {
+    private func makeTool(count: Int) throws -> (FileListTool, URL) {
         let root = URL(fileURLWithPath: NSTemporaryDirectory())
-            .appendingPathComponent("list-nocap-\(UUID().uuidString)")
+            .appendingPathComponent("list-batch-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
-        // 造 600 个文件（超过旧默认上限 500、低于旧硬上限 5000）
-        for i in 0..<600 {
+        for i in 0..<count {
             try Data("x".utf8).write(to: root.appendingPathComponent(String(format: "f%03d.txt", i)))
         }
         var config = AgentConfig()
@@ -27,38 +26,57 @@ final class FileListNoCapTests: XCTestCase {
         return (FileListTool(config: config, callbacks: NoopCallbacks()), root)
     }
 
-    /// 不传 max_entries：600 条全部返回，无截断提示。
-    func testDefaultListsAllEntries() async throws {
-        let (tool, root) = try makeTool()
+    /// 600 个文件：默认返回第 1 批 100 条，报告 600 条 / 6 批。
+    func testDefaultReturnsFirstBatchWithStats() async throws {
+        let (tool, root) = try makeTool(count: 600)
         defer { try? FileManager.default.removeItem(at: root) }
         let result = try await tool.run(["path": .string(".")])
         XCTAssertTrue(result.success)
+        XCTAssertTrue(result.output.contains("共 600 条，分 6 批（每批 100 条）"))
+        XCTAssertTrue(result.output.contains("当前第 1/6 批"))
         let lines = result.output.split(separator: "\n").filter { $0.hasPrefix("file ") }
-        XCTAssertEqual(lines.count, 600, "应返回全部 600 条，不再截断到 500")
-        XCTAssertFalse(result.output.contains("已截断"))
+        XCTAssertEqual(lines.count, 100, "默认只返回 100 条")
+        XCTAssertFalse(result.output.contains("f100.txt"), "不应包含第 2 批的文件")
     }
 
-    /// 显式传 max_entries：按调用方意愿截断并给出提示。
-    func testExplicitCapStillWorks() async throws {
-        let (tool, root) = try makeTool()
+    /// 逐批请求可拿全量：6 批共 600 条，文件互不重复。
+    func testAllBatchesCoverEveryFile() async throws {
+        let (tool, root) = try makeTool(count: 250)
+        defer { try? FileManager.default.removeItem(at: root) }
+        var collected: Set<String> = []
+        for batch in 1...3 {
+            let result = try await tool.run([
+                "path": .string("."), "batch": .int(batch),
+            ])
+            XCTAssertTrue(result.output.contains("共 250 条，分 3 批"))
+            XCTAssertTrue(result.output.contains("当前第 \(batch)/3 批"))
+            let names = result.output.split(separator: "\n")
+                .filter { $0.hasPrefix("file ") }
+                .compactMap { $0.split(separator: " ").last.map(String.init) }
+            collected.formUnion(names)
+        }
+        XCTAssertEqual(collected.count, 250, "3 批应覆盖全部 250 个文件")
+    }
+
+    /// 超出范围的批次返回空内容与明确提示。
+    func testOutOfRangeBatch() async throws {
+        let (tool, root) = try makeTool(count: 5)
         defer { try? FileManager.default.removeItem(at: root) }
         let result = try await tool.run([
-            "path": .string("."), "max_entries": .int(10),
+            "path": .string("."), "batch": .int(9),
         ])
-        XCTAssertTrue(result.success)
-        let lines = result.output.split(separator: "\n").filter { $0.hasPrefix("file ") }
-        XCTAssertEqual(lines.count, 10)
-        XCTAssertTrue(result.output.contains("max_entries=10"), "应说明是调用方设定的上限")
+        XCTAssertTrue(result.output.contains("当前第 9/1 批（超出范围，本批为空）"))
+        XCTAssertFalse(result.output.contains("file f"))
     }
 
-    /// schema 描述明确说明默认全量、上限可选。
-    func testSchemaDescribesNoCap() throws {
-        let (tool, root) = try makeTool()
+    /// schema 描述明确分批语义（batch 参数存在、max_entries 已移除）。
+    func testSchemaDescribesBatching() throws {
+        let (tool, root) = try makeTool(count: 1)
         defer { try? FileManager.default.removeItem(at: root) }
-        XCTAssertTrue(tool.description.contains("ALL entries"))
-        let maxParam = tool.parameters.objectValue?["properties"]?.objectValue?["max_entries"]
-        XCTAssertNotNil(maxParam, "保留参数供调用方主动收窄")
-        XCTAssertTrue(maxParam?.objectValue?["description"]?.stringValue?.contains("Omit for the complete list") ?? false)
+        XCTAssertTrue(tool.description.contains("batches of 100"))
+        let props = tool.parameters.objectValue?["properties"]?.objectValue
+        XCTAssertNotNil(props?["batch"])
+        XCTAssertNil(props?["max_entries"], "max_entries 应已被 batch 取代")
     }
 }
 

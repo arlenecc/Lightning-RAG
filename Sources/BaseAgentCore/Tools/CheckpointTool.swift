@@ -204,19 +204,30 @@ public final class StartLongTermUpdateTool: AgentTool {
         }
 
         let l1 = memoryDir.read(memoryDir.l1File, limit: SystemPromptLimits.maxL1Chars) ?? ""
+        // L0/L1 常驻关闭时，模型看不到 L0 决策树：把分类要点内联进 payload，
+        // 让记忆提纯在本模式下仍可独立完成（工具自身仍读 L1 全文，不受开关影响）。
+        let hierarchyOn = config.memoryHierarchyInSystemPrompt
+        let nextGuide = hierarchyOn
+            ? "按 L0 决策树先 read 再 patch：事实 → memory/global_mem.txt，任务坑 → memory/xxx_sop.md，改完同步 L1；memory/ 禁止 write 覆盖"
+            : "L0 未常驻，按此分类先 read 再 patch：验证过的环境事实 → memory/global_mem.txt；"
+                + "难获的任务坑/SOP → memory/xxx_sop.md；偏好/实体 → long_memory(op=\"graph\")；"
+                + "改完同步本返回的 l1_current（file_tools op=patch 少量追加，禁 write 覆盖）"
+        // MEMORY_PURIFY_PROMPT 首句「按L0提取」在 L0 未常驻时模型看不到依据，
+        // 替换为等价的自包含提纯指令（其余禁止项原样保留）。
+        let purifyPrompt = hierarchyOn
+            ? MEMORY_PURIFY_PROMPT
+            : MEMORY_PURIFY_PROMPT.replacingOccurrences(
+                of: "按L0提取", with: "按下方 next 的分类规则提取")
 
         let payload = JSONValue.object([
             "status": .string("DISTILL_READY"),
             "turn": .int(turn),
             "focus": .string(focus),
             "transcript": .string(String(transcript.suffix(1_800))),
-            // 注入上下文：L0 META-SOP 与整份 L1 已常驻 system prompt（在其后），
-            // 这里再回一份 L1 当前全文，供同步 patch 时精确匹配 old。
+            // 整份 L1 当前全文始终返回，供同步 patch 时精确匹配 old。
             "l1_current": .string(l1),
-            "prompt": .string(MEMORY_PURIFY_PROMPT),
-            // 详细四步已由 L0 决策树覆盖，只留一行指针，避免 payload 被截断成非法 JSON。
-            "next": .string(
-                "按 L0 决策树先 read 再 patch：事实 → memory/global_mem.txt，任务坑 → memory/xxx_sop.md，改完同步 L1；memory/ 禁止 write 覆盖"),
+            "prompt": .string(purifyPrompt),
+            "next": .string(nextGuide),
         ])
         return .ok(compactJSON(payload, maxChars: 4_000))
     }

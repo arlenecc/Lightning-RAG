@@ -25,6 +25,7 @@ final class L0SOPLimitTests: XCTestCase {
         var config = AgentConfig()
         config.workspace = root.path
         config.llmProvider = "api"
+        config.memoryHierarchyInSystemPrompt = true  // 验证 L0 需显式开启常驻
         let agent = Agent(llm: PlainLLM(), config: config, callbacks: NoopCallbacks())
         return (agent, root)
     }

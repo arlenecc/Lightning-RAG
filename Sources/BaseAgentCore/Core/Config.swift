@@ -167,6 +167,9 @@ public struct AgentConfig: Sendable {
     }
     public var requestTimeout: Double = 120.0
     public var maxIterations: Int = 15
+    /// 是否把 L0 META-SOP 与 L1 索引常驻 system prompt。默认关闭以节省上下文；
+    /// 关闭时 Agent 不加载这两段，但 memory 文件仍保留、记忆工具仍可用。
+    public var memoryHierarchyInSystemPrompt: Bool = false
     /// 预留（当前未接线）：历史窗口实际由 kernelRawTurns / kernelConsolidateEvery
     /// / kernelMaxContextTokens 决定，本字段只做配置兼容，不参与裁剪决策。
     public var maxHistory: Int = 50
@@ -759,6 +762,7 @@ public struct AgentConfig: Sendable {
         }
         if let v = double("request_timeout") { requestTimeout = v }
         if let v = int("max_iterations") { maxIterations = v }
+        if let v = bool("memory_hierarchy_in_system_prompt") { memoryHierarchyInSystemPrompt = v }
         if let v = int("max_history") { maxHistory = v }
         if let v = int("max_context_tokens") { maxContextTokens = v }
         if let v = double("context_shrink_ratio") { contextShrinkRatio = v }
@@ -1309,6 +1313,7 @@ public struct AgentConfig: Sendable {
                  "enabled": zone.enabled, "is_default": zone.isDefault]
             },
             "request_timeout": requestTimeout, "max_iterations": maxIterations,
+            "memory_hierarchy_in_system_prompt": memoryHierarchyInSystemPrompt,
             "max_history": maxHistory, "max_context_tokens": maxContextTokens,
             "context_shrink_ratio": contextShrinkRatio,
             "prompt_batch_size": promptBatchSize,

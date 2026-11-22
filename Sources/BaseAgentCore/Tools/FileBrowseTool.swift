@@ -10,11 +10,12 @@ import Foundation
 public final class FileListTool: AgentTool {
     public let name = "file_list"
     public let description =
-        "List directory entries inside the workspace (read-only). Returns ALL entries "
-        + "with per-entry type (dir/), size and last-modified time — no entry-count cap; "
-        + "the caller decides whether to narrow (glob) or truncate. Optional glob filter "
-        + "(e.g. *.swift) and recursive mode with depth cap. Hidden entries (dot-prefixed) "
-        + "are skipped."
+        "List directory entries inside the workspace (read-only), in batches of 100. "
+        + "Reports total matching entries and total batch count; returns ONLY the "
+        + "requested batch (default batch 1) to avoid huge outputs. Call again with "
+        + "batch=2,3,… to enumerate the complete list. Each entry shows type (dir/), "
+        + "size and last-modified time. Optional glob filter (e.g. *.swift) and recursive "
+        + "mode with depth cap. Hidden entries (dot-prefixed) are skipped."
     /// 只读操作，不需要确认。
     public let destructive = false
 
@@ -31,14 +32,16 @@ public final class FileListTool: AgentTool {
                     "Recurse into subdirectories (default false)."),
                 "max_depth": ToolSupport.numberProperty(
                     "Max recursion depth when recursive=true (default 3)."),
-                "max_entries": ToolSupport.numberProperty(
-                    "Optional caller-side cap: only set this if you want fewer entries. "
-                    + "Omit for the complete list."),
+                "batch": ToolSupport.numberProperty(
+                    "1-based page number (default 1). Output is capped at 100 entries "
+                    + "per batch; the result reports total entries and total batches. "
+                    + "Request batch=2,3,… to get the rest."),
             ],
             required: [])
     }
 
-    /// 默认全量输出：不设条目数上限，是否截断完全由调用方决定（显式传 max_entries）。
+    /// 每批条目数：防止多文件目录一次撑爆上下文。
+    static let batchSize = 100
     static let defaultMaxDepth = 3
     static let hardMaxDepth = 8
 
@@ -57,8 +60,8 @@ public final class FileListTool: AgentTool {
                 Int(ToolSupport.optionalDouble(args, "max_depth")
                     ?? Double(Self.defaultMaxDepth)),
                 Self.hardMaxDepth)
-            // 调用方显式传 max_entries 才截断；不传则全量输出（不再有默认/硬上限）。
-            let maxEntries = Int(ToolSupport.optionalDouble(args, "max_entries") ?? 0)
+            // 批次从 1 开始；默认第 1 批。
+            let batch = max(1, Int(ToolSupport.optionalDouble(args, "batch") ?? 1))
 
             let root = try ToolSupport.resolveWorkspacePath(path, workspace: config.workspace)
             var isDirectory: ObjCBool = false
@@ -69,7 +72,6 @@ public final class FileListTool: AgentTool {
 
             let globRegex = Self.globRegex(glob)
             var lines: [String] = []
-            var truncated = false
 
             func fmt(_ url: URL, isDir: Bool) -> String? {
                 let name = url.lastPathComponent
@@ -94,7 +96,6 @@ public final class FileListTool: AgentTool {
             if !recursive {
                 for item in try FileManager.default.contentsOfDirectory(
                     at: URL(fileURLWithPath: root), includingPropertiesForKeys: nil) {
-                    if maxEntries > 0, lines.count >= maxEntries { truncated = true; break }
                     var isDir: ObjCBool = false
                     _ = FileManager.default.fileExists(atPath: item.path, isDirectory: &isDir)
                     if let line = fmt(item, isDir: isDir.boolValue) { lines.append(line) }
@@ -105,7 +106,6 @@ public final class FileListTool: AgentTool {
                     includingPropertiesForKeys: [.isDirectoryKey],
                     options: [.skipsHiddenFiles])
                 while let item = enumerator?.nextObject() as? URL {
-                    if maxEntries > 0, lines.count >= maxEntries { truncated = true; break }
                     let depth = (enumerator?.level ?? 0)
                     if depth > maxDepth { enumerator?.skipDescendants(); continue }
                     let isDir = (try? item.resourceValues(forKeys: [.isDirectoryKey]))?
@@ -117,12 +117,18 @@ public final class FileListTool: AgentTool {
             guard !lines.isEmpty else {
                 return .ok("(empty directory \(recursive ? "tree" : ""): \(path))")
             }
-            var output = lines.joined(separator: "\n")
-            if truncated {
-                output += "\n… [已按调用方设定的 max_entries=\(maxEntries) 截断；"
-                    + "省略该参数可获取完整列表]"
-            }
-            return .ok(output)
+            // 确定性排序：否则 contentsOfDirectory/enumerator 顺序不稳定，
+            // 跨批请求会重复或漏掉文件，分批枚举失去意义。
+            lines.sort()
+            let totalBatches = (lines.count + Self.batchSize - 1) / Self.batchSize
+            let start = (batch - 1) * Self.batchSize
+            let page = start < lines.count
+                ? Array(lines[start..<min(start + Self.batchSize, lines.count)])
+                : []
+            let header = "共 \(lines.count) 条，分 \(totalBatches) 批（每批 \(Self.batchSize) 条），"
+                + "当前第 \(batch)/\(totalBatches) 批"
+                + (batch > totalBatches ? "（超出范围，本批为空）" : "") + "：\n"
+            return .ok(header + page.joined(separator: "\n"))
         } catch {
             return ToolSupport.failure(error)
         }

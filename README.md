@@ -58,7 +58,7 @@ scripts/package-app.sh release && scripts/package-dmg.sh
 只产出单一形态：应用本体不含任何内置模型，potion 语义切片 / jina embedding /
 jina reranker 均在首次启动时从 hf-mirror 自动下载；主模型、辅助模型与 OCR 需在
 配置中指定本地模型路径。按「打包 App → 打包 DMG」顺序构建，产物为
-`dist/Lightning-RAG-1.4.10.dmg`（约 40MB）。版本号可通过 `VERSION` 环境变量或
+`dist/Lightning-RAG-1.4.11.dmg`（约 40MB）。版本号可通过 `VERSION` 环境变量或
 `package-dmg.sh` 的参数覆盖。
 
 测试覆盖（当前 1000+ 个 XCTest；真实模型 E2E 在本地权重存在时随每次测试自动运行，缺少权重或需要外网/GGUF 等环境的用例会跳过）：sqlite-vec 事务写入/回滚、两段式 KNN、二值签名编码与 LSB-first 位打包、
@@ -129,7 +129,9 @@ HTML 与 Office 解析另有专项覆盖：HTML 保存页的本地 iframe / fram
 
 **自定义 system prompt**：首次启动会在 `<workspace>/assets/system_prompt.txt` 写出内置的 `BASE_SYSTEM_PROMPT`；之后每次启动读取该文件并替换内置提示词，可直接用文本编辑器调整模型行为规则，**重启（或重新应用配置）后生效**（会话期间保持不变，以免 system 前缀抖动使 KV cache 反复重建）。文件内容空白或不可读时本次回退内置提示词，且不会覆盖文件。它替换的是协议主体，L0 META-SOP 与 L1 全局索引仍按多级记忆机制追加在其后；轻量轮（纯寒暄/能力问询）使用内核的极简提示，不受该文件影响。内置提示词中的 `<summary>` 标签、`rag_tools(op="outline")` 起手式、工具状态词等是内核回注与测试的硬依赖，建议在原文基础上调整，不要整段删除。
 
-**v1.4.10（当前）**：预热提速与工具清单完善。GGUF 前缀快照上限对齐 10240；折叠后二次预热直接恢复主对话字节快照、跳过整段 prefill；启动期 GPU 仲裁（后台 RAG 预加载让位主预热）；预热进度上抛状态栏并允许预热期提前输入；L0 上限 4000→3000；`file_tools(op="list")` 默认全量输出、不再内置条目数上限（是否截断由调用方决定）；新增决策门重试与检查点改进。kernel 编译 A/B 探针与 schema 体积探针仅作诊断、未改变行为。
+**v1.4.11（当前）**：多级记忆开关、批量任务防幻觉与轻量轮判定修复。新增「多级记忆管理」开关（默认关闭，L0/L1 不再常驻 system prompt，省约 2.6k 字符；`start_long_term_update` 自带分类指引与 L1 全文、`update_working_checkpoint` 逐轮回注，工具链完整可用）；修复 `compactJSON` 粗暴截断导致非法 JSON、提纯 prompt 引用不可见 L0；system prompt 与工具层加入大批量任务范式/完成计数防幻觉；修复「社会分区有什么」中「会」误判为能力问询（含 40+ 问句审查）；`file_tools(list)` 改为每批 100 条、报告总数与批次数、可逐批获取；L0 上限 4000→3000；状态栏去掉重复 token 计数。
+
+**v1.4.10**：预热提速与工具清单完善。GGUF 前缀快照上限对齐 10240；折叠后二次 warmup 恢复主对话字节快照、跳过整段 prefill；启动期 GPU 仲裁；预热进度上抛状态栏并允许预热期提前输入；`file_tools(list)` 曾短暂改为全量输出；新增决策门重试与检查点改进。
 
 **v1.4.9**：推理链路优化、GGUF 工具兼容与清空对话提速。决策模型每次打分输出可读日志（`[decision]` 含分数/阈值/PASS-BLOCK/候选）；决策门三阈值独立配置、设置窗口单行可调（0.30–0.95）；主界面上下文占用百分比 + 顶部「清空对话」按钮（保留 system 预热 KV 前缀）；GGUF 补齐 MiniCPM5 工具 XML 净化；GGUF 主对话折叠/清空后恢复前缀快照；预编译正则、正文短路、UI O(n²) 短路、日志 DateFormatter 复用等 CPU 优化。
 

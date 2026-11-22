@@ -33,6 +33,41 @@ public final class FileReadTool: AgentTool {
             required: ["path"])
     }
 
+    /// 文件名拼错时，给出目录下最相近的真实文件名（最多 3 个），
+    /// 让模型下一轮直接引用真实名字，而不是继续编造/换工具重试。
+    static func nearestFileNames(to name: String, in directory: String) -> String {
+        guard !name.isEmpty,
+              let entries = try? FileManager.default.contentsOfDirectory(atPath: directory),
+              !entries.isEmpty else { return "" }
+        // 目录可能巨大（6 万+ 文件）：只比较与错名共享首尾片段的候选，避免 O(N×L²)。
+        let key = String(name.prefix(8))
+        let candidates = entries.filter { $0.hasPrefix(key) || name.hasPrefix(String($0.prefix(8))) }
+            .prefix(200)
+        let source = Array(name)
+        let scored: [(String, Int)] = candidates.map { candidate in
+            (candidate, editDistance(source, Array(candidate)))
+        }.sorted { $0.1 < $1.1 }
+        let picks = Array(scored.prefix(3).map(\.0))
+        guard !picks.isEmpty else { return "" }
+        return "\n[提示] 该目录下最接近的真实文件名（请直接复制使用）："
+            + picks.map { "\n  - \($0)" }.joined()
+    }
+
+    private static func editDistance(_ a: [Character], _ b: [Character]) -> Int {
+        if a.isEmpty { return b.count }
+        if b.isEmpty { return a.count }
+        var prev = Array(0...b.count)
+        for (i, ca) in a.enumerated() {
+            var curr = [i + 1]
+            for (j, cb) in b.enumerated() {
+                curr.append(min(prev[j + 1] + 1, curr[j] + 1,
+                                prev[j] + (ca == cb ? 0 : 1)))
+            }
+            prev = curr
+        }
+        return prev[b.count]
+    }
+
     public init(config: AgentConfig, callbacks: AgentCallbacks?, registry: ToolRegistry? = nil,
                 sopTracker: SOPReadTracker = SOPReadTracker()) {
         self.config = config
@@ -52,7 +87,12 @@ public final class FileReadTool: AgentTool {
             var isDirectory: ObjCBool = false
             guard FileManager.default.fileExists(atPath: full, isDirectory: &isDirectory),
                   !isDirectory.boolValue else {
-                return .fail("File does not exist: \(path)")
+                // 防幻觉/自纠：中文长文件名常被模型凭空改写。给出真实相近文件名，
+                // 让下一轮直接引用工具返回的名字，而不是继续猜。
+                let hint = Self.nearestFileNames(
+                    to: (full as NSString).lastPathComponent,
+                    in: (full as NSString).deletingLastPathComponent)
+                return .fail("File does not exist: \(path)" + hint)
             }
 
             let size = ToolSupport.fileSize(full)

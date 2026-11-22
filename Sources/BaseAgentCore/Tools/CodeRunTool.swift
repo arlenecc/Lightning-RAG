@@ -145,7 +145,19 @@ public final class CodeRunTool: AgentTool {
             }
 
             if outcome.exitCode == 0 {
-                return .ok(output.isEmpty ? "(no output)" : output)
+                // 防幻觉：脚本成功退出 ≠ 任务成功完成。批量任务若没有显式打印
+                // 完成计数，模型容易把「exit 0」当成「全量完成」并编造结果。
+                // 只在输出里确实有计数确认时保持原样；否则追加轻量提示。
+                let trimmed = output.trimmingCharacters(in: .whitespacesAndNewlines)
+                if trimmed.isEmpty {
+                    return .ok("(脚本执行成功但没有任何输出；未产生结果或完成确认。"
+                        + "批量任务必须显式打印处理数量与结果，禁止据此声称完成)")
+                }
+                if !Self.hasCompletionCount(trimmed) {
+                    return .ok(trimmed + "\n[提示] 输出中没有完成计数（如 DONE count=N）。"
+                        + "不要仅凭 exit 0 就声称任务已完成；批量任务须打印实际处理数量。")
+                }
+                return .ok(output)
             }
 
             var detail = outcome.exitCode.map { "Exit code \($0)" }
@@ -159,6 +171,21 @@ public final class CodeRunTool: AgentTool {
         } catch {
             return ToolSupport.failure(error)
         }
+    }
+
+    /// 输出中是否有明确的「完成计数」凭证。若脚本打印了处理数量
+    /// （`DONE count=N` / `processed N` / `wrote N` / `已完成 N 个` 等），
+    /// 认为模型有据可依，无需追加防幻觉提示。
+    private static func hasCompletionCount(_ output: String) -> Bool {
+        let patterns = [
+            "DONE", "done", "count", "COUNT", "processed", "PROCESSED",
+            "wrote", "WROTE", "written", "saved", "已完成", "已处理", "已写入",
+        ]
+        guard patterns.contains(where: { output.contains($0) }) else { return false }
+        // 必须同时出现数字，避免只有 "done" 字样却无实际数量。
+        return output.unicodeScalars.contains(where: { (s: Unicode.Scalar) in
+            s.value >= 48 && s.value <= 57
+        })
     }
 
     // MARK: 语言映射

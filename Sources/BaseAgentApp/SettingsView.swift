@@ -27,6 +27,8 @@ struct SettingsView: View {
     @State private var mainTimeout = 120.0
     /// 单次任务允许的最大工具调用轮数。
     @State private var maxIterations = 15
+    /// 是否把 L0 META-SOP / L1 索引常驻 system prompt（默认关闭，节省上下文）。
+    @State private var memoryHierarchyInSystemPrompt = false
     @State private var mainPromptBatch = 512
     @State private var mainThinking = true
     @State private var mainKVReuse = true
@@ -234,6 +236,8 @@ struct SettingsView: View {
                 auxModelBlock
                 Divider()
                 runParametersRow
+                Divider()
+                memoryHierarchyRow
                 Divider()
                 kernelDecisionGateRow
             }
@@ -481,6 +485,22 @@ struct SettingsView: View {
             Button("应用配置") { applyAPIConfig() }
                 .disabled(model.isSyncing || model.isDeduplicating || model.isBuildingANN
                     || model.isModelLoading || model.isRunning || model.isWarmingUp)
+        }
+        .font(.caption)
+    }
+
+    /// 记忆管理（L0-L4）：是否把 L0 META-SOP 与 L1 索引常驻 system prompt。
+    private var memoryHierarchyRow: some View {
+        HStack(spacing: 10) {
+            Text("多级记忆管理")
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.secondary)
+            Toggle("常驻 L0/L1 到 system prompt", isOn: $memoryHierarchyInSystemPrompt)
+                .toggleStyle(.checkbox)
+                .help("默认关闭：L0 META-SOP 与 L1 索引不写入 system prompt，"
+                    + "每轮省约 2.6k 字符上下文。关闭不影响 memory 文件、"
+                    + "working checkpoint 与 start_long_term_update（工具会内联分类要点并返回 L1 全文）")
+            Spacer(minLength: 8)
         }
         .font(.caption)
     }
@@ -1726,6 +1746,7 @@ struct SettingsView: View {
         mainTimeout = config.requestTimeout
         mainMmprojPath = config.llmMmprojPath
         maxIterations = config.maxIterations
+        memoryHierarchyInSystemPrompt = config.memoryHierarchyInSystemPrompt
         mainPromptBatch = config.promptBatchSize
         mainThinking = config.localLLMEnableThinking
         mainKVReuse = config.llmKVReuse
@@ -2107,6 +2128,7 @@ struct SettingsView: View {
         config.repetitionPenalty = max(0, mainRepetitionPenalty)
         config.requestTimeout = max(10, mainTimeout)
         config.maxIterations = min(max(1, maxIterations), 50)
+        config.memoryHierarchyInSystemPrompt = memoryHierarchyInSystemPrompt
         config.mlxCacheLimitMB = min(max(256, mlxCacheLimitMB), 2_048)
         config.mlxMemoryLimitMB = max(0, mlxMemoryLimitMB)
         config.promptBatchSize = max(0, mainPromptBatch)

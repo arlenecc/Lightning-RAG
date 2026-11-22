@@ -38,8 +38,10 @@ public enum AgentToolFactory {
                 + "- op=\"write\": overwrite or create a file (path, content).\n"
                 + "- op=\"modify\" (alias \"patch\"): replace the first occurrence of `old` with "
                 + "`new` (path, old, new, replace_all).\n"
-                + "- op=\"list\": list ALL directory entries (path, glob, recursive, max_depth; "
-                + "optional max_entries only if you want a cap).\n"
+                + "- op=\"list\": list directory entries in batches of 100 "
+                + "(path, glob, recursive, max_depth, batch). Result reports total entries "
+                + "and total batches; returns batch 1 by default. Request batch=2,3,… "
+                + "to enumerate all entries.\n"
                 + "- op=\"search\": regex-search file contents, returns \"path:line: text\" "
                 + "(pattern, path, glob, case_sensitive, context, max_results).",
             subcommands: [

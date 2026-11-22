@@ -493,7 +493,22 @@ public func fitTokens(_ text: String, maxTokens: Int) -> String {
 /// 把 dict/list 压成紧凑字符串（工作记忆注入系统提示时用）。
 public func compactJSON(_ obj: JSONValue, maxChars: Int = 400) -> String {
     let s = obj.jsonString()
-    return s.count <= maxChars ? s : String(s.prefix(maxChars)) + "…"
+    guard s.count > maxChars, let object = obj.objectValue else {
+        return s
+    }
+    // 粗暴 prefix 会把 JSON 截成非法串（模型无法解析），并可能丢掉后面的关键字段。
+    // 改为按字段从后往前裁剪长字符串值，始终保留合法 JSON 结构与所有键。
+    var trimmed = object
+    var budget = s.count - maxChars
+    let stringKeys = trimmed.keys.sorted()  // 确定性顺序，避免每次输出抖动
+    for key in stringKeys.reversed() {
+        guard budget > 0, let value = trimmed[key]?.stringValue,
+              value.count > 80 else { continue }
+        let shorten = min(budget, value.count - 80)
+        trimmed[key] = .string(String(value.prefix(value.count - shorten)) + "…")
+        budget -= shorten
+    }
+    return JSONValue.object(trimmed).jsonString()
 }
 
 // MARK: - 基于 LLMService 的异步摘要 / 蒸馏

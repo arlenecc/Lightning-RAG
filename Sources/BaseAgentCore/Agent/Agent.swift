@@ -1490,18 +1490,22 @@ public final class Agent: @unchecked Sendable {
     private func buildStaticSystemPrompt() -> String {
         staticSystemLock.lock()
         defer { staticSystemLock.unlock() }
-        let signature = memoryDirectory.signature()
+        // 关闭时常驻段只有 BASE：签名也要区分开关状态，否则从开切到关会命中旧缓存。
+        let includeHierarchy = config.memoryHierarchyInSystemPrompt
+        let signature = "\(includeHierarchy)|\(memoryDirectory.signature())"
         if signature == cachedStaticSignature, let cachedStaticSystem {
             return cachedStaticSystem
         }
-        let sop = memoryDirectory.loadSOP(maxChars: SystemPromptLimits.maxSOPChars)
-        let l1 = memoryDirectory.loadL1(maxChars: SystemPromptLimits.maxL1Chars)
         var text = baseSystemPrompt
-        if !sop.isEmpty {
-            text += "\n\n# [L0 META-SOP: memory_management_sop]\n" + sop
-        }
-        if !l1.isEmpty {
-            text += "\n\n# [L1 Global Memory Insight]\n" + l1
+        if includeHierarchy {
+            let sop = memoryDirectory.loadSOP(maxChars: SystemPromptLimits.maxSOPChars)
+            let l1 = memoryDirectory.loadL1(maxChars: SystemPromptLimits.maxL1Chars)
+            if !sop.isEmpty {
+                text += "\n\n# [L0 META-SOP: memory_management_sop]\n" + sop
+            }
+            if !l1.isEmpty {
+                text += "\n\n# [L1 Global Memory Insight]\n" + l1
+            }
         }
         cachedStaticSystem = text
         cachedStaticSignature = signature

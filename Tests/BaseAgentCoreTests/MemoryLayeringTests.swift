@@ -239,6 +239,7 @@ final class MemoryLayeringTests: XCTestCase {
         }
         var config = AgentConfig()
         config.workspace = workspace
+        config.memoryHierarchyInSystemPrompt = true  // 该测试验证 L0/L1 常驻，需显式开启
         let agent = Agent(llm: NoopLLM(), config: config, callbacks: SilentCallbacks())
         defer { agent.close() }
 
@@ -470,6 +471,7 @@ final class MemoryLayeringTests: XCTestCase {
         var config = AgentConfig()
         config.workspace = workspace
         config.maxIterations = 2
+        config.memoryHierarchyInSystemPrompt = true  // 该测试验证 L0/L1 前缀稳定
         let llm = E2ELLM()
         let agent = Agent(llm: llm, config: config, callbacks: SilentCallbacks())
         defer { agent.close() }
