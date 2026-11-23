@@ -760,11 +760,17 @@ public final class KernelLoop {
                     // 内核代发一次 rag_tools(op="status")，把真实统计交给模型总结。
                     // 弱模型常把锚点提示里的 <PLAN> 整段复述成答复而非发 tool_call，
                     // 兜底保证用户拿到真实数据且不会看到内部协议。
+                    let isDocContentQuestion = Self.looksLikeDocumentContentQuestion(userInput)
+                        && hasSuccessfulRagResult()
                     if !didFallbackKBStatus, intentOnly,
-                       Self.looksLikeKnowledgeBaseQuestion(userInput) {
+                       Self.looksLikeKnowledgeBaseQuestion(userInput) || isDocContentQuestion {
                         didFallbackKBStatus = true
+                        // 清单问句→status；"X 主要讲什么"→outline/search（用用户原话检索）。
+                        let fallbackArgs: [String: JSONValue] = isDocContentQuestion
+                            ? ["op": .string("search"), "query": .string(userInput)]
+                            : ["op": .string("status")]
                         let call = ToolCall(id: "", name: "rag_tools",
-                                            arguments: ["op": .string("status")])
+                                            arguments: fallbackArgs)
                         var stats: [ToolResult] = []
                         do {
                             stats = try await runtime.execute([call])
@@ -775,12 +781,15 @@ public final class KernelLoop {
                             didWork = true
                             fallbackToolText = first.output
                             let head = String(first.output.prefix(8_000))
+                            let opLabel = isDocContentQuestion ? "op=search" : "op=status"
+                            let answerHint = isDocContentQuestion
+                                ? "基于检索到的内容总结该书讲了什么" : "文档数、切片数、检索策略等"
                             pending = """
-                            [System] 内核已代你执行 rag_tools(op="status")，结果如下。
+                            [System] 内核已代你执行 rag_tools \(opLabel)，结果如下。
                             **不要再调用任何工具，也不要复述 <PLAN> / <WORKING MEMORY> 等
                             内部提示，也不要只输出 <summary> 元标签**：直接基于下面的
-                            真实统计用中文回答「知识库里有什么」（文档数、切片数、
-                            检索策略等），没有数据就明确说知识库为空，不要编造。
+                            真实结果用中文回答用户问题（\(answerHint)），
+                            没有数据就明确说明，不要编造。
 
                             \(head)
                             """
@@ -858,10 +867,15 @@ public final class KernelLoop {
                     // 三次强制之后模型仍不发调用，且任务不是给网址 / 本地文件 /
                     // 知识库 / 技能 / 长期记忆：代发一次 web_search，把真实搜索结果
                     // 交给模型收尾。搜索类任务不再因小模型只会描述计划而空转失败。
+                    // 文档内容问句（"X 主要讲什么"）即使不含"知识库"字样，只要历史里
+                    // 已有 RAG 命中，就属于知识库问答，绝不能代发 web_search 跑偏。
+                    let shouldNotWebSearch = Self.looksLikeKnowledgeBaseQuestion(userInput)
+                        || (Self.looksLikeDocumentContentQuestion(userInput)
+                            && hasSuccessfulRagResult())
                     if !didFallbackSearch, !resume, intentOnly,
                        Self.firstWebURL(in: userInput) == nil,
                        Self.firstLocalPath(in: userInput) == nil,
-                       !Self.looksLikeKnowledgeBaseQuestion(userInput),
+                       !shouldNotWebSearch,
                        !Self.looksLikeSkillQuestion(userInput),
                        !Self.looksLikeMemoryQuestion(userInput) {
                         didFallbackSearch = true
