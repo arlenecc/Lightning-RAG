@@ -1002,7 +1002,8 @@ final class ParserTests: XCTestCase {
         XCTAssertEqual(config.ragVectorElementType, .int8)
         XCTAssertEqual(config.ragChunkSize, 800)
         XCTAssertEqual(config.ragChunkOverlap, 80)
-        XCTAssertEqual(config.ragSearchMaxTotalChars, 12_000)
+        XCTAssertEqual(config.ragSearchMaxTotalChars, 20_000)
+        XCTAssertEqual(config.kernelMaxToolChars, 12_000)
         XCTAssertEqual(config.ragAuxSummarizeMinChars, 5_000)
         XCTAssertEqual(config.ragAuxSummarizeMaxChars, 20_000)
         XCTAssertEqual(config.ragVectorOverfetch, 2,

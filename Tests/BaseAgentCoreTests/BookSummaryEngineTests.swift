@@ -602,4 +602,33 @@ final class BookSummaryEngineTests: XCTestCase {
         XCTAssertEqual(try store.summaryJob(docID: document.docID)?.totalSections, 1)
         XCTAssertEqual(try store.bookSummary(docID: document.docID)?.summary, record.summary)
     }
+
+    /// 核心句模式：不依赖辅助模型，章节与全书摘要都由本地核心句组成。
+    func testCoreSentenceModeWorksWithoutAuxiliaryModel() async throws {
+        let store = try makeStore()
+        let document = try insertDocument(store, name: "core-mode.md")
+        let engine = BookSummaryEngine(store: store, summaryMode: .coreSentences)
+        let paragraphs = [
+            "核心观点句必须放在段首。",
+            "这是一段用于补充细节的普通叙述，不承担主要观点。",
+            "因此，全书的主线可以概括为从问题到方法的推进。",
+            "另一个细节例子只是用来解释背景。",
+            "最后总结一句：结论清晰且可验证。",
+        ]
+        let markdown = "# 第一章 概述\n\n"
+            + String(repeating: paragraphs.joined(separator: "\n\n"), count: 4)
+
+        let chapter = try await engine.processNextChapter(
+            document: document, markdown: markdown, llm: nil,
+            now: Date(), isCancelled: { false })
+        XCTAssertTrue(chapter.chapterCompleted)
+        XCTAssertFalse(chapter.summary.isEmpty)
+        XCTAssertEqual(try store.summaryJob(docID: document.docID)?.status, .summarizingBook)
+
+        let record = try await engine.processBookSummary(
+            document: document, markdown: markdown, llm: nil,
+            now: Date(), isCancelled: { false })
+        XCTAssertFalse(record.summary.isEmpty)
+        XCTAssertEqual(try store.summaryJob(docID: document.docID)?.status, .completed)
+    }
 }

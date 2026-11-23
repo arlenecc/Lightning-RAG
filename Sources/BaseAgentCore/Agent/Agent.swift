@@ -1725,7 +1725,8 @@ public final class Agent: @unchecked Sendable {
         // 改进8：至少 8 轮做一次整理建议（与折叠周期对齐），
         // 后台用辅助引擎产出建议、不改记忆文件。
         let tidyEvery = max(8, config.kernelConsolidateEvery)
-        let shouldTidy = session.currentTurn >= readLastMemoryTidyTurn() + tidyEvery
+        let shouldTidy = config.memoryTidyEnabled
+            && session.currentTurn >= readLastMemoryTidyTurn() + tidyEvery
         let shouldDistill = substantiveTurn && substantive
             && (distillRequested ?? kernel.distillRequested)
         // 事实抽取必须满足：有辅助模型（唯一允许的模型）+ 距上次成功 ≥4h

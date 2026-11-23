@@ -99,10 +99,10 @@ final class ChunkParameterConsistencyTests: XCTestCase {
         config.ragSearchMaxTotalChars = 5_000
         XCTAssertEqual(RAGEngine.outputCharLimit(config: config, maxTotalChars: nil), 5_000)
 
-        // 内核未配置时使用与默认值一致的 8000 兜底。
+        // 内核未配置时使用与默认值一致的 12000 兜底。
         config.kernelMaxToolChars = 0
         config.ragSearchMaxTotalChars = 20_000
-        XCTAssertEqual(RAGEngine.outputCharLimit(config: config, maxTotalChars: nil), 8_000)
+        XCTAssertEqual(RAGEngine.outputCharLimit(config: config, maxTotalChars: nil), 12_000)
 
         // 调用方显式指定时优先；但不得低于 1000 字符的最低可用上下文。
         XCTAssertEqual(RAGEngine.outputCharLimit(config: config, maxTotalChars: 3_000), 3_000)

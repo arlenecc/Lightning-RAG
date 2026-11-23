@@ -157,7 +157,12 @@ final class BookSummaryCoordinatorTests: XCTestCase {
         return BookSummaryCoordinator(
             engine: BookSummaryEngine(store: store),
             store: store,
-            configProvider: { AgentConfig() },
+            configProvider: {
+                // 这些用例验证辅助模型会话生命周期，显式走 aux_model 分支。
+                var config = AgentConfig()
+                config.bookSummaryMode = .auxModel
+                return config
+            },
             residentAuxProvider: { resident },
             transientAuxFactory: transient,
             now: { clock.now },
@@ -195,6 +200,36 @@ final class BookSummaryCoordinatorTests: XCTestCase {
             return XCTFail("常驻模式 15 分钟内应节流，实际 \(second)")
         }
         XCTAssertEqual(wait, 900, accuracy: 0.01)
+    }
+
+    /// 核心句模式：不创建/预加载辅助模型，直接本地处理章节。
+    func testCoreSentenceModeNeedsNoAuxiliaryModel() async throws {
+        let store = try makeStore()
+        let markdown = chapterMarkdown(1, bodyLength: 200)
+        _ = try insertDocument(store, markdown: markdown)
+        let transient = CoordinatorStubLLM()
+        var config = AgentConfig()
+        config.bookSummaryMode = .coreSentences
+        let clock = self.clock!
+        let coordinator = BookSummaryCoordinator(
+            engine: BookSummaryEngine(store: store, summaryMode: .coreSentences),
+            store: store,
+            configProvider: { config },
+            residentAuxProvider: { nil },
+            transientAuxFactory: { _ in transient },
+            now: { clock.now },
+            log: { _ in })
+
+        let began = await coordinator.beginSession(mode: .temporary)
+        XCTAssertTrue(began)
+        XCTAssertFalse(transient.preloaded, "核心句模式不应预加载辅助模型")
+        let first = await coordinator.runTick(mode: .temporary)
+        guard case .processedChapter(_, _, _, _, let completed) = first else {
+            return XCTFail("核心句模式应直接处理章节，实际 \(first)")
+        }
+        XCTAssertTrue(completed)
+        XCTAssertEqual(transient.calls, 0, "核心句模式不应调用辅助模型")
+        await coordinator.endSession()
     }
 
     func testTemporaryModeProcessesOneChapterPerFiveMinutes() async throws {

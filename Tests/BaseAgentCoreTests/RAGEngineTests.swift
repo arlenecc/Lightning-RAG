@@ -1239,6 +1239,20 @@ final class RAGEngineTests: XCTestCase {
                        "超过上限不做精简")
     }
 
+    /// 核心句模式：达到下限即压缩，不区分文档数、不设上限。
+    func testCoreCondenseHasNoUpperBoundAndIgnoresDocumentCount() {
+        var config = AgentConfig()
+        config.ragAuxSummarizeMinChars = 5_000
+
+        XCTAssertFalse(RAGEngine.shouldCondenseByCoreSentences(
+            outputChars: 4_999, documentCount: 1, config: config))
+        XCTAssertTrue(RAGEngine.shouldCondenseByCoreSentences(
+            outputChars: 5_000, documentCount: 1, config: config))
+        XCTAssertTrue(RAGEngine.shouldCondenseByCoreSentences(
+            outputChars: 20_001, documentCount: 2, config: config),
+                      "核心句模式不设 20k 上限")
+    }
+
     /// 分片必须严格不超过上限，且保持原有换行语义；单行超限时硬切。
     func testCondenseSplitByLinesRespectsLimit() {
         let text = (0..<40).map { "第\($0)行内容" }.joined(separator: "\n")
@@ -1321,6 +1335,8 @@ final class RAGEngineTests: XCTestCase {
         config.ragSearchMaxTotalChars = 2_000
         config.ragAuxSummarizeMinChars = 100
         config.ragAuxSummarizeMaxChars = 2_000
+        // 本用例验证辅助模型整理器；显式切到 aux_model。
+        config.ragCondenseMode = .auxModel
 
         let engine = RAGEngine(config: config, knowledgeBase: kb.path,
                                embedding: RagFakeEmbedding(), reranker: nil)
@@ -1338,6 +1354,47 @@ final class RAGEngineTests: XCTestCase {
         XCTAssertEqual(stages.filter { $0 == .chapter }.count, 2)
         XCTAssertEqual(stages.filter { $0 == .merge }.count, 1)
         XCTAssertTrue(output.hasPrefix("摘要:"))
+        engine.close()
+    }
+
+    /// 默认（core_sentences）：达到阈值也不调用辅助模型整理器，
+    /// 改为对全部切片做核心句压缩。
+    func testSearchFormattedUsesCoreSentencesByDefault() async throws {
+        let root = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("base-agent-rag-core-condense-\(UUID().uuidString)")
+        let kb = root.appendingPathComponent("kb")
+        try FileManager.default.createDirectory(at: kb, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let textA = (0..<80).map { _ in
+            "核心观点：apple 是水果。\n补充细节：apple 只是背景描述。"
+        }.joined(separator: "\n")
+        let textB = (0..<80).map { _ in
+            "核心观点：apple 也是一种颜色。\n补充细节：apple 仅是举例说明。"
+        }.joined(separator: "\n")
+        try textA.write(to: kb.appendingPathComponent("a.md"), atomically: true, encoding: .utf8)
+        try textB.write(to: kb.appendingPathComponent("b.md"), atomically: true, encoding: .utf8)
+
+        var config = AgentConfig()
+        config.workspace = root.path
+        config.knowledgeBase = kb.path
+        config.ragRerankEnabled = false
+        config.ragSemanticChunking = false
+        config.ragChunkSize = 800
+        config.ragChunkOverlap = 0
+        config.ragSearchMaxCharsPerResult = 1_000
+        config.ragSearchMaxTotalChars = 2_000
+        config.ragAuxSummarizeMinChars = 100
+        XCTAssertEqual(config.ragCondenseMode, .coreSentences)
+
+        let engine = RAGEngine(config: config, knowledgeBase: kb.path,
+                               embedding: RagFakeEmbedding(), reranker: nil)
+        _ = await engine.ingest()
+        engine.auxCondenser = { _, _ in "AUX_SHOULD_NOT_RUN" }
+        let output = try await engine.searchFormatted(query: "apple", topK: 2)
+        XCTAssertFalse(output.contains("AUX_SHOULD_NOT_RUN"),
+                       "默认核心句模式不应调用辅助模型整理器")
+        XCTAssertTrue(output.contains("核心句"), "默认应输出核心句压缩结果")
         engine.close()
     }
 

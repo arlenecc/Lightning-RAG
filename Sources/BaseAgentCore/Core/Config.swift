@@ -96,6 +96,20 @@ public enum PDFEngine: String, Codable, Sendable, CaseIterable {
     }
 }
 
+// MARK: - 长文本摘要方式
+
+/// RAG 结果浓缩 / 章节全书摘要的生成方式。
+/// - `coreSentences`：纯本地核心句提取，不调用模型（默认）；
+/// - `auxModel`：原辅助模型 map-reduce 摘要，保留备用。
+public enum TextDigestMode: String, Codable, Sendable, CaseIterable {
+    case coreSentences = "core_sentences"
+    case auxModel = "aux_model"
+
+    public init(stored: String) {
+        self = TextDigestMode(rawValue: stored.lowercased()) ?? .coreSentences
+    }
+}
+
 // MARK: - RAG 检索策略
 
 /// 知识图谱加持的 RAG 检索策略（默认 naive = 图谱能力加入前的原始实现）。
@@ -262,9 +276,13 @@ public struct AgentConfig: Sendable {
     /// 该产物目前没有下游消费者，开启只会让辅助模型每轮消化积压 session、
     /// 占用后台 GPU；等消费端接入后再开启。关闭时 session 仍会入队，数据不丢。
     public var memoryHistoryInsightEnabled: Bool = false
-    /// L1 工具结果字符上限。与 RAG 输出总上限（ragSearchMaxTotalChars=12000）
-    /// 取较小值生效：默认 8000 让 RAG 结果不会被内核二次静默截断。
-    public var kernelMaxToolChars: Int = 8_000
+    /// 记忆整理建议（memory/memory_tidy_proposal.md 生产端）：默认关闭。
+    /// 产物目前没有下游消费者；且辅助小模型常输出不合规格式，导致整理失败后
+    /// 每轮重试、白跑后台模型。需要时再打开。
+    public var memoryTidyEnabled: Bool = false
+    /// L1 工具结果字符上限。与 RAG 输出总上限（ragSearchMaxTotalChars=20000）
+    /// 取较小值生效：默认 12000 让 RAG 结果不会被内核二次静默截断。
+    public var kernelMaxToolChars: Int = 12_000
     /// RAG 工具结果「进历史 / KV 前缀」的额外收紧上限（字符）。0 表示不额外收紧，
     /// 沿用 L1 的 `kernelMaxToolChars`。RAG 结果通常 bulky，单独收紧只保留最相关
     /// 头部、丢弃尾部，避免几千字符的结果把历史 / KV 前缀撑大、拖慢后续每轮生成。
@@ -313,8 +331,8 @@ public struct AgentConfig: Sendable {
     public var ragRerankTimeoutSeconds: Double = 5
     /// 检索结果格式化时单条片段的字符上限（超出截断加省略号）。
     public var ragSearchMaxCharsPerResult: Int = 1_500
-    /// 检索结果总字符上限（超出截断）。
-    public var ragSearchMaxTotalChars: Int = 12_000
+    /// 检索结果总字符上限（超出截断）。与内核 `kernelMaxToolChars` 取较小值生效。
+    public var ragSearchMaxTotalChars: Int = 20_000
     /// 知识库只读查询（打开库 / 状态 / 检索）的超时秒数。上次同步被中断、
     /// 应用被强杀时，SQLite 需要先恢复遗留 WAL，可能耗时数分钟；启动与对话
     /// 路径都必须设上限：超出即跳过本次查询，不再阻塞。0 = 关闭超时。
@@ -327,6 +345,12 @@ public struct AgentConfig: Sendable {
     /// 默认 20000：精简内部按 4000 字符分片做 map-reduce 章节摘要，
     /// 因此上限不再受「一次性摘要不可靠」约束。
     public var ragAuxSummarizeMaxChars: Int = 20_000
+    /// RAG 结果浓缩方式：默认核心句压缩（含 5000 字以上），
+    /// `aux_model` 时回退到辅助模型 map-reduce 摘要。
+    public var ragCondenseMode: TextDigestMode = .coreSentences
+    /// 章节/全书摘要生成方式：默认核心句压缩，
+    /// `aux_model` 时回退到辅助模型摘要。
+    public var bookSummaryMode: TextDigestMode = .coreSentences
     /// 启动时自动同步知识库。默认关闭：首次全量同步会长时间占用
     /// embedding 模型与磁盘 IO，容易与对话争抢资源；需要时手动触发。
     public var ragAutoIngest: Bool = false
@@ -787,6 +811,7 @@ public struct AgentConfig: Sendable {
         if let v = int("kernel_raw_turns") { kernelRawTurns = v }
         if let v = int("kernel_consolidate_every") { kernelConsolidateEvery = v }
         if let v = bool("memory_history_insight_enabled") { memoryHistoryInsightEnabled = v }
+        if let v = bool("memory_tidy_enabled") { memoryTidyEnabled = v }
         if let v = int("kernel_max_tool_chars") { kernelMaxToolChars = v }
         if let v = int("kernel_rag_history_chars") { kernelRagHistoryChars = v }
         if let v = int("kernel_max_digest_lines") { kernelMaxDigestLines = v }
@@ -904,6 +929,8 @@ public struct AgentConfig: Sendable {
         if let v = int("rag_search_max_total_chars") { ragSearchMaxTotalChars = v }
         if let v = int("rag_aux_summarize_min_chars") { ragAuxSummarizeMinChars = v }
         if let v = int("rag_aux_summarize_max_chars") { ragAuxSummarizeMaxChars = v }
+        if let v = string("rag_condense_mode") { ragCondenseMode = TextDigestMode(stored: v) }
+        if let v = string("book_summary_mode") { bookSummaryMode = TextDigestMode(stored: v) }
         if let v = int("rag_vector_overfetch") { ragVectorOverfetch = v }
         if let v = int("rag_fts_overfetch") { ragFTSOverfetch = v }
         if let v = bool("rag_mcp_listen_lan") { ragMCPListenLan = v }
@@ -1335,6 +1362,7 @@ public struct AgentConfig: Sendable {
             "kernel_raw_turns": kernelRawTurns,
             "kernel_consolidate_every": kernelConsolidateEvery,
             "memory_history_insight_enabled": memoryHistoryInsightEnabled,
+            "memory_tidy_enabled": memoryTidyEnabled,
             "kernel_max_tool_chars": kernelMaxToolChars,
             "kernel_rag_history_chars": kernelRagHistoryChars,
             "kernel_max_digest_lines": kernelMaxDigestLines,
@@ -1420,6 +1448,8 @@ public struct AgentConfig: Sendable {
             "rag_search_max_total_chars": ragSearchMaxTotalChars,
             "rag_aux_summarize_min_chars": ragAuxSummarizeMinChars,
             "rag_aux_summarize_max_chars": ragAuxSummarizeMaxChars,
+            "rag_condense_mode": ragCondenseMode.rawValue,
+            "book_summary_mode": bookSummaryMode.rawValue,
             "rag_vector_overfetch": ragVectorOverfetch,
             "rag_fts_overfetch": ragFTSOverfetch,
             "rag_mcp_listen_lan": ragMCPListenLan,

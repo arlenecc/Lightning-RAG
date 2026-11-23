@@ -56,6 +56,19 @@ public final class BookSummaryCoordinator: @unchecked Sendable {
         }
         lock.unlock()
 
+        // 核心句模式完全本地、无需辅助模型：直接开会话，不预加载也不借用。
+        if configProvider().bookSummaryMode == .coreSentences {
+            guard !Task.isCancelled else { return false }
+            lock.lock()
+            sessionMode = mode
+            retryCounts.removeAll()
+            cancelRequested = false
+            stopRequested = false
+            lock.unlock()
+            log("章节摘要：核心句模式空闲会话（不加载辅助模型）")
+            return true
+        }
+
         if mode == .resident {
             guard !Task.isCancelled else { return false }
             guard residentAuxProvider() != nil else {
@@ -155,16 +168,21 @@ public final class BookSummaryCoordinator: @unchecked Sendable {
         lock.unlock()
         guard !stopping else { return .noWork }
 
+        let coreSentences = configProvider().bookSummaryMode == .coreSentences
         let llm: LLMService?
-        switch mode {
-        case .resident:
-            llm = residentAuxProvider()
-        case .temporary:
-            lock.lock()
-            llm = transientLLM
-            lock.unlock()
+        if coreSentences {
+            llm = nil
+        } else {
+            switch mode {
+            case .resident:
+                llm = residentAuxProvider()
+            case .temporary:
+                lock.lock()
+                llm = transientLLM
+                lock.unlock()
+            }
         }
-        guard let llm else {
+        if !coreSentences, llm == nil {
             log("章节摘要：\(mode == .resident ? "常驻" : "临时")辅助模型不可用")
             return .noWork
         }
@@ -314,7 +332,7 @@ public final class BookSummaryCoordinator: @unchecked Sendable {
     // MARK: - Tick 执行
 
     private func performTick(document: DocumentRecord, markdown: String,
-                             llm: LLMService, isBookSlot: Bool) async -> BookSummaryTickOutcome {
+                             llm: LLMService?, isBookSlot: Bool) async -> BookSummaryTickOutcome {
         // 摘要的每次 tick 都是一组独立提示；保留跨 tick 的 KV 只会把上一章内容
         // 带进下一次提示并长期占用内存，因此在结束（成功/失败/取消）时统一丢弃。
         defer { (llm as? KVCacheInvalidating)?.invalidateKVCache() }

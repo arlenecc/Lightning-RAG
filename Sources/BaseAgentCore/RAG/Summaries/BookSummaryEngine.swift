@@ -12,6 +12,10 @@ import CryptoKit
 public final class BookSummaryEngine: @unchecked Sendable {
 
     private let store: VectorStore
+    /// 摘要生成方式：默认核心句压缩；`.auxModel` 时走辅助模型摘要。
+    /// 直接构造引擎时默认保留旧行为，应用路径由 `AgentConfig.bookSummaryMode`
+    /// 显式传入（默认核心句）。
+    private let summaryMode: TextDigestMode
     /// 同时执行的摘要分片数（默认 5，上限 5）。MLX/ONNX 后端能为每个
     /// `isolated` 请求提供独立 KV/past，可真正并行；GGUF/VLM 单 context
     /// 后端会按能力标记退化为逐条执行。
@@ -23,9 +27,11 @@ public final class BookSummaryEngine: @unchecked Sendable {
     /// 长章节每个 map 分片的最大字符数。
     private static let mapSegmentCharacters = 3_000
 
-    public init(store: VectorStore, batchConcurrency: Int = 5) {
+    public init(store: VectorStore, batchConcurrency: Int = 5,
+                summaryMode: TextDigestMode = .auxModel) {
         self.store = store
         self.batchConcurrency = max(1, min(5, batchConcurrency))
+        self.summaryMode = summaryMode
     }
 
     // MARK: - Token 估算与分段
@@ -273,7 +279,7 @@ public final class BookSummaryEngine: @unchecked Sendable {
     /// 处理 `next_section` 指向的章节；已摘要且内容未变的章节自动跳过。
     public func processNextChapter(document: DocumentRecord,
                                    markdown: String,
-                                   llm: LLMService,
+                                   llm: LLMService?,
                                    now: Date,
                                    isCancelled: @escaping () -> Bool) async throws -> ChapterProcessResult {
         let cancellation = SummaryCancellation(isCancelled)
@@ -378,12 +384,19 @@ public final class BookSummaryEngine: @unchecked Sendable {
 
     private func summarizeSection(document: DocumentRecord,
                                   section: BookSection,
-                                  llm: LLMService,
+                                  llm: LLMService?,
                                   now: Date,
                                   cancellation: SummaryCancellation) async throws -> String {
         let body = section.body.trimmingCharacters(in: .whitespacesAndNewlines)
         if body.count < 40 {
             return Self.fallbackSummary(for: section)
+        }
+        if summaryMode == .coreSentences {
+            let core = CoreOpinionExtractor.compressed(body, topN: 3)
+            return core.isEmpty ? Self.fallbackSummary(for: section) : core
+        }
+        guard let llm else {
+            throw AgentError.llm("辅助模型不可用，无法生成章节摘要")
         }
         let budget = Self.segmentBudget(contextWindow: llm.contextWindow)
         // 超过 4000 字的章节即使整体塞得进上下文，也强制按 3000 字一段做
@@ -494,7 +507,7 @@ public final class BookSummaryEngine: @unchecked Sendable {
     /// 全部章节完成后的 map-reduce 全书摘要；组结果持久化后增量复用。
     public func processBookSummary(document: DocumentRecord,
                                    markdown: String,
-                                   llm: LLMService,
+                                   llm: LLMService?,
                                    now: Date,
                                    isCancelled: @escaping () -> Bool) async throws -> BookSummaryRecord {
         let cancellation = SummaryCancellation(isCancelled)
@@ -544,6 +557,39 @@ public final class BookSummaryEngine: @unchecked Sendable {
             throw AgentError.storage("本书尚未生成完整的章节摘要")
         }
 
+        if summaryMode == .coreSentences {
+            try cancellation.check()
+            let joined = chapters
+                .map { "【\($0.heading)】\($0.summary)" }
+                .joined(separator: "\n")
+            var summary = CoreOpinionExtractor.compressed(joined, topN: 5)
+            if summary.isEmpty {
+                summary = chapters.prefix(5)
+                    .map { "\($0.heading)：\($0.summary)" }
+                    .joined(separator: "\n")
+            }
+            guard !summary.isEmpty else {
+                throw AgentError.llm("核心句提取未返回有效的全书摘要")
+            }
+            let sourceHash = Self.shortHash(chapters.map {
+                "\($0.sectionIndex):\($0.contentHash):\($0.summary)"
+            }.joined(separator: "\n"))
+            let record = BookSummaryRecord(
+                docID: document.docID, summary: summary, outline: resolved.digest,
+                chapterCount: sections.count, sourceHash: sourceHash,
+                updatedAt: now.timeIntervalSince1970)
+            try store.upsertBookSummary(record)
+            try store.upsertSummaryJob(SummaryJobRecord(
+                docID: document.docID, status: .completed,
+                nextSection: max(sections.count, chapters.count),
+                totalSections: sections.count,
+                lastError: "", updatedAt: now.timeIntervalSince1970))
+            return record
+        }
+
+        guard let llm else {
+            throw AgentError.llm("辅助模型不可用，无法生成全书摘要")
+        }
         let lines = chapters.map { "- [\($0.heading)] \($0.summary)" }
         let budget = Self.segmentBudget(contextWindow: llm.contextWindow)
         let groups = Self.splitSegments(lines.joined(separator: "\n\n"),

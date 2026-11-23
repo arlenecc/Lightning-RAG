@@ -3228,12 +3228,12 @@ public final class RAGEngine {
     }
 
     /// 格式化输出的总字符上限：不得超过内核单次工具结果上限
-    /// （`kernelMaxToolChars`）。否则 RAG 认为自己输出了 12000 字符，
-    /// 内核拼接对话时又会静默截到 6000，用户看到的截断位置与提示不一致。
+    /// （`kernelMaxToolChars`）。否则 RAG 认为自己输出了 20000 字符，
+    /// 内核拼接对话时又会静默截到 12000，用户看到的截断位置与提示不一致。
     /// `maxTotalChars` 为调用方显式指定的上限（测试/内部用途）。
     static func outputCharLimit(config: AgentConfig, maxTotalChars: Int? = nil) -> Int {
         if let maxTotalChars { return max(1_000, maxTotalChars) }
-        let kernelCap = config.kernelMaxToolChars > 0 ? config.kernelMaxToolChars : 8_000
+        let kernelCap = config.kernelMaxToolChars > 0 ? config.kernelMaxToolChars : 12_000
         return max(1_000, min(config.ragSearchMaxTotalChars, kernelCap))
     }
 
@@ -4520,6 +4520,59 @@ public final class RAGEngine {
             || outputChars >= config.ragAuxSummarizeMinChars * 3 / 2
     }
 
+    /// 核心句模式的触发条件：只要达到下限就压缩，不区分文档数、不设上限。
+    /// 本地提取成本低，5000 字以上也无需再走辅助模型。
+    static func shouldCondenseByCoreSentences(outputChars: Int, documentCount: Int,
+                                              config: AgentConfig) -> Bool {
+        outputChars >= config.ragAuxSummarizeMinChars
+    }
+
+    /// 核心句压缩：按 `### [` 切片标题分段，逐段提取核心句并保留全部切片；
+    /// 无分节标记时压缩全文。压缩后不比原文短则回退原文。
+    private func coreSentenceCondense(_ output: String) -> String {
+        guard CoreOpinionExtractor.splitSentences(output).count > 1 else { return output }
+        let topN = CoreOpinionExtractor.perMethodTopN
+
+        var sections: [(header: String, body: String)] = []
+        var header = ""
+        var lines: [String] = []
+        func flush() {
+            if header.isEmpty && lines.isEmpty { return }
+            sections.append((header, lines.joined(separator: "\n")))
+            header = ""
+            lines = []
+        }
+        for line in output.split(separator: "\n", omittingEmptySubsequences: false) {
+            let text = String(line)
+            if text.hasPrefix("### [") {
+                flush()
+                header = text
+            } else {
+                lines.append(text)
+            }
+        }
+        flush()
+
+        if sections.isEmpty || (sections.count == 1 && sections[0].header.isEmpty) {
+            let core = CoreOpinionExtractor.compressed(output, topN: topN)
+            guard !core.isEmpty, core.count < output.count else { return output }
+            return core
+                + "\n[RAG 结果已提取核心句（每路 top\(topN)），原始 \(output.count) 字符]"
+        }
+
+        var parts: [String] = []
+        for section in sections {
+            parts.append(section.header)
+            let core = CoreOpinionExtractor.compressed(section.body, topN: topN)
+            parts.append(core.isEmpty ? section.body : core)
+        }
+        let compressed = parts.joined(separator: "\n")
+        guard compressed.count < output.count else { return output }
+        return compressed
+            + "\n[RAG 全部切片已提取核心句（共 \(sections.count) 段，每路 top\(topN)），"
+            + "原始 \(output.count) 字符]"
+    }
+
     /// 精简失败或输出为空时回退原文，绝不让检索结果变空。
     ///
     /// 采用 map-reduce（章节摘要）：
@@ -4532,6 +4585,14 @@ public final class RAGEngine {
     /// 断言崩溃，串行 + 稳定前缀复用比并发更稳，整体 prefill 也更短。
     private func condenseIfNeeded(_ output: String, hits: [SearchHit]) async -> String {
         let documentCount = Set(hits.map(\.source)).count
+        if config.ragCondenseMode == .coreSentences {
+            guard Self.shouldCondenseByCoreSentences(outputChars: output.count,
+                                                     documentCount: documentCount,
+                                                     config: config) else { return output }
+            let compressed = coreSentenceCondense(output)
+            AgentLog.info("[rag][condense] 核心句压缩 输入=\(output.count) 输出=\(compressed.count) 字符")
+            return compressed
+        }
         guard Self.shouldCondense(outputChars: output.count,
                                   documentCount: documentCount,
                                   config: config) else { return output }
@@ -4548,6 +4609,11 @@ public final class RAGEngine {
     /// 任何一次模型调用都不会超上下文，截断只会白白丢信息。
     private func condenseIfNeeded(_ output: String) async -> String {
         guard output.count >= config.ragAuxSummarizeMinChars else { return output }
+        if config.ragCondenseMode == .coreSentences {
+            let compressed = coreSentenceCondense(output)
+            AgentLog.info("[rag][condense] 核心句压缩(KG) 输入=\(output.count) 输出=\(compressed.count) 字符")
+            return compressed
+        }
         let chunks = Self.sectionsFromHeadings(output, limit: Self.condenseChapterChars)
         return await runCondense(output, chunks: chunks)
     }
@@ -4999,7 +5065,8 @@ public final class RAGEngine {
             : try ensureStore()
         let config = self.config
         return BookSummaryCoordinator(
-            engine: BookSummaryEngine(store: store),
+            engine: BookSummaryEngine(store: store,
+                                      summaryMode: config.bookSummaryMode),
             store: store,
             configProvider: { config },
             residentAuxProvider: residentAuxProvider,

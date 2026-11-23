@@ -161,6 +161,36 @@ final class KernelDecisionGateTests: XCTestCase {
                       "最终文本应原样交付")
     }
 
+    /// rag_tools 的 status（清单）与 outline（大纲）是结构性答案：即使判定器
+    /// 返回不足也直接放行，避免「知识库里有什么 / 这本书讲什么」被误判后反复检索。
+    func testKBStructureResultBypassesDecisionGate() async {
+        for op in ["status", "outline"] {
+            let judge = StubJudge(informationSufficientResult: false)
+            let model = ScriptedModel(firstTurn: {
+                Self.events([.init(kind: .done, toolCalls: [
+                    ToolCall(id: "t1", name: "rag_tools",
+                             arguments: ["op": .string(op)]),
+                ])])
+            })
+            let session = Session(budget: ContextBudget(total: 60_000), rawTurns: 50)
+            let loop = KernelLoop(runtime: makeRuntime(model: model, session: session),
+                                  config: makeConfig(maxFinishBlocks: 2),
+                                  systemPrompt: { "SYS" }, session: session, maxTurns: 8)
+            loop.decisionJudge = judge
+            let result = await loop.run("你知识库内有什么")
+
+            XCTAssertEqual(judge.completeCalls.count, 0, "\(op) 结果不应再送判定")
+            XCTAssertEqual(model.callCount, 2, "\(op) 应直接进入文本作答：工具轮 + 文本轮")
+            XCTAssertFalse(model.userPrompts.contains {
+                $0.contains("决策模型判定当前收集的信息可能不足")
+            }, "\(op) 不应注入继续检索的拦截提示")
+            XCTAssertTrue(model.kernelLogs.contains {
+                $0.contains("清单/大纲结果直接放行")
+            }, "\(op) 应记录放行日志")
+            XCTAssertTrue(result.text.contains("北京今日晴"))
+        }
+    }
+
     /// 判定不可用（nil）：静默放行，主流程不受影响。
     func testCompleteGateNilJudgePassesThrough() async {
         let judge = StubJudge(informationSufficientResult: nil)

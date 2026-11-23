@@ -299,7 +299,7 @@ public final class KernelLoop {
         let configured = max(2,
             config.kernelConsolidateEvery == 0 ? 18 : config.kernelConsolidateEvery)
         self.consolidateEvery = max(1, min(configured, max(1, resolved.rawTurns)))
-        self.maxToolChars = config.kernelMaxToolChars == 0 ? 8_000 : config.kernelMaxToolChars
+        self.maxToolChars = config.kernelMaxToolChars == 0 ? 12_000 : config.kernelMaxToolChars
         self.ragHistoryChars = config.kernelRagHistoryChars
         let fallbackTurns = config.maxIterations == 0 ? 15 : config.maxIterations
         self.maxTurns = max(1, maxTurns == 0 ? fallbackTurns : maxTurns)
@@ -1396,30 +1396,44 @@ public final class KernelLoop {
             let retrievalOnly = !toolCalls.isEmpty && toolCalls.allSatisfy {
                 ["rag_tools", "web_scan", "web_search"].contains($0.name)
             }
+            // status（清单）与 outline（大纲）都是知识库的结构性结果：
+            // 「知识库里有什么」「这本书讲什么」这类问句，拿到清单/大纲即可作答。
+            // 实测 0.8B 判定模型仍会给低分（0.326/0.266 < 0.40）并打回，模型随即
+            // 被推去反复检索、越查越偏。这里直接放行，并标记 prechecked 让收尾门
+            // 也不再重复判定。
+            let kbStructureAnswered = toolCalls.contains {
+                guard $0.name == "rag_tools" else { return false }
+                let op = $0.arguments["op"]?.stringValue
+                return op == "status" || op == "outline"
+            }
             if toolsEnabled, retrievalOnly, hasToolSuccess, !decisionPrechecked,
-               reviewRounds == 0,
-               decisionFinishBlocks < config.kernelDecisionGateMaxFinishBlocks,
-               let judge = decisionJudge {
-                let sufficient = await judge.informationSufficient(
-                    task: userInput,
-                    evidence: decisionEvidence())
-                if sufficient == false {
-                    decisionFinishBlocks += 1
-                    parts.append("""
-                    [System] 决策模型判定当前收集的信息可能不足以完整回答任务（第 \(decisionFinishBlocks)/\(config.kernelDecisionGateMaxFinishBlocks) 次拦截）。
-                    本轮不要直接写最终答案；请继续调用工具补齐缺失信息（换关键词/换来源、检查遗漏的必要数据点），不要重复上一轮相同的检索。
-                    若确认无法获取，请在答复中明确说明缺失的部分与原因后再收尾，不要编造。
-                    """)
-                    log("[kernel] 决策门（生成前）：拦截 "
-                        + "\(decisionFinishBlocks)/\(config.kernelDecisionGateMaxFinishBlocks)（信息不足）")
-                } else if sufficient == true {
+               reviewRounds == 0 {
+                if kbStructureAnswered {
                     decisionPrechecked = true
-                    log("[kernel] 决策门（生成前）：信息足够，放行生成")
-                } else {
-                    // nil = 判定不可用（模型缺失/超时）：静默放行，本轮任务
-                    // 不再重复判定，避免每次收尾都白等一次超时。
-                    decisionPrechecked = true
-                    log("[kernel] 决策门（生成前）：判定不可用，跳过后续判定")
+                    log("[kernel] 决策门（生成前）：rag_tools(op=status/outline) 清单/大纲结果直接放行")
+                } else if decisionFinishBlocks < config.kernelDecisionGateMaxFinishBlocks,
+                          let judge = decisionJudge {
+                    let sufficient = await judge.informationSufficient(
+                        task: userInput,
+                        evidence: decisionEvidence())
+                    if sufficient == false {
+                        decisionFinishBlocks += 1
+                        parts.append("""
+                        [System] 决策模型判定当前收集的信息可能不足以完整回答任务（第 \(decisionFinishBlocks)/\(config.kernelDecisionGateMaxFinishBlocks) 次拦截）。
+                        本轮不要直接写最终答案；请继续调用工具补齐缺失信息（换关键词/换来源、检查遗漏的必要数据点），不要重复上一轮相同的检索。
+                        若确认无法获取，请在答复中明确说明缺失的部分与原因后再收尾，不要编造。
+                        """)
+                        log("[kernel] 决策门（生成前）：拦截 "
+                            + "\(decisionFinishBlocks)/\(config.kernelDecisionGateMaxFinishBlocks)（信息不足）")
+                    } else if sufficient == true {
+                        decisionPrechecked = true
+                        log("[kernel] 决策门（生成前）：信息足够，放行生成")
+                    } else {
+                        // nil = 判定不可用（模型缺失/超时）：静默放行，本轮任务
+                        // 不再重复判定，避免每次收尾都白等一次超时。
+                        decisionPrechecked = true
+                        log("[kernel] 决策门（生成前）：判定不可用，跳过后续判定")
+                    }
                 }
             }
             pending = parts.joined(separator: "\n")
