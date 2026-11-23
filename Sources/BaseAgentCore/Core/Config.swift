@@ -258,6 +258,10 @@ public struct AgentConfig: Sendable {
     /// **例外**：上下文占用超过最大上下文 90%（`ContextBudget.needsAutoShrink`）时
     /// 走 `foldToRewatermark` 收缩到回水线（触发线下 30 个百分点）。
     public var kernelConsolidateEvery: Int = 18
+    /// 历史提炼（memory/history_insight.md 生产端）：默认关闭。
+    /// 该产物目前没有下游消费者，开启只会让辅助模型每轮消化积压 session、
+    /// 占用后台 GPU；等消费端接入后再开启。关闭时 session 仍会入队，数据不丢。
+    public var memoryHistoryInsightEnabled: Bool = false
     /// L1 工具结果字符上限。与 RAG 输出总上限（ragSearchMaxTotalChars=12000）
     /// 取较小值生效：默认 8000 让 RAG 结果不会被内核二次静默截断。
     public var kernelMaxToolChars: Int = 8_000
@@ -782,6 +786,7 @@ public struct AgentConfig: Sendable {
         if let v = int("kernel_max_context_tokens") { kernelMaxContextTokens = v }
         if let v = int("kernel_raw_turns") { kernelRawTurns = v }
         if let v = int("kernel_consolidate_every") { kernelConsolidateEvery = v }
+        if let v = bool("memory_history_insight_enabled") { memoryHistoryInsightEnabled = v }
         if let v = int("kernel_max_tool_chars") { kernelMaxToolChars = v }
         if let v = int("kernel_rag_history_chars") { kernelRagHistoryChars = v }
         if let v = int("kernel_max_digest_lines") { kernelMaxDigestLines = v }
@@ -1329,6 +1334,7 @@ public struct AgentConfig: Sendable {
             "kernel_max_context_tokens": kernelMaxContextTokens,
             "kernel_raw_turns": kernelRawTurns,
             "kernel_consolidate_every": kernelConsolidateEvery,
+            "memory_history_insight_enabled": memoryHistoryInsightEnabled,
             "kernel_max_tool_chars": kernelMaxToolChars,
             "kernel_rag_history_chars": kernelRagHistoryChars,
             "kernel_max_digest_lines": kernelMaxDigestLines,

@@ -1718,7 +1718,10 @@ public final class Agent: @unchecked Sendable {
 
         // 改进7：待提炼队列是**持久化**的，寒暄轮、辅助模型暂不可用、后台任务
         // 被下一次 run 取消等情况都不会丢，本轮或下一轮重新拾起即可。
-        let hasPending = !memoryDirectory.pendingInsightIds().isEmpty
+        // 历史提炼产物当前无下游消费者，默认关闭生产端：session 仍由 RawSessionStore
+        // 入队保留，开启开关后可从队列继续消化。
+        let hasPending = config.memoryHistoryInsightEnabled
+            && !memoryDirectory.pendingInsightIds().isEmpty
         // 改进8：至少 8 轮做一次整理建议（与折叠周期对齐），
         // 后台用辅助引擎产出建议、不改记忆文件。
         let tidyEvery = max(8, config.kernelConsolidateEvery)

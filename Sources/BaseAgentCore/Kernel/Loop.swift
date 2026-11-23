@@ -2419,6 +2419,17 @@ public final class KernelLoop {
     /// 不该重复注入；只有 Agent 开启新用户输入时才允许重新注入。
     public func beginUserRequest() {
         dynamicContextInjected = false
+        // 决策门记账必须按「用户请求」重置：这些变量是 KernelLoop 实例级状态，
+        // 若只在「清空对话」时重置，一次判定放行（decisionPrechecked=true）
+        // 会让后续所有无关请求永久跳过生成前门/收尾门/计划评审。
+        resetDecisionGateState()
+    }
+
+    private func resetDecisionGateState() {
+        decisionFinishBlocks = 0
+        decisionPrechecked = false
+        decisionPlanReviews = 0
+        decisionReviewedPlanKey = ""
     }
 
     /// 把上一段的失败上下文带进下一段 run()（自动续跑用）。
@@ -2456,10 +2467,7 @@ public final class KernelLoop {
         dynamicContextInjected = false
         repeatStreak = 0
         lastCallSigs.removeAll()
-        decisionFinishBlocks = 0
-        decisionPrechecked = false
-        decisionPlanReviews = 0
-        decisionReviewedPlanKey = ""
+        resetDecisionGateState()
         pendingSeed = nil
         resume = false
         state = .think
