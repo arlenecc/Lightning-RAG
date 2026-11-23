@@ -6,8 +6,9 @@ import Foundation
 /// 避免整段原文导致打分过慢或超上下文。纯函数，不依赖模型与网络。
 ///
 /// 方法 A：多信号启发式打分
-///   Score = w1·P_pos + w2·D_lexicon + w3·C_centrality + w4·L_length
+///   Score = w1·P_pos + w2·D_lexicon + w3·C_centrality + w4·L_length + w5·F_fact
 /// 方法 B：TextRank + 观点词加权初始化（观点句 2.0 / 普通句 0.5）
+/// 保真席位：两路 topN 之外，按 F_fact 强制纳入前 3 个数字/实体句。
 public enum CoreOpinionExtractor {
 
     /// 观点指示词表（出现频率越高，越可能是观点句）。
@@ -21,14 +22,43 @@ public enum CoreOpinionExtractor {
     /// 打分耗时进一步从 2.67s 降到 0.31s，故默认取 10。
     public static let perMethodTopN = 10
 
-    /// 权重：位置 0.25 / 观点词 0.30 / 中心度 0.30 / 长度 0.15。
+    /// 数字/实体保真席位：即使不在两路 topN 内，也按 F_fact 强制纳入前 3 句
+    /// （席位少一些，避免核心句集合过长）。
+    public static let factGuaranteeTop = 3
+
+    /// 权重：位置 0.25 / 观点词 0.30 / 中心度 0.30 / 长度 0.15 / 事实保真 0.25。
     public struct Weights: Sendable {
         public var position: Double = 0.25
         public var lexicon: Double = 0.30
         public var centrality: Double = 0.30
         public var length: Double = 0.15
+        /// 数字/实体保真加分权重（W_FACT）。
+        public var fact: Double = 0.25
         public init() {}
     }
+
+    /// 事实模式：命中越多类别，F_fact 越高（封顶 1.0）。
+    /// 覆盖数字+单位、百分比/分数、区间、日期时间、版本号、配置键值、条款编号、
+    /// 阈值/期限/审批类约束词 8 类。
+    private static let factPatterns: [NSRegularExpression] = {
+        let patterns = [
+            // 数字 + 常见单位（个/万/亿/人/次/天/小时/年/月/日/元/%/kg/km/MB/GB…）
+            "[0-9０-９一二三四五六七八九十百千万亿]+[ ]*(个|万|亿|人|次|天|日|小时|分钟|秒|年|月|周|元|美元|%|％|千克|公斤|克|米|公里|千米|MB|GB|TB|kbps|倍|层|条|页|章)",
+            // 百分比 / 分数 / 比率
+            "[0-9０-９]+[ ]*(%|％|/|∶|:)[ ]*[0-9０-９]*|百分之[0-9０-９一二三四五六七八九十]+",
+            // 区间
+            "[0-9０-９]+[ ]*(~|-|—|至|到)[ ]*[0-9０-９]+",
+            // 日期 / 时间
+            "[0-9０-９]{4}[年/-][0-9０-９]{1,2}[月/-][0-9０-９]{1,2}|[0-9０-９]{1,2}:[0-9０-９]{2}|[0-9０-９]{1,2}时[0-9０-９]{1,2}分",
+            // 版本号 / 编号
+            "v?[0-9０-９]+\\.[0-9０-９]+(\\.[0-9０-９]+)?|第[0-9０-９一二三四五六七八九十百]+[条款章节条]",
+            // 配置键值 / 参数名 = 值
+            "[A-Za-z_][A-Za-z0-9_]*[ ]*[=:][ ]*[\"']?[A-Za-z0-9_.-]+",
+            // 阈值 / 期限 / 审批类约束词
+            "阈值|上限|下限|不少于|不低于|不超过|至少|最多|截止|期限|必须|禁止|需审批|经批准|有效期|默认为|不得超过",
+        ]
+        return patterns.compactMap { try? NSRegularExpression(pattern: $0, options: .caseInsensitive) }
+    }()
 
     // MARK: - 主入口
 
@@ -47,11 +77,19 @@ public enum CoreOpinionExtractor {
         let heuristic = heuristicTop(sentences, query: query, count: n)
         let textRank = textRankTop(sentences, count: n)
 
-        // 合并去重：用句子原文（trim 后）作 key，保持启发式优先、再 TextRank 补充；
-        // 最终按原文顺序返回，便于模型按叙述顺序理解。
+        // 保真席位：两路 topN 之外，按 F_fact 得分强制纳入前 K 个数字/实体句。
+        // 这些句子即使观点/中心度不高，也可能含金额/日期/条款等关键细节，丢失代价高。
+        let factQuota = min(factGuaranteeTop, sentences.count)
+        let factTop = sentences.enumerated()
+            .filter { factScore($0.element) > 0 }
+            .sorted { factScore($0.element) > factScore($1.element)
+                || (factScore($0.element) == factScore($1.element) && $0.offset < $1.offset) }
+            .prefix(factQuota).map(\.element)
+
+        // 合并去重：启发式 → TextRank → 保真席位；最终按原文顺序返回。
         var picked = Set<String>()
         var merged: [String] = []
-        for s in heuristic + textRank where picked.insert(s).inserted {
+        for s in heuristic + textRank + factTop where picked.insert(s).inserted {
             merged.append(s)
         }
         let order = Dictionary(sentences.enumerated().map { ($0.element, $0.offset) },
@@ -85,9 +123,31 @@ public enum CoreOpinionExtractor {
 
     // MARK: - 切句
 
-    /// 复用 CharacterNgramBM25 的切句（按中英文句末标点与换行）。
+    /// 复用 CharacterNgramBM25 的切句（按中英文句末标点与换行），
+    /// 并修复小数点/版本号被误当句末的问题（"0.05%" 会被切成 "0." + "05%"），
+    /// 否则数字事实句被拆散、保真信号失效。
     public static func splitSentences(_ text: String) -> [String] {
-        CharacterNgramBM25.sentences(text)
+        let raw = CharacterNgramBM25.sentences(text)
+        guard raw.count > 1 else { return raw }
+        var merged: [String] = []
+        var buffer = raw[0]
+        for piece in raw.dropFirst() {
+            let a = buffer.trimmingCharacters(in: .whitespacesAndNewlines)
+            let b = piece.trimmingCharacters(in: .whitespacesAndNewlines)
+            let tail = a.last
+            let numericTail = tail.map { $0.isNumber } ?? false
+            let dotAfterDigit = (a.hasSuffix(".") || a.hasSuffix("．"))
+                && (a.dropLast().last?.isNumber ?? false)
+            let numericHead = b.first.map { $0.isNumber } ?? false
+            if (numericTail || dotAfterDigit) && numericHead {
+                buffer += piece
+            } else {
+                merged.append(buffer)
+                buffer = piece
+            }
+        }
+        merged.append(buffer)
+        return merged
     }
 
     // MARK: - 方法 A：多信号启发式
@@ -134,6 +194,19 @@ public enum CoreOpinionExtractor {
         }
     }
 
+    /// 数字/实体保真分：按命中的事实模式类别数计分（0~1）。
+    /// 每命中一类 +0.25，命中 4 类即满分——避免抽取时丢掉数字、日期、条款等关键细节。
+    public static func factScore(_ sentence: String) -> Double {
+        guard !sentence.isEmpty else { return 0 }
+        let ns = sentence as NSString
+        let range = NSRange(location: 0, length: ns.length)
+        var hits = 0
+        for pattern in factPatterns {
+            if pattern.firstMatch(in: sentence, range: range) != nil { hits += 1 }
+        }
+        return min(1.0, Double(hits) * 0.25)
+    }
+
     /// 长度惩罚：15~60 字满分；过短/过长按距离线性打折（下限 0.1）。
     private static func lengthScore(_ sentence: String) -> Double {
         let n = sentence.count
@@ -151,6 +224,7 @@ public enum CoreOpinionExtractor {
                 + w.lexicon * lexiconScore(sentence)
                 + w.centrality * centrality[index]
                 + w.length * lengthScore(sentence)
+                + w.fact * factScore(sentence)
             return (index, score)
         }
         return scored.sorted { $0.1 > $1.1 }.prefix(count).map { sentences[$0.0] }

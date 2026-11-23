@@ -1323,11 +1323,18 @@ public final class KernelLoop {
                 // RAG 结果 bulky：进历史 / KV 前缀前按 `ragHistoryChars` 单独收紧，
                 // 只保留最相关头部，避免几千字符的大返回把历史撑大、拖慢后续每轮生成。
                 // 不影响 `outcomes` —— nextPrompt / shouldExit 已基于完整数据算过。
-                let trimmed = KernelLoop.trimRagHistory(rec.name, rec.content,
+                let trimmed: String
+                if rec.name == "rag_tools" {
+                    trimmed = KernelLoop.trimRagHistory(rec.name, rec.content,
                                                        limit: ragHistoryChars)
+                } else {
+                    // web_search/web_scan 大返回（>2000 字）先提核心句压缩，
+                    // 避免大文本进上下文拖慢生成或触发暴力裁剪丢信息。
+                    trimmed = KernelLoop.trimWebHistory(rec.name, rec.content)
+                }
                 if trimmed.count < rec.content.count {
-                    log("[rag-trim] \(rec.name) 原始 \(rec.content.count) → "
-                        + "\(trimmed.count) 字符（ragHistoryChars=\(ragHistoryChars)）")
+                    let tag = rec.name == "rag_tools" ? "[rag-trim]" : "[web-trim]"
+                    log("\(tag) \(rec.name) 原始 \(rec.content.count) → \(trimmed.count) 字符")
                 }
                 rec.content = trimmed
                 return rec
@@ -1766,8 +1773,141 @@ public final class KernelLoop {
         guard limit > 0, name == "rag_tools", content.count > limit else {
             return content
         }
-        return String(content.prefix(limit))
-            + "\n…[RAG 结果已截断至 \(limit) 字符，原始 \(content.count) 字符]"
+        // RAG 结果回灌给模型前，不再 prefix 截断（只覆盖前面几个切片），
+        // 而是对「每个切片」提取核心观点句后全部保留：覆盖所有返回切片，
+        // 且无论原文多长，核心句集合长度恒定，不会让模型输出变慢。
+        var sections: [(header: String, text: String)] = []
+        var currentHeader = ""
+        var currentLines: [String] = []
+        func flush() {
+            if currentHeader.isEmpty && currentLines.isEmpty { return }
+            sections.append((currentHeader, currentLines.joined(separator: "\n")))
+            currentHeader = ""
+            currentLines = []
+        }
+        for line in content.split(separator: "\n", omittingEmptySubsequences: false) {
+            let s = String(line)
+            if s.hasPrefix("### [") {
+                flush()
+                currentHeader = s
+            } else {
+                currentLines.append(s)
+            }
+        }
+        flush()
+
+        // 无句末标点的超长单句（如 5000 个相同字符）：核心句提取无从压缩，
+        // 退回原 prefix 截断语义，避免核心句=原文让 limit 保护失效。
+        if CoreOpinionExtractor.splitSentences(content).count <= 1 {
+            return String(content.prefix(limit))
+                + "\n…[RAG 结果已截断至 \(limit) 字符，原始 \(content.count) 字符]"
+        }
+
+        // 自适应降级：先每路 top10；仍超预算就把句子数减半（每路 top5 → top3）再试。
+        // 用「含 footer 的完整文本」判断，避免估算偏差导致该降级时没降级。
+        var usedTopN = CoreOpinionExtractor.perMethodTopN
+        var compressed = ""
+        var out: [String] = []
+        func footerText(_ topN: Int) -> String {
+            "\n[RAG 全部切片已提取核心句（共 \(sections.count) 段，每路 top\(topN)），"
+                + "原始 \(content.count) 字符]"
+        }
+        while true {
+            out = []
+            if sections.isEmpty {
+                out.append(CoreOpinionExtractor.compressed(content, topN: usedTopN))
+            } else {
+                for section in sections {
+                    let core = CoreOpinionExtractor.compressed(section.text, topN: usedTopN)
+                    out.append(section.header)
+                    out.append(core.isEmpty ? section.text : core)
+                }
+            }
+            compressed = out.joined(separator: "\n")
+            if compressed.count + footerText(usedTopN).count <= limit || usedTopN <= 3 { break }
+            usedTopN = max(3, usedTopN / 2)  // 10 → 5 → 3 下限
+        }
+        // 含 footer 后仍超预算 → 走下面的按切片均分兜底。
+        guard compressed.count + footerText(usedTopN).count <= limit else {
+            // 极端情况：核心句仍超限 → 按切片均分预算，保证每个切片的标题和
+            // 至少一条核心句都保留（不能因长度预算又退化成"只覆盖前几个切片"）。
+            let marker = "\n[RAG 全部切片已提取核心句"
+            let body = compressed.components(separatedBy: marker).first ?? compressed
+            let blocks = body.components(separatedBy: "### [").dropFirst().map { "### [" + $0 }
+            let footerBudget = 120
+            // 标题约 30~40 字；预算紧时每片正文可低至 1 句（标题必须保留）。
+            let perBlock = max(0, (limit - footerBudget) / max(1, blocks.count) - 45)
+            var kept: [String] = []
+            for block in blocks {
+                let lines = block.split(separator: "\n").map(String.init)
+                guard let header = lines.first else { continue }
+                var text = ""
+                for line in lines.dropFirst() {
+                    if text.count + line.count + 1 <= perBlock {
+                        text += (text.isEmpty ? "" : "\n") + line
+                    } else { break }
+                }
+                kept.append(header + (text.isEmpty ? "\n（内容超预算，详见引用）" : "\n" + text))
+            }
+            return kept.joined(separator: "\n")
+                + "\n[RAG 全部 \(blocks.count) 切片已提取核心句（每路 top\(usedTopN)，按预算每片限 \(perBlock) 字符）；原始 \(content.count) 字符]"
+        }
+        return compressed
+            + "\n[RAG 全部切片已提取核心句（共 \(sections.count) 段，每路 top\(usedTopN)），"
+            + "原始 \(content.count) 字符]"
+    }
+
+    /// 网络工具结果进上下文前的核心句压缩：>2000 字才触发。
+    /// - web_search：按「N. 标题 / URL / 摘要」分段，标题与 URL 原样保留（模型要用 URL
+    ///   调 web_scan），只对摘要提取核心句。
+    /// - web_scan：网页正文整段提取核心句（标题/元信息行原样保留）。
+    static func trimWebHistory(_ name: String, _ content: String,
+                               threshold: Int = 2_000) -> String {
+        // 用户约定：超过 threshold（默认 2000 字）就压缩，与预算 limit 无关。
+        guard (name == "web_search" || name == "web_scan"),
+              content.count > threshold else { return content }
+
+        if name == "web_search" {
+            var out: [String] = []
+            var current: [String] = []
+            func flush() {
+                guard !current.isEmpty else { return }
+                // 首行「N. 标题」、URL 行原样；其余（摘要等）合并提取核心句。
+                let head = current.prefix(2)
+                let rest = current.dropFirst(2).joined(separator: " ")
+                var body = rest
+                if rest.count > threshold / 4 {
+                    let core = CoreOpinionExtractor.compressed(rest, topN: 5)
+                    if !core.isEmpty { body = core }
+                }
+                out.append((head + [body]).joined(separator: "\n"))
+                current = []
+            }
+            for line in content.split(separator: "\n", omittingEmptySubsequences: false) {
+                let s = String(line)
+                let numbered = s.range(of: #"^\d+\. "#, options: .regularExpression) != nil
+                if numbered { flush() }
+                current.append(s)
+            }
+            flush()
+            let result = out.joined(separator: "\n")
+            return result.count < content.count
+                ? result + "\n[web_search 摘要已提取核心句，原始 \(content.count) 字符]"
+                : content
+        }
+
+        // web_scan：保留开头连续的非空元信息行（标题/URL/状态），遇空行后是正文。
+        let lines = content.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+        let metaCount = min(6, lines.firstIndex(where: { $0.isEmpty }) ?? lines.count)
+        let meta = Array(lines.prefix(metaCount))
+        let body = Array(lines.dropFirst(metaCount)).joined(separator: "\n")
+        guard body.count > threshold else { return content }
+        let core = CoreOpinionExtractor.compressed(body, topN: CoreOpinionExtractor.perMethodTopN)
+        guard !core.isEmpty else { return content }
+        let result = (meta + [core]).joined(separator: "\n")
+        return result.count < content.count
+            ? result + "\n[web_scan 正文已提取核心句，原始 \(content.count) 字符]"
+            : content
     }
 
     // MARK: ACT：工具结果 → StepOutcome（L1 裁剪在这里发生）
