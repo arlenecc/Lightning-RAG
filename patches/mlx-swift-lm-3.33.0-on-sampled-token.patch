@@ -1,0 +1,26 @@
+--- a/Libraries/MLXLMCommon/Evaluate.swift
++++ b/Libraries/MLXLMCommon/Evaluate.swift
+@@ -1045,6 +1045,13 @@
+     public var tokenCount = 0
+     public let maxTokens: Int?
+ 
++    /// Local fork addition: notified with the token sampled in the *current*
++    /// step (before `next()` returns the previous step's token). This gives
++    /// constrained decoding the correct token for the next mask, but reading
++    /// the value still costs one GPU sync (`token.item` below) per step.
++    public var onSampledToken: (@Sendable (Int) -> Void)?
++
+     public var evictedTokenCount: Int {
+         KVCacheTree.leaves(in: cache).map(\.cache.evictedTokenCount).max() ?? 0
+     }
+@@ -1310,6 +1317,10 @@
+ 
+             tokenCount += 1
+ 
++            // Local fork: commit the just-sampled token (already queued by
++            // asyncEval above) before this step returns the previous token.
++            onSampledToken?(token.item(Int.self))
++
+             lastLogProbabilities = previousLogProbabilities
+             return previousY.tokens.item(Int.self)
+         }

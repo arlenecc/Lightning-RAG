@@ -298,6 +298,7 @@ public enum LLMBench {
         defer { llama_free(ctx) }
 
         let sampler = LlamaCppSampler(
+            vocab: model.vocab,
             vocabSize: model.vocabSize,
             config: LlamaCppSampling(temperature: 0, topK: 0, topP: 1, minP: 0,
                                      repetitionPenalty: 1))

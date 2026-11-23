@@ -34,6 +34,22 @@ final class SystemPromptContractTests: XCTestCase {
         XCTAssertTrue(p.contains("headless runs deny them"))
     }
 
+    func testBaseRequiresRuntimeDate() {
+        XCTAssertTrue(BASE_SYSTEM_PROMPT.contains("当前日期时间"),
+                      "BASE 未要求以运行时日期回答日期/时间问题")
+    }
+
+    func testRuntimeDateContextUsesInjectedClockAndZone() {
+        let date = ISO8601DateFormatter().date(from: "2026-11-23T10:37:00+08:00")!
+        let line = Agent.currentDateTimeContext(
+            now: date,
+            timeZone: TimeZone(identifier: "Asia/Shanghai")!,
+            locale: Locale(identifier: "zh_CN"))
+        XCTAssertTrue(line.contains("2026-11-23 10:37"))
+        XCTAssertTrue(line.contains("Asia/Shanghai"))
+        XCTAssertTrue(line.contains("不得使用训练数据或历史消息中的旧日期"))
+    }
+
     func testBaseKeepsMergedToolNames() {
         for s in ["file_tools", "rag_tools", "skill_tools", "long_memory",
                   "update_working_checkpoint", "start_long_term_update",

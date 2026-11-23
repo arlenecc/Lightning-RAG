@@ -177,7 +177,8 @@ final class LlamaCppVisionRuntime: @unchecked Sendable {
 
         let sampling = LlamaCppSampling(
             temperature: 0, topK: 0, topP: 1, minP: 0, repetitionPenalty: 1)
-        let sampler = LlamaCppSampler(vocabSize: model.vocabSize, config: sampling)
+        let sampler = LlamaCppSampler(vocab: model.vocab,
+                                      vocabSize: model.vocabSize, config: sampling)
         var decoder = LlamaCppUTF8StreamDecoder()
         var output = ""
         var generated = 0

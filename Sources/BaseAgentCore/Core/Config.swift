@@ -670,6 +670,9 @@ public struct AgentConfig: Sendable {
 
     public var browserEndpoint: String = ""
     public var alwaysConfirmCode: Bool = false
+    /// 工具调用时的约束解码（默认关闭）。开启后仅在本机 MLX / GGUF 后端、
+    /// 且本轮确实携带工具 schema 时生效；普通文本回答与远端 API 后端不受影响。
+    public var guidedToolArguments: Bool = false
     public var mcpServers: [MCPServerConfig] = []
 
     public init() {}
@@ -812,6 +815,7 @@ public struct AgentConfig: Sendable {
         if let v = int("kernel_consolidate_every") { kernelConsolidateEvery = v }
         if let v = bool("memory_history_insight_enabled") { memoryHistoryInsightEnabled = v }
         if let v = bool("memory_tidy_enabled") { memoryTidyEnabled = v }
+        if let v = bool("guided_tool_arguments") { guidedToolArguments = v }
         if let v = int("kernel_max_tool_chars") { kernelMaxToolChars = v }
         if let v = int("kernel_rag_history_chars") { kernelRagHistoryChars = v }
         if let v = int("kernel_max_digest_lines") { kernelMaxDigestLines = v }
@@ -1363,6 +1367,7 @@ public struct AgentConfig: Sendable {
             "kernel_consolidate_every": kernelConsolidateEvery,
             "memory_history_insight_enabled": memoryHistoryInsightEnabled,
             "memory_tidy_enabled": memoryTidyEnabled,
+            "guided_tool_arguments": guidedToolArguments,
             "kernel_max_tool_chars": kernelMaxToolChars,
             "kernel_rag_history_chars": kernelRagHistoryChars,
             "kernel_max_digest_lines": kernelMaxDigestLines,
@@ -1540,7 +1545,7 @@ public struct AgentConfig: Sendable {
         "llm_tokenizer_path", "llm_mmproj_path",
         "max_context_tokens", "context_shrink_ratio", "prompt_batch_size",
         "kv_cache_max_tokens", "llm_kv_reuse", "kv_cache_int8", "flash_attention",
-        "auto_preload_main",
+        "guided_tool_arguments", "auto_preload_main",
     ]
 
     /// 只影响辅助 LLM 槽位的配置键（辅助模型本身按需加载/卸载，槽位开关可原地生效）。

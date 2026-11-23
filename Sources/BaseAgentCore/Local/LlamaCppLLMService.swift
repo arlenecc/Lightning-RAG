@@ -27,6 +27,8 @@ public final class LlamaCppLLMService: LLMService, PreloadableLLMService,
     private let kvInt8: Bool
     /// 是否让 llama.cpp 强制启用 Flash Attention（可与 q8_0 KV 叠加）。
     private let flashAttention: Bool
+    /// 工具调用 lazy grammar 开关（配置 guidedToolArguments）。
+    private let guidedToolArguments: Bool
 
     /// 前缀 KV 快照上限：与 MLXLLMService.warmupSnapshotMaxTokens 对齐。
     /// 实测 system+13 工具前缀 8387 token，旧的 8192 会让 GGUF 跳过快照，
@@ -85,7 +87,8 @@ public final class LlamaCppLLMService: LLMService, PreloadableLLMService,
          mmprojPath: String? = nil,
          kvReuse: Bool = true,
          kvInt8: Bool = true,
-         flashAttention: Bool = true) {
+         flashAttention: Bool = true,
+         guidedToolArguments: Bool = false) {
         self.modelPath = modelPath
         self.identifier = "llama.cpp:\((modelPath as NSString).lastPathComponent)"
         self.contextWindow = max(1_024, contextWindow)
@@ -100,6 +103,7 @@ public final class LlamaCppLLMService: LLMService, PreloadableLLMService,
         self.kvReuse = kvReuse
         self.kvInt8 = kvInt8
         self.flashAttention = flashAttention
+        self.guidedToolArguments = guidedToolArguments
     }
 
     // MARK: - LLMService
@@ -614,12 +618,15 @@ public final class LlamaCppLLMService: LLMService, PreloadableLLMService,
             // elapsed 只剩工具解析的零点几毫秒，tps 被打成几万，性能日志
             // 完全失真，无法据此判断某轮是否真的变慢。
             let generationStart = Date()
+            let guidedGrammar = guidedToolArguments
+                ? QwenXMLToolGrammar.makeGBNF(tools: tools) : nil
             do {
                 (rawContent, generated) = try generateLoop(
                     context: loaded.context, model: model,
                     temperature: temperature, startPast: llama_pos(effectiveTokens.count),
                     budget: generationBudget, startInThink: startInThink,
-                    allowedToolNames: allowedToolNames, continuation: continuation)
+                    allowedToolNames: allowedToolNames, grammar: guidedGrammar,
+                    continuation: continuation)
             } catch {
                 // prefill / 生成失败后缓存可能停在半截位置（生成循环内部已
                 // 清过一次），这里统一清内存并重置账目，避免残留 KV 占内存、
@@ -737,12 +744,16 @@ public final class LlamaCppLLMService: LLMService, PreloadableLLMService,
         budget: Int,
         startInThink: Bool,
         allowedToolNames: Set<String>,
+        grammar: String?,
         continuation: AsyncThrowingStream<LLMStreamEvent, Error>.Continuation
     ) throws -> (rawContent: String, generated: [llama_token]) {
         let sampling = LlamaCppSampling(
             temperature: temperature, topK: topK, topP: topP,
-            minP: minP, repetitionPenalty: repetitionPenalty)
-        let sampler = LlamaCppSampler(vocabSize: model.vocabSize, config: sampling)
+            minP: minP, repetitionPenalty: repetitionPenalty,
+            grammar: grammar,
+            triggerPatterns: grammar == nil ? [] : [QwenXMLToolGrammar.lazyTriggerPattern])
+        let sampler = LlamaCppSampler(vocab: model.vocab,
+                                      vocabSize: model.vocabSize, config: sampling)
         var thinkSplitter = ThinkSplitter(startInThink: startInThink)
         // 与 MLX 侧同源的跨 chunk 内容净化器：MiniCPM5 把 <function ...> 切成碎块，
         // 旧 ToolTagSplitter 逐 chunk 匹配不到完整起始标签，XML 会泄漏到正文。
@@ -905,10 +916,13 @@ public final class LlamaCppLLMService: LLMService, PreloadableLLMService,
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .hasSuffix("<think>")
         let generationStart = Date()
+        let guidedGrammar = guidedToolArguments
+            ? QwenXMLToolGrammar.makeGBNF(tools: tools) : nil
         let (rawContent, generated) = try generateLoop(
             context: loaded.context, model: model, temperature: temperature,
             startPast: nPast, budget: budget, startInThink: startInThink,
-            allowedToolNames: allowedToolNames, continuation: continuation)
+            allowedToolNames: allowedToolNames, grammar: guidedGrammar,
+            continuation: continuation)
 
         let toolCalls = LocalToolCallParser.extract(
             raw: rawContent, allowedNames: allowedToolNames)

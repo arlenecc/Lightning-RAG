@@ -139,6 +139,13 @@ public final class MLXVLMLLMService: LLMService, PreloadableLLMService,
                                         content: piece.text
                                     ))
                                 }
+                            case .reasoning(let text):
+                                if !text.isEmpty {
+                                    continuation.yield(LLMStreamEvent(
+                                        kind: .reasoning, content: text))
+                                }
+                            case .steering:
+                                break
                             case .info(let info):
                                 usage = [
                                     "prompt_tokens": info.promptTokenCount,

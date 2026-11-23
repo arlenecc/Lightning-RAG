@@ -13,7 +13,7 @@ let package = Package(
         // Tokenizer：swift-transformers 的 Tokenizers 模块
         .package(url: "https://github.com/huggingface/swift-transformers", from: "1.3.0"),
         // MLX 模型加载（LLM / VLM / Embedding）
-        .package(url: "https://github.com/ml-explore/mlx-swift-lm", from: "3.32.0"),
+        .package(url: "https://github.com/ml-explore/mlx-swift-lm", from: "3.33.0"),
         // ONNX Runtime（embedding / reranker）
         .package(url: "https://github.com/microsoft/onnxruntime-swift-package-manager", from: "1.24.0"),
         // EPUB / OOXML 解包
@@ -45,8 +45,8 @@ let package = Package(
         // llama.cpp 官方 XCFramework：进程内 GGUF 加载（LLM / VLM / Embedding）
         .binaryTarget(
             name: "llama",
-            url: "https://github.com/ggml-org/llama.cpp/releases/download/b12602/llama-b12602-xcframework.zip",
-            checksum: "8dd3a69339f80f622bcac6ca8592509ee201473e66cda0aefc3ed22578789bbb"
+            url: "https://github.com/ggml-org/llama.cpp/releases/download/b12651/llama-b12651-xcframework.zip",
+            checksum: "d1905fc189a808a300e265313a9f67d5c21b6f52944f251e0d5d354efc403745"
         ),
         // CGPDF C 级 API 的 Swift shim：提取扫描页内嵌整页 JPEG（跳过栅格化）
         .target(
@@ -83,6 +83,9 @@ let package = Package(
                 .product(name: "MLXVLM", package: "mlx-swift-lm"),
                 .product(name: "MLXEmbedders", package: "mlx-swift-lm"),
                 .product(name: "MLXRerankers", package: "mlx-swift-lm"),
+                // 语法约束解码：mlx-swift-lm 内置的 MLXCXGrammar（xgrammar C++ vendored）
+                // + Swift 桥接层（GrammarTokenizer/GrammarConstraint/GuidedGenerationLoop）
+                .product(name: "MLXGuidedGeneration", package: "mlx-swift-lm"),
                 .product(name: "onnxruntime", package: "onnxruntime-swift-package-manager"),
                 .product(name: "ZIPFoundation", package: "ZipFoundation"),
                 .product(name: "AEXML", package: "AEXML"),
@@ -118,6 +121,7 @@ let package = Package(
             dependencies: [
                 "BaseAgentCore",
                 "ColBERTReader",
+                .product(name: "MLXGuidedGeneration", package: "mlx-swift-lm"),
                 .product(name: "ZIPFoundation", package: "ZipFoundation"),
                 .product(name: "MCP", package: "mcp-swift-sdk"),
             ],

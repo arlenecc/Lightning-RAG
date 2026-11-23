@@ -96,6 +96,8 @@ final class SystemPromptFileTests: XCTestCase {
 
         var config = AgentConfig()
         config.workspace = workspace
+        // 本用例验证「自定义主体 + L0/L1 常驻」；默认已关闭常驻，需显式开启。
+        config.memoryHierarchyInSystemPrompt = true
         let agent = Agent(llm: PromptTestLLM(), config: config,
                           callbacks: PromptTestCallbacks(),
                           baseSystemPrompt: loaded.text)

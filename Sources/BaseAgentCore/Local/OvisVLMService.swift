@@ -112,7 +112,7 @@ public final class OvisVLMService: VLMService, @unchecked Sendable {
                 switch generation {
                 case .chunk(let chunk):
                     text += chunk
-                case .info(_), .toolCall(_), .rejectedToolCall(_):
+                case .info(_), .toolCall(_), .rejectedToolCall(_), .reasoning(_), .steering(_):
                     // OCR 场景不消费思考/工具信息，只保留最终正文。
                     break
                 }

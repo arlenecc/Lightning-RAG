@@ -367,14 +367,20 @@ struct LlamaCppSampling {
     var topP: Float
     var minP: Float
     var repetitionPenalty: Float
+    /// 非空时挂载 lazy grammar sampler；只有生成文本命中触发串才生效。
+    var grammar: String?
+    var triggerPatterns: [String]
 
     init(temperature: Double, topK: Int, topP: Double, minP: Double,
-         repetitionPenalty: Double) {
+         repetitionPenalty: Double, grammar: String? = nil,
+         triggerPatterns: [String] = []) {
         self.temperature = Float(max(0, temperature))
         self.topK = max(0, topK)
         self.topP = Float(min(max(topP, 0), 1))
         self.minP = Float(min(max(minP, 0), 1))
         self.repetitionPenalty = Float(max(1, repetitionPenalty))
+        self.grammar = grammar
+        self.triggerPatterns = triggerPatterns
     }
 }
 
@@ -382,7 +388,7 @@ struct LlamaCppSampling {
 final class LlamaCppSampler {
     private let chain: UnsafeMutablePointer<llama_sampler>
 
-    init(vocabSize: Int, config: LlamaCppSampling) {
+    init(vocab: OpaquePointer, vocabSize: Int, config: LlamaCppSampling) {
         var params = llama_sampler_chain_default_params()
         params.no_perf = true
         guard let chain = llama_sampler_chain_init(params) else {
@@ -390,9 +396,31 @@ final class LlamaCppSampler {
         }
         self.chain = chain
 
-        if config.repetitionPenalty > 1.0 {
-            llama_sampler_chain_add(chain, llama_sampler_init_penalties(
-                Int32(vocabSize), 64, config.repetitionPenalty, 0, 0))
+        // 顺序很重要：grammar 必须在 top_k/top_p/min_p 之前，否则被前置采样器
+        // 屏蔽为 -inf 的合法 token 无法被语法恢复；penalties 放在 top-k 之后
+        // 避免全词表重复 token 扫描（llama.h 建议）。
+        // lazy grammar：生成文本命中 `<tool_call>` 后才开始约束，之前的
+        // 思考段/普通回答完全放行，因此普通对话不会受工具 schema 影响。
+        if let grammar = config.grammar, !grammar.isEmpty {
+            var patterns: [UnsafePointer<CChar>?] = config.triggerPatterns.compactMap {
+                guard let copied = strdup($0) else { return nil }
+                return UnsafePointer(copied)
+            }
+            defer { patterns.forEach { if let p = $0 { free(UnsafeMutableRawPointer(mutating: p)) } } }
+            let patternCount = patterns.count
+            let grammarSampler = grammar.withCString { grammarPtr in
+                patterns.withUnsafeMutableBufferPointer { buffer in
+                    llama_sampler_init_grammar_lazy_patterns(
+                        vocab, grammarPtr, nil,
+                        buffer.baseAddress, patternCount,
+                        nil, 0)
+                }
+            }
+            if let grammarSampler {
+                llama_sampler_chain_add(chain, grammarSampler)
+            } else {
+                AgentLog.warning("[gguf-guided] grammar 编译失败，本轮不做约束")
+            }
         }
         if config.topK > 0 {
             llama_sampler_chain_add(chain, llama_sampler_init_top_k(Int32(config.topK)))
@@ -402,6 +430,10 @@ final class LlamaCppSampler {
         }
         if config.minP > 0 {
             llama_sampler_chain_add(chain, llama_sampler_init_min_p(config.minP, 1))
+        }
+        if config.repetitionPenalty > 1.0 {
+            llama_sampler_chain_add(chain, llama_sampler_init_penalties(
+                Int32(vocabSize), 64, config.repetitionPenalty, 0, 0))
         }
         if config.temperature <= 0 {
             llama_sampler_chain_add(chain, llama_sampler_init_greedy())

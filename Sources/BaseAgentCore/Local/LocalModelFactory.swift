@@ -422,7 +422,7 @@ public final class LocalModelFactory: @unchecked Sendable {
         }
         if backend == "gguf" {
             // GGUF 的 FA 可与 q8_0 KV 叠加，故用原始 kvCacheInt8（不套 effective）。
-            let key = "llm-gguf:\(factor):\(config.effectiveMainContextTokens):\(config.maxTokens):\(config.llmKVReuse):\(config.kvCacheInt8):\(config.flashAttention)"
+            let key = "llm-gguf:\(factor):\(config.effectiveMainContextTokens):\(config.maxTokens):\(config.llmKVReuse):\(config.kvCacheInt8):\(config.flashAttention):\(config.guidedToolArguments)"
             return llms.value(for: key) {
                 do {
                     let file = try GGUFFileResolver.resolve(
@@ -443,7 +443,8 @@ public final class LocalModelFactory: @unchecked Sendable {
                                 ? nil : config.llmMmprojPath),
                         kvReuse: config.llmKVReuse,
                         kvInt8: config.kvCacheInt8,
-                        flashAttention: config.flashAttention
+                        flashAttention: config.flashAttention,
+                        guidedToolArguments: config.guidedToolArguments
                     )
                 } catch {
                     AgentLog.warning("本地 GGUF LLM 不可用：\(error.localizedDescription)")
@@ -466,7 +467,8 @@ public final class LocalModelFactory: @unchecked Sendable {
             contextWindow: config.effectiveMainContextTokens,
             promptBatchSize: config.promptBatchSize,
             kvReuse: config.llmKVReuse,
-            kvInt8: config.effectiveMainKVInt8
+            kvInt8: config.effectiveMainKVInt8,
+            guidedToolArguments: config.guidedToolArguments
         )
 
         return llms.value(for: key) {
@@ -488,7 +490,8 @@ public final class LocalModelFactory: @unchecked Sendable {
                     contextWindow: config.effectiveMainContextTokens,
                     promptBatchSize: config.promptBatchSize,
                     kvReuse: config.llmKVReuse,
-                    kvInt8: config.effectiveMainKVInt8
+                    kvInt8: config.effectiveMainKVInt8,
+                    guidedToolArguments: config.guidedToolArguments
                 )
             } catch {
                 AgentLog.warning("本地 LLM 不可用：\(error.localizedDescription)")
@@ -653,7 +656,8 @@ public final class LocalModelFactory: @unchecked Sendable {
             contextWindow: config.effectiveAuxContextTokens,
             promptBatchSize: config.auxPromptBatchSize,
             kvReuse: config.auxKvReuse,
-            kvInt8: config.effectiveAuxKVInt8
+            kvInt8: config.effectiveAuxKVInt8,
+            guidedToolArguments: false
         )
 
         return auxValue(key: key, sharedCache: sharedCache) {
@@ -817,9 +821,10 @@ public final class LocalModelFactory: @unchecked Sendable {
         contextWindow: Int,
         promptBatchSize: Int,
         kvReuse: Bool,
-        kvInt8: Bool
+        kvInt8: Bool,
+        guidedToolArguments: Bool
     ) -> String {
-        "\(prefix):\(value):\(maxTokens):\(topP):\(minP):\(topK):\(repetitionPenalty):\(enableThinking):\(contextWindow):\(promptBatchSize):\(kvReuse):\(kvInt8)"
+        "\(prefix):\(value):\(maxTokens):\(topP):\(minP):\(topK):\(repetitionPenalty):\(enableThinking):\(contextWindow):\(promptBatchSize):\(kvReuse):\(kvInt8):\(guidedToolArguments)"
     }
 }
 

@@ -2,6 +2,7 @@ import Foundation
 import MLX
 import MLXLLM
 import MLXLMCommon
+import MLXGuidedGeneration
 
 /// 本地 MLX LLM 服务（Qwen3 系）。
 ///
@@ -32,6 +33,14 @@ public final class MLXLLMService: LLMService, PreloadableLLMService,
     private let kvReuse: Bool
     /// KV cache int8 量化（QuantizedKVCache kvBits=8），KV 内存约减半。
     private let kvInt8: Bool
+    /// 工具调用约束解码开关（配置 guidedToolArguments）。只在有 tools 的生成里生效。
+    private let guidedToolArguments: Bool
+    /// 编译好的工具调用语法状态机按 EBNF 源码缓存；vendored xgrammar 不支持
+    /// clone，靠 GrammarLogitProcessor 在每轮 prompt() 时回滚复用。
+    private let guidedLock = NSLock()
+    private var guidedConstraint: GrammarConstraint?
+    private var guidedGrammarKey: String?
+    private var guidedVocabSize = 0
     /// 模型容器共享给同一模型的轻量副本；容器内是只读权重。
     private let state: LLMLoadState
     /// 跨轮 KV cache 与模型状态。MLX 调用由 Agent 串行驱动。
@@ -136,7 +145,8 @@ public final class MLXLLMService: LLMService, PreloadableLLMService,
         contextWindow: Int = 32768,
         promptBatchSize: Int = 0,
         kvReuse: Bool = true,
-        kvInt8: Bool = true
+        kvInt8: Bool = true,
+        guidedToolArguments: Bool = false
     ) {
         self.directory = directory
         self.modelName = modelName
@@ -151,6 +161,7 @@ public final class MLXLLMService: LLMService, PreloadableLLMService,
         self.promptBatchSize = max(0, promptBatchSize)
         self.kvReuse = kvReuse
         self.kvInt8 = kvInt8
+        self.guidedToolArguments = guidedToolArguments
         self.state = LLMLoadState()
     }
 
@@ -174,6 +185,7 @@ public final class MLXLLMService: LLMService, PreloadableLLMService,
         // 在自己独立的轨迹上跨轮复用。
         self.kvReuse = kvReuse
         self.kvInt8 = other.kvInt8
+        self.guidedToolArguments = other.guidedToolArguments
         self.state = other.state
     }
 
@@ -399,6 +411,8 @@ public final class MLXLLMService: LLMService, PreloadableLLMService,
                     }.value
                     let tokenizer = await container.tokenizer
                     let modelConfiguration = await container.configuration
+                    // 只有 opt-in 且本轮带 tools 时才挂载约束；其余路径零开销。
+                    let guided = guidedComponents(tokenizer: tokenizer, tools: tools)
 
                     if !rebuild, hasDelta, !tokenReused {
                         do {
@@ -509,7 +523,8 @@ public final class MLXLLMService: LLMService, PreloadableLLMService,
                     let iterator = try withError {
                         try TokenIterator(
                             input: input, model: model, cache: cache, state: state,
-                            parameters: parameters)
+                            parameters: parameters,
+                            components: guided?.components ?? GenerationComponents())
                     }
                     let wrapped = StatefulTokenIterator(iterator: iterator)
                     // 预填充后、生成前的状态，供下一次调用接续。
@@ -589,6 +604,14 @@ public final class MLXLLMService: LLMService, PreloadableLLMService,
                             AgentLog.info("[mlx] rejectedToolCall format=\(rejected.format) "
                                 + "tool=\(name) preview=\(String(rejected.rawTextPreview.prefix(120)))")
 
+                        case .reasoning(let text):
+                            // 3.33+ 把 think 段作为独立事件发出（无分隔符）。
+                            if !text.isEmpty {
+                                continuation.yield(LLMStreamEvent(
+                                    kind: .reasoning, content: text))
+                            }
+                        case .steering:
+                            break
                         case .info(let info):
                             let promptTokens = cachedPromptTokens + info.promptTokenCount
                             let total = promptTokens + info.generationTokenCount
@@ -1263,6 +1286,48 @@ public final class MLXLLMService: LLMService, PreloadableLLMService,
             case .tool:
                 return .tool(message.content, id: message.toolCallID, name: message.name)
             }
+        }
+    }
+
+    /// 为携带工具schema的生成构造约束组件。开关关闭、没有工具、schema 无法
+    /// 转成 Qwen XML 语法、或语法编译失败时一律返回 nil（完全走原路径）。
+    private func guidedComponents(tokenizer: any MLXLMCommon.Tokenizer,
+                                  tools: [JSONValue]) -> (components: GenerationComponents,
+                                                          state: GrammarProcessorState)? {
+        guard guidedToolArguments, !tools.isEmpty,
+              let grammar = QwenXMLToolGrammar.make(tools: tools) else { return nil }
+        guidedLock.lock()
+        defer { guidedLock.unlock() }
+        do {
+            if guidedGrammarKey != grammar || guidedConstraint == nil {
+                let vocab = TokenizerVocabExtractor.extractForGrammar(from: tokenizer)
+                // 没有 EOS id 时 xgrammar 的终止判定不可靠，直接放弃约束。
+                guard let eosID = tokenizer.eosTokenId else {
+                    AgentLog.warning("[guided] tokenizer 无 EOS id，跳过工具约束")
+                    return nil
+                }
+                let grammarTokenizer = try GrammarTokenizer(
+                    vocab: vocab.vocab,
+                    vocabType: vocab.vocabType,
+                    eosTokenId: Int32(eosID))
+                guidedConstraint = try GrammarConstraint(
+                    tokenizer: grammarTokenizer, grammar: grammar, rootRule: "root")
+                guidedGrammarKey = grammar
+                guidedVocabSize = vocab.vocab.count
+            }
+            guard let constraint = guidedConstraint else { return nil }
+            let state = GrammarProcessorState(
+                constraint: constraint,
+                tokenizer: UnguardedTokenizer(tokenizer),
+                vocabSize: guidedVocabSize,
+                trigger: QwenXMLToolGrammar.trigger)
+            let components = GenerationComponents(logitProcessorFactory: {
+                GrammarLogitProcessor(state: state)
+            })
+            return (components, state)
+        } catch {
+            AgentLog.warning("[guided] 工具约束语法编译失败，退回无约束：\(error.localizedDescription)")
+            return nil
         }
     }
 

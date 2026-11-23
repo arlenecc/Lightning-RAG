@@ -1506,6 +1506,22 @@ public final class Agent: @unchecked Sendable {
         return text
     }
 
+    /// 当前日期时间行。模型不知道真实日期时会凭训练数据编造（实测答 2024-06-19），
+    /// 因此每次请求都注入；放在动态尾部而不是 system 前缀，避免每天半夜改动
+    /// system 后触发整段历史重新 prefill。
+    static func currentDateTimeContext(
+        now: Date = Date(),
+        timeZone: TimeZone = .current,
+        locale: Locale = Locale(identifier: "zh_CN")
+    ) -> String {
+        let formatter = DateFormatter()
+        formatter.locale = locale
+        formatter.timeZone = timeZone
+        formatter.dateFormat = "yyyy-MM-dd HH:mm EEEE"
+        return "# 当前日期时间\n\(formatter.string(from: now))（\(timeZone.identifier)）。"
+            + "回答日期、时间、星期等问题必须以此为准，不得使用训练数据或历史消息中的旧日期。"
+    }
+
     /// 动态上下文（命中技能、知识库状态）。工作检查点由 `anchorPrompt` 每轮注入，
     /// 不在这里重复。
     ///
@@ -1514,7 +1530,7 @@ public final class Agent: @unchecked Sendable {
     /// 同一次用户请求内缓存一次，避免每轮工具循环都改写前缀。
     public func dynamicContextPrompt() async -> String {
         if let cachedDynamicContext { return cachedDynamicContext }
-        var sections: [String] = []
+        var sections: [String] = [Self.currentDateTimeContext()]
 
         // 工作检查点不在这里注入：Session.anchorPrompt 每轮已带 <key_info>，
         // 再放一份会让首个请求重复占两份 token。
