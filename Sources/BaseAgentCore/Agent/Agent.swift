@@ -1729,15 +1729,15 @@ public final class Agent: @unchecked Sendable {
             && session.currentTurn >= readLastMemoryTidyTurn() + tidyEvery
         let shouldDistill = substantiveTurn && substantive
             && (distillRequested ?? kernel.distillRequested)
-        // 事实抽取必须满足：有辅助模型（唯一允许的模型）+ 距上次成功 ≥4h
-        // + 当天文件有新增的完整 session。
-        let factDue = auxLLM != nil && factExtractionWorker.isDue()
+        // 事实抽取必须满足：距上次成功 ≥4h + 当天文件有新增的完整 session
+        // + 至少有一个可用模型（辅助模型，或支持 isolated 的主模型兜底）。
+        let factModelReady = auxLLM != nil || llm.supportsConcurrentIsolatedRequests
+        let factDue = factModelReady && factExtractionWorker.isDue()
         let hasLLMWork = factDue || hasPending || shouldTidy || shouldDistill
         guard hasLLMWork else { return }
 
         // 其余后台 LLM 工作影响整体功能：辅助优先、主模型 isolated 兜底；
-        // 主模型连 isolated 都不支持时跳过（持久化队列保留）。事实抽取是
-        // 唯一例外，上面已要求 auxLLM 存在。
+        // 主模型连 isolated 都不支持时跳过（持久化队列保留）。
         let service = auxLLM ?? llm
         if service === llm,
            Self.backgroundRequestOptions(for: service, isMain: true) == nil {
@@ -1897,13 +1897,15 @@ public final class Agent: @unchecked Sendable {
     /// 返回 true 表示这批对话已抽取过（模型有响应，无论是否解析出事实），
     /// 调用方据此推进文件游标；false = 被取消 / 模型无响应，保留待重试。
     private func extractFacts(conversation: String) async -> Bool {
-        // 事实抽取只允许辅助模型：辅助不可用时直接放弃，绝不回退主模型，
-        // 否则主模型 isolated 副本会全量 prefill 并与前台会话抢 GPU。
-        guard auxLLM != nil else { return false }
+        // 辅助模型优先；辅助不可用时由 collectChat 回退主模型 isolated 副本。
+        // 主模型若连 isolated 都不支持（如 llama.cpp），collectChat 会跳过本轮。
         guard beginBackgroundIfIdle() else { return false }
         defer { endBackground() }
+        if auxLLM == nil {
+            log("[memory] 辅助模型不可用，事实抽取改用主模型 isolated 兜底"
+                + "（抽取期间系统响应会变慢）")
+        }
         let text = String(conversation.prefix(FactExtractionWorker.maxTranscriptChars))
-        // collectChat 内部取 `auxLLM ?? llm`；上面的 guard 保证必走辅助模型。
         let raw = await collectChat([
             ChatMessage(role: .system, content: FACT_EXTRACT_SYSTEM),
             ChatMessage(role: .user, content: factExtractPrompt(conversation: text)),
@@ -2053,8 +2055,7 @@ public final class Agent: @unchecked Sendable {
     }
 
     /// 后台辅助任务的统一 LLM 入口（事实抽取 / 经验蒸馏 / 记忆整理 /
-    /// RAG 检索浓缩）。折叠摘要已改为逐轮自带 summary 的确定性折叠；
-    /// 事实抽取额外要求 `auxLLM` 存在（见 `extractFacts`），不会回退主模型。
+    /// RAG 检索浓缩）。折叠摘要已改为逐轮自带 summary 的确定性折叠。
     ///
     /// 这些任务影响整体功能（记忆/检索质量），因此**辅助模型优先、主模型
     /// 兜底**：辅助不可用时走主模型 isolated 副本（关闭 thinking、不碰主

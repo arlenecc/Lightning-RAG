@@ -613,6 +613,12 @@ public final class RAGEngine {
 
     /// 知识图谱抽取/关键词提取用的辅助模型（由 AppModel 注入，与 Agent.auxLLM 同实例）。
     public var auxLLM: LLMService?
+    /// 辅助模型不可用时，知识图谱抽取的主模型兜底提供者。
+    /// 用闭包动态读取，避免主模型切换后持有已释放的旧实例。
+    public var fallbackLLMProvider: (() -> LLMService?)?
+    /// 本次抽取确实改用主模型兜底时回调（App 侧据此弹窗提醒用户）。
+    /// 引擎不直接依赖 UI；是否提示、提示几次由调用方决定。
+    public var onMainModelFallback: (() -> Void)?
     /// 保护「使用 store」的整段读操作；close/reload 必须等读操作结束。
     private let searchLock = NSLock()
     /// ingest/close/reload 的互斥标志。不能用 NSRecursiveLock：
@@ -1259,8 +1265,23 @@ public final class RAGEngine {
         return out
     }
 
+    /// 选择知识图谱抽取模型：显式传入 > 已注入辅助模型 > 主模型兜底。
+    /// 返回 `usedFallback` 供调用方提示「抽取期间系统会变慢」。
+    private func resolveKnowledgeGraphLLM(
+        preferred: LLMService?
+    ) -> (service: LLMService, usedFallback: Bool)? {
+        if let preferred { return (preferred, false) }
+        if let aux = auxLLM { return (aux, false) }
+        // 主模型尚未加载时不要用占位实现兜底，否则会白跑一轮并可能弄脏图谱。
+        if let fallback = fallbackLLMProvider?(), !(fallback is UnloadedLLMService) {
+            return (fallback, true)
+        }
+        return nil
+    }
+
     /// 构建知识图谱：后台用辅助模型在已完成切片上抽取实体/关系，聚合入库，
     /// 随后建 SwiftGraph 并落快照。weight 随证据重算（不保留旧标量）。
+    /// 辅助模型不可用时改用主模型 isolated 兜底，并通过回调提醒调用方。
     @discardableResult
     public func buildKnowledgeGraph(
         auxLLM: LLMService? = nil,
@@ -1272,12 +1293,18 @@ public final class RAGEngine {
         var priorState: KnowledgeGraphStore.BuildState?
         var priorRevision = 0
         do {
-            let llm = auxLLM ?? self.auxLLM
-            guard let llm else {
-                log?("[kg] 辅助模型不可用，无法构建知识图谱（请先在配置中启用辅助模型）")
+            guard let selection = resolveKnowledgeGraphLLM(preferred: auxLLM) else {
+                log?("[kg] 辅助模型与主模型均不可用，无法构建知识图谱")
                 return stats
             }
-            self.auxLLM = llm
+            if selection.usedFallback {
+                log?("[kg] 辅助模型不可用，改用主模型 isolated 兜底抽取"
+                    + "（抽取期间系统响应会变慢）")
+                onMainModelFallback?()
+            } else {
+                self.auxLLM = selection.service
+            }
+            let llm = selection.service
             let store = try ensureKnowledgeGraphStore()
             priorState = try store.buildState()
             priorRevision = store.revision()
@@ -1349,7 +1376,13 @@ public final class RAGEngine {
         // 无法安全处理带 zone 前缀的外部切片，跳过增量以免重复抽取/误改图。
         // 外部切片变化会通过上面的 hash 比对被检测为 stale，提示用户重建。
         if !store.listExternalChunkRefs().isEmpty { return }
-        guard let llm = auxLLM else { return }
+        guard let selection = resolveKnowledgeGraphLLM(preferred: nil) else { return }
+        if selection.usedFallback {
+            AgentLog.warning("[kg] 辅助模型不可用，增量抽取改用主模型 isolated 兜底"
+                + "（抽取期间系统响应会变慢）")
+            onMainModelFallback?()
+        }
+        let llm = selection.service
         guard let (_, graph) = try? ensureKnowledgeGraph() else { return }
         let builder = KnowledgeGraphBuilder(store: store, graph: graph, llm: llm,
                                             limits: kgExtractionLimits,
@@ -1989,6 +2022,53 @@ public final class RAGEngine {
 
     // MARK: Ingest
 
+    /// 入库收尾：用核心句压缩为本次新增/变更的文档补齐章节与全书摘要。
+    ///
+    /// 只在 `bookSummaryMode == .coreSentences` 时执行；辅助模型模式仍交给
+    /// 空闲摘要任务。处理完即写库，`rag_outline` 在同步返回时就能读到完整
+    /// 的章节结构、章节摘要与全书摘要。
+    private func summarizeIngestedDocuments(store: VectorStore,
+                                            log: @escaping (String) -> Void) async -> Int {
+        guard config.bookSummaryMode == .coreSentences else { return 0 }
+        let documents: [DocumentRecord]
+        do {
+            documents = try store.summaryCandidates(limit: 10_000)
+        } catch {
+            log("RAG: 入库摘要候选读取失败：\(error.localizedDescription)")
+            return 0
+        }
+        guard !documents.isEmpty else { return 0 }
+        let engine = BookSummaryEngine(store: store, summaryMode: .coreSentences)
+        let cancelled: () -> Bool = { [weak self] in
+            Task.isCancelled || (self?.isCancelled ?? true)
+        }
+        var completed = 0
+        for document in documents {
+            if cancelled() { break }
+            guard !document.mdPath.isEmpty,
+                  let markdown = try? String(contentsOfFile: document.mdPath,
+                                             encoding: .utf8),
+                  !markdown.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                continue
+            }
+            do {
+                let chapter = try await engine.processNextChapter(
+                    document: document, markdown: markdown, llm: nil,
+                    now: Date(), isCancelled: cancelled, maxChapters: Int.max)
+                guard chapter.totalSections > 0, chapter.chapterCompleted else { continue }
+                _ = try await engine.processBookSummary(
+                    document: document, markdown: markdown, llm: nil,
+                    now: Date(), isCancelled: cancelled)
+                completed += 1
+                log("RAG: 入库摘要已补齐 \(document.docName)"
+                    + "（\(chapter.totalSections) 章，核心句）")
+            } catch {
+                log("RAG: 入库摘要生成失败 \(document.docName)：\(error.localizedDescription)")
+            }
+        }
+        return completed
+    }
+
     /// 增量同步知识库。返回统计；同一实例并发调用会被拒绝。
     ///
     /// ANN 索引的自动构建与知识图谱的增量抽取都在同步收尾后转到后台任务执行，
@@ -2392,6 +2472,16 @@ public final class RAGEngine {
                              metrics.tokens, metrics.tokensPerSecond,
                              metrics.peakMemoryMB, metrics.tokenBudget,
                              metrics.maxBatchTexts))
+            }
+            // 入库后立即补齐章节/全书摘要（核心句模式），保证同步返回时
+            // rag_outline 的目录、章节摘要与全书摘要都已可用。
+            if let store {
+                let summaryStarted = Date()
+                let summarized = await summarizeIngestedDocuments(store: store, log: logFn)
+                if summarized > 0 {
+                    logFn("RAG: 入库摘要补齐完成 — \(summarized) 本，"
+                        + "耗时 \(Self.elapsedText(summaryStarted))")
+                }
             }
             logFn("RAG: 同步完成 — \(stats.summary)")
             // 切片正文已入库，启动后台向量/编码回填；同步到此即刻返回，软件可立即使用。

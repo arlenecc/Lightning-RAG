@@ -235,7 +235,7 @@ final class KVPrefixReuseTests: XCTestCase {
         XCTAssertEqual(loop.consolidateEvery, 2)
     }
 
-    // MARK: - 后台事实抽取（4h 文件游标 / 仅辅助模型）
+    // MARK: - 后台事实抽取（4h 文件游标 / 辅助优先 + 主模型 isolated 兜底）
 
     /// 不支持独立会话的主模型（且无辅助模型）：后台 LLM 工作整体跳过，
     /// 不能改写主会话 KV。
@@ -252,19 +252,21 @@ final class KVPrefixReuseTests: XCTestCase {
         XCTAssertEqual(llm.optionCallCount, 0, "不支持独立会话时不应发起后台请求")
     }
 
-    /// 事实抽取**只允许辅助模型**：没有 aux 时即便主模型支持 isolated，
-    /// 也不得回退主模型做全量 prefill（那会与前台抢 GPU）。
-    func testFactExtractionRequiresAuxModel() async {
+    /// 无辅助模型、但主模型支持 isolated：事实抽取回退主模型 isolated 副本，
+    /// 不碰前台会话 KV；4h 内只跑一次。
+    func testFactExtractionFallsBackToIsolatedMain() async {
         let llm = RecordingLLM(supportsIsolated: true, reply: "Hello there!")
         let agent = makeAgent(llm: llm)
         defer { agent.close() }
 
-        for _ in 1...3 { _ = await agent.run("please remember my editor is vim") }
-        let idle = await waitForBackgroundIdle(agent)
-        XCTAssertTrue(idle)
+        for _ in 1...4 {
+            _ = await agent.run("please remember my editor is vim")
+            let idle = await waitForBackgroundIdle(agent)
+            XCTAssertTrue(idle)
+        }
 
-        XCTAssertEqual(llm.defaultCallCount, 3, "主模型只服务前台对话")
-        XCTAssertEqual(llm.optionCallCount, 0, "不得回退主模型做事实抽取")
+        XCTAssertEqual(llm.defaultCallCount, 4, "主模型前台对话次数不变")
+        XCTAssertEqual(llm.optionCallCount, 1, "无辅助模型时事实抽取回退一次 isolated 主模型")
     }
 
     /// 有辅助模型时按 4h 文件游标抽取：多轮（含周期性折叠）只跑一次，只写 memory graph。

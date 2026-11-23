@@ -176,6 +176,23 @@ final class KnowledgeGraphEndToEndTests: XCTestCase {
         """.write(to: kb.appendingPathComponent("project.md"), atomically: true, encoding: .utf8)
     }
 
+    /// 辅助模型不可用时，全量构建回退主模型，并触发一次用户提示回调。
+    func testBuildFallsBackToMainModelWithoutAux() async throws {
+        try writeSamples()
+        let engine = RAGEngine(config: config(strategy: .local), knowledgeBase: kb.path,
+                               embedding: BagOfWordsEmbedding(), reranker: nil)
+        _ = await engine.ingest()
+        var notified = false
+        engine.fallbackLLMProvider = { SampleKGLLM() }
+        engine.onMainModelFallback = { notified = true }
+
+        let stats = await engine.buildKnowledgeGraph()
+
+        XCTAssertTrue(notified, "改用主模型兜底时必须通知调用方弹提示")
+        XCTAssertGreaterThan(stats.entities, 0)
+        XCTAssertNil(engine.auxLLM, "兜底不应把主模型缓存成辅助模型")
+    }
+
     /// 新增文档后走增量抽取 + 内存图局部 upsert + 防抖快照。
     func testIncrementalUpdateAfterNewDocument() async throws {
         try writeSamples()

@@ -603,6 +603,46 @@ final class BookSummaryEngineTests: XCTestCase {
         XCTAssertEqual(try store.bookSummary(docID: document.docID)?.summary, record.summary)
     }
 
+    /// 入库批处理：一次调用处理完所有缺失章节，随后可生成全书摘要。
+    func testBatchChapterProcessingCompletesAllSections() async throws {
+        let store = try makeStore()
+        let document = try insertDocument(store, name: "batch.md")
+        let engine = BookSummaryEngine(store: store, summaryMode: .coreSentences)
+        let markdown = """
+        # 第一章 起点
+
+        核心观点是问题必须被清晰定义。因此，我们先梳理背景与目标。
+        这一段补充细节，说明范围与限制条件。
+
+        # 第二章 推进
+
+        实际上，方法的选择取决于约束条件。因此需要依次验证关键假设。
+        这一章继续展开论据与实现路径。
+
+        # 第三章 结论
+
+        综上所述，结论应该由证据支撑。最后总结可复用的经验。
+        这一段用于补充边界情况与后续工作。
+        """
+
+        let result = try await engine.processNextChapter(
+            document: document, markdown: markdown, llm: nil,
+            now: Date(), isCancelled: { false }, maxChapters: Int.max)
+
+        XCTAssertTrue(result.chapterCompleted)
+        XCTAssertEqual(result.totalSections, 3)
+        let chapters = try store.chapterSummaries(docID: document.docID)
+        XCTAssertEqual(chapters.count, 3)
+        XCTAssertTrue(chapters.allSatisfy { !$0.summary.isEmpty })
+        XCTAssertEqual(try store.summaryJob(docID: document.docID)?.status, .summarizingBook)
+
+        let book = try await engine.processBookSummary(
+            document: document, markdown: markdown, llm: nil,
+            now: Date(), isCancelled: { false })
+        XCTAssertFalse(book.summary.isEmpty)
+        XCTAssertEqual(try store.summaryJob(docID: document.docID)?.status, .completed)
+    }
+
     /// 核心句模式：不依赖辅助模型，章节与全书摘要都由本地核心句组成。
     func testCoreSentenceModeWorksWithoutAuxiliaryModel() async throws {
         let store = try makeStore()

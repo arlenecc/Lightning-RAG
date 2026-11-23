@@ -758,6 +758,14 @@ final class AppViewModel: ObservableObject {
         }
         // 知识图谱抽取/关键词提取复用辅助模型实例。
         newAgent.ragEngine.auxLLM = newAgent.auxLLM
+        // 辅助模型不可用时，知识图谱抽取回退到主模型（isolated，动态读取当前实例）。
+        newAgent.ragEngine.fallbackLLMProvider = { [weak newAgent] in newAgent?.llm }
+        newAgent.ragEngine.onMainModelFallback = { [weak self] in
+            Task { @MainActor [weak self] in
+                self?.showKnowledgeGraphMainFallbackNotice()
+            }
+        }
+        kgMainFallbackAlertShown = false
         agent = newAgent
         bindScheduler()
         refreshRAGStatus()
@@ -2702,6 +2710,18 @@ final class AppViewModel: ObservableObject {
     // MARK: 知识图谱
 
     private var kgBuildTask: Task<Void, Never>?
+    /// 主模型兜底抽图的提示只弹一次，避免增量抽取反复打扰。
+    private var kgMainFallbackAlertShown = false
+
+    /// 辅助模型不可用、改用主模型抽图时的用户提示（每个 Agent 生命周期一次）。
+    private func showKnowledgeGraphMainFallbackNotice() {
+        guard !kgMainFallbackAlertShown else { return }
+        kgMainFallbackAlertShown = true
+        appendLog("[kg] 辅助模型不可用，将使用主模型进行知识图谱抽取")
+        showInfoAlert(
+            title: "辅助模型不可用",
+            message: "将使用主模型进行知识图谱抽取，抽取期间系统响应会变慢，敬请谅解。")
+    }
 
     /// 刷新知识图谱构建状态（不加载模型，直接查 SQLite）。
     func refreshKnowledgeGraphStatus() {
@@ -2743,9 +2763,9 @@ final class AppViewModel: ObservableObject {
             showInfoAlert(title: "暂不能构建知识图谱", message: "对话正在生成，请等本轮结束后再试。")
             return
         }
-        guard agent.auxLLM != nil else {
+        if agent.auxLLM == nil, agent.llm is UnloadedLLMService {
             showInfoAlert(title: "暂不能构建知识图谱",
-                          message: "知识图谱抽取需要辅助模型，请先在配置中启用辅助模型。")
+                          message: "辅助模型不可用，主模型也尚未加载，请先加载主模型后再试。")
             return
         }
         cancelIdleUnload()

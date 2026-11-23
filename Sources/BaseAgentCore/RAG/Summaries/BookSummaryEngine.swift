@@ -277,11 +277,13 @@ public final class BookSummaryEngine: @unchecked Sendable {
     // MARK: - 逐章处理
 
     /// 处理 `next_section` 指向的章节；已摘要且内容未变的章节自动跳过。
+    /// `maxChapters` 默认 1（空闲摘要逐章推进）；入库批处理传大值可一次补齐全书。
     public func processNextChapter(document: DocumentRecord,
                                    markdown: String,
                                    llm: LLMService?,
                                    now: Date,
-                                   isCancelled: @escaping () -> Bool) async throws -> ChapterProcessResult {
+                                   isCancelled: @escaping () -> Bool,
+                                   maxChapters: Int = 1) async throws -> ChapterProcessResult {
         let cancellation = SummaryCancellation(isCancelled)
         let resolved = resolve(document, markdown: markdown)
         let total = resolved.sections.count
@@ -330,6 +332,8 @@ public final class BookSummaryEngine: @unchecked Sendable {
                 lastError: job?.lastError ?? "", updatedAt: now.timeIntervalSince1970))
         }
 
+        let batchLimit = max(1, maxChapters)
+        var processed = 0
         while index < total {
             let section = resolved.sections[index]
             if let existing = try store.chapterSummary(docID: document.docID, sectionIndex: index),
@@ -349,6 +353,7 @@ public final class BookSummaryEngine: @unchecked Sendable {
                     level: section.level, summary: summary,
                     contentHash: section.contentHash,
                     updatedAt: now.timeIntervalSince1970))
+                processed += 1
                 let next = index + 1
                 let chapterCompleted = next >= total
                 try store.upsertSummaryJob(SummaryJobRecord(
@@ -356,10 +361,13 @@ public final class BookSummaryEngine: @unchecked Sendable {
                     status: chapterCompleted ? .summarizingBook : .pending,
                     nextSection: next, totalSections: total,
                     lastError: "", updatedAt: now.timeIntervalSince1970))
-                return ChapterProcessResult(
-                    sectionIndex: index, totalSections: total,
-                    chapterCompleted: chapterCompleted, bookCompleted: false,
-                    titleRepaired: resolved.hadRepairs, summary: summary)
+                if chapterCompleted || processed >= batchLimit {
+                    return ChapterProcessResult(
+                        sectionIndex: index, totalSections: total,
+                        chapterCompleted: chapterCompleted, bookCompleted: false,
+                        titleRepaired: resolved.hadRepairs, summary: summary)
+                }
+                index = next
             } catch {
                 if !cancellation.isCancellation(error) {
                     try? store.upsertSummaryJob(SummaryJobRecord(

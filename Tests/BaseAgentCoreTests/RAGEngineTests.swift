@@ -154,6 +154,13 @@ final class RAGEngineTests: XCTestCase {
         XCTAssertNotNil(outline)
         XCTAssertTrue(outline?.digest.contains("第一章") == true)
 
+        // 入库收尾应直接用核心句补齐两章摘要与全书摘要，rag_outline 立即可用。
+        let enriched = try XCTUnwrap(engine.getEnrichedOutline(docName: "fruits.md"))
+        XCTAssertEqual(enriched.chapterSummaries.count, 2)
+        XCTAssertTrue(enriched.chapterSummaries.allSatisfy { !$0.summary.isEmpty })
+        XCTAssertNotNil(enriched.bookSummary)
+        XCTAssertEqual(enriched.jobProgress.jobStatus, .completed)
+
         let hits = try await engine.search(query: "apple fruit", topK: 3)
         XCTAssertFalse(hits.isEmpty)
         XCTAssertTrue(hits[0].source.hasSuffix("fruits.md"))
