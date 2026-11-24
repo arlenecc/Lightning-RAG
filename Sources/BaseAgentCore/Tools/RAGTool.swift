@@ -161,22 +161,33 @@ public final class RagOutlineTool: AgentTool {
                 + "若只是想列出/清点已索引文档，请改用 rag_tools(op=\"status\")。")
         }
 
-        // 多分区：默认库查不到时遍历其它挂载分区（book 可能在非默认库，
-        // 如《病毒星球》在自然分区而默认库是社会分区）。
-        let candidates: [(RAGEngine, DocumentLookupResult)] = [(engine, engine.lookupDocument(name))]
-            + extraEngines.map { ($0, $0.lookupDocument(name)) }
+        // 多分区惰性查找：先查默认库，命中即返回，不再对其它分区做
+        // 归一化全表兜底（旧实现用 map 提前算完所有分区，命中时也白扫）。
+        func collectAmbiguous(_ list: [DocumentRecord], into lines: inout [String]) {
+            lines.append(contentsOf: list.prefix(20).map {
+                "  - \($0.docName)（ID: \($0.docID)）"
+            })
+        }
         var ambiguousLines: [String] = []
-        for (eng, lookup) in candidates {
-            switch lookup {
+        let firstLookup = engine.lookupDocument(name)
+        if case .found(let record) = firstLookup,
+           let enriched = engine.getEnrichedOutline(for: record) {
+            return ragToolOK(Self.format(enriched))
+        }
+        if case .ambiguous(let list) = firstLookup {
+            collectAmbiguous(list, into: &ambiguousLines)
+        }
+        // 默认库未命中/仅歧义时才遍历其它挂载分区（book 可能在非默认库，
+        // 如《病毒星球》在自然分区而默认库是社会分区）。
+        for eng in extraEngines {
+            switch eng.lookupDocument(name) {
             case .found(let record):
                 if let enriched = eng.getEnrichedOutline(for: record) {
                     return ragToolOK(Self.format(enriched))
                 }
-                // 该分区有此文档但没有大纲，继续找其它分区。
+                // 该分区有此文档但没有大纲，继续找下一个。
             case .ambiguous(let list):
-                ambiguousLines.append(contentsOf: list.prefix(20).map {
-                    "  - \($0.docName)（ID: \($0.docID)）"
-                })
+                collectAmbiguous(list, into: &ambiguousLines)
             case .notFound:
                 break
             }
