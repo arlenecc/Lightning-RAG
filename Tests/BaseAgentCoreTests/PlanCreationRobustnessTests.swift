@@ -63,6 +63,24 @@ final class PlanCreationRobustnessTests: XCTestCase {
         XCTAssertEqual(plan.steps[0].note, "已完成")
     }
 
+    func testPatchWithOnlyNoteFallsBackToDoingStep() async throws {
+        let config = makeConfig(temporaryWorkspace())
+        let tool = UpdatePlanTool(config: config, callbacks: nil)
+        let createArgs: [String: JSONValue] = [
+            "op": .string("create"),
+            "goal": .string("目标"),
+            "steps": .array([.string("第一步"), .string("第二步")]),
+        ]
+        let created = try await tool.run(createArgs)
+        XCTAssertTrue(created.success, created.error)
+
+        let noteArgs: [String: JSONValue] = ["op": .string("patch"), "note": .string("记一笔")]
+        let result = try await tool.run(noteArgs)
+        XCTAssertTrue(result.success, result.error)
+        let plan = try XCTUnwrap(PlanStore.load(config))
+        XCTAssertEqual(plan.steps[0].note, "记一笔")
+    }
+
     func testEmptyCallStillReportsMissingOp() async throws {
         let config = makeConfig(temporaryWorkspace())
         let tool = UpdatePlanTool(config: config, callbacks: nil)
@@ -70,6 +88,17 @@ final class PlanCreationRobustnessTests: XCTestCase {
         let result = try await tool.run(emptyArgs)
         XCTAssertFalse(result.success)
         XCTAssertTrue(result.error.contains("op"))
+    }
+
+    // MARK: - 文档名容错
+
+    func testDocumentKeyNormalizesSpaceDashAndFullWidth() {
+        let key = RAGEngine.normalizedDocumentKey("46 亿年的地球物语 - 地球起源到今天的全部历史.pdf")
+        let stored = RAGEngine.normalizedDocumentKey("46亿年的地球物语-地球起源到今天的全部历史.pdf")
+        XCTAssertEqual(key, stored)
+        XCTAssertEqual(RAGEngine.normalizedDocumentKey("借地而生 - 写给地球人的土壤生命史"),
+                       RAGEngine.normalizedDocumentKey("借地而生：写给地球人的土壤生命史.pdf"))
+        XCTAssertEqual(RAGEngine.normalizedDocumentKey("ＡＢＣ　ＤＥＦ"), "abcdef")
     }
 
     // MARK: - grammar 强制必填参数

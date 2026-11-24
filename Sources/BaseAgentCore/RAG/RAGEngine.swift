@@ -723,6 +723,40 @@ public final class RAGEngine {
         return String(cString: resolved)
     }
 
+    /// 文档名容错匹配用的归一化：全角→半角、去扩展名、删除空白与各类
+    /// 连字符/冒号标点，最后小写。模型常把 `46亿年的地球物语-地球起源到今天`
+    /// 复述成 `46 亿年的地球物语 - 地球起源到今天`，SQL 的 instr 子串匹配对
+    /// 空格敏感会直接漏掉，归一化后再比一次即可消除这类 outline 失败。
+    static func normalizedDocumentKey(_ name: String) -> String {
+        var scalars = String.UnicodeScalarView()
+        for scalar in name.unicodeScalars {
+            let value = scalar.value
+            if value >= 0xFF01 && value <= 0xFF5E,
+               let half = Unicode.Scalar(value - 0xFEE0) {
+                scalars.append(half)               // 全角 ASCII → 半角
+            } else if value == 0x3000 {
+                scalars.append(" ")                // 全角空格
+            } else {
+                scalars.append(scalar)
+            }
+        }
+        var stem = String(scalars).lowercased()
+        for ext in [".pdf", ".epub", ".mobi", ".docx", ".doc", ".txt", ".md"] {
+            if stem.hasSuffix(ext) {
+                stem = String(stem.dropLast(ext.count))
+                break
+            }
+        }
+        // 连字符/冒号/破折号等分隔符一律删除：书名里的 "-"、"：" 常被模型
+        // 互相替换，删掉后 "借地而生-写给地球人" 与 "借地而生：写给地球人"
+        // 归一化结果一致。
+        let separators = CharacterSet(charactersIn: "-－—–_:：·、,.，。()（）[]【】\"'“”")
+        let scalarsOut = stem.unicodeScalars.filter {
+            !CharacterSet.whitespacesAndNewlines.contains($0) && !separators.contains($0)
+        }
+        return String(String.UnicodeScalarView(scalarsOut))
+    }
+
     // MARK: 旧版共享索引迁移
 
     /// 旧版布局把所有知识库目录的索引共用 `rag_data` 根目录，切换知识库目录
@@ -5091,6 +5125,24 @@ public final class RAGEngine {
 
             if candidates.count == 1 { return .found(candidates[0]) }
             if candidates.count > 1 { return .ambiguous(candidates) }
+
+            // SQL 的 instr 子串匹配对空格/连字符/全半角敏感：query 里的
+            // "46 亿年的地球物语 - ..." 命中不了库里的 "46亿年的地球物语-..."。
+            // 候选为空时做一次归一化全表兜底（精确 > 包含），唯一命中才放行。
+            let normalizedTarget = Self.normalizedDocumentKey(target)
+            let all = (try? store.allDocumentRows()) ?? []
+            let exactNormalized = all.filter { record in
+                Self.normalizedDocumentKey(record.docName) == normalizedTarget
+                    || (!record.mdPath.isEmpty
+                        && Self.normalizedDocumentKey(record.mdPath) == normalizedTarget)
+            }
+            if exactNormalized.count == 1 { return .found(exactNormalized[0]) }
+            if exactNormalized.count > 1 { return .ambiguous(exactNormalized) }
+            let containsNormalized = all.filter {
+                Self.normalizedDocumentKey($0.docName).contains(normalizedTarget)
+            }
+            if containsNormalized.count == 1 { return .found(containsNormalized[0]) }
+            if containsNormalized.count > 1 { return .ambiguous(containsNormalized) }
             return .notFound
         }
         if let result {
@@ -5135,6 +5187,22 @@ public final class RAGEngine {
         if exact.count > 1 { return .ambiguous(records(exact)) }
         if sameName.count == 1 { return .found(records(sameName)[0]) }
         if sameName.count > 1 { return .ambiguous(records(sameName)) }
+
+        // 与 documents 表一致的全半角/空白/连字符容错。
+        let normalizedTarget = Self.normalizedDocumentKey(target)
+        let normalizedEntries: [(source: String, entry: RAGManifestEntry)] = manifest.compactMap {
+            (source: $0.key, entry: $0.value)
+        }
+        let normExact = normalizedEntries.filter {
+            Self.normalizedDocumentKey($0.entry.docName) == normalizedTarget
+        }
+        if normExact.count == 1 { return .found(records(normExact)[0]) }
+        if normExact.count > 1 { return .ambiguous(records(normExact)) }
+        let normContains = normalizedEntries.filter {
+            Self.normalizedDocumentKey($0.entry.docName).contains(normalizedTarget)
+        }
+        if normContains.count == 1 { return .found(records(normContains)[0]) }
+        if normContains.count > 1 { return .ambiguous(records(normContains)) }
         return .notFound
     }
 

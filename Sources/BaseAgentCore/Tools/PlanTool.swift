@@ -297,8 +297,15 @@ public final class UpdatePlanTool: AgentTool {
             if let index = plan.steps.firstIndex(where: { $0.status != status }) {
                 indices = [index]
             }
+        } else if !note.isEmpty {
+            // 兼容只带 note 的调用：模型常想记一笔结论却漏了 step_id，
+            // 直接失败会浪费一整轮；回退到第一个仍在进行中的步骤。
+            if let index = plan.steps.firstIndex(where: { $0.status == "doing" })
+                ?? plan.steps.firstIndex(where: { $0.status == "pending" }) {
+                indices = [index]
+            }
         } else {
-            return .fail("patch with only 'note' requires 'step_id'")
+            return .fail("patch needs status and/or note")
         }
 
         guard !indices.isEmpty else {
