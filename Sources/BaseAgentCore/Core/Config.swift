@@ -670,9 +670,10 @@ public struct AgentConfig: Sendable {
 
     public var browserEndpoint: String = ""
     public var alwaysConfirmCode: Bool = false
-    /// 工具调用时的约束解码（默认关闭）。开启后仅在本机 MLX / GGUF 后端、
+    /// 工具调用时的约束解码（默认开启）。仅在本机 MLX / GGUF 后端、
     /// 且本轮确实携带工具 schema 时生效；普通文本回答与远端 API 后端不受影响。
-    public var guidedToolArguments: Bool = false
+    /// 关闭可设 guided_tool_arguments=false（旧配置未写此键时按开启处理）。
+    public var guidedToolArguments: Bool = true
     public var mcpServers: [MCPServerConfig] = []
 
     public init() {}
