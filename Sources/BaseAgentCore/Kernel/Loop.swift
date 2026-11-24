@@ -253,6 +253,9 @@ public final class KernelLoop {
     private var decisionFinishBlocks = 0
     /// 生成前判定已放行：本轮任务的证据已确认足够，收尾时不再重复判定。
     private var decisionPrechecked = false
+    /// 本轮任务中 rag_search 曾返回最高相似度 > 0.5 的切片：检索本身已找到
+    /// 匹配材料，视为完成度达成，生成前门与收尾门都不再做完成度判定。
+    private var ragHighConfidence = false
     /// 计划评审提示已触发次数（预算 = config.kernelDecisionGateMaxPlanReviews）。
     private var decisionPlanReviews = 0
     /// 已评审过的计划标识（goal+stepCount），同一计划只评审一次。
@@ -1239,6 +1242,23 @@ public final class KernelLoop {
                     successSigs.insert(callSig(tc))
                 }
             }
+            // rag_search 已确认找到匹配材料时视为达成完成度，生成前门与收尾门
+            // 都不再判定（即使本批工具混有 update_plan 等非检索调用）：
+            // - 向量检索：召回最高相似度 > 0.5，或判定确认存在相关切片（任一即可）；
+            // - 极速检索：问句相关度判定确实执行且至少一条切片相关。
+            // 不校验 op：rag_tools 省略 op 且带 query 时默认就是 search。
+            for (i, result) in rawResults.enumerated()
+            where i < toolCalls.count && toolCalls[i].name == "rag_tools" {
+                let maxScore = result.metrics["rag_max_score"] ?? 0
+                let confirmed = (result.metrics["rag_relevance_confirmed"] ?? 0) > 0.5
+                guard maxScore > 0.5 || confirmed else { continue }
+                if !ragHighConfidence {
+                    log(confirmed
+                        ? "[kernel] rag_search 已判定存在与问句相关的切片，跳过完成度判定"
+                        : "[kernel] rag_search 最高相似度 > 0.5，跳过完成度判定")
+                }
+                ragHighConfidence = true
+            }
             // 只有真正发出非 update_plan 的工具调用才算开工。
             // `update_plan` 只改计划状态，绝不能算作「已经做过事」，否则
             // 模型可以 create 时直接写 status="done"、再输出一段文字就收尾，
@@ -1406,33 +1426,41 @@ public final class KernelLoop {
                 let op = $0.arguments["op"]?.stringValue
                 return op == "status" || op == "outline"
             }
-            if toolsEnabled, retrievalOnly, hasToolSuccess, !decisionPrechecked,
-               reviewRounds == 0 {
-                if kbStructureAnswered {
+            // 向量检索的最高相似度 > 0.5，或任一模式判定确认存在相关切片：
+            // 检索本身已找到匹配材料，视为达成完成度，不再让 0.8B 判定模型
+            // 对整段证据做二次猜测。该标记在结果返回时即写入
+            // （ragHighConfidence），收尾门同样受其约束。
+            if toolsEnabled, hasToolSuccess, !decisionPrechecked, reviewRounds == 0 {
+                if ragHighConfidence {
                     decisionPrechecked = true
-                    log("[kernel] 决策门（生成前）：rag_tools(op=status/outline) 清单/大纲结果直接放行")
-                } else if decisionFinishBlocks < config.kernelDecisionGateMaxFinishBlocks,
-                          let judge = decisionJudge {
-                    let sufficient = await judge.informationSufficient(
-                        task: userInput,
-                        evidence: decisionEvidence())
-                    if sufficient == false {
-                        decisionFinishBlocks += 1
-                        parts.append("""
-                        [System] 决策模型判定当前收集的信息可能不足以完整回答任务（第 \(decisionFinishBlocks)/\(config.kernelDecisionGateMaxFinishBlocks) 次拦截）。
-                        本轮不要直接写最终答案；请继续调用工具补齐缺失信息（换关键词/换来源、检查遗漏的必要数据点），不要重复上一轮相同的检索。
-                        若确认无法获取，请在答复中明确说明缺失的部分与原因后再收尾，不要编造。
-                        """)
-                        log("[kernel] 决策门（生成前）：拦截 "
-                            + "\(decisionFinishBlocks)/\(config.kernelDecisionGateMaxFinishBlocks)（信息不足）")
-                    } else if sufficient == true {
+                    log("[kernel] 决策门（生成前）：rag_search 已确认检索到匹配材料，直接放行")
+                } else if retrievalOnly {
+                    if kbStructureAnswered {
                         decisionPrechecked = true
-                        log("[kernel] 决策门（生成前）：信息足够，放行生成")
-                    } else {
-                        // nil = 判定不可用（模型缺失/超时）：静默放行，本轮任务
-                        // 不再重复判定，避免每次收尾都白等一次超时。
-                        decisionPrechecked = true
-                        log("[kernel] 决策门（生成前）：判定不可用，跳过后续判定")
+                        log("[kernel] 决策门（生成前）：rag_tools(op=status/outline) 清单/大纲结果直接放行")
+                    } else if decisionFinishBlocks < config.kernelDecisionGateMaxFinishBlocks,
+                              let judge = decisionJudge {
+                        let sufficient = await judge.informationSufficient(
+                            task: userInput,
+                            evidence: decisionEvidence())
+                        if sufficient == false {
+                            decisionFinishBlocks += 1
+                            parts.append("""
+                            [System] 决策模型判定当前收集的信息可能不足以完整回答任务（第 \(decisionFinishBlocks)/\(config.kernelDecisionGateMaxFinishBlocks) 次拦截）。
+                            本轮不要直接写最终答案；请继续调用工具补齐缺失信息（换关键词/换来源、检查遗漏的必要数据点），不要重复上一轮相同的检索。
+                            若确认无法获取，请在答复中明确说明缺失的部分与原因后再收尾，不要编造。
+                            """)
+                            log("[kernel] 决策门（生成前）：拦截 "
+                                + "\(decisionFinishBlocks)/\(config.kernelDecisionGateMaxFinishBlocks)（信息不足）")
+                        } else if sufficient == true {
+                            decisionPrechecked = true
+                            log("[kernel] 决策门（生成前）：信息足够，放行生成")
+                        } else {
+                            // nil = 判定不可用（模型缺失/超时）：静默放行，本轮任务
+                            // 不再重复判定，避免每次收尾都白等一次超时。
+                            decisionPrechecked = true
+                            log("[kernel] 决策门（生成前）：判定不可用，跳过后续判定")
+                        }
                     }
                 }
             }
@@ -2596,6 +2624,7 @@ public final class KernelLoop {
     private func resetDecisionGateState() {
         decisionFinishBlocks = 0
         decisionPrechecked = false
+        ragHighConfidence = false
         decisionPlanReviews = 0
         decisionReviewedPlanKey = ""
     }

@@ -798,6 +798,17 @@ public final class Agent: @unchecked Sendable {
                 ? try await colbertFusedRerank(fused20, query: query, topK: topK)
                 : try await vectorFusedRerank(fused20, query: query, topK: topK)
         }
+        // 默认向量/重排路径、极速（ColBERT）路径与单库一致：先按问句判定切片
+        // 相关性，只把相关切片的「问句相关句 + 核心代表句」交给模型；判定全部
+        // 不相关时返回未找到。判定汇总模式（multiZoneUseDecisionJudge）即使失败
+        // 降级也不再二次判定，避免同一次查询连续等两轮模型超时。
+        if !usedDecision && !config.multiZoneUseDecisionJudge {
+            let maxScore = citations.map(\.score).max() ?? 0
+            let filtered = try await ragEngine.relevanceFilteredOutcome(
+                query: query, citations: citations, maxScore: maxScore, timeout: nil)
+            return await ragEngine.mergedWithKnowledgeGraph(
+                filtered, query: query, source: source)
+        }
         let outcome = RAGRetrievalOutcome(context: MultiZoneRetrieval.primaryContext(citations),
                                           citations: citations)
         // 统一图谱（跨分区聚合抽取）融合：仅增强 context，不改变融合后的跨库 citations。

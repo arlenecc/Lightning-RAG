@@ -211,12 +211,16 @@ public struct ToolResult: Sendable {
     public var error: String
     /// true 表示工具要求中断整轮（ask_user / 终止信号）。
     public var shouldExit: Bool
+    /// 结构化指标（如 RAG 最高相似度），供内核决策使用，不展示给模型。
+    public var metrics: [String: Double]
 
-    public init(success: Bool, output: String = "", error: String = "", shouldExit: Bool = false) {
+    public init(success: Bool, output: String = "", error: String = "",
+                shouldExit: Bool = false, metrics: [String: Double] = [:]) {
         self.success = success
         self.output = output
         self.error = error
         self.shouldExit = shouldExit
+        self.metrics = metrics
     }
 
     public static func ok(_ output: String) -> ToolResult { .init(success: true, output: output) }

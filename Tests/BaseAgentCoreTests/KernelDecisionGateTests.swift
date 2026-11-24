@@ -191,6 +191,141 @@ final class KernelDecisionGateTests: XCTestCase {
         }
     }
 
+    /// rag_search 返回最高相似度 > 0.5：检索已找到匹配材料，生成前门与
+    /// 收尾门都不再送完成度判定（即使判定器会返回「不足」）。
+    func testHighConfidenceRagSearchBypassesDecisionGate() async {
+        let judge = StubJudge(informationSufficientResult: false)
+        let model = ScriptedModel(firstTurn: {
+            Self.events([.init(kind: .done, toolCalls: [
+                // 不带 op：rag_tools 会按 query 推断为 search，内核也必须识别。
+                ToolCall(id: "t1", name: "rag_tools",
+                         arguments: ["query": .string("苹果是什么颜色")]),
+            ])])
+        })
+        let session = Session(budget: ContextBudget(total: 60_000), rawTurns: 50)
+        let runtime = KernelRuntime(
+            stream: { messages, _, _ in model.stream(messages) },
+            execute: { calls in
+                calls.map { _ in
+                    ToolResult(success: true,
+                               output: "### [1] 来源: apple.md\n- 苹果是红色的。",
+                               metrics: ["rag_max_score": 0.82])
+                }
+            },
+            schemas: { [] },
+            log: { model.kernelLogs.append($0) })
+        let loop = KernelLoop(runtime: runtime, config: makeConfig(maxFinishBlocks: 2),
+                              systemPrompt: { "SYS" }, session: session, maxTurns: 8)
+        loop.decisionJudge = judge
+        let result = await loop.run("苹果是什么颜色")
+
+        XCTAssertEqual(judge.completeCalls.count, 0, "高置信检索不应再送判定")
+        XCTAssertEqual(model.callCount, 2, "应直接进入文本作答：工具轮 + 文本轮")
+        XCTAssertTrue(model.kernelLogs.contains {
+            $0.contains("最高相似度 > 0.5")
+        }, "应记录高置信放行日志")
+        XCTAssertTrue(result.text.contains("北京今日晴"))
+    }
+
+    /// 最高相似度未超过阈值（如重排关闭时的 RRF 分数）：仍走原有完成度判定。
+    func testLowConfidenceRagSearchStillJudged() async {
+        let judge = StubJudge(informationSufficientResult: false)
+        let model = ScriptedModel(firstTurn: {
+            Self.events([.init(kind: .done, toolCalls: [
+                ToolCall(id: "t1", name: "rag_tools",
+                         arguments: ["query": .string("苹果是什么颜色")]),
+            ])])
+        })
+        let session = Session(budget: ContextBudget(total: 60_000), rawTurns: 50)
+        let runtime = KernelRuntime(
+            stream: { messages, _, _ in model.stream(messages) },
+            execute: { calls in
+                calls.map { _ in
+                    ToolResult(success: true,
+                               output: "### [1] 来源: apple.md\n- 苹果是红色的。",
+                               metrics: ["rag_max_score": 0.02])
+                }
+            },
+            schemas: { [] },
+            log: { model.kernelLogs.append($0) })
+        let loop = KernelLoop(runtime: runtime, config: makeConfig(maxFinishBlocks: 2),
+                              systemPrompt: { "SYS" }, session: session, maxTurns: 8)
+        loop.decisionJudge = judge
+        _ = await loop.run("苹果是什么颜色")
+
+        XCTAssertEqual(judge.completeCalls.count, 2,
+                       "低置信检索仍应在生成前 + 收尾各判定一次")
+        XCTAssertEqual(model.callCount, 3)
+    }
+
+    /// 向量检索：最高分只有 0.02（如重排关闭的 RRF），但相关度判定确认存在
+    /// 相关切片——两个条件满足其一即放行。极速检索没有最高分指标时同样适用。
+    func testRelevanceConfirmedRagSearchBypassesDecisionGate() async {
+        let judge = StubJudge(informationSufficientResult: false)
+        let model = ScriptedModel(firstTurn: {
+            Self.events([.init(kind: .done, toolCalls: [
+                ToolCall(id: "t1", name: "rag_tools",
+                         arguments: ["query": .string("苹果是什么颜色")]),
+            ])])
+        })
+        let session = Session(budget: ContextBudget(total: 60_000), rawTurns: 50)
+        let runtime = KernelRuntime(
+            stream: { messages, _, _ in model.stream(messages) },
+            execute: { calls in
+                calls.map { _ in
+                    ToolResult(success: true,
+                               output: "### [1] 来源: apple.md\n- 苹果是红色的。",
+                               metrics: ["rag_max_score": 0.02,
+                                         "rag_relevance_confirmed": 1])
+                }
+            },
+            schemas: { [] },
+            log: { model.kernelLogs.append($0) })
+        let loop = KernelLoop(runtime: runtime, config: makeConfig(maxFinishBlocks: 2),
+                              systemPrompt: { "SYS" }, session: session, maxTurns: 8)
+        loop.decisionJudge = judge
+        let result = await loop.run("苹果是什么颜色")
+
+        XCTAssertEqual(judge.completeCalls.count, 0, "确认相关切片后不应再送判定")
+        XCTAssertEqual(model.callCount, 2, "应直接进入文本作答：工具轮 + 文本轮")
+        XCTAssertTrue(model.kernelLogs.contains {
+            $0.contains("存在与问句相关的切片")
+        }, "应记录极速检索的相关切片放行日志")
+        XCTAssertTrue(result.text.contains("北京今日晴"))
+    }
+
+    /// 极速检索：判定未确认相关切片（全部不相关或判定不可用）时，
+    /// 仍走原有完成度判定，不能凭 MaxSim 分数直接放行。
+    func testRelevanceNotConfirmedRagSearchStillJudged() async {
+        let judge = StubJudge(informationSufficientResult: false)
+        let model = ScriptedModel(firstTurn: {
+            Self.events([.init(kind: .done, toolCalls: [
+                ToolCall(id: "t1", name: "rag_tools",
+                         arguments: ["query": .string("苹果是什么颜色")]),
+            ])])
+        })
+        let session = Session(budget: ContextBudget(total: 60_000), rawTurns: 50)
+        let runtime = KernelRuntime(
+            stream: { messages, _, _ in model.stream(messages) },
+            execute: { calls in
+                calls.map { _ in
+                    ToolResult(success: true,
+                               output: "（知识库中未找到与问句相关的内容）",
+                               metrics: ["rag_relevance_confirmed": 0])
+                }
+            },
+            schemas: { [] },
+            log: { model.kernelLogs.append($0) })
+        let loop = KernelLoop(runtime: runtime, config: makeConfig(maxFinishBlocks: 2),
+                              systemPrompt: { "SYS" }, session: session, maxTurns: 8)
+        loop.decisionJudge = judge
+        _ = await loop.run("苹果是什么颜色")
+
+        XCTAssertEqual(judge.completeCalls.count, 2,
+                       "未确认相关切片时仍应在生成前 + 收尾各判定一次")
+        XCTAssertEqual(model.callCount, 3)
+    }
+
     /// 判定不可用（nil）：静默放行，主流程不受影响。
     func testCompleteGateNilJudgePassesThrough() async {
         let judge = StubJudge(informationSufficientResult: nil)

@@ -103,6 +103,37 @@ public enum CoreOpinionExtractor {
         extract(text, query: query, topN: topN).joined(separator: "\n")
     }
 
+    /// 全文扫描的核心句提取：超长文本按句子窗口分段抽取，再对候选集做一次
+    /// 全局选择。不截断原文，尾部内容同样参与提取；同时把 TextRank 的
+    /// O(n²) 控制在窗口规模内（极速检索切片可达 8000 字，整段直接构图
+    /// 单条约 0.5s，分窗后可降到约 0.2s）。
+    static func extractScanningAll(_ text: String, topN: Int = perMethodTopN) -> [String] {
+        let sentences = splitSentences(text)
+        // 窗口按句数切分：80 句约 2000~3000 字，是 TextRank 成本与
+        // 抽取粒度的平衡点。短文本直接走原路径，行为不变。
+        let windowSize = 80
+        guard sentences.count > windowSize else {
+            return extract(text, query: nil, topN: topN)
+        }
+
+        var candidates: [String] = []
+        var seen = Set<String>()
+        var start = 0
+        while start < sentences.count {
+            let end = min(start + windowSize, sentences.count)
+            let window = sentences[start..<end].joined(separator: "\n")
+            for sentence in extract(window, query: nil, topN: topN)
+            where seen.insert(sentence).inserted {
+                candidates.append(sentence)
+            }
+            start = end
+        }
+        guard candidates.count > topN else { return candidates }
+        // 候选句保持原文顺序；在候选集上再选一次，避免尾部窗口的代表句
+        // 被前面的窗口整体挤掉。
+        return extract(candidates.joined(separator: "\n"), query: nil, topN: topN)
+    }
+
     /// 打分前的统一文本压缩：短文本直通（行为完全不变），超长文本用融合核心句
     /// 替代粗暴 prefix 截断。所有 judgeBinary / score 打分点共用这一个入口。
     /// - Parameters:

@@ -110,15 +110,23 @@ public struct RAGCitation: Sendable, Identifiable, Equatable {
 }
 
 /// 检索即展示的检索产出：`context` 只含进模型上下文的内容
-/// （top-1 切片 + 图谱实体/关系），`citations` 是全部召回切片
-/// （含 top-1），供 UI 气泡展示。
+/// （默认检索为相关切片的压缩句，其余模式为 top-1 切片 + 图谱实体/关系），
+/// `citations` 是采纳的切片，供 UI 气泡展示；`maxScore` 是召回阶段最高分，
+/// 供内核判定「是否已达完成度」。
 public struct RAGRetrievalOutcome: Sendable {
     public var context: String
     public var citations: [RAGCitation]
+    public var maxScore: Double
+    /// 相关度判定是否真正执行、且至少有一条切片被判相关（极速检索的完成度依据）。
+    /// fail-open（模型不可用/失败）或全部不相关时为 false。
+    public var relevanceConfirmed: Bool
 
-    public init(context: String, citations: [RAGCitation]) {
+    public init(context: String, citations: [RAGCitation], maxScore: Double = 0,
+                relevanceConfirmed: Bool = false) {
         self.context = context
         self.citations = citations
+        self.maxScore = maxScore
+        self.relevanceConfirmed = relevanceConfirmed
     }
 }
 

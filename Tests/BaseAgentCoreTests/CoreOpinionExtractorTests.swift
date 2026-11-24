@@ -66,4 +66,32 @@ final class CoreOpinionExtractorTests: XCTestCase {
         XCTAssertLessThan(compressed.count, text.count)
         XCTAssertFalse(compressed.isEmpty)
     }
+
+    /// 超长文本必须全文扫描：位于尾部（窗口之外）的核心句也要参与抽取，
+    /// 不能只截取头部 3000 字。
+    func testLongTextScanCoversTail() {
+        let filler = (0..<200).map {
+            "第\($0)句是普通的背景描述，介绍环境与用途，语气平缓没有观点。"
+        }.joined()
+        let tail = "综上所述，尾部的核心结论是必须启用双写校验，因此数据完整性才有保障。"
+        let text = filler + tail
+
+        let result = CoreOpinionExtractor.extractScanningAll(text, topN: 5)
+        XCTAssertFalse(result.isEmpty)
+        XCTAssertTrue(result.contains { $0.contains("双写校验") },
+                      "尾部核心句应参与抽取，不能因只看头部而遗漏")
+
+        // 不截断：结果必须来自原文中的真实句子。
+        XCTAssertTrue(result.allSatisfy { text.contains($0) })
+    }
+
+    /// 短文本（单窗口以内）直接复用原提取逻辑，行为不变。
+    func testScanningAllMatchesExtractForShortText() {
+        let text = (0..<30).map {
+            "第\($0)句是普通叙述内容，用于说明背景与环境。"
+        }.joined()
+        XCTAssertEqual(CoreOpinionExtractor.splitSentences(text).count, 30)
+        XCTAssertEqual(CoreOpinionExtractor.extractScanningAll(text, topN: 5),
+                       CoreOpinionExtractor.extract(text, topN: 5))
+    }
 }

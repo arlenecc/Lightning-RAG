@@ -1405,9 +1405,9 @@ final class RAGEngineTests: XCTestCase {
         engine.close()
     }
 
-    /// 检索即展示：全部召回切片进 citations（top-1 标记 isPrimary），
-    /// 但上下文只含 1 条切片正文；空结果不产 citations。
-    func testSearchWithCitationsKeepsTopOneInContext() async throws {
+    /// 默认检索：召回切片先做问句相关度判定，采纳切片按「相关句 + 核心句」
+    /// 压缩进上下文。测试 workspace 无决策模型 → fail-open 保留全部切片。
+    func testSearchWithCitationsFiltersAndCompressesContext() async throws {
         let root = URL(fileURLWithPath: NSTemporaryDirectory())
             .appendingPathComponent("base-agent-rag-citations-\(UUID().uuidString)")
         let kb = root.appendingPathComponent("kb")
@@ -1432,7 +1432,7 @@ final class RAGEngineTests: XCTestCase {
                                embedding: RagFakeEmbedding(), reranker: nil)
         _ = await engine.ingest()
         let outcome = try await engine.searchWithCitations(query: "apple", topK: 5)
-        // 全部召回切片都作为气泡卡片返回，只有第一个标记 isPrimary。
+        // 采纳切片作为气泡卡片返回，只有第一个标记 isPrimary。
         XCTAssertGreaterThan(outcome.citations.count, 1)
         XCTAssertEqual(outcome.citations.filter(\.isPrimary).count, 1)
         XCTAssertTrue(outcome.citations[0].isPrimary)
@@ -1440,10 +1440,11 @@ final class RAGEngineTests: XCTestCase {
             XCTAssertEqual(citation.rank, index + 1)
             if index > 0 { XCTAssertFalse(citation.isPrimary) }
         }
-        // 上下文只有一条切片正文：不出现第二个 "### 来源:"。
-        XCTAssertEqual(outcome.context.components(separatedBy: "### 来源:").count - 1, 1)
-        XCTAssertTrue(outcome.context.contains("检索即展示"))
-        XCTAssertTrue(outcome.context.contains(outcome.citations[0].text.prefix(10)))
+        // 无决策模型 → fail-open：每条采纳切片一个 `### [n] 来源:` 压缩段。
+        XCTAssertEqual(outcome.context.components(separatedBy: "### [").count - 1,
+                       outcome.citations.count)
+        XCTAssertTrue(outcome.context.contains("相关度判定暂不可用"))
+        XCTAssertTrue(outcome.context.contains("来源: \(outcome.citations[0].source)"))
 
         // 指定来源无匹配（明确返回空，不退化成全局检索）：兜底文案，无气泡。
         let empty = try await engine.searchWithCitations(query: "apple",
@@ -1453,9 +1454,9 @@ final class RAGEngineTests: XCTestCase {
         engine.close()
     }
 
-    /// rag_search 工具：召回切片通过 onRetrievedChunks 推给 UI，
-    /// 工具输出（进上下文）只含 top-1 一条切片正文。
-    func testRagSearchToolEmitsCitationsAndSingleChunkContext() async throws {
+    /// rag_search 工具：采纳切片通过 onRetrievedChunks 推给 UI，
+    /// 工具输出按切片压缩（测试无决策模型时 fail-open 保留全部召回切片）。
+    func testRagSearchToolEmitsCitationsAndCompressedContext() async throws {
         let root = URL(fileURLWithPath: NSTemporaryDirectory())
             .appendingPathComponent("base-agent-rag-tool-\(UUID().uuidString)")
         let kb = root.appendingPathComponent("kb")
@@ -1492,9 +1493,75 @@ final class RAGEngineTests: XCTestCase {
         XCTAssertEqual(recorder.received.count, 1)
         XCTAssertGreaterThan(recorder.received[0].count, 1)
         XCTAssertTrue(recorder.received[0][0].isPrimary)
-        // 进上下文的输出只有一条切片正文（不含其余切片）。
+        // 进上下文的压缩段数与采纳切片数一致。
         let body = result.toMessage()
-        XCTAssertEqual(body.components(separatedBy: "### 来源:").count - 1, 1)
+        XCTAssertEqual(body.components(separatedBy: "### [").count - 1,
+                       recorder.received[0].count)
+        XCTAssertEqual(result.metrics["rag_max_score"] ?? 0,
+                       recorder.received[0].map(\.score).max() ?? 0,
+                       accuracy: 1e-9)
+        XCTAssertEqual(result.metrics["rag_relevance_confirmed"], 0,
+                       "无决策模型时 fail-open，不能确认存在相关切片")
+        engine.close()
+    }
+
+    /// 极速检索模式：内核完成度依据是「判定确认存在相关切片」，
+    /// 因此只输出 rag_relevance_confirmed，不输出不可比的 MaxSim 最高分。
+    func testRagSearchToolFastModeEmitsRelevanceConfirmationMetric() async throws {
+        var config = AgentConfig()
+        config.ragMode = "colbert"
+        config.colbertReaderEnabled = true
+        let engine = RAGEngine(config: config, knowledgeBase: "unused-fast-mode")
+        let citations = [
+            RAGCitation(id: "d1", rank: 1, source: "apple.md", heading: "",
+                        text: "苹果是红色的。", score: 0.87, isPrimary: true),
+        ]
+        let tool = RagSearchTool(config: config, engine: engine,
+                                 searchHandler: { _, _, _ in
+            RAGRetrievalOutcome(context: "### [1] 来源: apple.md\n- 苹果是红色的。",
+                                citations: citations, maxScore: 0.87,
+                                relevanceConfirmed: true)
+        })
+        let confirmed = try await tool.run(["query": .string("苹果是什么颜色")])
+        XCTAssertTrue(confirmed.success)
+        XCTAssertEqual(confirmed.metrics["rag_relevance_confirmed"], 1)
+        XCTAssertNil(confirmed.metrics["rag_max_score"],
+                     "极速模式不应输出与阈值不可比的 MaxSim 最高分")
+
+        let notConfirmed = RagSearchTool(config: config, engine: engine,
+                                         searchHandler: { _, _, _ in
+            RAGRetrievalOutcome(context: "（知识库中未找到与问句相关的内容）",
+                                citations: [], maxScore: 0.87,
+                                relevanceConfirmed: false)
+        })
+        let rejected = try await notConfirmed.run(["query": .string("火星陨石坑")])
+        XCTAssertTrue(rejected.success, "未找到是正常检索结论，不是工具失败")
+        XCTAssertEqual(rejected.metrics["rag_relevance_confirmed"], 0)
+        XCTAssertNil(rejected.metrics["rag_max_score"],
+                     "全部不相关时不能用召回最高分触发放行")
+        engine.close()
+    }
+
+    /// 向量检索模式：同时输出最高分与判定确认，内核按「任一成立」放行。
+    /// 即使最高分低于 0.5（如重排关闭时的 RRF 分数），判定相关也能确认完成度。
+    func testRagSearchToolVectorModeEmitsBothConfidenceMetrics() async throws {
+        let config = AgentConfig()
+        let engine = RAGEngine(config: config, knowledgeBase: "unused-vector-mode")
+        let citations = [
+            RAGCitation(id: "1", rank: 1, source: "apple.md", heading: "",
+                        text: "苹果是红色的。", score: 0.02, isPrimary: true),
+        ]
+        let tool = RagSearchTool(config: config, engine: engine,
+                                 searchHandler: { _, _, _ in
+            RAGRetrievalOutcome(context: "### [1] 来源: apple.md\n- 苹果是红色的。",
+                                citations: citations, maxScore: 0.02,
+                                relevanceConfirmed: true)
+        })
+        let result = try await tool.run(["query": .string("苹果是什么颜色")])
+        XCTAssertTrue(result.success)
+        XCTAssertEqual(result.metrics["rag_max_score"] ?? -1, 0.02, accuracy: 1e-9)
+        XCTAssertEqual(result.metrics["rag_relevance_confirmed"], 1,
+                       "向量模式也应输出判定确认，供内核与最高分做「或」判断")
         engine.close()
     }
 }

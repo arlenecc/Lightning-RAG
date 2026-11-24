@@ -32,21 +32,21 @@ let ragUsageNote = """
 执行命令用 `file_tools`/`shell_run`/`code_run`，均照常可用。
 """
 
-func ragToolOK(_ text: String) -> ToolResult {
-    .ok(text + ragUsageNote)
+func ragToolOK(_ text: String, metrics: [String: Double] = [:]) -> ToolResult {
+    .init(success: true, output: text + ragUsageNote, metrics: metrics)
 }
 
 // MARK: - rag_search
 
 /// 知识库检索工具：等价于 Python `RagSearchTool`。
 ///
-/// 检索即展示（Retrieval-as-Presentation）：召回切片不再全量进模型上下文。
-/// 只有相关度最高的 1 条切片进上下文供模型参考总结；全部召回切片
-/// （含 top-1）通过 `AgentCallbacks.onRetrievedChunks` 推给 UI，
-/// 作为气泡附在回复后供用户点开查看。
+/// 检索即展示（Retrieval-as-Presentation）：默认检索与极速检索模式下，召回切片
+/// 先与问句做二元相关度判定，只有相关的切片进入上下文；每条切片以「问句相关
+/// top5 句 + 核心代表句」压缩后提供，不相关切片被过滤。全部采纳切片通过
+/// `AgentCallbacks.onRetrievedChunks` 推给 UI，作为气泡附在回复后供用户点开。
 public final class RagSearchTool: AgentTool {
     public let name = "rag_search"
-    public let description = "从本地知识库（RAG）检索与 query 相关的内容，可限定来源文件。query 请使用用户原始措辞，不要翻译或音译。只返回相关度最高的 1 条切片全文进上下文，其余召回切片不进上下文、而是作为引用气泡直接展示给用户（用户可自行点开查看）；如最高分切片不足以回答，请换措辞再次检索。来源/章节只是索引标识、不是磁盘文件路径，无需再找原文件。此说明只针对知识库文档，不影响 web_scan / file_tools / shell_run 等其它工具。"
+    public let description = "从本地知识库（RAG）检索与 query 相关的内容，可限定来源文件。query 请使用用户原始措辞，不要翻译或音译。默认检索与极速检索模式会先判定切片与问句的相关性，只把相关切片以「问句相关句 + 核心代表句」压缩进上下文，不相关切片会被过滤；其它检索模式只返回最相关的 1 条切片全文。如判定结果不足以回答，请换措辞再次检索。来源/章节只是索引标识、不是磁盘文件路径，无需再找原文件。此说明只针对知识库文档，不影响 web_scan / file_tools / shell_run 等其它工具。"
     public let parameters: JSONValue = .object([
         "type": .string("object"),
         "properties": .object([
@@ -71,6 +71,8 @@ public final class RagSearchTool: AgentTool {
     /// 多分区联合检索处理器：非空时优先使用它（多分区挂载），否则退回单 engine。
     public typealias SearchHandler = (_ query: String, _ topK: Int, _ source: String?) async throws -> RAGRetrievalOutcome
     private let searchHandler: SearchHandler?
+    /// 极速检索模式：完成度依据是「判定存在相关切片」而非召回最高分。
+    private let usesRelevanceConfirmation: Bool
     /// 检索即展示：召回切片通过回调推给 UI 气泡；无 UI 调用方为 nil。
     private weak var callbacks: AgentCallbacks?
 
@@ -81,6 +83,7 @@ public final class RagSearchTool: AgentTool {
                 searchHandler: SearchHandler? = nil) {
         self.engine = engine
         self.searchHandler = searchHandler
+        self.usesRelevanceConfirmation = config.colbertReaderEnabled
         self.callbacks = callbacks
     }
 
@@ -102,7 +105,16 @@ public final class RagSearchTool: AgentTool {
             if !outcome.citations.isEmpty {
                 callbacks?.onRetrievedChunks(outcome.citations)
             }
-            return ragToolOK(outcome.context)
+            // 完成度确认指标（内核按「任一成立」放行）：
+            // - 向量检索：召回最高分 > 0.5，或判定确认存在相关切片；
+            // - 极速检索：只认判定确认（MaxSim 分数与阈值不可比，不输出
+            //   rag_max_score，避免全部不相关时仍被最高分误放行）。
+            let confirmed: Double = outcome.relevanceConfirmed ? 1 : 0
+            let metrics: [String: Double] = usesRelevanceConfirmation
+                ? ["rag_relevance_confirmed": confirmed]
+                : ["rag_max_score": outcome.maxScore,
+                   "rag_relevance_confirmed": confirmed]
+            return ragToolOK(outcome.context, metrics: metrics)
         } catch {
             return .fail("知识库检索失败: \(error.localizedDescription)")
         }

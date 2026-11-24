@@ -1236,7 +1236,9 @@ public final class RAGEngine {
         // 图谱 context（默认上限 3000 token）+ 主检索 context 可能超预算，
         // 统一走既有 condense（按章节 map-reduce 压缩），避免挤占回答模型上下文。
         let condensed = await condenseIfNeeded(merged)
-        return RAGRetrievalOutcome(context: condensed, citations: outcome.citations)
+        return RAGRetrievalOutcome(context: condensed, citations: outcome.citations,
+                                   maxScore: outcome.maxScore,
+                                   relevanceConfirmed: outcome.relevanceConfirmed)
     }
 
     /// 本库可作为知识图谱抽取输入的全部切片。
@@ -4300,7 +4302,13 @@ public final class RAGEngine {
                         query: query, source: source)
                     return kgOnly
                 }
-                let merged = await mergedWithKnowledgeGraph(outcome, query: query, source: source)
+                // 极速检索与默认检索一致：先用问句判定切片相关性，只采纳相关切片；
+                // 上下文由「判定时提取的 top5 问句相关句 + 切片核心代表句」压缩组成。
+                let maxScore = outcome.citations.map(\.score).max() ?? 0
+                let filtered = try await relevanceFilteredOutcome(
+                    query: query, citations: outcome.citations, maxScore: maxScore,
+                    timeout: timeout, timing: timing)
+                let merged = await mergedWithKnowledgeGraph(filtered, query: query, source: source)
                 citationCount = merged.citations.count
                 return merged
             } catch is RerankTimeout {
@@ -4326,15 +4334,124 @@ public final class RAGEngine {
         guard !hits.isEmpty else {
             return RAGRetrievalOutcome(context: "（知识库中未找到相关内容）", citations: [])
         }
+        let maxScore = hits.map(\.score).max() ?? 0
+        let filtered = try await relevanceFilteredOutcome(
+            query: query, hits: hits, maxScore: maxScore,
+            timeout: timeout, timing: timing)
+        citationCount = filtered.citations.count
+        return filtered
+    }
+
+    /// 默认/极速检索的「问句相关度过滤 + 压缩上下文」。
+    ///
+    /// 1. 用决策模型对每条切片做二元相关性判定（输入是 query-aware top5 句）；
+    /// 2. 判定不相关的切片不采纳，也不占用上下文；
+    /// 3. 采纳切片按「问句相关 top5 句 + 核心代表句」去重压缩后提供给模型。
+    ///
+    /// 判定模型不可用/失败时 fail-open：保留全部切片，但仍做压缩，
+    /// 避免一次模型缺失让检索完全不可用。任务取消会向上抛出，不被 fail-open 吞掉。
+    private func relevanceFilteredOutcome(query: String, hits: [SearchHit],
+                                          maxScore: Double, timeout: Double?,
+                                          timing: RAGSearchTiming) async throws
+        -> RAGRetrievalOutcome {
         let citations = hits.enumerated().map { index, hit in
             RAGCitation(id: String(hit.rowID), rank: index + 1,
                         source: (hit.source as NSString).lastPathComponent,
-                        heading: hit.heading, text: hit.text, score: hit.score,
-                        isPrimary: index == 0)
+                        heading: hit.heading, text: hit.text,
+                        score: hit.score, isPrimary: index == 0)
         }
-        citationCount = citations.count
-        return RAGRetrievalOutcome(context: Self.formatPrimaryContext(hits: hits),
-                                   citations: citations)
+        return try await relevanceFilteredOutcome(query: query, citations: citations,
+                                                  maxScore: maxScore, timeout: timeout,
+                                                  timing: timing)
+    }
+
+    /// 对已召回切片做同一套过滤与压缩；多分区融合的默认向量/重排路径、
+    /// 极速检索（ColBERT）路径复用。`timing` 为空时不记录阶段耗时。
+    func relevanceFilteredOutcome(query: String, citations: [RAGCitation],
+                                  maxScore: Double, timeout: Double?,
+                                  timing: RAGSearchTiming? = nil) async throws
+        -> RAGRetrievalOutcome {
+        let started = Date()
+        defer { timing?.set("relevance", seconds: Date().timeIntervalSince(started)) }
+        guard !citations.isEmpty else {
+            return RAGRetrievalOutcome(context: "（知识库中未找到相关内容）",
+                                       citations: [], maxScore: 0)
+        }
+
+        var scores: [Double] = []
+        var judgeError: Error?
+        // 本地无决策模型时直接 fail-open，不在默认检索里触发下载/加载：
+        // 否则第一次 rag_search 可能被几百 MB 的模型下载拖住。
+        if let scorer = try? ensureDecisionScorer(), scorer.isModelAvailable {
+            // 与决策模式一致的墙钟预算：判定模型卡死时 fail-open，
+            // 不能让默认检索被一次模型前向拖住整个对话。
+            let effectiveTimeout = resolvedTimeout(timeout)
+            let budget = effectiveTimeout == 0 ? Double.greatestFiniteMagnitude
+                : max(30, effectiveTimeout * 3)
+            do {
+                scores = try await Self.withTimeout(budget) {
+                    try await scorer.score(
+                        query: query, passages: citations.map(\.text),
+                        coreSentenceCount: 5, useCoreSentences: true, progress: nil)
+                }
+            } catch {
+                // 用户取消时不要降级成「全部保留」继续组装上下文。
+                if Task.isCancelled { throw CancellationError() }
+                judgeError = error
+            }
+        }
+        // 判定模型在取消时可能返回部分分数而不抛错（逐批 break），
+        // 这种情况同样不能当成可用判定继续组装上下文。
+        if Task.isCancelled { throw CancellationError() }
+        let judged = scores.count == citations.count
+        if !judged {
+            AgentLog.warning("RAG 相关度判定不可用，保留全部切片: "
+                + (judgeError?.localizedDescription ?? "决策模型未加载"))
+        }
+
+        // 二元判定：>= 0.5 即「相关」，不设额外阈值。
+        let kept = citations.enumerated().compactMap { offset, citation -> RAGCitation? in
+            if judged && scores[offset] < 0.5 { return nil }
+            return citation
+        }
+        guard !kept.isEmpty else {
+            AgentLog.info("[rag] 相关度过滤：\(citations.count) 条全部不相关，返回未找到")
+            return RAGRetrievalOutcome(context: "（知识库中未找到与问句相关的内容）",
+                                       citations: [], maxScore: maxScore)
+        }
+
+        let adopted = kept.enumerated().map { index, citation -> RAGCitation in
+            var copy = citation
+            copy.rank = index + 1
+            copy.isPrimary = index == 0
+            return copy
+        }
+        let blocks = adopted.enumerated().map { index, citation -> String in
+            let heading = citation.heading.isEmpty ? "" : "\n章节: \(citation.heading)"
+            let relevant = CharacterNgramBM25.coreSentences(
+                query: query, text: citation.text, count: 5)
+            // 极速检索切片可达 8000 字：按句窗扫描全文（不截断头部），
+            // 尾部信息同样参与核心句提取，同时避免整段 TextRank 的 O(n²) 开销。
+            let core = CoreOpinionExtractor.extractScanningAll(citation.text, topN: 5)
+            var seen = Set<String>()
+            let merged = (relevant + core).filter { seen.insert($0).inserted }
+            let body = merged.map { "- \($0)" }.joined(separator: "\n")
+            // 用 `### [` 前缀：内核 trimRagHistory / condenseIfNeeded 按该标记
+            // 分段，逐片压缩时不会把问句相关句换成通用核心句。
+            return "### [\(index + 1)] 来源: \(citation.source) (相关度: "
+                + String(format: "%.4f", citation.score) + ")\(heading)\n\(body)"
+        }
+        let header = judged
+            ? "本次共召回 \(citations.count) 条切片，其中 \(kept.count) 条判定与问句相关；"
+                + "每条只保留「问句相关句 + 核心代表句」，不相关切片已过滤："
+            : "本次共召回 \(citations.count) 条切片，相关度判定暂不可用，已保留全部切片；"
+                + "每条只保留「问句相关句 + 核心代表句」："
+        return RAGRetrievalOutcome(
+            context: header + "\n\n" + blocks.joined(separator: "\n\n"),
+            citations: adopted, maxScore: maxScore,
+            // judged && kept 非空：判定确实执行且至少一条相关，供极速检索
+            // 作为「已找到匹配材料」的依据；fail-open 不算确认。
+            relevanceConfirmed: judged)
     }
 
     /// 单条 top-1 切片的上下文格式：告诉模型其余切片去了哪里、不够时怎么办。
