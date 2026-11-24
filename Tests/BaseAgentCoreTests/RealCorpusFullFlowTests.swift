@@ -273,13 +273,8 @@ final class RealCorpusFullFlowTests: XCTestCase {
                       searchResult.output)
 
         let outlineTool = RagOutlineTool(config: toolConfig, engine: fullEngine)
-        let outlineResult = try await outlineTool.run([:])
-        XCTAssertTrue(outlineResult.success, outlineResult.output)
-        for name in fullEngine.listDocuments(limit: 100).names {
-            XCTAssertTrue(outlineResult.output.contains((name as NSString).lastPathComponent),
-                          outlineResult.output)
-        }
-        // 单本文档大纲：目录/摘要内容也必须能取出，而不只是文件名列表。
+        // outline 只做单文档概览，不再列出全部文档；文档清单由 status 覆盖。
+        // 单本文档大纲：目录/摘要内容也必须能取出。
         let firstName = try XCTUnwrap(fullEngine.listDocuments(limit: 1).names.first)
         let bookOutline = try await outlineTool.run(["book_name": .string(firstName)])
         XCTAssertTrue(bookOutline.success, bookOutline.output)

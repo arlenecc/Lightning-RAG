@@ -123,19 +123,20 @@ public final class RagSearchTool: AgentTool {
 
 // MARK: - rag_outline
 
-/// 文档大纲工具：等价于 Python `RagOutlineTool`。
+/// 单文档概览工具：只看某一本已索引文档的目录结构、逐章摘要与全书摘要。
+/// 文档清单/工作区状态由 RagStatusTool 负责，不在本工具内提供。
 public final class RagOutlineTool: AgentTool {
     public let name = "rag_outline"
-    public let description = "查看**某一本已知文档**的章节结构（目录）与全书/章节摘要：先整体了解这本书再决定搜哪一章。book_name 传具体文档名（支持部分匹配）。不要用它列文档清单或清点分区收录了哪些书——那是 rag_tools(op=\"status\") 的职责。章节标题/摘要是向量库索引内容、不是磁盘文件路径，无需再找原文件。此说明只针对知识库文档，不影响 web_scan / file_tools / shell_run 等其它工具。"
+    public let description = "快速概览**某一本已索引文档**：目录结构、各章摘要、全书摘要。必须传具体 book_name（支持部分匹配，跨全部分区查找）。不负责文档清单/工作区状态——列文档、看分区收录了哪些书请用 rag_tools(op=\"status\")。章节标题/摘要是向量库索引内容、不是磁盘文件路径，无需再找原文件。此说明只针对知识库文档，不影响 web_scan / file_tools / shell_run 等其它工具。"
     public let parameters: JSONValue = .object([
         "type": .string("object"),
         "properties": .object([
             "book_name": .object([
                 "type": .string("string"),
-                "description": .string("要查看大纲的具体文档名（支持部分匹配）；列文档清单请用 rag_tools(op=\"status\")"),
+                "description": .string("必填：要概览的具体文档名（支持部分匹配，跨所有已挂载分区查找）；列文档清单请用 rag_tools(op=\"status\")"),
             ]),
         ]),
-        "required": .array([]),
+        "required": .array([.string("book_name")]),
     ])
 
     private let engine: RAGEngine
@@ -153,26 +154,11 @@ public final class RagOutlineTool: AgentTool {
 
     public func run(_ args: [String: JSONValue]) async throws -> ToolResult {
         let name = args.trimmedString("book_name")
-        if name.isEmpty {
-            let list = engine.listDocuments(limit: 100)
-            let allLists = [list] + extraEngines.map { $0.listDocuments(limit: 100) }
-            let total = allLists.reduce(0) { $0 + $1.total }
-            guard total > 0 else {
-                return ragToolOK("知识库中还没有已索引文档。")
-            }
-            var lines = ["已索引文档（共 \(total) 个，跨 \(allLists.count) 个分区）:"]
-            for (i, l) in allLists.enumerated() {
-                if allLists.count > 1 {
-                    lines.append("  [分区 \(i + 1)]")
-                }
-                lines.append(contentsOf: l.names.map {
-                    "  - \((($0 as NSString).lastPathComponent))"
-                })
-                if l.total > l.names.count {
-                    lines.append("    …（该分区仅显示前 \(l.names.count) 个）")
-                }
-            }
-            return ragToolOK(lines.joined(separator: "\n"))
+        // 本工具只做单文档概览，不再提供"不传就列全部文档"能力——清单/状态
+        // 完全交给 rag_tools(op="status")，避免模型把两个 op 的职责混起来。
+        guard !name.isEmpty else {
+            return .fail("缺少必填参数 book_name：请提供要概览的具体文档名；"
+                + "若只是想列出/清点已索引文档，请改用 rag_tools(op=\"status\")。")
         }
 
         // 多分区：默认库查不到时遍历其它挂载分区（book 可能在非默认库，

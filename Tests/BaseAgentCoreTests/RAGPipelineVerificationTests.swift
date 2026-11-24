@@ -224,13 +224,7 @@ final class RAGPipelineVerificationTests: XCTestCase {
         XCTAssertTrue(searchResult.output.contains(documentNames[1]), searchResult.output)
         XCTAssertTrue(searchResult.output.contains("相关度") || searchResult.output.contains("RRF"))
 
-        let outlineTool = RagOutlineTool(config: config, engine: engine)
-        let outlineResult = try await outlineTool.run([:])
-        XCTAssertTrue(outlineResult.success, outlineResult.output)
-        for name in documentNames {
-            XCTAssertTrue(outlineResult.output.contains(name), outlineResult.output)
-        }
-
+        // outline 只做单文档概览，文档清单由 status 验证。
         let statusTool = RagStatusTool(config: config, engine: engine)
         let statusResult = try await statusTool.run([:])
         XCTAssertTrue(statusResult.success, statusResult.output)

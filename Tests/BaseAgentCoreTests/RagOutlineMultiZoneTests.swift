@@ -69,8 +69,8 @@ final class RagOutlineMultiZoneTests: XCTestCase {
         XCTAssertTrue(result.output.contains("第一章"), result.output)
     }
 
-    /// 不传 book_name 时，列表应包含所有分区的文档。
-    func testListIncludesAllZones() async throws {
+    /// 不再提供列表能力：不传 book_name 应报错并指向 status。
+    func testListAllRemovedAndRedirectsToStatus() async throws {
         let root = URL(fileURLWithPath: NSTemporaryDirectory())
             .appendingPathComponent("outline-list-\(UUID().uuidString)")
         defer { try? FileManager.default.removeItem(at: root) }
@@ -99,9 +99,8 @@ final class RagOutlineMultiZoneTests: XCTestCase {
 
         let tool = RagOutlineTool(config: config, engine: eA, extraEngines: [eB])
         let result = try await tool.run([:])
-        XCTAssertTrue(result.success)
-        XCTAssertTrue(result.output.contains("社会书"), result.output)
-        XCTAssertTrue(result.output.contains("自然书"), result.output)
-        XCTAssertTrue(result.output.contains("跨 2 个分区"), result.output)
+        XCTAssertFalse(result.success, "outline 不应再提供列全部文档能力")
+        XCTAssertTrue(result.error.contains("book_name"), result.error)
+        XCTAssertTrue(result.error.contains("status"), result.error)
     }
 }
