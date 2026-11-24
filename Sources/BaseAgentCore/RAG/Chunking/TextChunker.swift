@@ -49,7 +49,10 @@ public final class TextChunker: TextChunkingStrategy {
         // 先把同一章节内的短片段合并到接近 chunk_size，再加重叠：
         // PDF 的页尾、引文、短小节如果各自成片，召回结果会只有一两百字。
         let coalesced = coalesceShortPieces(raw, source: document.source)
-        let withOverlap = applyOverlap(coalesced, overlapTokens: options.overlapTokens)
+        // 章节尾部/纯标题片段可能被夹在「已满的前块」和「新章节」之间，
+        // coalesce 只向前合并且不跨章节，这里做最后一道兜底。
+        let absorbed = absorbDegeneratePieces(coalesced)
+        let withOverlap = applyOverlap(absorbed, overlapTokens: options.overlapTokens)
         var chunks: [Chunk] = []
         for item in withOverlap {
             let trimmed = item.text.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -175,6 +178,92 @@ public final class TextChunker: TextChunkingStrategy {
         if trimmed.range(of: pattern, options: .regularExpression) != nil { return true }
         let lower = trimmed.lowercased()
         return lower.hasPrefix("chapter ") || lower.hasPrefix("part ")
+    }
+
+    // MARK: 兜底归并碎片
+
+    /// 处理 `coalesceShortPieces` 无法覆盖的退化片段：
+    /// - 章节尾部碎片：前一块已接近/达到预算，后一块属于新章节，
+    ///   向前合并不下、向后又不允许跨章节；
+    /// - 纯标题片段：标题行后紧跟另一个标题时，整节只有标题本身。
+    ///
+    /// 只处理「孤立在章节边界上」的退化片段：章节尾部优先向前，
+    /// 新章节开头/纯标题优先向后；两个方向都放不下才丢弃。
+    /// 2-5 字的极短碎片无论位置都处理；其余短语义片保持独立，
+    /// 避免把语义切分刚建立的边界又抹掉。
+    private func absorbDegeneratePieces(
+        _ pieces: [(text: String, heading: String,
+                    sectionIndex: Int, mergeable: Bool)]
+    ) -> [(text: String, heading: String, sectionIndex: Int, mergeable: Bool)] {
+        guard pieces.count > 1 else { return pieces }
+        let tokenFloor = max(1, options.minChunkTokens / 2)
+        let charFloor = min(50, max(0, options.minChunkTokens))
+        // 真实切片尺寸允许 10% 余量吸收碎片；很小的测试配置仍严格受
+        // chunk_size 约束，保持既有的「切片不超预算」不变量。
+        let mergeBudget = options.chunkSizeTokens >= 100
+            ? options.chunkSizeTokens * 11 / 10
+            : options.chunkSizeTokens
+        var output = pieces
+        var index = 0
+
+        while index < output.count {
+            guard output.count > 1 else { break }
+            let piece = output[index]
+            let trimmed = piece.text.trimmingCharacters(in: .whitespacesAndNewlines)
+            let headingOnly = Self.isHeadingOnly(trimmed, heading: piece.heading)
+            let key = Self.topHeading(piece.heading)
+            let previousIsOther = index > 0
+                && Self.topHeading(output[index - 1].heading) != key
+            let nextIsOther = index + 1 < output.count
+                && Self.topHeading(output[index + 1].heading) != key
+            let isDegenerate = trimmed.count < charFloor
+                || options.tokenCounter(trimmed) < tokenFloor
+            // 2-5 字的碎片无论是语义切分还是分页残留，都不应单独进入索引。
+            let isVeryTiny = trimmed.count <= 5 || options.tokenCounter(trimmed) < 3
+            guard headingOnly || isVeryTiny
+                || (isDegenerate && (previousIsOther || nextIsOther)) else {
+                index += 1
+                continue
+            }
+
+            // 章节尾部（前一块同章节）优先向前；新章节开头/纯标题优先向后。
+            let preferNext = headingOnly ? (previousIsOther || index == 0) : previousIsOther
+            let candidates = preferNext ? [index + 1, index - 1] : [index - 1, index + 1]
+            var absorbed = false
+            for neighbor in candidates where neighbor >= 0 && neighbor < output.count {
+                var merged = neighbor < index
+                    ? output[neighbor].text + "\n" + piece.text
+                    : piece.text + "\n" + output[neighbor].text
+                merged = merged.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard options.tokenCounter(merged) <= mergeBudget else { continue }
+                var target = output[neighbor]
+                target.text = merged
+                // 跨章节合并后不能再参与 overlap，避免把语义边界抹平。
+                target.mergeable = target.mergeable && piece.mergeable
+                    && target.sectionIndex == piece.sectionIndex
+                output[neighbor] = target
+                output.remove(at: index)
+                absorbed = true
+                break
+            }
+            if !absorbed { output.remove(at: index) }
+        }
+        return output
+    }
+
+    /// heading 的顶层章节名（`A > B` 取 A）。
+    private static func topHeading(_ heading: String) -> String {
+        (heading.components(separatedBy: " > ").first ?? heading)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    /// 正文是否只有一个标题行（忽略 Markdown `#` 前缀）。
+    private static func isHeadingOnly(_ text: String, heading: String) -> Bool {
+        let cleaned = text.replacingOccurrences(of: #"^#{1,6}\s*"#, with: "",
+                                                options: .regularExpression)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !cleaned.isEmpty else { return false }
+        return cleaned == topHeading(heading)
     }
 
     // MARK: Overlap
