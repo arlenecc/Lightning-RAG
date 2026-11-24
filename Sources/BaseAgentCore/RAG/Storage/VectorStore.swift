@@ -129,7 +129,8 @@ public final class VectorStore: @unchecked Sendable {
     public init(dbPath: String, dimension: Int, enableSQLiteVec: Bool = true,
                 elementType: VectorElementType = .fp32,
                 binaryDimension: Int = 0, binarySource: String = "",
-                indexFingerprint: String = "") throws {
+                indexFingerprint: String = "",
+                metadataOnly: Bool = false) throws {
         let resolvedDimension = max(1, dimension)
         // 非法维度（如 bin 维度不是 8 的倍数）在打开库之前就报错，
         // 避免先建出一张错误的表再回滚。
@@ -153,7 +154,13 @@ public final class VectorStore: @unchecked Sendable {
         self.sqliteVecAvailable = enableSQLiteVec && db.vectorExtensionLoaded
         try createBaseSchema()
         self.cachedChunkCount = Self.readStoredCount(db, key: Self.chunkCountKey)
-        if rebuildReason != nil {
+        if metadataOnly {
+            // 元数据连接（极速模式的目录/摘要/KG 路径）：绝不允许改写向量存储
+            // 结构。历史教训：useVec0=false 的 ensureVectorTable 会把既有 vec0
+            // 表判为「类型不匹配」并整表 DROP——切一次极速模式就丢掉全部主向量
+            // （bin 签名因 setupBinaryIndexLocked 的 0 维早退而幸免）。
+            self.vectorEnabled = false
+        } else if rebuildReason != nil {
             // 待重建：旧表保持原样（不删数据），但向量通道暂时关闭。
             self.vectorEnabled = false
         } else if sqliteVecAvailable, elementType.supportsVec0Index {
@@ -170,6 +177,7 @@ public final class VectorStore: @unchecked Sendable {
         } else {
             try ensureVectorTable(dimension: self.dimension, useVec0: false)
         }
+        guard !metadataOnly else { return }
         do {
             try setupRerankStorageLocked()
         } catch {
@@ -184,6 +192,13 @@ public final class VectorStore: @unchecked Sendable {
             binaryStorageEnabled = false
             binaryStorageReason = "初始化失败：\(error.localizedDescription)"
         }
+    }
+
+    /// 诊断用：主向量影子表（vec0 _rowids）行数，用于校验 vec0 行完整性。
+    public func countVectorRows() throws -> Int {
+        lock.lock(); defer { lock.unlock() }
+        return Int(try db.scalar(
+            "SELECT COUNT(*) FROM \(Self.vectorTable)_rowids").intValue ?? 0)
     }
 
     /// 仅元数据用途打开库（目录 / 章节摘要 / 全书摘要的读写），不依赖 embedding 实例。
@@ -211,7 +226,8 @@ public final class VectorStore: @unchecked Sendable {
         let fingerprint = meta(fingerprintKey) ?? ""
         return try VectorStore(dbPath: dbPath, dimension: dimension,
                                enableSQLiteVec: false, elementType: element,
-                               indexFingerprint: fingerprint)
+                               indexFingerprint: fingerprint,
+                               metadataOnly: true)
     }
 
     public func close() {

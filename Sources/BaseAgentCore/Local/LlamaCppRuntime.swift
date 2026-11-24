@@ -410,10 +410,17 @@ final class LlamaCppSampler {
             let patternCount = patterns.count
             let grammarSampler = grammar.withCString { grammarPtr in
                 patterns.withUnsafeMutableBufferPointer { buffer in
-                    llama_sampler_init_grammar_lazy_patterns(
-                        vocab, grammarPtr, nil,
-                        buffer.baseAddress, patternCount,
-                        nil, 0)
+                    // grammar_root 必须传显式规则名：llama.cpp b12651 的
+                    // init_grammar_impl 会对它做 strlen，传 nil 触发
+                    // EXC_BAD_ACCESS(SIGSEGV) 直接把 App 打崩（GGUF 模型专属，
+                    // MLX 后端走 GrammarConstraint 不受影响）。GBNF 源码
+                    // 入口规则名为 "root"，与 MLX 侧 rootRule 一致。
+                    "root".withCString { rootPtr in
+                        llama_sampler_init_grammar_lazy_patterns(
+                            vocab, grammarPtr, rootPtr,
+                            buffer.baseAddress, patternCount,
+                            nil, 0)
+                    }
                 }
             }
             if let grammarSampler {

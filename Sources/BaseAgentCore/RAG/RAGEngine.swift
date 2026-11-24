@@ -949,8 +949,11 @@ public final class RAGEngine {
             // 主向量数据不受影响，回填随后补齐签名。
             let declaredDimension = binarySignatureDimension
             let declaredSource = binarySignatureSource
-            if existing.binaryDimension != declaredDimension
-                || (declaredDimension > 0 && existing.binarySource != declaredSource) {
+            // declaredDimension == 0 表示 provider 未声明位宽（含极速模式：
+            // embedding 为 nil）——无从判断对错，保持现状不动库。
+            if declaredDimension > 0,
+               existing.binaryDimension != declaredDimension
+                || existing.binarySource != declaredSource {
                 AgentLog.warning("RAG: 已打开库的二值位宽/来源（\(existing.binaryDimension)位/"
                     + "\(existing.binarySource.isEmpty ? "-" : existing.binarySource)）与当前"
                     + " embedding（\(declaredDimension)位/"
