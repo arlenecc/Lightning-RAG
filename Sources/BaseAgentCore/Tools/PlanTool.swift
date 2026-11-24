@@ -140,8 +140,10 @@ public final class UpdatePlanTool: AgentTool {
             }
             let goal = ToolSupport.optionalString(args, "goal") ?? ""
             let stepsValue = parseStepsValue(args["steps"])
-            let stepID = (ToolSupport.optionalString(args, "step_id") ?? "")
-                .trimmingCharacters(in: .whitespacesAndNewlines)
+            // 模型偶尔把 step_id 写成 JSON 数组字面量（如 `["1"]`）；按 schema
+            // 它是 string，coerceString 会原样保留，导致 no step matched。
+            // 这里解一层数组，取首个非空元素，避免白白浪费一轮。
+            let stepID = Self.normalizedStepID(args["step_id"])
             let status = (ToolSupport.optionalString(args, "status") ?? "")
                 .trimmingCharacters(in: .whitespacesAndNewlines)
                 .lowercased()
@@ -169,6 +171,29 @@ public final class UpdatePlanTool: AgentTool {
             }
         } catch {
             return ToolSupport.failure(error)
+        }
+    }
+
+    /// 把 step_id 归一化为步骤 id：兼容 JSON 数组字面量 `["1"]` 与实际数组。
+    private static func normalizedStepID(_ value: JSONValue?) -> String {
+        guard let value, !value.isNull else { return "" }
+        func first(from array: [JSONValue]) -> String {
+            array.compactMap { $0.stringValue }.first(where: { !$0.isEmpty }) ?? ""
+        }
+        switch value {
+        case .string(let text):
+            let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+            if trimmed.hasPrefix("["),
+               let data = trimmed.data(using: .utf8),
+               let array = try? JSONDecoder().decode([JSONValue].self, from: data) {
+                return first(from: array)
+            }
+            return trimmed
+        case .array(let array):
+            return first(from: array)
+        default:
+            return ToolSupport.coerceString(value)
+                .trimmingCharacters(in: .whitespacesAndNewlines)
         }
     }
 

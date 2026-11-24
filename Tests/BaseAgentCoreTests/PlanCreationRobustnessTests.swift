@@ -81,6 +81,28 @@ final class PlanCreationRobustnessTests: XCTestCase {
         XCTAssertEqual(plan.steps[0].note, "记一笔")
     }
 
+    func testPatchWithArrayStepIDString() async throws {
+        let config = makeConfig(temporaryWorkspace())
+        let tool = UpdatePlanTool(config: config, callbacks: nil)
+        let createArgs: [String: JSONValue] = [
+            "op": .string("create"),
+            "goal": .string("目标"),
+            "steps": .array([.string("第一步"), .string("第二步")]),
+        ]
+        let created = try await tool.run(createArgs)
+        XCTAssertTrue(created.success, created.error)
+
+        // 模型实测传的是 `["1"]` 字符串字面量，而不是 schema 声明的 string。
+        let patchArgs: [String: JSONValue] = [
+            "op": .string("patch"), "step_id": .string("[\"1\"]"),
+            "status": .string("done"), "note": .string("完成"),
+        ]
+        let result = try await tool.run(patchArgs)
+        XCTAssertTrue(result.success, result.error)
+        let plan = try XCTUnwrap(PlanStore.load(config))
+        XCTAssertEqual(plan.steps[0].status, "done")
+    }
+
     func testEmptyCallStillReportsMissingOp() async throws {
         let config = makeConfig(temporaryWorkspace())
         let tool = UpdatePlanTool(config: config, callbacks: nil)

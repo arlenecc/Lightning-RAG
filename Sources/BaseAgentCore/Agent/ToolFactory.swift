@@ -130,9 +130,12 @@ public enum AgentToolFactory {
                 + "in the tool result; all retrieved chunks are also shown "
                 + "to the user as citation bubbles. If insufficient, re-search with different "
                 + "wording.\n"
-                + "- op=\"outline\": view a document's chapter outline/summaries, or list all "
-                + "documents (book_name).\n"
-                + "- op=\"status\": knowledge-base indexing status (lists all partitions).\n"
+                + "- op=\"outline\": view chapter outline/summaries of ONE known document "
+                + "(book_name). Do NOT use it to list documents or count a partition's books.\n"
+                + "- op=\"status\": THE entry point for ANY request to list/count/enumerate "
+                + "indexed documents ('what documents are in the KB', 'list all docs', 'what does "
+                + "partition X contain'). Returns every partition's document-name list plus index "
+                + "status. Never use op=\"search\" or op=\"outline\" for document lists.\n"
                 + "- op=\"ingest\": build/update the index (force).",
             subcommands: [
                 ("search", RagSearchTool(config: config, callbacks: callbacks, registry: registry,

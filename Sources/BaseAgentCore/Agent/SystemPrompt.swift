@@ -15,6 +15,7 @@ import Foundation
 public let KNOWLEDGE_BASE_HINT = """
 这些文档名是向量库的索引标识、不是磁盘文件路径；问这些已索引文档的内容用
 `rag_tools`（op="outline"/"search"/"status"，返回片段即正文，无需再找原文件）。
+清单类意图（罗列/清点/枚举已索引文档，无论措辞）只用 `op="status"`；`op="outline"` 只接具体文档名看单本大纲，不能用来列清单。
 本说明只针对知识库文档：给网址或要实时信息请用 `web_scan` / `web_search` 从外部检索或获取；
 领域性/知识性问题先用 `rag_tools(op="search")` 跨全部分区检索，只有检索无命中或明确不足时，
 才用 `web_search` 搜索补充，再从搜索结果里取真实可用的 URL 交给 `web_scan` 读正文；
@@ -53,7 +54,7 @@ You are base-agent, a local autonomous agent. Complete tasks by reasoning, plann
 ## 工具（能力/参数以 schema 为准，此处只列处理规则）
 - 联网：缺信息按交互协议主动 `web_search` 补搜，不以知识库检索替代联网；正文用结果里的真实 URL 交 `web_scan`。
 - `web_scan`：仅当渲染后仍是加载壳、或需等待选择器 / 执行页面脚本 / 截图时才用 op="render"，其余用默认 op="scan"。
-- 知识库：问「知识库里有什么/有哪些文档/分区清单/收录了哪些书」用 `rag_tools(op="status")` 拿分区与文档清单，不要对这种清单问题用 `op="search"`（语义检索只返回片段、答非所问）；
+- 知识库：**只要意图是罗列/清点已索引文档（有哪些文档、列出所有文档、具体都有哪些、各分区收录了什么、收录了哪些书，无论措辞）一律 `rag_tools(op="status")`**——它返回每个分区的名字和全部文档名；绝不能用 `op="search"`（只返回片段，答非所问）或 `op="outline"`（只看单本大纲，且只接受具体文档名，传分区名必然失败）。
   问具体书/文档的内容（如「X 主要讲什么」）才先 `rag_tools(op="outline")` 看大纲，再 `rag_tools(op="search")` 补细节；
   其它领域性/知识性问题才直接 `rag_tools(op="search")` 跨全部分区检索，默认覆盖所有挂载分区，不传 source 限定单个文档名，不凭文档名列表判定「没覆盖」就改走联网（窄规则见每轮知识库说明）；问整体搜前言/导论、问具体章节搜该章（勿 scattershot）；单次 outline 后 `rag_tools(op="search")` 至多 3 次且目标互异（内核硬上限）。
 - 外置经验：先 `skill_tools(op="semantic_search")`、无果再 `skill_tools(op="search")`、命中后 `skill_tools(op="load")`；只有计划至少 3 步、用户中途纠正或补充要求、且全部步骤完成后才可 `skill_tools(op="save")`，一轮完成/定时/无人值守任务不保存（内核拒绝）。浏览全部用 `op="list"`。

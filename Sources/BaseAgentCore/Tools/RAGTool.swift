@@ -126,13 +126,13 @@ public final class RagSearchTool: AgentTool {
 /// 文档大纲工具：等价于 Python `RagOutlineTool`。
 public final class RagOutlineTool: AgentTool {
     public let name = "rag_outline"
-    public let description = "查看已索引文档的章节结构（目录）与内容摘要，用于先整体了解一本书再定位细节；不传 book_name 时列出全部已索引文档。章节标题/摘要是向量库索引内容、不是磁盘文件路径，无需再找原文件。此说明只针对知识库文档，不影响 web_scan / file_tools / shell_run 等其它工具。"
+    public let description = "查看**某一本已知文档**的章节结构（目录）与全书/章节摘要：先整体了解这本书再决定搜哪一章。book_name 传具体文档名（支持部分匹配）。不要用它列文档清单或清点分区收录了哪些书——那是 rag_tools(op=\"status\") 的职责。章节标题/摘要是向量库索引内容、不是磁盘文件路径，无需再找原文件。此说明只针对知识库文档，不影响 web_scan / file_tools / shell_run 等其它工具。"
     public let parameters: JSONValue = .object([
         "type": .string("object"),
         "properties": .object([
             "book_name": .object([
                 "type": .string("string"),
-                "description": .string("文档名称（支持部分匹配）；留空则列出所有文档"),
+                "description": .string("要查看大纲的具体文档名（支持部分匹配）；列文档清单请用 rag_tools(op=\"status\")"),
             ]),
         ]),
         "required": .array([]),
@@ -200,7 +200,12 @@ public final class RagOutlineTool: AgentTool {
             lines.append(contentsOf: ambiguousLines)
             return ragToolOK(lines.joined(separator: "\n"))
         }
-        return .fail("未找到文档: \(name)")
+        // 失败时也给出路：模型常把分区名（社会/自然/历史）或「全部文档」
+        // 这类清单意图当成 book_name 传进来，直接 .fail 会让它反复重试
+        // outline 直到轮次耗尽。明确指向 status，一次就能自纠。
+        return .fail("未找到文档: \(name)。若你想列出/清点已索引文档（含分区名如「\(name)」），"
+            + "请改用 rag_tools(op=\"status\")，它返回每个分区的文档名清单；"
+            + "本工具只接具体文档名看单本大纲。")
     }
 
     // MARK: - 输出
@@ -314,7 +319,7 @@ public final class RagOutlineTool: AgentTool {
 /// 知识库状态工具：等价于 Python `RagStatusTool`。
 public final class RagStatusTool: AgentTool {
     public let name = "rag_status"
-    public let description = "查看知识库索引状态：知识库目录、RAG 目录、切片数、已索引文件列表。"
+    public let description = "查看知识库清单与索引状态：**任何罗列/清点已索引文档的问句（有哪些文档、列出所有文档、各分区收录了什么、具体都有哪些书）一律用本工具**，它返回每个分区的名字、切片数和全部文档名清单；另含 RAG 目录、向量后端等状态。这是清单类问题的唯一正确入口，不要用 op=\"search\"（只返回片段）或 op=\"outline\"（只看单本大纲）。"
     public let parameters: JSONValue = .object([
         "type": .string("object"),
         "properties": .object([:]),

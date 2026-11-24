@@ -58,6 +58,19 @@ final class SystemPromptContractTests: XCTestCase {
         }
     }
 
+    /// 清单类问题必须锁定 status：引导文本不能再用枚举式问句，也不能宣传
+    /// outline 的「列出全部文档」能力，否则模型把分区名当 book_name 反复失败。
+    func testDocumentListRoutingPointsToStatusOnly() {
+        XCTAssertTrue(BASE_SYSTEM_PROMPT.contains("一律 `rag_tools(op=\"status\")`"),
+                      "BASE 应给出清单意图的规则式引导")
+        XCTAssertFalse(BASE_SYSTEM_PROMPT.contains("问「知识库里有什么"),
+                       "BASE 不应再依赖枚举式问句")
+        XCTAssertTrue(KNOWLEDGE_BASE_HINT.contains("清单类意图"),
+                      "动态提示应给出清单意图规则")
+        XCTAssertTrue(KNOWLEDGE_BASE_HINT.contains("只接具体文档名看单本大纲"),
+                      "动态提示应限定 outline 用途")
+    }
+
     /// 旧工具名与「全局禁令」措辞不得回流（历史事故：模型把它泛化成能力边界，
     /// 连 web_scan 都不敢调，反问用户「我是本地 agent，没有访问外网的权限」）。
     func testNoLegacyToolNamesOrGlobalBans() {
