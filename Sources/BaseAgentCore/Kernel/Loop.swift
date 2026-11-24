@@ -233,6 +233,12 @@ public final class KernelLoop {
     private var fallbackToolText = ""
     private var planNudged = 0
     private var planFinishNudge = 0
+    /// 本段内 update_plan(create) 调用失败的次数。工具层已兼容缺 op 的旧
+    /// 格式，这里的失败通常是 goal/steps 缺失等真实错误；纠正提示先于
+    /// 内核代建生效，避免一失败就把计划锁死成固定的两步模板。
+    private var planCreateFailures = 0
+    /// 代建前的纠正预算：失败后给模型几次带正确示例的重试机会。
+    private let maxPlanCreateCorrections = 2
     /// 连续「只描述计划 / 只声明要开工」却零工具调用的轮数。
     private var intentStall = 0
     /// 规划提示是否已在本段注入过（一段只注入一次）。
@@ -375,6 +381,7 @@ public final class KernelLoop {
         fallbackToolText = ""
         planNudged = 0
         planFinishNudge = 0
+        planCreateFailures = 0
         intentStall = 0
         planGateHintInjected = false
         dynamicContextInjected = false
@@ -474,12 +481,12 @@ public final class KernelLoop {
             // 一遍，而 pending 会写进 rec.prompt 永久留在历史里，越重试
             // 上下文越长（实测 3614→5689 字符）。意图空转期间也不注入，
             // 避免与「直接调用工具」的指令互相打架。
-            // 内核代建计划后的「立即执行」强指令：专治「反复描述计划不调工具」
-            // 的空转。isMultistep 任务已由代建分支接管，这里不再注入 planGateHint，
-            // 避免「先登记」提示诱发规划焦虑。
+            // 多步任务同样需要「先建计划」的一次性提示：代建已降级为纠正
+            // 预算耗尽后的最后兜底，不能再靠代建接管。意图空转（intentStall>0）
+            // 时跳过，避免与「直接调工具」的强指令打架。
             if toolsEnabled && session.getPlan() == nil && !didWork
                 && intentStall == 0 && !planGateHintInjected
-                && !isSimpleInput(userInput) && !isMultistep(userInput) {
+                && !isSimpleInput(userInput) {
                 pending += planGateHint
                 planGateHintInjected = true
             }
@@ -1115,30 +1122,10 @@ public final class KernelLoop {
             // ---- 规划前置门：先于执行 ----
             let hasActual = toolCalls.contains { $0.name != "update_plan" }
             let hasPlanOp = toolCalls.contains { $0.name == "update_plan" }
-            // 计划面板保障：多步任务（isMultistep 命中，或已实际发出工具调用）
-            // 而模型尚未自觉建计划时，内核代建一条最小计划并同步面板/落盘。
-            // 旧实现只在「已发工具调用」后才代建，导致「先规划」提示诱发
-            // 的空转场景（模型反复描述计划却零工具调用）永远建不起计划、面板
-            // 始终为空。代建**不拦截执行**，只保证面板有内容、进度可见、反思
-            // 门与收尾判定有据可依；模型随后仍可 update_plan 覆盖或细化。
-            if toolsEnabled, session.getPlan() == nil,
-               (hasActual || isMultistep(userInput)), !hasPlanOp {
-                let plan = Plan(goal: String(userInput.prefix(80)), steps: [
-                    PlanStep(id: "1",
-                             title: "立即调用工具获取真实数据（如 web_scan / rag_tools(op=\"search\")）",
-                             status: "doing"),
-                    PlanStep(id: "2", title: "基于工具结果整理并给出最终答复",
-                             status: "pending"),
-                ])
-                session.setPlan(plan)
-                do {
-                    try PlanStore.save(plan, config: config)
-                } catch {
-                    AgentLog.warning("[kernel] 计划落盘失败: \(error.localizedDescription)")
-                }
-                callbacks.onPlanUpdated(plan)
-                log("[kernel] 多步任务模型未建计划，内核代建最小计划（不拦截工具执行）")
-            }
+            // 代建已降级为最后兜底：工具结果回来后先看 update_plan 是否成功、
+            // 失败则先用带正确示例的纠正提示给模型重试机会；预算耗尽仍无
+            // 计划才在这里/结果后补一条最小计划。不再「一看到工具调用就代建」，
+            // 否则计划面板永远是那两步模板，模型自己的多步计划再也长不出来。
 
             // ---- 大纲后检索次数硬上限（默认 3）----
             // 每次 `rag_tools(op="outline")` 开启新一轮「检索预算」并清零；超出上限的 `rag_tools(op="search")`
@@ -1236,6 +1223,49 @@ public final class KernelLoop {
             // 把它重置之前，被「未充分尝试就 blocked」的守卫读走。
             let stepFailsBefore = stepFails
             let batch = trackFailures(toolCalls, rawResults)
+
+            // ---- 计划保障：纠正优先，内核代建只作最后兜底 ----
+            // 每轮工具结果回来后检查计划是否落地。没落地时先给模型带正确
+            // 示例的纠正提示（并回带 update_plan 的真实错误），预算耗尽才
+            // 代建固定两步计划。旧实现一看到工具调用就代建，导致计划面板
+            // 永远是那两步模板；这里把顺序倒过来。
+            var planCorrectionHint: String?
+            if toolsEnabled, session.getPlan() == nil,
+               (hasActual || isMultistep(userInput)) {
+                planCreateFailures += 1
+                if planCreateFailures <= maxPlanCreateCorrections {
+                    let planError = toolCalls.enumerated().compactMap { idx, tc -> String? in
+                        guard tc.name == "update_plan", idx < rawResults.count,
+                              !rawResults[idx].success else { return nil }
+                        return rawResults[idx].output
+                    }.first ?? ""
+                    let remaining = maxPlanCreateCorrections - planCreateFailures + 1
+                    planCorrectionHint = """
+                    [System] 这是一项多步任务，但 Session 里还没有执行计划——反思门和收尾判定都依赖它。
+                    请立即登记计划：update_plan({"op":"create","goal":"一句话目标","steps":["步骤1：具体动作","步骤2：验证或下一步"]})。
+                    op 必填；steps 至少 2 个具体可验证的步骤，不要写「调用工具」「整理答复」这类空泛步骤。
+                    \(planError.isEmpty ? "" : "刚才 update_plan 失败：\(String(planError.prefix(200)))\n")
+                    剩余纠正机会 \(remaining) 次；耗尽后内核才会代建一个笼统的最小计划。
+                    """
+                    log("[kernel] 计划纠正 \(planCreateFailures)/\(maxPlanCreateCorrections)，暂不代建")
+                } else {
+                    let plan = Plan(goal: String(userInput.prefix(80)), steps: [
+                        PlanStep(id: "1",
+                                 title: "立即调用工具获取真实数据（如 web_scan / rag_tools(op=\"search\")）",
+                                 status: "doing"),
+                        PlanStep(id: "2", title: "基于工具结果整理并给出最终答复",
+                                 status: "pending"),
+                    ])
+                    session.setPlan(plan)
+                    do {
+                        try PlanStore.save(plan, config: config)
+                    } catch {
+                        AgentLog.warning("[kernel] 计划落盘失败: \(error.localizedDescription)")
+                    }
+                    callbacks.onPlanUpdated(plan)
+                    log("[kernel] 计划纠正耗尽，内核代建最小计划（最后兜底）")
+                }
+            }
             // 记录成功签名：成功返回的调用，下次原样重发时在 preset 阶段直接拦截。
             for (i, tc) in toolCalls.enumerated() {
                 if i < rawResults.count, rawResults[i].success {
@@ -1399,8 +1429,11 @@ public final class KernelLoop {
             parts.append(contentsOf: recoveryHints(toolCalls, rawResults,
                                                    batch: batch,
                                                    stepFailsBefore: stepFailsBefore))
-            // 补建提示：已开始执行但 plan 仍空 → 提醒补建计划（兜底）。
-            if didWork && session.getPlan() == nil && planNudged < planNudgeMax {
+            // 纠正提示优先：已带正确示例与真实错误，不再叠加泛泛的补建提醒，
+            // 避免同一轮两条近乎重复的长指令挤占上下文、诱发规划焦虑。
+            if let hint = planCorrectionHint {
+                parts.append(hint)
+            } else if didWork && session.getPlan() == nil && planNudged < planNudgeMax {
                 planNudged += 1
                 parts.append("""
                 [System] 你已经开始执行但 Session 中还没有执行计划（plan 为空）——后续多步任务将没有进度可跟踪。请立即用 update_plan(op='create', goal=..., steps=[...]) 把目标和已完成/待做步骤登记为计划；之后每完成一步用 update_plan(op='patch', step_id=..., status='done', note='结论') 更新进度。计划每轮回注，是跟踪推进的依据。
@@ -2659,6 +2692,7 @@ public final class KernelLoop {
         fallbackToolText = ""
         planNudged = 0
         planFinishNudge = 0
+        planCreateFailures = 0
         intentStall = 0
         planGateHintInjected = false
         dynamicContextInjected = false

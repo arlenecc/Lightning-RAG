@@ -81,7 +81,7 @@ final class QwenXMLToolGrammarTests: XCTestCase {
         _ = try constraint.commitToken(4) // >
         mask = try constraint.computeMask()
         XCTAssertTrue(bit(mask.mask, 5), "应允许 <parameter=")
-        XCTAssertTrue(bit(mask.mask, 9), "零参数时也应允许直接闭合")
+        XCTAssertFalse(bit(mask.mask, 9), "query 是 required，不允许零参数直接闭合")
 
         _ = try constraint.commitToken(5) // <parameter=
         mask = try constraint.computeMask()

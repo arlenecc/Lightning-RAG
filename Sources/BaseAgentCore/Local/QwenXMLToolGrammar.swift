@@ -25,6 +25,10 @@ enum QwenXMLToolGrammar {
     private struct ToolSpec {
         let name: String
         let keys: [String]
+        /// 必须出现的参数名（schema 的 `required`，按声明顺序）。xgrammar 的
+        /// 工具调用语法若不强制必填项，小模型常输出缺 `op` 的旧格式调用，
+        /// 工具层虽然兼容，但这里补齐能让模型第一下就生成正确结构。
+        let required: [String]
     }
 
     static func make(tools: [JSONValue]) -> String? {
@@ -32,11 +36,17 @@ enum QwenXMLToolGrammar {
             guard let function = tool["function"]?.objectValue,
                   let name = function["name"]?.stringValue, !name.isEmpty else { return nil }
             var keys: [String] = []
+            var required: [String] = []
             if let parameters = function["parameters"]?.objectValue,
                let properties = parameters["properties"]?.objectValue {
                 keys = properties.keys.sorted()
+                if let declared = parameters["required"]?.arrayValue {
+                    let valid = Set(keys)
+                    required = declared.compactMap { $0.stringValue }
+                        .filter { valid.contains($0) }
+                }
             }
-            return ToolSpec(name: name, keys: keys)
+            return ToolSpec(name: name, keys: keys, required: required)
         }
         guard !specs.isEmpty else { return nil }
 
@@ -47,18 +57,32 @@ enum QwenXMLToolGrammar {
         ]
         for (index, spec) in specs.enumerated() {
             let paramRule = "param\(index)"
-            let alternatives = spec.keys.map { key in
+            // 必填项独立成产生式并在 call 里强制展开一次；其余仍走
+            // 可重复的 paramRule。必填项自身也从 paramRule 的候选里排除，
+            // 避免同一参数被输出两次（如两个 <parameter=op>）。
+            let optionalKeys = spec.keys.filter { !spec.required.contains($0) }
+            let optionalAlternatives = optionalKeys.map { key in
                 "\"\(escape(key))\""
             }.joined(separator: " | ")
-            lines.append("call\(index) ::= \"\(escape(spec.name))\" ws \">\" ws "
-                + "\(paramRule)* \"</function>\" ws \"</tool_call>\"")
-            if alternatives.isEmpty {
-                // 无参数工具：给一个不可达的产生式，保持规则集合合法。
-                lines.append("\(paramRule) ::= \"\\u0000\"")
-            } else {
-                lines.append("\(paramRule) ::= \"<parameter=\" (\(alternatives)) ws \">\" ws "
+            var callBody = "\"\(escape(spec.name))\" ws \">\" ws"
+            for (reqIndex, key) in spec.required.enumerated() {
+                let reqRule = "req\(index)_\(reqIndex)"
+                callBody += " \(reqRule)"
+                lines.append("\(reqRule) ::= \"<parameter=\" \"\(escape(key))\" ws \">\" ws "
                     + "value \"</parameter>\" ws")
             }
+            if optionalAlternatives.isEmpty {
+                // 无可选参数：不给 paramRule 任何可产出分支；若连必填项也没有，
+                // 用不可达产生式保持规则集合合法。
+                if spec.required.isEmpty {
+                    lines.append("\(paramRule) ::= \"\\u0000\"")
+                }
+            } else {
+                lines.append("\(paramRule) ::= \"<parameter=\" (\(optionalAlternatives)) ws \">\" ws "
+                    + "value \"</parameter>\" ws")
+                callBody += " \(paramRule)*"
+            }
+            lines.append("call\(index) ::= \(callBody) \"</function>\" ws \"</tool_call>\"")
         }
         return lines.joined(separator: "\n")
     }

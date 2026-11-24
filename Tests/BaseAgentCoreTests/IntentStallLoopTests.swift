@@ -349,27 +349,34 @@ final class IntentStallLoopTests: XCTestCase {
         XCTAssertGreaterThanOrEqual(state.executed.count, 0)
     }
 
-    /// 计划面板保障：模型从不 update_plan、直接发工具调用时，内核必须代建
-    /// 最小计划并回调面板；工具照常执行、收尾后计划自动标完成。
+    /// 计划面板保障：模型连续多轮不建计划时，内核先给带正确示例的纠正
+    /// 提示（计划面板保持为空），纠正预算耗尽后才代建最小计划；代建不
+    /// 拦截工具执行，收尾后计划自动标完成。
     func testKernelAutoCreatesPlanForMultistepTask() async {
         let state = State()
         let plans = PlanCollector()
         let callbacks = PlanRecordingCallbacks(plans: plans)
-        let call = ToolCall(id: "c1", name: "web_scan",
-                            arguments: ["url": .string("https://cnn.com")])
         let loop = makeLoop(state,
                             reply: { index in
-                                index == 1 ? self.callStream(call)
-                                    : self.textStream("已完成：CNN 今日要闻共 3 条。")
+                                if index <= 3 {
+                                    let call = ToolCall(
+                                        id: "c\(index)", name: "web_scan",
+                                        arguments: ["url": .string("https://cnn.com/\(index)")])
+                                    return self.callStream(call)
+                                }
+                                return self.textStream("已完成：CNN 今日要闻共 3 条。")
                             },
                             callbacks: callbacks)
         let result = await loop.run(
             "请按步骤获取 cnn.com 今日新闻并总结", toolsEnabled: true)
 
-        XCTAssertEqual(state.executed, ["web_scan"],
+        XCTAssertEqual(state.executed, ["web_scan", "web_scan", "web_scan"],
             "代建计划不得拦截工具执行：\(state.executed)")
+        let prompts = state.prompts
+        XCTAssertTrue(prompts.dropFirst().contains { $0.contains("剩余纠正机会") },
+            "代建前应先给纠正提示：\(prompts)")
         XCTAssertGreaterThanOrEqual(plans.snapshot().count, 1,
-            "计划面板应收到代建计划：\(plans.snapshot().count)")
+            "纠正预算耗尽后计划面板应收到代建计划：\(plans.snapshot().count)")
         let created = plans.snapshot().first
         XCTAssertTrue(created?.goal.hasPrefix("请按步骤获取") == true,
             "goal 应来自用户输入：\(created?.goal ?? "?")")

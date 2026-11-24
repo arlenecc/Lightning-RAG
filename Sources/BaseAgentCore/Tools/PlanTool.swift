@@ -115,9 +115,29 @@ public final class UpdatePlanTool: AgentTool {
 
     public func run(_ args: [String: JSONValue]) async throws -> ToolResult {
         do {
-            let op = try ToolSupport.requireString(args, "op")
+            // 兼容旧格式：小模型（含 Qwen3.5-4B）常把 op 漏掉，直接按
+            // update_plan({goal, steps}) / update_plan({step_id, status, note})
+            // 调用。这类调用的意图没有歧义，旧格式本身也能被 schema 的其它
+            // 字段区分，所以按对应 op 推断执行，而不是直接抛
+            // "missing required argument: op" —— 那会让本轮计划落空、内核
+            // 随后代建固定两步计划，计划面板再也长不出多步。
+            let rawOp = ToolSupport.optionalString(args, "op")?
                 .trimmingCharacters(in: .whitespacesAndNewlines)
-                .lowercased()
+                .lowercased() ?? ""
+            let op: String
+            if rawOp.isEmpty {
+                if args["goal"] != nil || args["steps"] != nil {
+                    op = "create"
+                    AgentLog.info("[plan] 兼容旧格式 update_plan(goal,steps)，按 op=create 处理")
+                } else if args["step_id"] != nil || args["status"] != nil || args["note"] != nil {
+                    op = "patch"
+                    AgentLog.info("[plan] 兼容旧格式 update_plan(step_id,status,note)，按 op=patch 处理")
+                } else {
+                    throw ToolError.message("missing required argument: op")
+                }
+            } else {
+                op = rawOp
+            }
             let goal = ToolSupport.optionalString(args, "goal") ?? ""
             let stepsValue = parseStepsValue(args["steps"])
             let stepID = (ToolSupport.optionalString(args, "step_id") ?? "")
