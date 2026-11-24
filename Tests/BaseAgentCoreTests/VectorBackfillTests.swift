@@ -55,6 +55,34 @@ final class VectorBackfillTests: XCTestCase {
         XCTAssertEqual(store.count, 2, "重复回填不应产生重复行")
     }
 
+    /// 回归：int8 模式下 vec0 二值表不支持 rowid 点查，签名齐全的库曾被
+    /// enqueueMissingVectors 全部误判为缺失、启动即全量回填抢占 GPU。
+    /// 签名覆盖率计数齐全时不得入队任何回填任务。
+    func testEnqueueSkipsWhenBinarySignaturesComplete() throws {
+        let path = directory.appendingPathComponent("int8-index.sqlite").path
+        let makeInt8Store = {
+            try VectorStore(dbPath: path, dimension: 4, enableSQLiteVec: true,
+                            elementType: .int8, binaryDimension: 8,
+                            binarySource: "test-signing", indexFingerprint: "fp-int8")
+        }
+        do {
+            let store = try makeInt8Store()
+            let chunks = (0..<3).map {
+                Chunk(text: "doc \($0) content", source: "book.pdf", chunkIndex: $0)
+            }
+            let vectors = (0..<3).map { _ in [Float](repeating: 0.5, count: 4) }
+            let signatures = (0..<3).map { _ in Data([0b1010_1010]) }
+            try store.add(chunks: chunks, vectors: vectors, binarySignatures: signatures)
+            XCTAssertEqual(store.binaryIndexStatus().rows, 3)
+        }
+        // 重开（模拟启动）：签名齐全，不应误判入队。
+        let reopened = try makeInt8Store()
+        XCTAssertEqual(reopened.count, 3)
+        XCTAssertEqual(reopened.enqueueMissingVectors(limit: 100), 0,
+                       "签名齐全时不应把已有切片误判为缺向量/缺签名")
+        XCTAssertEqual(reopened.pendingVectorCount(), 0)
+    }
+
     func testPendingSurvivesReopen() throws {
         do {
             let store = try makeStore()

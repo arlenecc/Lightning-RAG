@@ -724,15 +724,23 @@ public final class VectorStore: @unchecked Sendable {
         lock.lock(); defer { lock.unlock() }
         guard rebuildReason == nil else { return 0 }
         // 两类缺口都要补：① 缺向量；② 二值粗筛开启时缺 bin 签名（有向量但没签名）。
-        // 只补①会让历史签名缺失的切片永远凑不齐 binaryRows==chunkRows，
-        // isComplete 恒为 false → ANN 目标退回 dense，二值 ANN 永远构建不了。
+        // 关键：vec0 二值表（bit 量化）不支持 `WHERE rowid = ?` 点查，也不支持
+        // `SELECT rowid FROM 表` 全表扫描（实测均返回空），只有 KNN MATCH 可用。
+        // 旧实现的 NOT EXISTS 点查会把已齐全的库全部误判为缺签名：启动即入队
+        // 1925 条回填，抢占 GPU 让主模型 tps 从 16 掉到 2~5。改用代码维护的
+        // binary_rows 计数器判定：>= chunks 即视为覆盖齐全，跳过签名扫描；
+        // 真缺签名时（dimension/source 变化）setupBinaryIndexLocked 会把
+        // binary_rows 归零，下面仍会正常入队补齐。
         let missingVectorSQL = """
             SELECT c.rowid, c.source, c.chunk_index
             FROM \(Self.chunksTable) c
             WHERE (
                 NOT EXISTS (SELECT 1 FROM \(Self.vectorTable) v WHERE v.rowid = c.rowid)
             """
-        let missingSignatureSQL = binaryStorageEnabled ? """
+        let chunkTotal = cachedChunkCount ?? maxRowIDLocked
+        let signatureComplete = binaryStorageEnabled && chunkTotal > 0
+            && binaryRows >= chunkTotal
+        let missingSignatureSQL = (binaryStorageEnabled && !signatureComplete) ? """
                 OR NOT EXISTS (SELECT 1 FROM \(Self.binaryVectorTable) b WHERE b.rowid = c.rowid)
             """ : ""
         let tailSQL = """
