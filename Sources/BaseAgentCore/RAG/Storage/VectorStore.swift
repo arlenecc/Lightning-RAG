@@ -1,6 +1,18 @@
 import Foundation
 import CryptoKit
 
+/// 二值签名位宽与库声明不一致：签名来自当前 provider（其位宽才是正确位宽），
+/// bin 表是旧位宽建的。回填调度捕获后应重建 store，重建时 bin 表会按当前
+/// 位宽 DROP/重建并归零计数，主向量数据不受影响。
+struct BinarySignatureWidthMismatchError: Error, CustomStringConvertible {
+    let signatureBytes: Int
+    let declaredBytes: Int
+
+    var description: String {
+        "二值签名位宽与库不一致：签名 \(signatureBytes) 字节 != 库声明 \(declaredBytes) 字节"
+    }
+}
+
 /// SQLite + sqlite-vec 向量库。
 ///
 /// 设计要点（对应原 LanceDB 实现的替换方案）：
@@ -731,17 +743,21 @@ public final class VectorStore: @unchecked Sendable {
         // binary_rows 计数器判定：>= chunks 即视为覆盖齐全，跳过签名扫描；
         // 真缺签名时（dimension/source 变化）setupBinaryIndexLocked 会把
         // binary_rows 归零，下面仍会正常入队补齐。
+        // 主向量的缺失检查同理：vec0 虚拟表的 rowid 点查不可靠（手动补做
+        // 曾把 1925 条已回填切片全部重新入队；二值表的点查同样如此）。vec0
+        // 为每张虚拟表自动维护影子表 `*_rowids`（普通表、可正常点查）：
+        // 存在时优先用它判定；不存在（旧版扩展/非 vec0 存储）时回退主表点查。
         let missingVectorSQL = """
             SELECT c.rowid, c.source, c.chunk_index
             FROM \(Self.chunksTable) c
             WHERE (
-                NOT EXISTS (SELECT 1 FROM \(Self.vectorTable) v WHERE v.rowid = c.rowid)
+                \(missingRowCheckLocked(virtualTable: Self.vectorTable))
             """
         let chunkTotal = cachedChunkCount ?? maxRowIDLocked
         let signatureComplete = binaryStorageEnabled && chunkTotal > 0
             && binaryRows >= chunkTotal
         let missingSignatureSQL = (binaryStorageEnabled && !signatureComplete) ? """
-                OR NOT EXISTS (SELECT 1 FROM \(Self.binaryVectorTable) b WHERE b.rowid = c.rowid)
+                OR \(missingRowCheckLocked(virtualTable: Self.binaryVectorTable))
             """ : ""
         let tailSQL = """
             )
@@ -768,6 +784,22 @@ public final class VectorStore: @unchecked Sendable {
             AgentLog.info("VectorStore: 补入 \(added) 条缺失向量到回填队列")
         }
         return added
+    }
+
+    /// vec0 虚拟表的 rowid 缺失判定（须持锁调用）。
+    ///
+    /// vec0 虚拟表不支持 `WHERE rowid = ?` 点查（实测返回空），只有 KNN MATCH
+    /// 可用；而它自动维护的影子表 `<表名>_rowids` 是普通表、可正常点查。
+    /// 影子表存在时用 `NOT EXISTS 影子表` 判缺失；不存在（旧版扩展/非 vec0
+    /// 存储的普通表）时回退主表点查——普通表的点查是可靠的。
+    private func missingRowCheckLocked(virtualTable: String) -> String {
+        let shadow = "\(virtualTable)_rowids"
+        let shadowExists = !((try? db.query(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+            [.text(shadow)])) ?? []).isEmpty
+        return shadowExists
+            ? "NOT EXISTS (SELECT 1 FROM \(shadow) v WHERE v.rowid = c.rowid)"
+            : "NOT EXISTS (SELECT 1 FROM \(virtualTable) v WHERE v.rowid = c.rowid)"
     }
 
     /// 待回填的一批：rowid + 正文文本（供后台计算 embedding）。
@@ -803,13 +835,16 @@ public final class VectorStore: @unchecked Sendable {
         guard vector.count == dimension else {
             throw AgentError.storage("回填向量维度 \(vector.count) != \(dimension)")
         }
-        if let binarySignature, binaryStorageEnabled {
-            let expected = binaryDimension / 8
-            guard binarySignature.count == expected else {
-                throw AgentError.storage("回填二值签名字节数 \(binarySignature.count) != \(expected)")
-            }
-        }
         lock.lock(); defer { lock.unlock() }
+        // 签名位宽与库声明不一致（旧库 bin 表位宽 != 当前 provider 签名位宽）：
+        // 不降级停用——签名来自当前 provider，其位宽才是正确位宽。抛出专用
+        // 错误，由回填调度重建 store：重建时 setupBinaryIndexLocked 会按当前
+        // 位宽重建 bin 表并归零计数，随后回填把签名补齐，二值粗筛恢复完整。
+        let signature = binarySignature
+        if let sig = signature, binaryStorageEnabled, sig.count != binaryDimension / 8 {
+            throw BinarySignatureWidthMismatchError(signatureBytes: sig.count,
+                                                    declaredBytes: binaryDimension / 8)
+        }
         try withChunkCounterRollback {
             try db.transaction {
                 // 幂等：重启续做时同一 rowid 可能被重复回填，先删再插避免重复行。
@@ -821,13 +856,13 @@ public final class VectorStore: @unchecked Sendable {
                     "INSERT INTO \(Self.vectorTable)(rowid, embedding) VALUES(?, \(expression))",
                     [.int(rowid), .blob(blob)])
                 try upsertRerankVector(rowID: rowid, blob: blob)
-                if binaryStorageEnabled, let binarySignature {
+                if binaryStorageEnabled, let signature {
                     // 先判断是否已有 bin 行，避免重复回填把计数算重。
                     let existed = (try? db.scalar(
                         "SELECT 1 FROM \(Self.binaryVectorTable) WHERE rowid = ?",
                         [.int(rowid)]).intValue) != nil
                     try db.execute("DELETE FROM \(Self.binaryVectorTable) WHERE rowid = ?", [.int(rowid)])
-                    try insertBinarySignature(rowID: rowid, signature: binarySignature)
+                    try insertBinarySignature(rowID: rowid, signature: signature)
                     if !existed { binaryRows += 1 }
                     try persistBinaryCounterLocked()
                 }

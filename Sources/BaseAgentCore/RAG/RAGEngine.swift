@@ -942,7 +942,25 @@ public final class RAGEngine {
 
     private func ensureStore() throws -> VectorStore {
         storeLock.lock(); defer { storeLock.unlock() }
-        if let store { return store }
+        if let existing = store {
+            // 防漂移：embedding 实例/配置变化后（签名位宽或来源不同），缓存 store
+            // 的 bin 表位宽已不代表当前 provider——继续写入必然报维度错误。关闭
+            // 重建：setupBinaryIndexLocked 按当前位宽重建 bin 表并归零计数，
+            // 主向量数据不受影响，回填随后补齐签名。
+            let declaredDimension = binarySignatureDimension
+            let declaredSource = binarySignatureSource
+            if existing.binaryDimension != declaredDimension
+                || (declaredDimension > 0 && existing.binarySource != declaredSource) {
+                AgentLog.warning("RAG: 已打开库的二值位宽/来源（\(existing.binaryDimension)位/"
+                    + "\(existing.binarySource.isEmpty ? "-" : existing.binarySource)）与当前"
+                    + " embedding（\(declaredDimension)位/"
+                    + "\(declaredSource.isEmpty ? "-" : declaredSource)）不一致，重建向量库对齐")
+                existing.close()
+                store = nil
+            } else {
+                return existing
+            }
+        }
         guard let embedding else {
             throw AgentError.storage("embedding 模型不可用，无法打开向量库；请检查 local_embedding_model 配置")
         }
@@ -1181,6 +1199,20 @@ public final class RAGEngine {
         }
         // 注意：reload 在每次同步结束都会调用，ColBERT 服务刻意保持常驻（预热意图），
         // 不随 reload 释放；仅在 close/deinit（切换配置/销毁引擎）时显式 shutdown。
+        searchLock.lock(); defer { searchLock.unlock() }
+        storeLock.lock()
+        store?.close()
+        store = nil
+        metadataStore?.close()
+        metadataStore = nil
+        storeLock.unlock()
+    }
+
+    /// 二值签名位宽与库不一致时的对齐重建：丢弃当前 store，下次 ensureStore
+    /// 按当前 embedding 的位宽重建 bin 表（setupBinaryIndexLocked），主向量
+    /// 数据不受影响。不同于 close()/reload()，这里不停回填服务——回填闭包
+    /// 下一轮会自然拿到重建后的新 store。
+    private func discardStoreForBinaryRealignment() {
         searchLock.lock(); defer { searchLock.unlock() }
         storeLock.lock()
         store?.close()
@@ -1803,6 +1835,14 @@ public final class RAGEngine {
                         try writeStore.fillPendingVector(rowid: item.rowid, vector: vectors[i],
                                                          binarySignature: signatures?[i])
                         done += 1
+                    } catch let mismatch as BinarySignatureWidthMismatchError {
+                        // 位宽不一致不降级：签名来自当前 provider，其位宽才是正确位宽。
+                        // 丢弃旧 store 并按当前配置重建（bin 表按当前签名位宽重建、
+                        // 计数归零），本批剩余条目保持 pending 由后续批次补齐。
+                        AgentLog.warning("[backfill] \(mismatch)，重建向量库对齐二值位宽；"
+                            + "rowid=\(item.rowid) 及本批剩余条目待下轮重试")
+                        discardStoreForBinaryRealignment()
+                        break
                     } catch {
                         // 单条失败退避重试（2s，排到队尾），不永久丢弃、不饿死后续切片。
                         // 若连接刚被关闭，重新取连接再退避，避免对已关闭库执行 UPDATE。

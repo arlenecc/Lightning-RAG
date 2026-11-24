@@ -1133,10 +1133,38 @@ public final class KernelLoop {
             var executeCalls: [ToolCall] = []
             var preset: [Int: ToolResult] = [:]
             var liveCount = ragSearchCount
+            // 硬护栏命中的纠正提示：不能直接写 pending（批次结束会被 parts 整体重建覆盖），
+            // 先暂存，批次收尾时并入 parts。
+            var retrievalSkipWarning: String?
             for (i, tc) in toolCalls.enumerated() {
                 let sig = callSig(tc)
                 let tcOp = tc.arguments["op"]?.stringValue ?? ""
                 let isRagOutline = tc.name == "rag_tools" && tcOp == "outline"
+                // 硬护栏：本次任务至今没有任何成功的检索结果时，不允许把
+                // 检索类计划步骤标 skipped——跳过唯一的资料来源等于在零材料
+                // 情况下强行作答。拦截 patch 并注入更强的纠正提示。
+                if tc.name == "update_plan", tcOp == "patch",
+                   (tc.arguments["status"]?.stringValue ?? "")
+                       .trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "skipped",
+                   !hasSuccessfulRetrievalResult() {
+                    // 计划尚未落盘时（create+patch 同轮）退回本批 create 参数解析。
+                    let stepList = session.getPlan().map {
+                        $0.steps.map { (id: $0.id, title: $0.title) }
+                    } ?? Self.createStepTitles(in: toolCalls)
+                    if let violated = Self.retrievalSkipViolation(
+                        stepID: tc.arguments["step_id"]?.stringValue ?? "",
+                        titles: stepList) {
+                        retrievalSkipWarning = "[System] 内核已拒绝把「\(violated)」标为 skipped："
+                            + "本次任务至今没有任何成功的检索结果（RAG / web 均无）。这是目前唯一的资料来源"
+                            + "步骤，跳过它等于在没有任何材料的情况下强行作答。请立刻执行该检索步骤"
+                            + "（如 rag_tools(op=\"search\", query=…)、web_search、web_scan）；"
+                            + "只有该步骤确实无法完成时，才允许改标 blocked 并写明具体原因。"
+                        preset[i] = .fail("内核拒绝该 patch：检索步骤不允许在无任何检索结果时跳过。\n"
+                            + (retrievalSkipWarning ?? ""))
+                        log("[kernel] 硬护栏：无检索结果，拒绝 skip「\(violated)」")
+                        continue
+                    }
+                }
                 // 已经以完全相同参数失败过的调用，再执行必然还是失败。旧版只在
                 // 事后给软提示，模型仍把同一个 file_tools(read) / shell_run cat 原样
                 // 重发三次（知识库问答里读臆造的 .md 路径），整轮被耗空。
@@ -1326,7 +1354,8 @@ public final class KernelLoop {
                     for step in plan.steps
                     where step.status != "done" && step.status != "skipped" {
                         if await judge.stepNecessary(goal: plan.goal,
-                                                     step: step.title) == false {
+                                                     step: step.title,
+                                                     context: toolEvidenceSummary()) == false {
                             unnecessary.append(step.title)
                         }
                     }
@@ -1442,6 +1471,8 @@ public final class KernelLoop {
             // 重复调用/计划评审提醒必须在 pending 赋值前并入，否则会被整体覆盖。
             if let repeatWarning { parts.append(repeatWarning) }
             if let planReviewWarning { parts.append(planReviewWarning) }
+            // 硬护栏拒绝 skip 检索步骤的强纠正提示。
+            if let retrievalSkipWarning { parts.append(retrievalSkipWarning) }
 
             // 决策门（生成前）：检索类工具刚返回，先判定证据是否足够，再让模型
             // 写最终答案。避免「信息不足却先花 400 token 写草稿、随后被打回」
@@ -2185,6 +2216,103 @@ public final class KernelLoop {
                     && !result.content.contains("success=false")
             }
         }
+    }
+
+    /// 本次请求里是否已有成功的检索类结果（RAG / web_search / web_scan）。
+    /// 供「拒绝跳过检索步骤」硬护栏判断材料是否已就位。
+    private func hasSuccessfulRetrievalResult() -> Bool {
+        session.turns.contains { turn in
+            turn.toolResults.contains { result in
+                guard ["rag_tools", "web_search", "web_scan"].contains(result.name) else { return false }
+                let content = result.content.trimmingCharacters(in: .whitespacesAndNewlines)
+                return !content.isEmpty
+                    && !result.content.hasPrefix("ERROR")
+                    && !result.content.contains("success=false")
+            }
+        }
+    }
+
+    /// 已成功获取的工具结果概要（每条取工具名 + 前 120 字），供计划评审的
+    /// `stepNecessary(context:)` 判断信息获取类步骤是否已有对应材料。
+    private func toolEvidenceSummary(limit: Int = 600) -> String {
+        var parts: [String] = []
+        var total = 0
+        outer: for turn in session.turns {
+            for result in turn.toolResults {
+                guard result.name != "update_plan",
+                      !result.content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                      !result.content.hasPrefix("ERROR"),
+                      !result.content.contains("success=false") else { continue }
+                let flat = result.content.replacingOccurrences(of: "\n", with: " ")
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                let line = "- \(result.name): \(String(flat.prefix(120)))"
+                if total + line.count > limit { break outer }
+                parts.append(line)
+                total += line.count
+            }
+        }
+        return parts.isEmpty ? "" : parts.joined(separator: "\n")
+    }
+
+    /// 检索/信息获取类步骤识别：标题含检索、搜索、大纲、联网等关键词。
+    static func looksLikeRetrievalStep(_ title: String) -> Bool {
+        let lower = title.lowercased()
+        let markers = ["search", "检索", "搜索", "查询", "outline", "大纲",
+                       "web_scan", "web_search", "联网", "rag", "知识库",
+                       "查阅", "查找", "收集", "获取资料", "取得资料", "读文件", "读取"]
+        return markers.contains { lower.contains($0) }
+    }
+
+    /// 硬护栏判定：patch 把检索类步骤标 skipped 时返回被跳过的步骤标题。
+    /// step_id 缺失时 PlanTool 会把第一个状态不匹配的步骤改状态，这里按
+    /// 「计划中仍有未完成检索类步骤」放宽判定——宁可多拦，不可漏拦。
+    static func retrievalSkipViolation(stepID: String,
+                                       titles: [(id: String, title: String)]) -> String? {
+        let target = stepID.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !target.isEmpty {
+            guard let step = titles.first(where: { $0.id == target }),
+                  looksLikeRetrievalStep(step.title) else { return nil }
+            return step.title
+        }
+        return titles.first(where: { looksLikeRetrievalStep($0.title) })?.title
+    }
+
+    /// 计划尚未落盘时（create+patch 同轮发出）从本批 create 参数里解析步骤标题。
+    /// steps 兼容数组（字符串/对象）与分号/换行分隔的字符串两种写法。
+    static func createStepTitles(in calls: [ToolCall]) -> [(id: String, title: String)] {
+        for call in calls where call.name == "update_plan" {
+            let op = (call.arguments["op"]?.stringValue ?? "").lowercased()
+            let isCreate = op == "create" || (op.isEmpty && call.arguments["goal"] != nil)
+            guard isCreate, let stepsValue = call.arguments["steps"] else { continue }
+            let titles: [(id: String, title: String)]
+            switch stepsValue {
+            case .array(let items):
+                titles = items.enumerated().compactMap { index, item -> (id: String, title: String)? in
+                    switch item {
+                    case .string(let text):
+                        return text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                            ? nil : (String(index + 1), text)
+                    case .object(let object):
+                        let title = object["title"]?.stringValue ?? ""
+                        return title.isEmpty ? nil : (String(index + 1), title)
+                    default:
+                        return nil
+                    }
+                }
+            case .string(let raw):
+                titles = raw
+                    .split(whereSeparator: { ";；\n，".contains($0) })
+                    .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                    .enumerated()
+                    .compactMap { index, text in
+                        text.isEmpty ? nil : (String(index + 1), text)
+                    }
+            default:
+                titles = []
+            }
+            if !titles.isEmpty { return titles }
+        }
+        return []
     }
 
     /// 意图空转且已有 RAG 结果时，把「立即调用工具」这类前置步骤标 done，

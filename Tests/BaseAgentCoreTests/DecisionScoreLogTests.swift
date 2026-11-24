@@ -42,7 +42,7 @@ final class DecisionScoreLogTests: XCTestCase {
         let judge = MeteorKernelJudge(scorer: scorer,
                                       planThreshold: 0.6, finishThreshold: 0.5)
         let lines = try await captured {
-            _ = await judge.stepNecessary(goal: "写个脚本", step: "查资料")
+            _ = await judge.stepNecessary(goal: "写个脚本", step: "查资料", context: "")
             _ = await judge.informationSufficient(task: "查知识库", evidence: "结果")
         }
         let decisionLines = lines.filter { $0.contains("[decision]") }

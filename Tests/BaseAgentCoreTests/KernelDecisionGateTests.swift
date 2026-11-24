@@ -16,7 +16,7 @@ final class KernelDecisionGateTests: XCTestCase {
     private final class StubJudge: KernelDecisionJudge, @unchecked Sendable {
         let stepNecessaryResult: Bool?
         let informationSufficientResult: Bool?
-        private(set) var stepCalls: [(goal: String, step: String)] = []
+        private(set) var stepCalls: [(goal: String, step: String, context: String)] = []
         private(set) var completeCalls: [(task: String, evidence: String)] = []
         private let lock = NSLock()
 
@@ -26,9 +26,9 @@ final class KernelDecisionGateTests: XCTestCase {
             self.informationSufficientResult = informationSufficientResult
         }
 
-        func stepNecessary(goal: String, step: String) async -> Bool? {
+        func stepNecessary(goal: String, step: String, context: String) async -> Bool? {
             lock.lock(); defer { lock.unlock() }
-            stepCalls.append((goal, step))
+            stepCalls.append((goal, step, context))
             return stepNecessaryResult
         }
 
@@ -92,6 +92,30 @@ final class KernelDecisionGateTests: XCTestCase {
         config.kernelDecisionGateMaxFinishBlocks = maxFinishBlocks
         config.kernelDecisionGateMaxPlanReviews = maxPlanReviews
         return config
+    }
+
+    /// 多轮脚本化假模型：按 `turns` 顺序逐轮发事件，超出后重复最后一轮。
+    private final class MultiTurnModel {
+        let turns: [[LLMStreamEvent]]
+        private(set) var userPrompts: [String] = []
+        var kernelLogs: [String] = []
+        private var index = 0
+
+        init(turns: [[LLMStreamEvent]]) { self.turns = turns }
+
+        func stream(_ messages: [ChatMessage]) -> AsyncThrowingStream<LLMStreamEvent, Error> {
+            userPrompts.append(messages.last { $0.role == .user }?.content ?? "")
+            let events = turns[min(index, turns.count - 1)]
+            index += 1
+            return AsyncThrowingStream { c in
+                for e in events { c.yield(e) }
+                c.finish()
+            }
+        }
+    }
+
+    private static func textAnswerTurn() -> [LLMStreamEvent] {
+        [.init(kind: .content, content: "查询完成：北京今日晴。"), .init(kind: .done)]
     }
 
     private static func toolTurnEvents() -> [LLMStreamEvent] {
@@ -403,6 +427,168 @@ final class KernelDecisionGateTests: XCTestCase {
         XCTAssertFalse(model.userPrompts.contains {
             $0.contains("决策模型认为计划中以下步骤")
         }, "全部必要时不注入修订提示")
+    }
+
+    /// stepNecessary 能看到上下文：内核把「已成功获取的工具结果概要」传给判定器，
+    /// 供其收紧「跳过信息获取步骤」的语义。
+    func testStepNecessaryReceivesEvidenceContext() async {
+        let judge = StubJudge(stepNecessaryResult: true)
+        let model = MultiTurnModel(turns: [
+            [.init(kind: .done, toolCalls: [
+                ToolCall(id: "w1", name: "web_search",
+                         arguments: ["query": .string("北京天气")]),
+            ])],
+            [.init(kind: .done, toolCalls: [Self.planCreateCall()])],
+            Self.textAnswerTurn(),
+        ])
+        let session = Session(budget: ContextBudget(total: 60_000), rawTurns: 50)
+        let runtime = KernelRuntime(
+            stream: { messages, _, _ in model.stream(messages) },
+            execute: { calls in
+                calls.map { call in
+                    if call.name == "update_plan",
+                       call.arguments["op"]?.stringValue == "create" {
+                        Self.installPlan(session: session)
+                    }
+                    return call.name == "web_search"
+                        ? .ok("北京今日晴，气温 5 到 15 摄氏度。")
+                        : .ok("工具结果：部分信息……")
+                }
+            },
+            schemas: { [] },
+            log: { model.kernelLogs.append($0) })
+        let loop = KernelLoop(runtime: runtime, config: makeConfig(),
+                              systemPrompt: { "SYS" }, session: session, maxTurns: 8)
+        loop.decisionJudge = judge
+        _ = await loop.run("北京今天的天气怎么样")
+
+        XCTAssertEqual(judge.stepCalls.count, 2, "两个未完成步骤都应被评审")
+        XCTAssertTrue(judge.stepCalls.allSatisfy { $0.context.contains("web_search") },
+                      "context 应包含已成功的 web_search 结果概要")
+        XCTAssertTrue(judge.stepCalls.contains {
+            $0.context.contains("北京今日晴")
+        }, "context 应带上工具结果内容片段")
+    }
+
+    // MARK: - 检索步骤 skip 硬护栏
+
+    /// 计划已落盘：没有任何成功检索结果时，把检索类步骤标 skipped 的 patch
+    /// 被内核拒绝，步骤状态不被修改，并注入更强的纠正提示。
+    func testHardGuardBlocksSkipWithoutRetrievalResults() async {
+        let judge = StubJudge(stepNecessaryResult: true)
+        let model = MultiTurnModel(turns: [
+            [.init(kind: .done, toolCalls: [Self.planCreateCall()])],
+            [.init(kind: .done, toolCalls: [
+                ToolCall(id: "p1", name: "update_plan",
+                         arguments: ["op": .string("patch"), "step_id": .string("1"),
+                                     "status": .string("skipped")]),
+            ])],
+            Self.textAnswerTurn(),
+        ])
+        let session = Session(budget: ContextBudget(total: 60_000), rawTurns: 50)
+        let runtime = KernelRuntime(
+            stream: { messages, _, _ in model.stream(messages) },
+            execute: { calls in
+                calls.map { call in
+                    if call.name == "update_plan",
+                       call.arguments["op"]?.stringValue == "create" {
+                        Self.installPlan(session: session)
+                    }
+                    return .ok("工具结果：部分信息……")
+                }
+            },
+            schemas: { [] },
+            log: { model.kernelLogs.append($0) })
+        let loop = KernelLoop(runtime: runtime, config: makeConfig(),
+                              systemPrompt: { "SYS" }, session: session, maxTurns: 8)
+        loop.decisionJudge = judge
+        _ = await loop.run("完成测试任务")
+
+        XCTAssertTrue(model.userPrompts.contains {
+            $0.contains("内核已拒绝把「检索相关资料」标为 skipped")
+        }, "应注入强纠正提示")
+        XCTAssertTrue(model.userPrompts.contains {
+            $0.contains("立刻执行该检索步骤")
+        }, "提示应指明先检索")
+        XCTAssertEqual(session.getPlan()?.steps.first?.status, "doing",
+                       "被拒绝的 patch 不应修改步骤状态")
+        XCTAssertTrue(model.kernelLogs.contains {
+            $0.contains("硬护栏：无检索结果，拒绝 skip")
+        })
+    }
+
+    /// create+patch 同轮发出：计划尚未落盘时回退到本批 create 参数解析，
+    /// 同样拦截对检索步骤的 skip。
+    func testHardGuardBlocksSkipInSameBatchAsCreate() async {
+        let judge = StubJudge(stepNecessaryResult: true)
+        let model = MultiTurnModel(turns: [
+            [.init(kind: .done, toolCalls: [
+                ToolCall(id: "c1", name: "update_plan",
+                         arguments: ["op": .string("create"),
+                                     "goal": .string("完成测试任务"),
+                                     "steps": .array([.string("检索相关资料"),
+                                                      .string("总结答复")])]),
+                ToolCall(id: "p1", name: "update_plan",
+                         arguments: ["op": .string("patch"), "step_id": .string("1"),
+                                     "status": .string("skipped")]),
+            ])],
+            Self.textAnswerTurn(),
+        ])
+        let session = Session(budget: ContextBudget(total: 60_000), rawTurns: 50)
+        let runtime = KernelRuntime(
+            stream: { messages, _, _ in model.stream(messages) },
+            execute: { calls in
+                calls.map { call in
+                    if call.name == "update_plan",
+                       call.arguments["op"]?.stringValue == "create" {
+                        Self.installPlan(session: session)
+                    }
+                    return .ok("工具结果：部分信息……")
+                }
+            },
+            schemas: { [] },
+            log: { model.kernelLogs.append($0) })
+        let loop = KernelLoop(runtime: runtime, config: makeConfig(),
+                              systemPrompt: { "SYS" }, session: session, maxTurns: 8)
+        loop.decisionJudge = judge
+        _ = await loop.run("完成测试任务")
+
+        XCTAssertTrue(model.userPrompts.contains {
+            $0.contains("内核已拒绝把「检索相关资料」标为 skipped")
+        }, "create+patch 同轮也应被硬护栏拦截")
+    }
+
+    /// 已有成功检索结果后再 skip：硬护栏不拦截（材料已就位，跳过合理）。
+    func testHardGuardAllowsSkipAfterRetrievalSuccess() async {
+        let judge = StubJudge(stepNecessaryResult: true)
+        let model = MultiTurnModel(turns: [
+            [.init(kind: .done, toolCalls: [
+                ToolCall(id: "r1", name: "rag_tools",
+                         arguments: ["query": .string("苹果是什么颜色")]),
+            ])],
+            [.init(kind: .done, toolCalls: [
+                ToolCall(id: "p1", name: "update_plan",
+                         arguments: ["op": .string("patch"), "step_id": .string("1"),
+                                     "status": .string("skipped")]),
+            ])],
+            Self.textAnswerTurn(),
+        ])
+        let session = Session(budget: ContextBudget(total: 60_000), rawTurns: 50)
+        let runtime = KernelRuntime(
+            stream: { messages, _, _ in model.stream(messages) },
+            execute: { calls in
+                calls.map { _ in .ok("### [1] 来源: apple.md\n- 苹果是红色的。") }
+            },
+            schemas: { [] },
+            log: { model.kernelLogs.append($0) })
+        let loop = KernelLoop(runtime: runtime, config: makeConfig(),
+                              systemPrompt: { "SYS" }, session: session, maxTurns: 8)
+        loop.decisionJudge = judge
+        _ = await loop.run("苹果是什么颜色")
+
+        XCTAssertFalse(model.userPrompts.contains {
+            $0.contains("内核已拒绝")
+        }, "已有成功检索结果时不应拦截 skip")
     }
 
     // MARK: - 真机集成（模型文件缺失时自动跳过）

@@ -60,6 +60,8 @@ final class RAGEngineBinaryANNTests: XCTestCase {
         try writeDocs(2)
         let engine = makeEngine()
         _ = await engine.ingest()
+        // 二值覆盖判定需要全部签名回填完成（文本先行入库），先等回填结束。
+        try await awaitVectorsFilled(engine)
         XCTAssertEqual(engine.resolvedANNIndexTarget(), .binary)
         let result = try XCTUnwrap(engine.buildANNIndex())
         XCTAssertTrue(result.summary.contains("二值 ANN"), result.summary)
@@ -72,6 +74,7 @@ final class RAGEngineBinaryANNTests: XCTestCase {
         try writeDocs(2)
         let engine = makeEngine { $0.ragBinaryCoarseEnabled = false }
         _ = await engine.ingest()
+        try await awaitVectorsFilled(engine)
         XCTAssertEqual(engine.resolvedANNIndexTarget(), .dense)
         _ = try XCTUnwrap(engine.buildANNIndex())
         XCTAssertTrue(try XCTUnwrap(engine.annIndexStatus()).isReady)
@@ -83,6 +86,7 @@ final class RAGEngineBinaryANNTests: XCTestCase {
         try writeDocs(2)
         let engine = makeEngine()
         _ = await engine.ingest()
+        try await awaitVectorsFilled(engine)
         _ = try XCTUnwrap(engine.buildANNIndex())
         let status = engine.status(sourceLimit: 0, maxAge: 0)
         XCTAssertEqual(status["binary_ann"]?.stringValue, "ready")
@@ -107,10 +111,21 @@ final class RAGEngineBinaryANNTests: XCTestCase {
         try writeDocs(2)
         let engine = makeEngine()
         _ = await engine.ingest()
+        try await awaitVectorsFilled(engine)
         _ = try XCTUnwrap(engine.buildANNIndex())
         let hits = try await engine.search(query: "apple turbine", topK: 3)
         XCTAssertFalse(hits.isEmpty)
         XCTAssertTrue(hits.contains { $0.binaryScore != nil })
         engine.close()
+    }
+
+    // MARK: 回填等待辅助
+
+    /// 等待全部切片向量/签名回填完成（文本先行入库，二值覆盖与 ANN 断言需要完整数据）。
+    private func awaitVectorsFilled(_ engine: RAGEngine) async throws {
+        for _ in 0..<300 {
+            if engine.vectorCompleteness().pending == 0 { return }
+            try await Task.sleep(nanoseconds: 100_000_000)
+        }
     }
 }

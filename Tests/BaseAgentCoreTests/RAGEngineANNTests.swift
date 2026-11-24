@@ -119,9 +119,15 @@ final class RAGEngineANNTests: XCTestCase {
         var config = makeConfig()
         config.ragANNMinChunks = 1
         let engine = makeEngine(config)
+        // 断言失败时也要关闭引擎：泄漏的后台回填服务（共享全局 embedding gate）
+        // 会干扰后续用例的回填时序。
+        defer { engine.close() }
         let stats = await engine.ingest()
         XCTAssertGreaterThan(stats.chunks, 0)
-        // ingest 只负责调度后台构建；构建完成后状态才就绪。
+        // 向量回填全部完成且服务排空（约 6s 空闲判定）后才会调度自动构建：
+        // 先等向量补齐，再等服务退出，最后等构建任务收尾。
+        try await awaitVectorsFilled(engine)
+        try await awaitBackfillIdle(engine)
         await engine.awaitANNAutoBuild()
 
         let status = try XCTUnwrap(engine.annIndexStatus())
@@ -141,6 +147,7 @@ final class RAGEngineANNTests: XCTestCase {
         var offConfig = config
         offConfig.ragANNEnabled = false
         let offEngine = makeEngine(offConfig)
+        defer { offEngine.close() }
         let offHits = try await offEngine.search(query: "apple fruit turbine", topK: 3)
         XCTAssertFalse(offHits.isEmpty)
         XCTAssertTrue(offHits.contains { hit in hits.contains { $0.rowID == hit.rowID } },
@@ -157,6 +164,8 @@ final class RAGEngineANNTests: XCTestCase {
         let engine = makeEngine(config)
         _ = await engine.ingest()
         await engine.awaitANNAutoBuild()
+        // 手动构建需要完整向量（文本先行入库），等后台回填结束再建。
+        try await awaitVectorsFilled(engine)
 
         let first = try XCTUnwrap(engine.buildANNIndex())
         XCTAssertGreaterThan(first.blocks, 0)
@@ -175,6 +184,8 @@ final class RAGEngineANNTests: XCTestCase {
         config.ragANNAutoBuild = false
         let engine = makeEngine(config)
         _ = await engine.ingest()
+        // ANN 构建需要完整向量（文本先行入库），等后台回填结束再建。
+        try await awaitVectorsFilled(engine)
         _ = try XCTUnwrap(engine.buildANNIndex())
 
         // 新增来源形成尾块，删除后的实际覆盖率才会低于 100%。
@@ -232,6 +243,8 @@ final class RAGEngineANNTests: XCTestCase {
         config.ragANNClusterSize = 4
         let engine = makeEngine(config)
         _ = await engine.ingest()
+        // 取消/续建验证需要完整向量（文本先行入库），等后台回填结束再建。
+        try await awaitVectorsFilled(engine)
         let chunks = engine.status(sourceLimit: 0, maxAge: 0)["chunks_stored"]?.intValue ?? 0
         XCTAssertGreaterThan(chunks, 8, "至少需要两块才能验证取消")
 
@@ -256,5 +269,23 @@ final class RAGEngineANNTests: XCTestCase {
         XCTAssertEqual(status.indexedRows, chunks)
         XCTAssertTrue(status.isReady, status.summary)
         engine.close()
+    }
+
+    // MARK: 回填等待辅助
+
+    /// 等待全部切片向量回填完成（文本先行入库，ANN 构建与断言需要完整向量）。
+    private func awaitVectorsFilled(_ engine: RAGEngine) async throws {
+        for _ in 0..<300 {
+            if engine.vectorCompleteness().pending == 0 { return }
+            try await Task.sleep(nanoseconds: 100_000_000)
+        }
+    }
+
+    /// 等待后台回填服务排空退出（约 6 秒空闲判定；排空回调才会调度自动构建）。
+    private func awaitBackfillIdle(_ engine: RAGEngine) async throws {
+        for _ in 0..<120 {
+            if !engine.backfillStatus().running { return }
+            try await Task.sleep(nanoseconds: 100_000_000)
+        }
     }
 }

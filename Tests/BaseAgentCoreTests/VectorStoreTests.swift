@@ -268,4 +268,67 @@ final class VectorStoreTests: XCTestCase {
             legacy.close()
         }
     }
+
+    /// 回填签名位宽与库不一致时不得降级停用二值通道：必须抛出专用错误，
+    /// 由回填调度丢弃 store 按当前 provider 位宽重建（对应线上
+    /// 「96 字节签名写进 bit[128] bin 表」的历史窗口状态）。
+    func testFillPendingVectorThrowsOnSignatureWidthMismatch() throws {
+        let store = try VectorStore(dbPath: directory.appendingPathComponent("selfheal.sqlite").path,
+                                    dimension: 3, enableSQLiteVec: true,
+                                    binaryDimension: 16, binarySource: "test")
+        XCTAssertTrue(store.binaryStorageEnabled)
+        let rowids = try store.addTextsOnly(chunks: [
+            Chunk(text: "正文一", source: "a.md", chunkIndex: 0),
+            Chunk(text: "正文二", source: "a.md", chunkIndex: 1),
+        ])
+        XCTAssertEqual(rowids.count, 2)
+        XCTAssertEqual(store.pendingVectorCount(), 2)
+
+        // 宽度错误的签名（3 字节 != 16/8=2 字节）：不降级停用，直接抛专用错误，
+        // 由回填调度丢弃 store 按当前位宽重建；该条不出队、保持 pending。
+        var thrown: Error?
+        XCTAssertNoThrow(thrown = {
+            do {
+                try store.fillPendingVector(rowid: rowids[0], vector: [1, 0, 0],
+                                            binarySignature: Data([1, 2, 3]))
+                return nil
+            } catch { return error }
+        }())
+        let mismatch = try XCTUnwrap(thrown as? BinarySignatureWidthMismatchError,
+                                     "位宽不匹配必须抛出 BinarySignatureWidthMismatchError")
+        XCTAssertEqual(mismatch.signatureBytes, 3)
+        XCTAssertEqual(mismatch.declaredBytes, 2)
+        XCTAssertTrue(store.binaryStorageEnabled, "不得降级停用二值通道")
+        XCTAssertEqual(store.pendingVectorCount(), 2, "出错的条目必须保持 pending")
+
+        // 位宽正确的签名照常回填（二值通道未被污染）。
+        try store.fillPendingVector(rowid: rowids[0], vector: [1, 0, 0],
+                                    binarySignature: Data([1, 2]))
+        XCTAssertEqual(store.pendingVectorCount(), 1)
+        let hits = try store.search(vector: [1, 0, 0], topK: 1)
+        XCTAssertEqual(hits.first?.text, "正文一", "主向量已回填、可检索")
+
+        // 无签名的主向量回填不受影响（签名 nil 时跳过位宽校验）。
+        try store.fillPendingVector(rowid: rowids[1], vector: [0, 1, 0])
+        XCTAssertEqual(store.pendingVectorCount(), 0)
+        store.close()
+    }
+
+    /// 已回填齐全的库不得被 enqueueMissingVectors 误判为缺向量：vec0 主表的
+    /// rowid 点查不可靠（返回空），必须走影子表 `chunk_vectors_rowids`
+    ///（对应线上「手动补做把 1925 条已回填切片全部重新入队」）。
+    func testEnqueueMissingVectorsDoesNotReenqueueFilledChunks() throws {
+        let store = try VectorStore(dbPath: directory.appendingPathComponent("enqueue.sqlite").path,
+                                    dimension: 3, enableSQLiteVec: true)
+        XCTAssertTrue(store.vectorEnabled)
+        let chunks = [
+            Chunk(text: "alpha text", source: "a.md", chunkIndex: 0),
+            Chunk(text: "beta text", source: "b.md", chunkIndex: 0),
+        ]
+        XCTAssertEqual(try store.add(chunks: chunks, vectors: [[1, 0, 0], [0, 1, 0]]), 2)
+        XCTAssertEqual(store.pendingVectorCount(), 0)
+        XCTAssertEqual(try store.enqueueMissingVectors(), 0,
+                       "向量齐全时不应有任何条目被重新入队")
+        store.close()
+    }
 }

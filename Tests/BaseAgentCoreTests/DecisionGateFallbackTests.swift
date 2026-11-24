@@ -46,7 +46,7 @@ final class DecisionGateFallbackTests: XCTestCase {
         let judge = MeteorKernelJudge(scorer: scorer, timeoutSeconds: 1)
         // 模型缺失：两次判定都必须 nil（静默放行），不得抛错阻塞主流程。
         let first = await judge.informationSufficient(task: "t", evidence: "e")
-        let second = await judge.stepNecessary(goal: "g", step: "s")
+        let second = await judge.stepNecessary(goal: "g", step: "s", context: "")
         XCTAssertNil(first)
         XCTAssertNil(second)
     }

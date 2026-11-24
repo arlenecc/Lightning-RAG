@@ -488,7 +488,7 @@ final class AppViewModel: ObservableObject {
             // 但向量回填续做不应被无关模型（如主 LLM）缺失阻断：
             // 普通模式回填在无模型时也能读 pending；这里独立 kick 一次。
             // 与 preloadRAGModels 末尾的 kick 幂等。
-            agent?.ragEngine.kickBackfill()
+            kickAllRAGBackfills()
         }
         // 即使无需预加载模型（API 模式/未启用辅助模型），也要让闲时摘要
         // 在启动后按空闲计时自动开始。
@@ -1153,7 +1153,7 @@ final class AppViewModel: ObservableObject {
         }
         // 启动续做：若上次同步中断留下「正文已入库、向量未回填」的切片，
         // 预加载完成后启动后台回填补齐；无待回填项时循环会自行退出。
-        agent.ragEngine.kickBackfill()
+        kickAllRAGBackfills()
     }
 
     /// 用稳定的 system prompt + 工具清单预热主模型 KV cache，并更新状态栏。
@@ -2681,9 +2681,12 @@ final class AppViewModel: ObservableObject {
         statusText = "正在补做向量…"
         appendLog("[backfill] 用户手动触发向量补做")
         let targetID = ObjectIdentifier(agent)
-        let engine = agent.ragEngine
+        // 主引擎 + 全部知识分区引擎一起补做：分区引擎的 pending 不会被
+        // 启动/同步路径自动覆盖，只补主引擎会让分区长期缺向量。
+        let engines = ([agent.ragEngine]
+            + agent.zoneEngines.values.filter { $0 !== agent.ragEngine })
         Task.detached(priority: .utility) { [weak self] in
-            let enqueued = engine.requestVectorBackfill()
+            let enqueued = engines.reduce(0) { $0 + $1.requestVectorBackfill() }
             // 等后台回填告一段落（最多 ~90 秒），期间定期刷新状态文本。
             for i in 0..<30 {
                 try? await Task.sleep(nanoseconds: 3_000_000_000)
@@ -2692,7 +2695,7 @@ final class AppViewModel: ObservableObject {
                 if i % 2 == 0 {
                     await MainActor.run { [weak self] in self?.refreshRAGStatus() }
                 }
-                if !engine.backfillStatus().running { break }
+                if engines.allSatisfy({ !$0.backfillStatus().running }) { break }
             }
             await MainActor.run { [weak self] in
                 guard let self else { return }
@@ -2708,6 +2711,16 @@ final class AppViewModel: ObservableObject {
     }
 
     // MARK: 知识图谱
+
+    /// 对主引擎与全部知识分区引擎触发后台回填（幂等）。启动/预热续做用：
+    /// 只 kick 主引擎会让分区库中断遗留的 pending 永远无人处理。
+    private func kickAllRAGBackfills() {
+        guard let agent else { return }
+        agent.ragEngine.kickBackfill()
+        for engine in agent.zoneEngines.values where engine !== agent.ragEngine {
+            engine.kickBackfill()
+        }
+    }
 
     private var kgBuildTask: Task<Void, Never>?
     /// 主模型兜底抽图的提示只弹一次，避免增量抽取反复打扰。

@@ -47,7 +47,9 @@ enum DecisionScoreLog {
 /// 内核必须静默放行，绝不能因为决策门故障阻塞主流程。
 public protocol KernelDecisionJudge: AnyObject, Sendable {
     /// 计划步骤是否必要合理（true=必要；false=可能不必要/多余；nil=不可用）。
-    func stepNecessary(goal: String, step: String) async -> Bool?
+    /// `context` 是内核提供的「已成功获取的工具结果概要」（几百字），
+    /// 用于判断信息获取类步骤是否已有对应材料。
+    func stepNecessary(goal: String, step: String, context: String) async -> Bool?
     /// 已收集信息是否足以完整回答任务（true=足够；false=不足；nil=不可用）。
     /// `evidence` 是最终交给生成模型的材料（工具结果原文 + 会话状态），
     /// 实现方不得再截断或摘要——被裁掉的部分可能正是判定依据。
@@ -153,13 +155,23 @@ public final class MeteorKernelJudge: KernelDecisionJudge, @unchecked Sendable {
         }
     }
 
-    public func stepNecessary(goal: String, step: String) async -> Bool? {
+    public func stepNecessary(goal: String, step: String, context: String) async -> Bool? {
+        let trimmedContext = context.trimmingCharacters(in: .whitespacesAndNewlines)
         let state = """
         Task goal: \(goal)
         Plan step: \(step)
+
+        Context gathered so far (briefs of successful tool results):
+        \(trimmedContext.isEmpty ? "(none yet — no tool has returned anything)" : trimmedContext)
         """
+        // 收紧「跳过信息获取步骤」的语义：只要该步骤是检索/获取来源、
+        // 且上下文里还没有对应材料，就必须判为必要，防止计划评审把
+        // 唯一的检索步骤判成「多余」。
         guard let prob = await judge("plan_step", state: state, question:
             "Is this plan step necessary and reasonable to achieve the task goal? "
+                + "IMPORTANT: if the step gathers information from a source "
+                + "(search / outline / web_scan / web_search / reading files) and the context above "
+                + "does not yet contain the corresponding material, it MUST be judged necessary. "
                 + "(A: unnecessary or redundant, B: necessary and reasonable)") else {
             return nil
         }

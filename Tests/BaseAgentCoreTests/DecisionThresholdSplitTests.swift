@@ -53,7 +53,7 @@ final class DecisionThresholdSplitTests: XCTestCase {
         scorer.finishProb = 0.55
         let judge = MeteorKernelJudge(scorer: scorer,
                                       planThreshold: 0.6, finishThreshold: 0.5)
-        let planOK = await judge.stepNecessary(goal: "g", step: "s")
+        let planOK = await judge.stepNecessary(goal: "g", step: "s", context: "")
         let finishOK = await judge.informationSufficient(task: "t", evidence: "e")
         XCTAssertEqual(planOK, false, "0.45 < 0.6 应判不必要")
         XCTAssertEqual(finishOK, true, "0.55 >= 0.5 应判足够")
@@ -65,7 +65,7 @@ final class DecisionThresholdSplitTests: XCTestCase {
         scorer.planProb = 0.55
         scorer.finishProb = 0.55
         let judge = MeteorKernelJudge(scorer: scorer, threshold: 0.6)
-        let plan = await judge.stepNecessary(goal: "g", step: "s")
+        let plan = await judge.stepNecessary(goal: "g", step: "s", context: "")
         let finish = await judge.informationSufficient(task: "t", evidence: "e")
         XCTAssertEqual(plan, false)
         XCTAssertEqual(finish, false)
