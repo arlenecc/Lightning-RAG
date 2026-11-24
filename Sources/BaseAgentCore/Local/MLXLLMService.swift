@@ -36,9 +36,9 @@ public final class MLXLLMService: LLMService, PreloadableLLMService,
     /// 工具调用约束解码开关（配置 guidedToolArguments）。只在有 tools 的生成里生效。
     private let guidedToolArguments: Bool
     /// 编译好的工具调用语法状态机按 EBNF 源码缓存；vendored xgrammar 不支持
-    /// clone，靠 GrammarLogitProcessor 在每轮 prompt() 时回滚复用。
+    /// clone，靠 GuidedConstraintState 在每轮 prompt() 时回滚到初始状态后复用。
     private let guidedLock = NSLock()
-    private var guidedConstraint: GrammarConstraint?
+    private var guidedConstraint: GuidedConstraintState?
     private var guidedGrammarKey: String?
     private var guidedVocabSize = 0
     /// 模型容器共享给同一模型的轻量副本；容器内是只读权重。
@@ -1310,14 +1310,15 @@ public final class MLXLLMService: LLMService, PreloadableLLMService,
                     vocab: vocab.vocab,
                     vocabType: vocab.vocabType,
                     eosTokenId: Int32(eosID))
-                guidedConstraint = try GrammarConstraint(
-                    tokenizer: grammarTokenizer, grammar: grammar, rootRule: "root")
+                guidedConstraint = GuidedConstraintState(
+                    constraint: try GrammarConstraint(
+                        tokenizer: grammarTokenizer, grammar: grammar, rootRule: "root"))
                 guidedGrammarKey = grammar
                 guidedVocabSize = vocab.vocab.count
             }
             guard let constraint = guidedConstraint else { return nil }
             let state = GrammarProcessorState(
-                constraint: constraint,
+                constraintState: constraint,
                 tokenizer: UnguardedTokenizer(tokenizer),
                 vocabSize: guidedVocabSize,
                 trigger: QwenXMLToolGrammar.trigger)

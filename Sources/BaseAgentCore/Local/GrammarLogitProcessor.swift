@@ -41,10 +41,55 @@ private final class GrammarMaskBuffer {
     }
 }
 
+/// 与 `GrammarConstraint`（matcher）同生命周期的共享提交计数。
+/// MLXLLMService 按 grammar 源码缓存同一个 constraint，却为每一轮生成新建
+/// `GrammarProcessorState`；提交数若放在 state 里，新一轮的 `committed` 从 0
+/// 开始，`reset()` 就不会回滚上一轮遗留的 matcher 推进，下一次 commit 会被
+/// xgrammar 以 `GrammarError.commitFailed`（error 4）拒绝。
+final class GuidedConstraintState: @unchecked Sendable {
+    let constraint: GrammarConstraint
+    private var committed: Int32 = 0
+    private var invalid = false
+    private let lock = NSLock()
+
+    init(constraint: GrammarConstraint) { self.constraint = constraint }
+
+    var isAvailable: Bool {
+        lock.lock(); defer { lock.unlock() }
+        return !invalid
+    }
+
+    func disable() {
+        lock.lock(); invalid = true; lock.unlock()
+    }
+
+    /// 回到本轮生成前的 matcher 状态；覆盖上一轮正常完成、被取消或超时的所有路径。
+    func rollbackAll() {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !invalid, committed > 0 else { return }
+        do {
+            try constraint.rollback(committed)
+        } catch {
+            AgentLog.warning("[guided] 语法状态回滚失败，后续禁用约束：\(error.localizedDescription)")
+            invalid = true
+        }
+        committed = 0
+    }
+
+    func commit(tokenID: Int) throws -> CommitResult {
+        let result = try constraint.commitToken(Int32(tokenID))
+        lock.lock()
+        committed += 1 + Int32(result.tokens.count)
+        lock.unlock()
+        return result
+    }
+}
+
 /// 约束解码的全部可变状态。官方 API 下 token 由 LogitProcessor.didSample 提交
 /// （读一次 GPU 值）；若应用了 patch，也可由 fork 的回调提交。
 final class GrammarProcessorState: @unchecked Sendable {
-    let constraint: GrammarConstraint
+    let constraintState: GuidedConstraintState
     let tokenizer: UnguardedTokenizer
     let vocabSize: Int
     let trigger: String
@@ -52,29 +97,28 @@ final class GrammarProcessorState: @unchecked Sendable {
     private var decoded = ""
     private var armed = false
     private var finished = false
-    private var committed: Int32 = 0
     private var maskBuffer: GrammarMaskBuffer?
     /// rollback 失败时禁用本实例约束，避免陈旧状态污染后续生成。
     private var constraintInvalid = false
 
-    init(constraint: GrammarConstraint, tokenizer: UnguardedTokenizer,
+    init(constraintState: GuidedConstraintState, tokenizer: UnguardedTokenizer,
          vocabSize: Int, trigger: String) {
-        self.constraint = constraint
+        self.constraintState = constraintState
         self.tokenizer = tokenizer
         self.vocabSize = vocabSize
         self.trigger = trigger
     }
 
+    /// 兼容直接构造单个 constraint 的调用方（含单测）。
+    convenience init(constraint: GrammarConstraint, tokenizer: UnguardedTokenizer,
+                     vocabSize: Int, trigger: String) {
+        self.init(constraintState: GuidedConstraintState(constraint: constraint),
+                  tokenizer: tokenizer, vocabSize: vocabSize, trigger: trigger)
+    }
+
     func reset() {
-        if committed > 0 {
-            do {
-                try constraint.rollback(committed)
-            } catch {
-                AgentLog.warning("[guided] 语法状态回滚失败，本实例后续禁用约束：\(error.localizedDescription)")
-                constraintInvalid = true
-            }
-        }
-        committed = 0
+        guard !constraintInvalid else { return }
+        constraintState.rollbackAll()
         decoded = ""
         armed = false
         finished = false
@@ -82,11 +126,11 @@ final class GrammarProcessorState: @unchecked Sendable {
     }
 
     /// 当前约束是否仍可用；rollback 失败或处于 copy 副本时禁用。
-    var isAvailable: Bool { !constraintInvalid }
+    var isAvailable: Bool { !constraintInvalid && constraintState.isAvailable }
 
     /// vendored xgrammar 无 clone：copy 出的副本不能安全共享 matcher，直接禁用。
     func makeDisabledCopy() -> GrammarProcessorState {
-        let copy = GrammarProcessorState(constraint: constraint, tokenizer: tokenizer,
+        let copy = GrammarProcessorState(constraintState: constraintState, tokenizer: tokenizer,
                                          vocabSize: vocabSize, trigger: trigger)
         copy.constraintInvalid = true
         return copy
@@ -106,8 +150,7 @@ final class GrammarProcessorState: @unchecked Sendable {
         decoded += tokenizer.tokenizer.decode(tokenIds: [tokenID])
 
         do {
-            let result = try constraint.commitToken(Int32(tokenID))
-            committed += 1 + Int32(result.tokens.count)
+            let result = try constraintState.commit(tokenID: tokenID)
             if result.isTerminated {
                 finished = true
                 AgentLog.info("[guided] tool-call grammar completed")
@@ -122,7 +165,7 @@ final class GrammarProcessorState: @unchecked Sendable {
     /// 的中间状态会改变位图，缓存会导致输出错位，因此不做区间复用。
     func maskArray(logits: MLXArray) -> MLXArray? {
         guard isAvailable, armed, !finished else { return nil }
-        guard let mask = try? constraint.computeMask(), mask.needsApply else { return nil }
+        guard let mask = try? constraintState.constraint.computeMask(), mask.needsApply else { return nil }
         let dimension = logits.shape[logits.ndim - 1]
         guard dimension > 0 else { return nil }
         if maskBuffer == nil {

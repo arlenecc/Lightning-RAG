@@ -71,4 +71,41 @@ final class GrammarLogitProcessorTests: XCTestCase {
         let restored = processor.process(logits: logits).asArray(Float.self)
         XCTAssertEqual(restored, [Float](repeating: 0, count: Self.vocab.count))
     }
+
+    /// 回归：MLXLLMService 按 grammar 源码缓存同一个 GrammarConstraint，
+    /// 每一轮却新建 GrammarProcessorState。新一轮必须回滚上一轮遗留的
+    /// matcher 状态，否则 xgrammar 的 accept_token 会拒绝合法 token。
+    func testSharedConstraintResetsBetweenTurns() throws {
+        let source = try XCTUnwrap(QwenXMLToolGrammar.make(tools: makeTools()))
+        let grammarTokenizer = try GrammarTokenizer(
+            vocab: Self.vocab, vocabType: .raw, eosTokenId: 0)
+        let constraint = try GrammarConstraint(
+            tokenizer: grammarTokenizer, grammar: source, rootRule: "root")
+        let shared = GuidedConstraintState(constraint: constraint)
+        let tokenizer = UnguardedTokenizer(FakeTokenizer(vocab: Self.vocab))
+        let logits = MLXArray([Float](repeating: 0, count: Self.vocab.count))
+
+        func newProcessor() -> GrammarLogitProcessor {
+            GrammarLogitProcessor(state: GrammarProcessorState(
+                constraintState: shared, tokenizer: tokenizer,
+                vocabSize: Self.vocab.count,
+                trigger: QwenXMLToolGrammar.trigger))
+        }
+
+        // 第一轮：触发后提交一个合法 token。
+        var first = newProcessor()
+        first.didSample(token: MLXArray(4)) // "<tool_call>"
+        first.didSample(token: MLXArray(1)) // "<function="
+        let firstMask = first.process(logits: logits).asArray(Float.self)
+        XCTAssertTrue(firstMask[3].isInfinite && firstMask[3] < 0)
+
+        // 第二轮：共享同一 constraint，但新的 state 从零开始。
+        var second = newProcessor()
+        second.prompt(MLXArray([1, 2, 3]))
+        second.didSample(token: MLXArray(4))
+        second.didSample(token: MLXArray(1))
+        let secondMask = second.process(logits: logits).asArray(Float.self)
+        XCTAssertTrue(secondMask[3].isInfinite && secondMask[3] < 0,
+                      "跨轮复用 matcher 后仍能提交 token 并施加掩码")
+    }
 }
