@@ -1564,4 +1564,52 @@ final class RAGEngineTests: XCTestCase {
                        "向量模式也应输出判定确认，供内核与最高分做「或」判断")
         engine.close()
     }
+
+    /// 目录/章节清单查询识别 + 目录切片特征识别。
+    func testOutlineQueryAndTextDetection() {
+        XCTAssertTrue(RAGEngine.isOutlineQuery("水的密码 都有哪些章节"))
+        XCTAssertTrue(RAGEngine.isOutlineQuery("列出完整目录"))
+        XCTAssertFalse(RAGEngine.isOutlineQuery("水的密码主要讲什么"))
+        let outlineText = "# 第十二章解读波浪 …… 208\n诞生 …… 212 当海水遇到陆地 …… 224"
+        XCTAssertTrue(RAGEngine.looksLikeOutlineText(outlineText))
+        XCTAssertFalse(RAGEngine.looksLikeOutlineText("病毒通过水平基因转移影响宿主进化。"))
+    }
+
+    /// 目录类查询：命中目录切片时跳过二元判定，返回原文（否则 0.8B 判定模型
+    /// 会把「第X章……页码」全判不相关，导致召回到了目录却答"未找到"）。
+    func testOutlineQueryKeepsOutlineCitationsWithoutJudge() async throws {
+        let config = AgentConfig()
+        let engine = RAGEngine(config: config, knowledgeBase: "unused-vector-mode")
+        defer { engine.close() }
+        let citations = [
+            RAGCitation(id: "1", rank: 1, source: "水的密码.pdf", heading: "",
+                        text: "# 第十二章解读波浪 …… 208\n诞生 …… 212 当海水遇到陆地 …… 224",
+                        score: 0.71, isPrimary: true),
+            RAGCitation(id: "2", rank: 2, source: "水的密码.pdf", heading: "",
+                        text: "# 第十三章阿曼欣喜之旅 …… 244\n第十四章海岸 …… 260",
+                        score: 0.65, isPrimary: false),
+        ]
+        let outcome = try await engine.relevanceFilteredOutcome(
+            query: "水的密码 完整目录 所有章节", citations: citations,
+            maxScore: 0.71, timeout: 0)
+        XCTAssertEqual(outcome.citations.count, 2)
+        XCTAssertTrue(outcome.context.contains("第十二章解读波浪"), "应返回目录原文")
+        XCTAssertTrue(outcome.relevanceConfirmed, "目录查询应确认相关，避免内核反复空搜")
+    }
+
+    /// 工具输出层：未采纳任何切片时 maxScore 必须归零，避免内核误判已完成。
+    func testSearchToolZeroesMaxScoreWhenNoCitations() async throws {
+        let config = AgentConfig()
+        let engine = RAGEngine(config: config, knowledgeBase: "unused-vector-mode")
+        let tool = RagSearchTool(config: config, engine: engine,
+                                 searchHandler: { _, _, _ in
+            RAGRetrievalOutcome(context: "（知识库中未找到与问句相关的内容）",
+                                citations: [], maxScore: 0.87)
+        })
+        let result = try await tool.run(["query": .string("不存在的主题")])
+        XCTAssertTrue(result.success)
+        XCTAssertEqual(result.metrics["rag_max_score"] ?? -1, 0, accuracy: 1e-9,
+                       "全部不相关时不能用过滤前的最高分放行")
+        engine.close()
+    }
 }

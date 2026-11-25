@@ -4442,6 +4442,26 @@ public final class RAGEngine {
                                                   timing: timing)
     }
 
+    /// 目录/章节清单类问句：这类问题要的是「有哪些章」，不是语义内容。
+    static func isOutlineQuery(_ query: String) -> Bool {
+        let markers = ["目录", "章节", "有哪些章", "都有什么章", "全部章节",
+                       "章节列表", "全书结构", "书的结构", "分几章", "多少章",
+                       "章节目录", "各章", "树的目录", "outline"]
+        return markers.contains { query.contains($0) }
+    }
+
+    /// 切片是否呈目录特征：含「第X章 / Chapter N」且带页码数字。
+    /// 用轻量字符扫描，避免为一次判定引入正则编译开销。
+    static func looksLikeOutlineText(_ text: String) -> Bool {
+        let sample = String(text.prefix(1_200))
+        let hasChapter = sample.contains("章") || sample.lowercased().contains("chapter")
+        guard hasChapter else { return false }
+        // 目录行常见「…… 208」「... 」「 12 」形式的页码结尾
+        let hasPageNumbers = sample.contains("…") || sample.contains("..")
+            || sample.contains(" 1 ") || sample.contains(" 2 ") || sample.contains(" 3 ")
+        return hasPageNumbers
+    }
+
     /// 对已召回切片做同一套过滤与压缩；多分区融合的默认向量/重排路径、
     /// 极速检索（ColBERT）路径复用。`timing` 为空时不记录阶段耗时。
     func relevanceFilteredOutcome(query: String, citations: [RAGCitation],
@@ -4453,6 +4473,25 @@ public final class RAGEngine {
         guard !citations.isEmpty else {
             return RAGRetrievalOutcome(context: "（知识库中未找到相关内容）",
                                        citations: [], maxScore: 0)
+        }
+
+        // 目录/章节清单类查询：候选多为「第X章……页码」列表，没有可判定的
+        // 语义句——0.8B 判定模型会把它们全判为不相关，核心句提取也提不出内容，
+        // 导致明明召回到了目录切片却被判「未找到」。这类查询直接走原文通道：
+        // 跳过二元判定与核心句压缩，把目录原文交给模型。
+        if Self.isOutlineQuery(query), citations.contains(where: { Self.looksLikeOutlineText($0.text) }) {
+            let outlineCitations = citations.filter { Self.looksLikeOutlineText($0.text) }
+            let blocks = outlineCitations.prefix(8).enumerated().map { index, citation in
+                "### [\(index + 1)] 来源: \(citation.source) (相关度: "
+                    + String(format: "%.4f", citation.score) + ")\n"
+                    + String(citation.text.prefix(1_500))
+            }
+            AgentLog.info("[rag] 目录类查询：跳过相关度判定，返回 \(outlineCitations.count) 条目录切片原文")
+            return RAGRetrievalOutcome(
+                context: "已召回目录/章节结构切片（原文，供列目录与后续按章节检索）：\n\n"
+                    + blocks.joined(separator: "\n\n"),
+                citations: Array(outlineCitations.prefix(8)),
+                maxScore: maxScore, relevanceConfirmed: true)
         }
 
         var scores: [Double] = []
@@ -4493,8 +4532,12 @@ public final class RAGEngine {
         }
         guard !kept.isEmpty else {
             AgentLog.info("[rag] 相关度过滤：\(citations.count) 条全部不相关，返回未找到")
+            // 关键：maxScore 是「过滤前」的向量/重排分数，全部被判不相关时必须
+            // 归零。否则内核 Loop 读到 maxScore > 0.5 会置 ragHighConfidence，
+            // 认为「检索已找到材料」而放行收尾——模型拿着"未找到"的空结果
+            // 却被告知材料已足够，只能反复换词搜索直到轮次耗尽。
             return RAGRetrievalOutcome(context: "（知识库中未找到与问句相关的内容）",
-                                       citations: [], maxScore: maxScore)
+                                       citations: [], maxScore: 0)
         }
 
         let adopted = kept.enumerated().map { index, citation -> RAGCitation in

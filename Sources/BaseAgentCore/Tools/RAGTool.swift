@@ -110,9 +110,12 @@ public final class RagSearchTool: AgentTool {
             // - 极速检索：只认判定确认（MaxSim 分数与阈值不可比，不输出
             //   rag_max_score，避免全部不相关时仍被最高分误放行）。
             let confirmed: Double = outcome.relevanceConfirmed ? 1 : 0
+            // 没有任何采纳切片时 maxScore 必须归零：过滤前的召回最高分不能
+            // 证明「材料已就位」，否则内核会凭它放行收尾、模型反复空搜。
+            let exportedMaxScore = outcome.citations.isEmpty ? 0 : outcome.maxScore
             let metrics: [String: Double] = usesRelevanceConfirmation
                 ? ["rag_relevance_confirmed": confirmed]
-                : ["rag_max_score": outcome.maxScore,
+                : ["rag_max_score": exportedMaxScore,
                    "rag_relevance_confirmed": confirmed]
             return ragToolOK(outcome.context, metrics: metrics)
         } catch {
