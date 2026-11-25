@@ -17,6 +17,85 @@ final class KernelLoopRagHistoryTests: XCTestCase {
         XCTAssertTrue(out.contains("原始 5000 字符"))
     }
 
+    /// outline 结果不是切片列表：全书摘要必须原文保留，不能走核心句提取
+    /// 压成碎片（否则「总结全书」类问题反而拿不到摘要）。
+    func testOutlineKeepsBookSummaryVerbatim() {
+        // 摘要 110×19≈2090 字，加头与目录超过 2000 触发压缩，但摘要原文
+        // 必须逐字保留，只丢章节目录。
+        let summary = String(repeating: "病毒深刻影响宿主基因组与生物多样性。", count: 90)
+        let tree = (0..<40).map { "- 第\($0 + 1)章 病毒与宿主关系简述" }.joined(separator: "\n")
+        let outline = """
+        文档: 病毒星球.pdf
+        文档 ID: 123
+        章节摘要进度: 10/10（全书摘要已完成）
+
+        全书摘要:
+        \(summary)
+
+        章节结构:
+        \(tree)
+        """
+        let out = KernelLoop.trimRagHistory("rag_tools", outline, limit: 2_000)
+        XCTAssertTrue(out.contains(summary), "全书摘要应逐字保留，不能被核心句提取压碎")
+        XCTAssertTrue(out.contains("章节摘要进度: 10/10"), "头信息应保留")
+        XCTAssertTrue(out.count < outline.count, "超长章节目录应被截掉")
+        XCTAssertTrue(out.contains("原始 \(outline.count) 字符"))
+    }
+
+    /// 用户问具体章节时，命中章节的摘要必须优先于其他章节目录保留。
+    func testOutlinePrioritizesMatchingChapterForChapterQuestion() {
+        let otherChapters = (0..<30).map { "- 第\($0 + 1)章 病毒分类与命名" }.joined(separator: "\n")
+        let outline = """
+        文档: 病毒星球.pdf
+        文档 ID: 123
+        章节摘要进度: 40/40（全书摘要已完成）
+
+        全书摘要:
+        本书从多学科视角重新审视病毒与人类文明的关系。
+
+        章节结构:
+        \(otherChapters)
+        - [巨型病毒与进化] Mimivirus 是已知最大的病毒，揭示了病毒在宿主基因组中的角色与进化意义。
+        """
+        let out = KernelLoop.trimRagHistory(
+            "rag_tools", outline, limit: 300,
+            query: "巨型病毒与进化讲了什么")
+        XCTAssertTrue(out.contains("Mimivirus 是已知最大的病毒"), "命中章节摘要应优先保留")
+        XCTAssertTrue(out.contains("匹配章节摘要优先"), "应标注章节优先模式")
+    }
+
+    /// 用户问全书总结时，全书摘要原文优先，章节目录只作补充。
+    func testOutlinePrioritizesFullSummaryForWholeBookQuestion() {
+        let summary = String(repeating: "病毒与人类文明共同演化。", count: 40)
+        let tree = (0..<30).map { "- 第\($0 + 1)章 病毒分类与命名" }.joined(separator: "\n")
+        let outline = """
+        文档: 病毒星球.pdf
+        文档 ID: 123
+        章节摘要进度: 40/40（全书摘要已完成）
+
+        全书摘要:
+        \(summary)
+
+        章节结构:
+        \(tree)
+        """
+        let out = KernelLoop.trimRagHistory(
+            "rag_tools", outline, limit: 800,
+            query: "总结一下病毒星球全书的内容")
+        XCTAssertTrue(out.contains(summary), "全书总结时摘要应逐字保留")
+        XCTAssertTrue(out.contains("全书摘要优先"), "应标注全书摘要优先模式")
+    }
+
+    /// 摘要自身超预算时保留开头并明确标注，而不是压成不可读的碎片。
+    func testOutlineHugeSummaryTruncatedWithNotice() {
+        let summary = String(repeating: "病", count: 5_000)
+        let outline = "文档: x.pdf\n全书摘要:\n\(summary)"
+        let out = KernelLoop.trimRagHistory("rag_tools", outline, limit: 300)
+        XCTAssertTrue(out.contains("全书摘要"), "应保留摘要标题")
+        XCTAssertTrue(out.contains("已截断"), "应明确标注截断")
+        XCTAssertLessThan(out.count, 400)
+    }
+
     /// 小体积 RAG 结果不应被改动（避免无谓截断影响质量）。
     func testSmallRagResultUntouched() {
         let small = String(repeating: "x", count: 500)

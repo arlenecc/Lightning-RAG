@@ -180,7 +180,10 @@ public struct AgentConfig: Sendable {
         return enabled.isEmpty ? [] : enabled
     }
     public var requestTimeout: Double = 120.0
-    public var maxIterations: Int = 15
+    /// 单次任务的内核轮次上限。默认放宽到 50：多步 RAG/工具任务常在 15 轮
+    /// 内耗尽，触发自动续跑（每段重跑 prefill，实测放大到 29 次 LLM 调用）。
+    /// 超长任务仍受上下文预算与自动续跑 2 段的双重约束，不会无限跑。
+    public var maxIterations: Int = 50
     /// 是否把 L0 META-SOP 与 L1 索引常驻 system prompt。默认关闭以节省上下文；
     /// 关闭时 Agent 不加载这两段，但 memory 文件仍保留、记忆工具仍可用。
     public var memoryHierarchyInSystemPrompt: Bool = false

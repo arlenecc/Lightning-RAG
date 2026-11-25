@@ -1418,8 +1418,11 @@ public final class KernelLoop {
                 // 不影响 `outcomes` —— nextPrompt / shouldExit 已基于完整数据算过。
                 let trimmed: String
                 if rec.name == "rag_tools" {
+                    // 传本轮用户问题：outline 结果据此判断「总结全书」还是
+                    // 「某章讲什么」，优先保留对应摘要原文。
                     trimmed = KernelLoop.trimRagHistory(rec.name, rec.content,
-                                                       limit: ragHistoryChars)
+                                                       limit: ragHistoryChars,
+                                                       query: userInput)
                 } else {
                     // web_search/web_scan 大返回（>2000 字）先提核心句压缩，
                     // 避免大文本进上下文拖慢生成或触发暴力裁剪丢信息。
@@ -1889,9 +1892,17 @@ public final class KernelLoop {
     /// RAG 工具结果进历史 / KV 前缀前的纯函数收紧：保留最相关头部、丢弃尾部，
     /// 避免 bulky 大返回把历史撑大、拖慢后续每轮生成。仅 `rag_tools`（合并后的
     /// 知识库工具）结果收紧；`limit <= 0`、或内容未超限时原样返回。
-    static func trimRagHistory(_ name: String, _ content: String, limit: Int) -> String {
+    static func trimRagHistory(_ name: String, _ content: String, limit: Int,
+                               query: String = "") -> String {
         guard limit > 0, name == "rag_tools", content.count > limit else {
             return content
+        }
+        // outline（单文档概览：全书摘要 + 章节目录）不是切片列表，不能用
+        // 下面的「核心句提取」——那会把全书摘要压成几句碎片甚至清空（实测
+        // 3073 字压到 131 字），用户问「总结全书」时模型反而拿不到摘要。
+        // 走专用分支：按 query 意图优先保留全书摘要或匹配章节的摘要原文。
+        if content.contains("章节摘要进度:") || content.contains("全书摘要:") {
+            return trimOutlineHistory(content, limit: limit, query: query)
         }
         // RAG 结果回灌给模型前，不再 prefix 截断（只覆盖前面几个切片），
         // 而是对「每个切片」提取核心观点句后全部保留：覆盖所有返回切片，
@@ -1975,6 +1986,97 @@ public final class KernelLoop {
         return compressed
             + "\n[RAG 全部切片已提取核心句（共 \(sections.count) 段，每路 top\(usedTopN)），"
             + "原始 \(content.count) 字符]"
+    }
+
+    /// outline（单文档概览）专用收紧：按用户意图优先保留材料原文。
+    /// - 「总结全书/主要讲什么」类：全书摘要原文优先，章节目录按预算补充；
+    /// - 指向具体章节（query 含章节标题/主题词）：命中章节的摘要原文优先，
+    ///   全书摘要次之，其余章节目录最后。
+    /// 一切内容只截断、不改写（不用切片核心句提取器），避免把摘要压成碎片。
+    static func trimOutlineHistory(_ content: String, limit: Int,
+                                   query: String = "") -> String {
+        let lines = content.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+        var header: [String] = []
+        var summary: [String] = []
+        var tree: [String] = []
+        enum Section { case header, summary, tree }
+        var section: Section = .header
+        for line in lines {
+            if line.hasPrefix("全书摘要:") || line.hasPrefix("内容概览（")
+                || line.hasPrefix("内容摘要:") {
+                section = .summary
+                summary.append(line)
+            } else if line.hasPrefix("章节结构:") {
+                section = .tree
+                tree.append(line)
+            } else {
+                switch section {
+                case .header: header.append(line)
+                case .summary: summary.append(line)
+                case .tree: tree.append(line)
+                }
+            }
+        }
+
+        // 意图判定与章节匹配。章节行形如 "- [标题] 摘要" 或 "- 标题"。
+        let wholeBookMarkers = ["全书", "整本", "总结", "概括", "主要讲", "大体", "整体上",
+                                "全书内容", "这本书讲", "主要介绍", "概述"]
+        let wantsWholeBook = wholeBookMarkers.contains { query.contains($0) }
+        let stopWords = ["主要", "讲什么", "讲些", "是什么", "介绍一下", "关于", "内容",
+                         "章节", "哪一章", "请", "的", "了", "？", "?", "。", "，", ","]
+        var keywords = [String]()
+        if !wantsWholeBook && !query.isEmpty {
+            var cleaned = query
+            for word in stopWords { cleaned = cleaned.replacingOccurrences(of: word, with: " ") }
+            keywords = cleaned.split(whereSeparator: { $0.isWhitespace }).map(String.init)
+                .filter { $0.count >= 1 }
+        }
+        func chapterTitle(_ line: String) -> String {
+            var t = line.trimmingCharacters(in: .whitespaces)
+            while t.hasPrefix("-") || t.hasPrefix(" ") { t = String(t.dropFirst()).trimmingCharacters(in: .whitespaces) }
+            if t.hasPrefix("[") { t = String(t.dropFirst()) }
+            return t.components(separatedBy: "]").first ?? t
+        }
+        func isSummaryLine(_ line: String) -> Bool { line.contains("] ") }
+        var matched: [String] = []
+        var rest: [String] = []
+        for line in tree where line.trimmingCharacters(in: .whitespaces).hasPrefix("-") {
+            let title = chapterTitle(line)
+            // 主判据：query 直接包含章节标题（最稳，章节标题通常就是主题词）；
+            // 次判据：query 拆出的关键词命中标题。
+            let titleHit = !title.isEmpty && query.contains(title)
+            let keywordHit = keywords.contains { kw in
+                title.contains(kw) || (kw.count >= 2 && line.contains(kw))
+            }
+            if titleHit || keywordHit { matched.append(line) } else { rest.append(line) }
+        }
+        let treeHeader = tree.first(where: { $0.hasPrefix("章节结构:") })
+        let treeOther = tree.filter { !$0.trimmingCharacters(in: .whitespaces).hasPrefix("-")
+            && !$0.hasPrefix("章节结构:") }
+
+        // 组装优先级：头 → [命中章节原文] → 全书摘要原文 → 其余目录。
+        var out = header
+        if !matched.isEmpty { out.append(contentsOf: matched) }
+        out.append(contentsOf: summary)
+        if let treeHeader { out.append(treeHeader) }
+
+        let truncatedNotice = "\n…[材料已截断，保留至 %d 字符，原始 \(content.count) 字符]"
+        if out.joined(separator: "\n").count + 60 > limit {
+            let budget = max(1, limit - 120)
+            var body = String(out.joined(separator: "\n").prefix(budget))
+            body += String(format: truncatedNotice, budget)
+            return body
+        }
+        let mode = matched.isEmpty ? (wantsWholeBook ? "全书摘要优先" : "全书摘要优先")
+                                   : "匹配章节摘要优先"
+        let footer = "\n[outline 已收紧：\(mode)；原始 \(content.count) 字符]"
+        var budget = limit - out.joined(separator: "\n").count - footer.count
+        for line in rest + treeOther where budget > 0 {
+            let cost = line.count + 1
+            if cost <= budget { out.append(line); budget -= cost } else { break }
+        }
+        if budget <= 0 { out.append("…（章节目录已按预算截断）") }
+        return out.joined(separator: "\n") + footer
     }
 
     /// 网络工具结果进上下文前的核心句压缩：>2000 字才触发。
