@@ -275,17 +275,6 @@ public final class LlamaCppLLMService: LLMService, PreloadableLLMService,
     }
 
     /// 快照签名：模型/context/KV 量化/FA/system/tools 任一变化都必须失效。
-    /// GGUF lazy grammar 只接受「触发串恰好是单 token」的情况。
-    /// 多 token 时 token trigger 会在片段 token 上过早触发，regex trigger 又有
-    /// replay 崩溃风险，因此宁可关闭本轮约束，也不能让进程 abort。
-    static func resolveGrammar(_ grammar: String?,
-                               triggerTokens: [llama_token]) -> (grammar: String?, tokens: [llama_token]) {
-        guard grammar != nil else { return (nil, []) }
-        return triggerTokens.count == 1
-            ? (grammar, triggerTokens)
-            : (nil, [])
-    }
-
     /// 用完整内容做 FNV-1a，避免长度相同但内容不同的 system/tools 误命中。
     private static func mainPrefixSignature(modelPath: String, contextWindow: Int,
                                             kvInt8: Bool, flashAttention: Bool,
@@ -630,7 +619,7 @@ public final class LlamaCppLLMService: LLMService, PreloadableLLMService,
             // 完全失真，无法据此判断某轮是否真的变慢。
             let generationStart = Date()
             let guidedGrammar = guidedToolArguments
-                ? QwenXMLToolGrammar.makeGBNF(tools: tools) : nil
+                ? QwenXMLToolGrammar.makeGBNFAfterTrigger(tools: tools) : nil
             do {
                 (rawContent, generated) = try generateLoop(
                     context: loaded.context, model: model,
@@ -758,36 +747,33 @@ public final class LlamaCppLLMService: LLMService, PreloadableLLMService,
         grammar: String?,
         continuation: AsyncThrowingStream<LLMStreamEvent, Error>.Continuation
     ) throws -> (rawContent: String, generated: [llama_token]) {
-        // 只用「单 token 触发」启用 GGUF lazy grammar：
-        // - llama.cpp token trigger 命中任一 token 即触发；若 `<tool_call>` 被
-        //   切成多个 token，传整个 token 数组会在片段 token 出现时过早触发。
-        // - regex trigger 会回放 trigger_buffer，把原 token id 配截断 piece 喂
-        //   给 grammar，可能抛 C++ 异常并 abort。
-        // 因此多 token / tokenize 失败时宁可本轮不约束，也不能让进程崩溃。
-        let tokenized = grammar == nil
-            ? []
-            : (try? model.tokenize(QwenXMLToolGrammar.trigger, addSpecial: false)) ?? []
-        let resolved = Self.resolveGrammar(grammar, triggerTokens: tokenized)
-        let effectiveGrammar = resolved.grammar
-        let triggerTokens = resolved.tokens
-        if grammar != nil, resolved.grammar == nil {
-            AgentLog.warning("[gguf-guided] 触发串不是单 token（\(tokenized.count) 个），"
-                + "本轮禁用约束解码，避免 lazy grammar 误触发或崩溃")
+        // 不用 llama.cpp 的 lazy grammar：实测它的 trigger token/regex 都会把
+        // 触发串重新喂给 grammar，和 Qwen tool-call 模板组合会抛
+        // `Unexpected empty grammar stack` 并 abort。
+        // 这里改为 app 自己检测 `<tool_call>`；检测到后换成一个普通
+        // （非 lazy）grammar sampler，grammar 入口从 `<function=` 开始。
+        func makeSampler(applyGrammar: Bool) -> LlamaCppSampler {
+            let sampling = LlamaCppSampling(
+                temperature: temperature, topK: topK, topP: topP,
+                minP: minP, repetitionPenalty: repetitionPenalty,
+                grammar: applyGrammar ? grammar : nil,
+                triggerTokens: [], triggerPatterns: [])
+            return LlamaCppSampler(vocab: model.vocab,
+                                   vocabSize: model.vocabSize, config: sampling)
         }
-        let sampling = LlamaCppSampling(
-            temperature: temperature, topK: topK, topP: topP,
-            minP: minP, repetitionPenalty: repetitionPenalty,
-            grammar: effectiveGrammar,
-            triggerTokens: triggerTokens,
-            triggerPatterns: [])
-        let sampler = LlamaCppSampler(vocab: model.vocab,
-                                      vocabSize: model.vocabSize, config: sampling)
+        var sampler = makeSampler(applyGrammar: false)
+        var grammarActive = false
         var thinkSplitter = ThinkSplitter(startInThink: startInThink)
         // 与 MLX 侧同源的跨 chunk 内容净化器：MiniCPM5 把 <function ...> 切成碎块，
         // 旧 ToolTagSplitter 逐 chunk 匹配不到完整起始标签，XML 会泄漏到正文。
         var contentSanitizer = ContentSanitizer()
         var decoder = LlamaCppUTF8StreamDecoder()
         var rawContent = ""
+        // 增量触发检测：只保留「触发串长度 - 1」个尾部字符，避免每个 token
+        // 都对整个 rawContent 做 contains 扫描（长回复会变成 O(n²)）。
+        let trigger = QwenXMLToolGrammar.trigger
+        let triggerTailCapacity = max(0, trigger.count - 1)
+        var triggerScan = ""
         var generated: [llama_token] = []
         var nPast = startPast
 
@@ -813,17 +799,34 @@ public final class LlamaCppLLMService: LLMService, PreloadableLLMService,
                 try Task.checkCancellation()
                 if Int(nPast) >= contextWindow { break }
                 let token = sampler.sample(context: context)
-                sampler.accept(token)
+                let bytes = model.pieceBytes(token)
+                let text = bytes.isEmpty ? "" : decoder.feed(bytes)
+                if !text.isEmpty { emit(text) }
+
+                // 只在触发串刚完整出现时切换 grammar；触发 token 本身不喂给
+                // grammar（GBNF 入口已经是 `<function=`），避免二次消费。
+                var triggerFound = false
+                if grammar != nil, !grammarActive, !text.isEmpty {
+                    triggerScan += text
+                    if triggerScan.contains(trigger) {
+                        triggerFound = true
+                    } else {
+                        triggerScan = String(triggerScan.suffix(triggerTailCapacity))
+                    }
+                }
+                if triggerFound {
+                    grammarActive = true
+                    triggerScan = ""
+                    sampler = makeSampler(applyGrammar: true)
+                    AgentLog.info("[gguf-guided] 检测到 \(trigger)，启用工具 grammar")
+                } else {
+                    sampler.accept(token)
+                }
+
                 generated.append(token)
                 try LlamaCppContext.decode(token: token, context: context)
                 nPast += 1
                 if model.isEndOfGeneration(token) { break }
-
-                let bytes = model.pieceBytes(token)
-                if !bytes.isEmpty {
-                    let text = decoder.feed(bytes)
-                    if !text.isEmpty { emit(text) }
-                }
             }
 
             let tail = decoder.flush()

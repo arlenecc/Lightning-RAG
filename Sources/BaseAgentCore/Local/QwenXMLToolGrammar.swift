@@ -107,6 +107,13 @@ enum QwenXMLToolGrammar {
             with: "root ::= \"<tool_call>\" ws \"<function=\"")
     }
 
+    /// 触发串已经由 app 自己检测并消费后使用的 GBNF：入口从 `<function=` 开始。
+    /// 避免把 `<tool_call>` 再喂给 grammar，绕开 llama.cpp lazy grammar 的
+    /// trigger replay/token trigger 状态不匹配导致的 C++ abort。
+    static func makeGBNFAfterTrigger(tools: [JSONValue]) -> String? {
+        make(tools: tools)
+    }
+
     private static func escape(_ text: String) -> String {
         var out = ""
         for ch in text {
