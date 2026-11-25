@@ -26,9 +26,11 @@ struct SettingsView: View {
     @State private var mainRepetitionPenalty = 1.0
     @State private var mainTimeout = 120.0
     /// 单次任务允许的最大工具调用轮数。
-    @State private var maxIterations = 15
+    @State private var maxIterations = 50
     /// 是否把 L0 META-SOP / L1 索引常驻 system prompt（默认关闭，节省上下文）。
     @State private var memoryHierarchyInSystemPrompt = false
+    /// 工具调用约束解码（仅本机 MLX / GGUF 后端生效）。
+    @State private var guidedToolArguments = true
     @State private var mainPromptBatch = 512
     @State private var mainThinking = true
     @State private var mainKVReuse = true
@@ -483,6 +485,11 @@ struct SettingsView: View {
                 .toggleStyle(.checkbox)
                 .help("勾选后 L0 META-SOP 与 L1 索引常驻 system prompt；"
                     + "默认关闭，每轮省约 2.6k 字符上下文。关闭不影响 memory 文件与记忆工具")
+            Toggle("约束解码", isOn: $guidedToolArguments)
+                .toggleStyle(.checkbox)
+                .help("开启后本机 MLX / GGUF 主模型按工具 schema 约束生成工具调用："
+                    + "工具名和必填参数结构正确。关闭可提升生成速度（实测约 3~4 倍），"
+                    + "但工具调用完全依赖模型自觉；远端 API 后端始终不受影响")
             Spacer(minLength: 8)
             Button("应用配置") { applyAPIConfig() }
                 .disabled(model.isSyncing || model.isDeduplicating || model.isBuildingANN
@@ -1733,6 +1740,7 @@ struct SettingsView: View {
         mainMmprojPath = config.llmMmprojPath
         maxIterations = config.maxIterations
         memoryHierarchyInSystemPrompt = config.memoryHierarchyInSystemPrompt
+        guidedToolArguments = config.guidedToolArguments
         mainPromptBatch = config.promptBatchSize
         mainThinking = config.localLLMEnableThinking
         mainKVReuse = config.llmKVReuse
@@ -2115,6 +2123,7 @@ struct SettingsView: View {
         config.requestTimeout = max(10, mainTimeout)
         config.maxIterations = min(max(1, maxIterations), 50)
         config.memoryHierarchyInSystemPrompt = memoryHierarchyInSystemPrompt
+        config.guidedToolArguments = guidedToolArguments
         config.mlxCacheLimitMB = min(max(256, mlxCacheLimitMB), 2_048)
         config.mlxMemoryLimitMB = max(0, mlxMemoryLimitMB)
         config.promptBatchSize = max(0, mainPromptBatch)
