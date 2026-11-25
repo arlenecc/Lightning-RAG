@@ -36,9 +36,12 @@ final class KernelLoopRagHistoryTests: XCTestCase {
         \(tree)
         """
         let out = KernelLoop.trimRagHistory("rag_tools", outline, limit: 2_000)
-        XCTAssertTrue(out.contains(summary), "全书摘要应逐字保留，不能被核心句提取压碎")
         XCTAssertTrue(out.contains("章节摘要进度: 10/10"), "头信息应保留")
-        XCTAssertTrue(out.count < outline.count, "超长章节目录应被截掉")
+        // 新优先级：目录骨架完整保留（40 章标题），摘要按余量保留，不再逐字保证
+        XCTAssertTrue(out.contains("- 第1章"), "章节目录骨架应保留以引导后续 search")
+        XCTAssertTrue(out.contains("- 第40章"), "目录骨架应尽量覆盖全部章节")
+        XCTAssertTrue(out.contains("章节目录优先") || out.contains("已截断"))
+        XCTAssertTrue(out.count < outline.count, "超长内容应按预算收紧")
         XCTAssertTrue(out.contains("原始 \(outline.count) 字符"))
     }
 
@@ -61,10 +64,15 @@ final class KernelLoopRagHistoryTests: XCTestCase {
             "rag_tools", outline, limit: 300,
             query: "巨型病毒与进化讲了什么")
         XCTAssertTrue(out.contains("Mimivirus 是已知最大的病毒"), "命中章节摘要应优先保留")
-        XCTAssertTrue(out.contains("匹配章节摘要优先"), "应标注章节优先模式")
+        XCTAssertTrue(out.contains("匹配章节摘要 + 目录优先"), "应标注章节优先模式")
+        if let chapterPos = out.range(of: "Mimivirus")?.lowerBound,
+           let summaryPos = out.range(of: "本书从多学科")?.lowerBound {
+            XCTAssertLessThan(chapterPos, summaryPos, "命中章节摘要应排在全书摘要之前")
+        }
     }
 
-    /// 用户问全书总结时，全书摘要原文优先，章节目录只作补充。
+    /// 无匹配 / 全书总结时：章节目录骨架必须排在全书摘要之前，
+    /// 便于摘要质量差时仍能按目录标题引导后续 search。
     func testOutlinePrioritizesFullSummaryForWholeBookQuestion() {
         let summary = String(repeating: "病毒与人类文明共同演化。", count: 40)
         let tree = (0..<30).map { "- 第\($0 + 1)章 病毒分类与命名" }.joined(separator: "\n")
@@ -82,8 +90,12 @@ final class KernelLoopRagHistoryTests: XCTestCase {
         let out = KernelLoop.trimRagHistory(
             "rag_tools", outline, limit: 800,
             query: "总结一下病毒星球全书的内容")
-        XCTAssertTrue(out.contains(summary), "全书总结时摘要应逐字保留")
-        XCTAssertTrue(out.contains("全书摘要优先"), "应标注全书摘要优先模式")
+        XCTAssertTrue(out.contains("章节目录优先"), "应标注目录优先模式")
+        let treePos = out.range(of: "- 第1章")?.lowerBound
+        let summaryPos = out.range(of: "病毒与人类文明共同演化")?.lowerBound
+        if let treePos, let summaryPos {
+            XCTAssertLessThan(treePos, summaryPos, "章节目录骨架应排在全书摘要之前")
+        }
     }
 
     /// 摘要自身超预算时保留开头并明确标注，而不是压成不可读的碎片。

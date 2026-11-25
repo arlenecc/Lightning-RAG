@@ -1988,10 +1988,12 @@ public final class KernelLoop {
             + "原始 \(content.count) 字符]"
     }
 
-    /// outline（单文档概览）专用收紧：按用户意图优先保留材料原文。
-    /// - 「总结全书/主要讲什么」类：全书摘要原文优先，章节目录按预算补充；
-    /// - 指向具体章节（query 含章节标题/主题词）：命中章节的摘要原文优先，
-    ///   全书摘要次之，其余章节目录最后。
+    /// outline（单文档概览）专用收紧：按用户意图分层保留材料原文。
+    /// 优先级（始终尽量掌握章节目录，便于后续按标题 search 具体分片）：
+    /// - 命中章节：头 → 命中章节摘要原文 → 章节目录骨架 → 全书摘要 → 其他；
+    /// - 未命中：头 → 章节目录骨架 → 全书摘要 → 其他。
+    /// 目录骨架只保留「缩进 + - 标题」（丢弃行内长摘要），因此即使预算紧张
+    /// 也能覆盖全部章节；全书摘要质量参差时目录仍可引导后续检索。
     /// 一切内容只截断、不改写（不用切片核心句提取器），避免把摘要压成碎片。
     static func trimOutlineHistory(_ content: String, limit: Int,
                                    query: String = "") -> String {
@@ -2054,29 +2056,55 @@ public final class KernelLoop {
         let treeOther = tree.filter { !$0.trimmingCharacters(in: .whitespaces).hasPrefix("-")
             && !$0.hasPrefix("章节结构:") }
 
-        // 组装优先级：头 → [命中章节原文] → 全书摘要原文 → 其余目录。
-        var out = header
-        if !matched.isEmpty { out.append(contentsOf: matched) }
-        out.append(contentsOf: summary)
-        if let treeHeader { out.append(treeHeader) }
+        // 目录骨架：每条章节行只留「缩进 + - [标题]」，丢弃行内长摘要。
+        // 这是「始终尽量掌握章节目录」的关键——骨架体积远小于摘要行，
+        // 即使预算紧张也能覆盖全部章节标题，引导后续 search。
+        func skeleton(_ line: String) -> String {
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            guard trimmed.hasPrefix("-") else { return line }
+            let indent = String(line.prefix(line.count - trimmed.count))
+            if let close = trimmed.firstIndex(of: "]") {
+                return indent + String(trimmed[...close])   // "- [标题]"
+            }
+            return line                                      // "- 标题"（本就无摘要）
+        }
+        let chapterLines = tree.filter { $0.trimmingCharacters(in: .whitespaces).hasPrefix("-") }
+        let compactTree = chapterLines.map(skeleton)
 
-        let truncatedNotice = "\n…[材料已截断，保留至 %d 字符，原始 \(content.count) 字符]"
-        if out.joined(separator: "\n").count + 60 > limit {
-            let budget = max(1, limit - 120)
-            var body = String(out.joined(separator: "\n").prefix(budget))
-            body += String(format: truncatedNotice, budget)
-            return body
-        }
-        let mode = matched.isEmpty ? (wantsWholeBook ? "全书摘要优先" : "全书摘要优先")
-                                   : "匹配章节摘要优先"
+        let mode = matched.isEmpty ? "章节目录优先" : "匹配章节摘要 + 目录优先"
         let footer = "\n[outline 已收紧：\(mode)；原始 \(content.count) 字符]"
-        var budget = limit - out.joined(separator: "\n").count - footer.count
-        for line in rest + treeOther where budget > 0 {
-            let cost = line.count + 1
-            if cost <= budget { out.append(line); budget -= cost } else { break }
+        // 分层追加：每层能整块塞就整块塞，否则逐行塞到预算耗尽；
+        // 目录骨架优先于全书摘要（摘要质量参差时目录仍能引导检索）。
+        var out: [String] = []
+        var budget = max(0, limit - footer.count)
+        func appendLayer(_ layer: [String], truncatingTail: Bool = false) {
+            guard budget > 0 else { return }
+            for line in layer {
+                let cost = line.count + 1
+                if cost <= budget {
+                    out.append(line)
+                    budget -= cost
+                } else if truncatingTail {
+                    let room = budget - 1
+                    if room > 24 {
+                        out.append(String(line.prefix(room))
+                            + "…[已截断，原始 \(content.count) 字符]")
+                        budget = 0
+                    }
+                    break
+                } else {
+                    break
+                }
+            }
         }
-        if budget <= 0 { out.append("…（章节目录已按预算截断）") }
-        return out.joined(separator: "\n") + footer
+        appendLayer(header)
+        if !matched.isEmpty { appendLayer(matched) }          // 命中章节摘要原文（含摘要）
+        if let treeHeader { appendLayer([treeHeader]) }
+        appendLayer(compactTree)                              // 全部章节骨架（优先保完整）
+        appendLayer(summary, truncatingTail: true)            // 全书摘要（可截尾）
+        appendLayer(rest + treeOther)                         // 其他内容（未命中章节行等）
+        let notice = budget <= 0 ? "\n…[其余内容已按预算截断]" : ""
+        return out.joined(separator: "\n") + notice + footer
     }
 
     /// 网络工具结果进上下文前的核心句压缩：>2000 字才触发。
