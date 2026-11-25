@@ -145,9 +145,9 @@ final class PlanCreationRobustnessTests: XCTestCase {
 
     func testGrammarForcesRequiredParameter() throws {
         let source = try XCTUnwrap(QwenXMLToolGrammar.make(tools: [toolSchema(required: ["op"])]))
-        XCTAssertTrue(source.contains("req0_0 ::= \"<parameter=\" \"op\""),
+        XCTAssertTrue(source.contains("req00 ::= \"<parameter=\" \"op\""),
                       "必填 op 应有独立且强制的产生式: \(source)")
-        XCTAssertTrue(source.contains("call0 ::= \"update_plan\" ws \">\" ws req0_0"),
+        XCTAssertTrue(source.contains("call0 ::= \"update_plan\" ws \">\" ws req00"),
                       "call 规则必须展开必填项: \(source)")
         XCTAssertFalse(source.contains("param0 ::= \"<parameter=\" (\"goal\" | \"op\")"),
                        "必填项不应再出现在可重复的可选参数里: \(source)")

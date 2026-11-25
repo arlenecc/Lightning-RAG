@@ -50,8 +50,18 @@ enum QwenXMLToolGrammar {
         }
         guard !specs.isEmpty else { return nil }
 
+        // GBNF（llama.cpp）对括号分组较严格：`("x")` 单候选括号会被判为
+        // 语法错误（XGrammar/XGrammar 的 EBNF 则接受）。用 helper 统一生成
+        // 候选表达式：单个直接写字面量，多个才用括号包起来。
+        func alternation(_ keys: [String]) -> String {
+            let parts = keys.map { "\"\(escape($0))\"" }
+            return parts.count == 1 ? parts[0] : "(\(parts.joined(separator: " | ")))"
+        }
+        // 注意：call0/call1 是规则名（不是字面量），绝不能加引号。
+        let callAlternatives = specs.indices.map { "call\($0)" }.joined(separator: " | ")
+        let callChoice = specs.count == 1 ? callAlternatives : "(\(callAlternatives))"
         var lines: [String] = [
-            "root ::= ws \"<function=\" (\(specs.indices.map { "call\($0)" }.joined(separator: " | ")))",
+            "root ::= ws \"<function=\" \(callChoice)",
             "ws ::= [ \\t\\n]*",
             "value ::= [^<]*",
         ]
@@ -61,12 +71,12 @@ enum QwenXMLToolGrammar {
             // 可重复的 paramRule。必填项自身也从 paramRule 的候选里排除，
             // 避免同一参数被输出两次（如两个 <parameter=op>）。
             let optionalKeys = spec.keys.filter { !spec.required.contains($0) }
-            let optionalAlternatives = optionalKeys.map { key in
-                "\"\(escape(key))\""
-            }.joined(separator: " | ")
+            let optionalAlternatives = alternation(optionalKeys)
             var callBody = "\"\(escape(spec.name))\" ws \">\" ws"
             for (reqIndex, key) in spec.required.enumerated() {
-                let reqRule = "req\(index)_\(reqIndex)"
+                // llama.cpp GBNF 不接受规则名里的下划线（实测 req0_0 编译
+                // 失败），用纯字母数字命名（req00 / req01 ...）。
+                let reqRule = "req\(index)\(reqIndex)"
                 callBody += " \(reqRule)"
                 lines.append("\(reqRule) ::= \"<parameter=\" \"\(escape(key))\" ws \">\" ws "
                     + "value \"</parameter>\" ws")
@@ -78,7 +88,7 @@ enum QwenXMLToolGrammar {
                     lines.append("\(paramRule) ::= \"\\u0000\"")
                 }
             } else {
-                lines.append("\(paramRule) ::= \"<parameter=\" (\(optionalAlternatives)) ws \">\" ws "
+                lines.append("\(paramRule) ::= \"<parameter=\" \(optionalAlternatives) ws \">\" ws "
                     + "value \"</parameter>\" ws")
                 callBody += " \(paramRule)*"
             }
