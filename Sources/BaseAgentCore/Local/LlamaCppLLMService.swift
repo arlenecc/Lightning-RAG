@@ -275,6 +275,17 @@ public final class LlamaCppLLMService: LLMService, PreloadableLLMService,
     }
 
     /// 快照签名：模型/context/KV 量化/FA/system/tools 任一变化都必须失效。
+    /// GGUF lazy grammar 只接受「触发串恰好是单 token」的情况。
+    /// 多 token 时 token trigger 会在片段 token 上过早触发，regex trigger 又有
+    /// replay 崩溃风险，因此宁可关闭本轮约束，也不能让进程 abort。
+    static func resolveGrammar(_ grammar: String?,
+                               triggerTokens: [llama_token]) -> (grammar: String?, tokens: [llama_token]) {
+        guard grammar != nil else { return (nil, []) }
+        return triggerTokens.count == 1
+            ? (grammar, triggerTokens)
+            : (nil, [])
+    }
+
     /// 用完整内容做 FNV-1a，避免长度相同但内容不同的 system/tools 误命中。
     private static func mainPrefixSignature(modelPath: String, contextWindow: Int,
                                             kvInt8: Bool, flashAttention: Bool,
@@ -747,23 +758,28 @@ public final class LlamaCppLLMService: LLMService, PreloadableLLMService,
         grammar: String?,
         continuation: AsyncThrowingStream<LLMStreamEvent, Error>.Continuation
     ) throws -> (rawContent: String, generated: [llama_token]) {
-        // 首选 trigger token 而非 regex：Qwen3.5 GGUF 实测 `<tool_call>` 是单
-        // token（248058）。llama.cpp 的 regex trigger 会回放 trigger_buffer，
-        // 用原 token id 配截断 piece 喂 grammar，可能抛 C++ 异常并 abort；
-        // token trigger 走直接命中分支，不做回放。
-        let triggerTokens = grammar == nil
+        // 只用「单 token 触发」启用 GGUF lazy grammar：
+        // - llama.cpp token trigger 命中任一 token 即触发；若 `<tool_call>` 被
+        //   切成多个 token，传整个 token 数组会在片段 token 出现时过早触发。
+        // - regex trigger 会回放 trigger_buffer，把原 token id 配截断 piece 喂
+        //   给 grammar，可能抛 C++ 异常并 abort。
+        // 因此多 token / tokenize 失败时宁可本轮不约束，也不能让进程崩溃。
+        let tokenized = grammar == nil
             ? []
             : (try? model.tokenize(QwenXMLToolGrammar.trigger, addSpecial: false)) ?? []
-        if grammar != nil, triggerTokens.isEmpty {
-            AgentLog.warning("[gguf-guided] 触发串无法 tokenize，退回 regex trigger")
+        let resolved = Self.resolveGrammar(grammar, triggerTokens: tokenized)
+        let effectiveGrammar = resolved.grammar
+        let triggerTokens = resolved.tokens
+        if grammar != nil, resolved.grammar == nil {
+            AgentLog.warning("[gguf-guided] 触发串不是单 token（\(tokenized.count) 个），"
+                + "本轮禁用约束解码，避免 lazy grammar 误触发或崩溃")
         }
         let sampling = LlamaCppSampling(
             temperature: temperature, topK: topK, topP: topP,
             minP: minP, repetitionPenalty: repetitionPenalty,
-            grammar: grammar,
+            grammar: effectiveGrammar,
             triggerTokens: triggerTokens,
-            triggerPatterns: grammar == nil || !triggerTokens.isEmpty
-                ? [] : [QwenXMLToolGrammar.lazyTriggerPattern])
+            triggerPatterns: [])
         let sampler = LlamaCppSampler(vocab: model.vocab,
                                       vocabSize: model.vocabSize, config: sampling)
         var thinkSplitter = ThinkSplitter(startInThink: startInThink)

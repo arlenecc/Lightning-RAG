@@ -26,6 +26,20 @@ final class GgufGrammarTriggerTests: XCTestCase {
         ]
     }
 
+    func testGrammarIsDisabledUnlessTriggerIsSingleToken() {
+        let single = LlamaCppLLMService.resolveGrammar("gbnf", triggerTokens: [248058])
+        XCTAssertEqual(single.grammar, "gbnf")
+        XCTAssertEqual(single.tokens, [248058])
+
+        let multi = LlamaCppLLMService.resolveGrammar("gbnf", triggerTokens: [1, 2])
+        XCTAssertNil(multi.grammar, "多 token 触发串不能启用 lazy grammar")
+        XCTAssertTrue(multi.tokens.isEmpty)
+
+        let empty = LlamaCppLLMService.resolveGrammar("gbnf", triggerTokens: [])
+        XCTAssertNil(empty.grammar)
+        XCTAssertTrue(empty.tokens.isEmpty)
+    }
+
     func testTriggerStringIsSingleToken() throws {
         guard let path = try smallModelPath() else { throw XCTSkip("无小模型") }
         let model = try LlamaCppModel(path: path, gpuLayers: 0)
