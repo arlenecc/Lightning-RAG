@@ -747,11 +747,23 @@ public final class LlamaCppLLMService: LLMService, PreloadableLLMService,
         grammar: String?,
         continuation: AsyncThrowingStream<LLMStreamEvent, Error>.Continuation
     ) throws -> (rawContent: String, generated: [llama_token]) {
+        // 首选 trigger token 而非 regex：Qwen3.5 GGUF 实测 `<tool_call>` 是单
+        // token（248058）。llama.cpp 的 regex trigger 会回放 trigger_buffer，
+        // 用原 token id 配截断 piece 喂 grammar，可能抛 C++ 异常并 abort；
+        // token trigger 走直接命中分支，不做回放。
+        let triggerTokens = grammar == nil
+            ? []
+            : (try? model.tokenize(QwenXMLToolGrammar.trigger, addSpecial: false)) ?? []
+        if grammar != nil, triggerTokens.isEmpty {
+            AgentLog.warning("[gguf-guided] 触发串无法 tokenize，退回 regex trigger")
+        }
         let sampling = LlamaCppSampling(
             temperature: temperature, topK: topK, topP: topP,
             minP: minP, repetitionPenalty: repetitionPenalty,
             grammar: grammar,
-            triggerPatterns: grammar == nil ? [] : [QwenXMLToolGrammar.lazyTriggerPattern])
+            triggerTokens: triggerTokens,
+            triggerPatterns: grammar == nil || !triggerTokens.isEmpty
+                ? [] : [QwenXMLToolGrammar.lazyTriggerPattern])
         let sampler = LlamaCppSampler(vocab: model.vocab,
                                       vocabSize: model.vocabSize, config: sampling)
         var thinkSplitter = ThinkSplitter(startInThink: startInThink)

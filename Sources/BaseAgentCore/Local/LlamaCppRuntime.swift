@@ -369,17 +369,23 @@ struct LlamaCppSampling {
     var repetitionPenalty: Float
     /// 非空时挂载 lazy grammar sampler；只有生成文本命中触发串才生效。
     var grammar: String?
+    /// 首选触发方式：`<tool_call>` 的 token id。直接 trigger token 会走
+    /// llama.cpp 的 token 命中分支，不做 trigger_buffer 回放，避免回放时
+    /// token id 与截断 piece 不匹配导致 grammar accept 抛 C++ 异常。
+    var triggerTokens: [llama_token]
+    /// 仅当模型词表无法 tokenize 出触发 token 时兜底。
     var triggerPatterns: [String]
 
     init(temperature: Double, topK: Int, topP: Double, minP: Double,
          repetitionPenalty: Double, grammar: String? = nil,
-         triggerPatterns: [String] = []) {
+         triggerTokens: [llama_token] = [], triggerPatterns: [String] = []) {
         self.temperature = Float(max(0, temperature))
         self.topK = max(0, topK)
         self.topP = Float(min(max(topP, 0), 1))
         self.minP = Float(min(max(minP, 0), 1))
         self.repetitionPenalty = Float(max(1, repetitionPenalty))
         self.grammar = grammar
+        self.triggerTokens = triggerTokens
         self.triggerPatterns = triggerPatterns
     }
 }
@@ -402,24 +408,41 @@ final class LlamaCppSampler {
         // lazy grammar：生成文本命中 `<tool_call>` 后才开始约束，之前的
         // 思考段/普通回答完全放行，因此普通对话不会受工具 schema 影响。
         if let grammar = config.grammar, !grammar.isEmpty {
+            // 优先用 trigger token：Qwen3.5 GGUF 里 `<tool_call>` 是单 token
+            // （实测 248058）。llama.cpp 的 token 命中分支会直接 accept 这个
+            // token；regex 命中分支会回放 trigger_buffer，把原 token id 配
+            // 截断后的 piece 再喂给 grammar，可能抛 `Unexpected empty grammar
+            // stack after accepting piece` 并 abort（无 Swift/C++ catch 边界）。
             var patterns: [UnsafePointer<CChar>?] = config.triggerPatterns.compactMap {
                 guard let copied = strdup($0) else { return nil }
                 return UnsafePointer(copied)
             }
             defer { patterns.forEach { if let p = $0 { free(UnsafeMutableRawPointer(mutating: p)) } } }
-            let patternCount = patterns.count
-            let grammarSampler = grammar.withCString { grammarPtr in
-                patterns.withUnsafeMutableBufferPointer { buffer in
-                    // grammar_root 必须传显式规则名：llama.cpp b12651 的
-                    // init_grammar_impl 会对它做 strlen，传 nil 触发
-                    // EXC_BAD_ACCESS(SIGSEGV) 直接把 App 打崩（GGUF 模型专属，
-                    // MLX 后端走 GrammarConstraint 不受影响）。GBNF 源码
-                    // 入口规则名为 "root"，与 MLX 侧 rootRule 一致。
-                    "root".withCString { rootPtr in
-                        llama_sampler_init_grammar_lazy_patterns(
-                            vocab, grammarPtr, rootPtr,
-                            buffer.baseAddress, patternCount,
-                            nil, 0)
+            var grammarSampler: UnsafeMutablePointer<llama_sampler>?
+            grammar.withCString { grammarPtr in
+                // llama.cpp 对 trigger_patterns/trigger_tokens 两个指针都有非空断言，
+                // 即使数量为 0 也要给出有效指针。
+                var patternStorage = patterns
+                patternStorage.withUnsafeMutableBufferPointer { patternBuffer in
+                    var triggerTokens = config.triggerTokens
+                    var tokenPlaceholder: [llama_token] = [0]
+                    var tokenStorage = triggerTokens
+                    tokenStorage.withUnsafeMutableBufferPointer { tokenBuffer in
+                        tokenPlaceholder.withUnsafeMutableBufferPointer { placeholderBuffer in
+                            let tokensPtr = triggerTokens.isEmpty
+                                ? placeholderBuffer.baseAddress : tokenBuffer.baseAddress
+                            // grammar_root 必须传显式规则名：llama.cpp b12651 的
+                            // init_grammar_impl 会对它做 strlen，传 nil 触发
+                            // EXC_BAD_ACCESS(SIGSEGV) 直接把 App 打崩（GGUF 模型专属，
+                            // MLX 后端走 GrammarConstraint 不受影响）。GBNF 源码
+                            // 入口规则名为 "root"，与 MLX 侧 rootRule 一致。
+                            "root".withCString { rootPtr in
+                                grammarSampler = llama_sampler_init_grammar_lazy_patterns(
+                                    vocab, grammarPtr, rootPtr,
+                                    patternBuffer.baseAddress, patterns.count,
+                                    tokensPtr, triggerTokens.count)
+                            }
+                        }
                     }
                 }
             }

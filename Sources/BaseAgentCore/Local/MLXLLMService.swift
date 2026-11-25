@@ -535,14 +535,33 @@ public final class MLXLLMService: LLMService, PreloadableLLMService,
                     activeTranscript = transcriptAfter
                     activeToolsKey = toolsKey
                     activeIterator = wrapped
-                    let (stream, generationTask) = MLXLMCommon.generateTask(
-                        promptTokenCount: input.text.tokens.size,
-                        modelConfiguration: modelConfiguration,
-                        tokenizer: tokenizer,
-                        iterator: wrapped,
-                        tools: toolSpecs,
-                        toolCallPolicy: parameters.toolCallPolicy)
+
+                    // MLX 生成线程里 GrammarLogitProcessor.didSample 会调用
+                    // token.item(Int.self)，它在 MLX 底层走同步 eval；一旦底层报错
+                    // 而没有 task-local handler，就会落到全局 fatalError 直接杀进程。
+                    // generateTask 内部用 Task {} 继承 task-local，所以在这里安装
+                    // 生成期专用 handler：记录错误 + 立刻取消生成，随后由流末尾的
+                    // check() 抛给现有 catch 统一丢弃 KV/失败，而不是崩溃。
+                    let mlxGenerationError = MLXGenerationErrorBox()
+                    let generated = withErrorHandler({ message in
+                        AgentLog.error("[mlx] generation eval error: \(message)")
+                        mlxGenerationError.record(message)
+                        innerTask.cancel()
+                    }) {
+                        MLXLMCommon.generateTask(
+                            promptTokenCount: input.text.tokens.size,
+                            modelConfiguration: modelConfiguration,
+                            tokenizer: tokenizer,
+                            iterator: wrapped,
+                            tools: toolSpecs,
+                            toolCallPolicy: parameters.toolCallPolicy)
+                    }
+                    let stream = generated.0
+                    let generationTask = generated.1
                     innerTask.task = generationTask
+                    // 极小概率：生成任务在挂载前就报错，handler 时 innerTask 还是空的；
+                    // 这里补一次 check，保证错误不会被当成正常收尾。
+                    try mlxGenerationError.check()
                     // 登记到会话级屏障：下一轮 prefill 前会 await 它真正退出。
                     self.registerGeneration(generationTask)
                     // 竞态兜底：外层取消可能发生在生成任务挂载之前。
@@ -565,6 +584,7 @@ public final class MLXLLMService: LLMService, PreloadableLLMService,
 
                     for await generation in stream {
                         try Task.checkCancellation()
+                        try mlxGenerationError.check()
                         switch generation {
                         case .chunk(let text):
                             rawContent += text
@@ -697,6 +717,7 @@ public final class MLXLLMService: LLMService, PreloadableLLMService,
                     }
 
                     _ = await innerTask.task?.value
+                    try mlxGenerationError.check()
                     // 释放已完成的底层生成任务，避免服务长期持有其闭包与流。
                     innerTask.task = nil
                     if truncated {
@@ -1661,6 +1682,32 @@ final class StreamCompletion: @unchecked Sendable {
             waiter = continuation
             lock.unlock()
         }
+    }
+}
+
+/// 生成期 MLX 错误收集盒。`withErrorHandler` 的 handler 可能在生成线程回调，
+/// 所以这里用锁保护；消费流时调用 `check()` 把错误转成 Swift throw。
+final class MLXGenerationErrorBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var firstMessage: String?
+
+    /// 仅供回归测试观察第一条错误。
+    var firstMessageForTesting: String? {
+        lock.lock(); defer { lock.unlock() }
+        return firstMessage
+    }
+
+    func record(_ message: String) {
+        lock.lock()
+        if firstMessage == nil { firstMessage = message }
+        lock.unlock()
+    }
+
+    func check() throws {
+        lock.lock()
+        let message = firstMessage
+        lock.unlock()
+        if let message { throw MLXError.caught(message) }
     }
 }
 
