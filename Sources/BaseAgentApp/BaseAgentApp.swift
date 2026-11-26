@@ -58,57 +58,57 @@ struct BaseAgentDesktopApp: App {
         .defaultSize(width: 1280, height: 820)
         .commands {
             CommandGroup(replacing: .newItem) {}
-            CommandMenu("对话") {
-                Button("清空对话") { model.resetConversation() }
+            CommandMenu(L("对话")) {
+                Button(L("清空对话")) { model.resetConversation() }
                     .keyboardShortcut("k", modifiers: [.command, .shift])
-                Button("停止") { model.cancel() }
+                Button(L("停止")) { model.cancel() }
                     .keyboardShortcut(".", modifiers: [.command])
                     .disabled(!model.isRunning)
-                Button("同步所有知识库") { model.syncAllKnowledge(force: false) }
+                Button(L("同步所有知识库")) { model.syncAllKnowledge(force: false) }
                     .disabled(model.isRunning || model.isModelLoading
                         || model.isWarmingUp || model.isSyncing || model.isBuildingANN)
-                Button("强制全量同步") { model.syncAllKnowledge(force: true) }
+                Button(L("强制全量同步")) { model.syncAllKnowledge(force: true) }
                     .disabled(model.isRunning || model.isModelLoading
                         || model.isWarmingUp || model.isSyncing || model.isBuildingANN)
-                Button(model.isStoppingSync ? "正在停止同步…" : "停止知识库同步") {
+                Button(model.isStoppingSync ? L("正在停止同步…") : L("停止知识库同步")) {
                     model.stopSync()
                 }
                 .disabled(!model.isSyncing || model.isStoppingSync)
-                Button("构建 ANN 索引") { model.requestANNIndexBuild() }
+                Button(L("构建 ANN 索引")) { model.requestANNIndexBuild() }
                     .disabled(model.isRunning || model.isModelLoading || model.isWarmingUp
                         || model.isSyncing || model.isBuildingANN)
-                Button("停止 ANN 索引构建") { model.stopANNIndexBuild() }
+                Button(L("停止 ANN 索引构建")) { model.stopANNIndexBuild() }
                     .disabled(!model.isBuildingANN)
             }
         }
 
-        Window("配置", id: "settings") {
+        Window(L("配置"), id: "settings") {
             SettingsView(model: model)
         }
         .defaultSize(width: 940, height: 860)
 
-        Window("日志", id: "logs") {
+        Window(L("日志"), id: "logs") {
             LogsWindowView(model: model)
         }
         .defaultSize(width: 900, height: 620)
 
-        Window("引用切片", id: "citation-viewer") {
+        Window(L("引用切片"), id: "citation-viewer") {
             ChunkViewerWindowView(model: model)
         }
         .defaultSize(width: 780, height: 680)
 
-        Window("OCR 识别测试", id: "ocr-lab") {
+        Window(L("OCR 识别测试"), id: "ocr-lab") {
             OCRLabView(model: model)
                 .frame(minWidth: 900, minHeight: 640)
         }
         .defaultSize(width: 1280, height: 880)
 
-        Window("转换工具", id: "markdown-converter") {
+        Window(L("转换工具"), id: "markdown-converter") {
             MarkdownConvertView(model: model)
         }
         .defaultSize(width: 1120, height: 680)
 
-        Window("扫描书阅读器", id: "mobi-scan-reader") {
+        Window(L("扫描书阅读器"), id: "mobi-scan-reader") {
             MobiScanReaderView(model: model)
                 .frame(minWidth: 900, minHeight: 640)
         }
@@ -156,61 +156,61 @@ struct MainView: View {
                 Button {
                     showClearConversationConfirm = true
                 } label: {
-                    Label("清空对话", systemImage: "trash")
+                    Label(L("清空对话"), systemImage: "trash")
                         .labelStyle(.titleAndIcon)
                 }
                 .disabled(model.isModelLoading || model.isWarmingUp)
-                .help("清空当前对话与上下文；保留已预热的系统提示 KV 缓存，下一轮只 prefill 新问句，恢复推理速度")
+                .help(L("清空当前对话与上下文；保留已预热的系统提示 KV 缓存，下一轮只 prefill 新问句，恢复推理速度"))
                 .confirmationDialog(
-                    "清空当前对话？",
+                    L("清空当前对话？"),
                     isPresented: $showClearConversationConfirm,
                     titleVisibility: .visible
                 ) {
-                    Button("清空对话", role: .destructive) {
+                    Button(L("清空对话"), role: .destructive) {
                         model.resetConversation()
                     }
-                    Button("取消", role: .cancel) {}
+                    Button(L("取消"), role: .cancel) {}
                 } message: {
-                    Text("会清空对话窗口与累积的上下文（不会删除知识库与记忆文件）。系统提示的 KV 缓存会保留，下一轮可立即恢复速度。")
+                    Text(L("会清空对话窗口与累积的上下文（不会删除知识库与记忆文件）。系统提示的 KV 缓存会保留，下一轮可立即恢复速度。"))
                 }
 
                 // 与配置窗口内「开始同步」一致的快捷入口：目录已配置时无需进设置。
                 Button {
                     model.syncAllKnowledge(force: false)
                 } label: {
-                    Label("同步知识", systemImage: "arrow.triangle.2.circlepath")
+                    Label(L("同步知识"), systemImage: "arrow.triangle.2.circlepath")
                         .labelStyle(.titleAndIcon)
                 }
                 .disabled(model.isRunning || model.isModelLoading
                     || model.isWarmingUp || model.isSyncing || model.isBuildingANN
                     || !model.missingDefaultModels.isEmpty)
-                .help("一键同步所有启用的知识分区（未配置多分区时同步默认知识库）")
+                .help(L("一键同步所有启用的知识分区（未配置多分区时同步默认知识库）"))
 
                 Button {
                     model.stopSync()
                 } label: {
-                    Label(model.isStoppingSync ? "正在停止…" : "停止同步",
+                    Label(model.isStoppingSync ? L("正在停止…") : L("停止同步"),
                           systemImage: "stop.circle")
                         .labelStyle(.titleAndIcon)
                 }
                 .disabled(!model.isSyncing || model.isStoppingSync)
-                .help(model.isStoppingSync ? "正在停止同步…" : "停止知识库同步")
+                .help(model.isStoppingSync ? L("正在停止同步…") : L("停止知识库同步"))
 
                 Button {
                     openWindow(id: "settings")
                 } label: {
-                    Label("配置", systemImage: "gearshape")
+                    Label(L("配置"), systemImage: "gearshape")
                         .labelStyle(.titleAndIcon)
                 }
-                .help("打开配置窗口")
+                .help(L("打开配置窗口"))
 
                 Button {
                     openWindow(id: "logs")
                 } label: {
-                    Label("日志", systemImage: "list.bullet.rectangle")
+                    Label(L("日志"), systemImage: "list.bullet.rectangle")
                         .labelStyle(.titleAndIcon)
                 }
-                .help("打开日志窗口")
+                .help(L("打开日志窗口"))
             }
         }
         .onAppear {
@@ -247,7 +247,7 @@ struct MainView: View {
     private var schedulePane: some View {
         VStack(spacing: 0) {
             HStack(spacing: 6) {
-                Text("定时任务").font(.caption).bold()
+                Text(L("定时任务")).font(.caption).bold()
                 if !model.scheduledTasks.isEmpty {
                     Text("\(model.scheduledTasks.filter(\.enabled).count)/\(model.scheduledTasks.count)")
                         .font(.caption2)
@@ -260,7 +260,7 @@ struct MainView: View {
                     Image(systemName: "arrow.clockwise")
                 }
                 .buttonStyle(.borderless)
-                .help("刷新定时任务")
+                .help(L("刷新定时任务"))
             }
             .padding(.horizontal, 8)
             .padding(.vertical, 6)
@@ -270,11 +270,11 @@ struct MainView: View {
             ScrollView {
                 if model.scheduledTasks.isEmpty {
                     VStack(alignment: .leading, spacing: 4) {
-                        Text("暂无定时任务。")
+                        Text(L("暂无定时任务。"))
                             .font(.caption)
                             .foregroundStyle(.secondary)
-                        Text("在对话里说「每天早上 9 点帮我……」即可创建；"
-                            + "到点后自动执行，结果显示在对话里。")
+                        Text(L("在对话里说「每天早上 9 点帮我……」即可创建；")
+                            + L("到点后自动执行，结果显示在对话里。"))
                             .font(.caption2)
                             .foregroundStyle(.tertiary)
                     }
@@ -299,7 +299,7 @@ struct MainView: View {
                     Image(systemName: "checkmark.seal.fill")
                         .font(.caption)
                         .foregroundStyle(Color.green)
-                        .help("一次性任务已完成")
+                        .help(L("一次性任务已完成"))
                 } else {
                     Button {
                         model.setScheduledTaskEnabled(task, enabled: !task.enabled)
@@ -310,7 +310,7 @@ struct MainView: View {
                             .foregroundStyle(task.enabled ? Color.accentColor : Color.secondary)
                     }
                     .buttonStyle(.borderless)
-                    .help(task.enabled ? "停用任务" : "启用任务")
+                    .help(task.enabled ? L("停用任务") : L("启用任务"))
                 }
 
                 Text(task.title)
@@ -325,7 +325,7 @@ struct MainView: View {
                     Image(systemName: "play.circle").font(.caption)
                 }
                 .buttonStyle(.borderless)
-                .help("立即执行一次")
+                .help(L("立即执行一次"))
                 .disabled(model.isRunning || model.isModelLoading
                     || model.isWarmingUp || model.isSyncing || model.isBuildingANN)
                 Button {
@@ -334,7 +334,7 @@ struct MainView: View {
                     Image(systemName: "trash").font(.caption)
                 }
                 .buttonStyle(.borderless)
-                .help("删除任务")
+                .help(L("删除任务"))
             }
             Text(scheduleDetail(task))
                 .font(.caption2)
@@ -348,17 +348,17 @@ struct MainView: View {
     private func scheduleDetail(_ task: ScheduledTask) -> String {
         var parts = [task.rule.summary]
         if task.isCompleted {
-            parts.append("已完成（一次性）")
+            parts.append(L("已完成（一次性）"))
         } else if task.enabled {
             let next = task.nextRunDate()
             parts.append(Date() >= next
-                ? "已到期（等待执行）"
-                : "下次 \(scheduleLocalTimeText(next))")
+                ? L("已到期（等待执行）")
+                : L("下次 \(scheduleLocalTimeText(next))"))
         } else {
-            parts.append("已停用")
+            parts.append(L("已停用"))
         }
         if let result = task.lastResult, !result.isEmpty {
-            parts.append("上次：\(result)")
+            parts.append(L("上次：\(result)"))
         }
         return parts.joined(separator: " · ")
     }
@@ -368,7 +368,7 @@ struct MainView: View {
     private var planPane: some View {
         VStack(spacing: 0) {
             HStack(spacing: 6) {
-                Text("任务计划").font(.caption).bold()
+                Text(L("任务计划")).font(.caption).bold()
                 if let plan = model.plan {
                     Text(planProgress(plan))
                         .font(.caption2)
@@ -381,14 +381,14 @@ struct MainView: View {
                     Image(systemName: "arrow.clockwise")
                 }
                 .buttonStyle(.borderless)
-                .help("刷新计划")
+                .help(L("刷新计划"))
                 Button {
                     model.clearPlan()
                 } label: {
                     Image(systemName: "trash")
                 }
                 .buttonStyle(.borderless)
-                .help("清空计划（运行中会先终止）")
+                .help(L("清空计划（运行中会先终止）"))
                 .disabled(model.plan == nil && !model.isRunning)
             }
             .padding(.horizontal, 8)
@@ -413,10 +413,10 @@ struct MainView: View {
                     .padding(8)
                 } else {
                     VStack(alignment: .leading, spacing: 4) {
-                        Text("暂无计划。")
+                        Text(L("暂无计划。"))
                             .font(.caption)
                             .foregroundStyle(.secondary)
-                        Text("Agent 开始任务前会先规划步骤，这里会实时显示进度。")
+                        Text(L("Agent 开始任务前会先规划步骤，这里会实时显示进度。"))
                             .font(.caption2)
                             .foregroundStyle(.tertiary)
                     }
@@ -463,7 +463,7 @@ struct MainView: View {
             Spacer(minLength: 0)
 
             if isCurrent {
-                Text("进行中")
+                Text(L("进行中"))
                     .font(.caption2)
                     .padding(.horizontal, 5)
                     .padding(.vertical, 1)
@@ -502,9 +502,9 @@ struct MainView: View {
     private var thinkingPane: some View {
         VStack(spacing: 0) {
             HStack(spacing: 6) {
-                Text("思考过程").font(.caption).bold()
+                Text(L("思考过程")).font(.caption).bold()
                 Spacer(minLength: 4)
-                Text(model.reasoning.isEmpty ? "—" : "\(model.reasoning.count) 字")
+                Text(model.reasoning.isEmpty ? "—" : L("\(model.reasoning.count) 字"))
                     .font(.caption2)
                     .foregroundStyle(.secondary)
             }
@@ -516,7 +516,7 @@ struct MainView: View {
             ScrollViewReader { proxy in
                 ScrollView {
                     if model.reasoning.isEmpty {
-                        Text("暂无思考内容。")
+                        Text(L("暂无思考内容。"))
                             .font(.caption)
                             .foregroundStyle(.secondary)
                             .frame(maxWidth: .infinity, alignment: .leading)
@@ -578,7 +578,7 @@ struct MainView: View {
                 .disabled(model.isRunning || model.isModelLoading
                     || model.isWarmingUp || model.isSyncing || model.isBuildingANN
                     || !model.missingDefaultModels.isEmpty)
-                .help("增量同步知识库")
+                .help(L("增量同步知识库"))
                 Button {
                     model.syncAllKnowledge(force: true)
                 } label: {
@@ -589,7 +589,7 @@ struct MainView: View {
                 .disabled(model.isRunning || model.isModelLoading
                     || model.isWarmingUp || model.isSyncing || model.isBuildingANN
                     || !model.missingDefaultModels.isEmpty)
-                .help("强制全量同步（忽略增量缓存，全部重新解析入库）")
+                .help(L("强制全量同步（忽略增量缓存，全部重新解析入库）"))
                 if model.isSyncing {
                     Button {
                         model.stopSync()
@@ -600,7 +600,7 @@ struct MainView: View {
                     }
                     .buttonStyle(.borderless)
                     .disabled(model.isStoppingSync)
-                    .help(model.isStoppingSync ? "正在停止同步…" : "停止知识库同步")
+                    .help(model.isStoppingSync ? L("正在停止同步…") : L("停止知识库同步"))
                 }
                 if model.isBuildingANN {
                     Button {
@@ -609,7 +609,7 @@ struct MainView: View {
                         Image(systemName: "stop.circle").font(.caption)
                     }
                     .buttonStyle(.borderless)
-                    .help("停止 ANN 索引构建（已写完的块会保留，可再次构建续建）")
+                    .help(L("停止 ANN 索引构建（已写完的块会保留，可再次构建续建）"))
                 }
             }
         }
@@ -638,7 +638,7 @@ struct MainView: View {
                         Image(systemName: "stop.circle").font(.caption)
                     }
                     .buttonStyle(.borderless)
-                    .help("停止下载（已下载部分保留，下次从断点续传）")
+                    .help(L("停止下载（已下载部分保留，下次从断点续传）"))
                 }
                 ProgressView(value: model.modelDownloadProgress)
             } else if model.config.autoDownloadMissingModels {
@@ -646,17 +646,17 @@ struct MainView: View {
                     Image(systemName: "exclamationmark.triangle.fill")
                         .font(.caption2)
                         .foregroundStyle(.orange)
-                    Text("默认模型缺失，需联网下载后才能使用")
+                    Text(L("默认模型缺失，需联网下载后才能使用"))
                         .font(.caption2)
                         .lineLimit(1)
                         .truncationMode(.tail)
                     Spacer(minLength: 4)
-                    Button("下载") {
+                    Button(L("下载")) {
                         model.startModelDownload()
                     }
                     .buttonStyle(.borderless)
                     .controlSize(.small)
-                    .help("从 hf-mirror.com 下载默认模型（支持断点续传）")
+                    .help(L("从 hf-mirror.com 下载默认模型（支持断点续传）"))
                 }
             } else {
                 // 自行下载指定模式：不自动下载，引导用户去配置窗口指定模型；
@@ -665,23 +665,23 @@ struct MainView: View {
                     Image(systemName: "exclamationmark.triangle.fill")
                         .font(.caption2)
                         .foregroundStyle(.orange)
-                    Text("默认模型缺失（自行管理模式），请在配置中指定可用模型")
+                    Text(L("默认模型缺失（自行管理模式），请在配置中指定可用模型"))
                         .font(.caption2)
                         .lineLimit(1)
                         .truncationMode(.tail)
                     Spacer(minLength: 4)
-                    Button("打开配置") {
+                    Button(L("打开配置")) {
                         openWindow(id: "settings")
                     }
                     .buttonStyle(.borderless)
                     .controlSize(.small)
-                    .help("在配置窗口为各阶段指定自行准备好的模型")
-                    Button("自动下载") {
+                    .help(L("在配置窗口为各阶段指定自行准备好的模型"))
+                    Button(L("自动下载")) {
                         model.startModelDownload()
                     }
                     .buttonStyle(.borderless)
                     .controlSize(.small)
-                    .help("手动触发一次自动下载补全（已选择自行管理，不会自动启动）")
+                    .help(L("手动触发一次自动下载补全（已选择自行管理，不会自动启动）"))
                 }
             }
         }
@@ -691,7 +691,7 @@ struct MainView: View {
     private var modelLabel: String {
         if model.config.llmProvider == "local" {
             return model.config.localLLMModel.isEmpty
-                ? "本地 MLX（未配置模型）"
+                ? L("本地 MLX（未配置模型）")
                 : model.config.localLLMModel
         }
         return "\(model.config.model) · \(model.config.baseURL)"
@@ -728,8 +728,8 @@ struct MainView: View {
                 .frame(maxWidth: .infinity)
                 .multilineTextAlignment(.center)
                 .padding(.top, 6)
-                .help("上下文占用 = 本轮 prompt + 已生成 token 占实际生效上下文窗口的比例；"
-                    + "接近上限时内核会折叠历史或重建上下文")
+                .help(L("上下文占用 = 本轮 prompt + 已生成 token 占实际生效上下文窗口的比例；")
+                    + L("接近上限时内核会折叠历史或重建上下文"))
 
             // 待发送附件缩略图；用户可在发送前逐个移除。
             if !attachments.isEmpty {
@@ -755,7 +755,7 @@ struct MainView: View {
                                 }
                                 .buttonStyle(.plain)
                                 .offset(x: 5, y: -5)
-                                .help("移除附件")
+                                .help(L("移除附件"))
                             }
                         }
                     }
@@ -765,7 +765,7 @@ struct MainView: View {
             }
 
             HStack(alignment: .bottom, spacing: 8) {
-                TextField("输入消息，Enter 发送（Shift+Enter 换行）…",
+                TextField(L("输入消息，Enter 发送（Shift+Enter 换行）…"),
                           text: $input, axis: .vertical)
                     .lineLimit(1...6)
                     .textFieldStyle(.plain)
@@ -807,7 +807,7 @@ struct MainView: View {
                                 .fill(Color.secondary.opacity(0.12)))
                 }
                 .buttonStyle(.plain)
-                .help("添加图片等附件（多模态）")
+                .help(L("添加图片等附件（多模态）"))
                 .disabled(model.isRunning || model.isModelLoading || model.isWarmingUp)
                 Button {
                     if model.isRunning {
@@ -816,7 +816,7 @@ struct MainView: View {
                         send()
                     }
                 } label: {
-                    Text(model.isRunning ? "停止" : "发送")
+                    Text(model.isRunning ? L("停止") : L("发送"))
                         .font(.body.weight(.medium))
                         .foregroundStyle(.white)
                         // 与左侧消息输入框同高（46pt）、同圆角。
@@ -828,7 +828,7 @@ struct MainView: View {
                 .buttonStyle(.plain)
                 .disabled(sendBlocked)
                 .opacity(sendBlocked ? 0.45 : 1)
-                .help(model.isRunning ? "停止本轮生成" : "发送消息")
+                .help(model.isRunning ? L("停止本轮生成") : L("发送消息"))
             }
             .padding(10)
         }
@@ -890,7 +890,7 @@ struct MainView: View {
         }
         let window = model.config.effectiveMainContextTokens
         if window > 0, model.totalTokens > 0 {
-            parts.append("上下文 \(contextUsagePercent)%（\(model.totalTokens)/\(window)）")
+            parts.append(L("上下文 \(contextUsagePercent)%（\(model.totalTokens)/\(window)）"))
         }
         return parts.joined(separator: " · ")
     }
@@ -982,15 +982,15 @@ struct LogsWindowView: View {
         VStack(spacing: 0) {
             HStack(spacing: 8) {
                 Picker("", selection: $tab) {
-                    Text("日志").tag(0)
-                    Text("工具调用").tag(1)
+                    Text(L("日志")).tag(0)
+                    Text(L("工具调用")).tag(1)
                 }
                 .pickerStyle(.segmented)
                 .labelsHidden()
 
                 Spacer(minLength: 8)
 
-                Button("复制全部") {
+                Button(L("复制全部")) {
                     let text = model.logs
                         .map { "\(timeText($0.timestamp))  \($0.text)" }
                         .joined(separator: "\n")
@@ -999,13 +999,13 @@ struct LogsWindowView: View {
                     pb.setString(text, forType: .string)
                 }
                 .disabled(model.logs.isEmpty)
-                .help("复制全部日志到剪贴板")
+                .help(L("复制全部日志到剪贴板"))
 
-                Button("清空") {
+                Button(L("清空")) {
                     model.clearLogs()
                 }
                 .disabled(model.logs.isEmpty && model.toolEvents.isEmpty)
-                .help("清空当前面板的日志记录")
+                .help(L("清空当前面板的日志记录"))
             }
             .padding(8)
 
@@ -1025,7 +1025,7 @@ struct LogsWindowView: View {
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 2) {
                     if model.logs.isEmpty {
-                        Text("暂无日志。")
+                        Text(L("暂无日志。"))
                             .font(.caption)
                             .foregroundStyle(.secondary)
                             .padding(10)
@@ -1066,7 +1066,7 @@ struct LogsWindowView: View {
     private var toolList: some View {
         Group {
             if model.toolEvents.isEmpty {
-                Text("暂无工具调用记录。")
+                Text(L("暂无工具调用记录。"))
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -1100,7 +1100,7 @@ struct CitationChipsRow: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
-            Text("召回切片 \(citations.count) 条（点击查看原文）")
+            Text(L("召回切片 \(citations.count) 条（点击查看原文）"))
                 .font(.caption2)
                 .foregroundStyle(.secondary)
             ScrollView(.horizontal, showsIndicators: false) {
@@ -1119,7 +1119,7 @@ struct CitationChipsRow: View {
             Image(systemName: citation.isPrimary ? "star.fill" : "doc.text")
                 .font(.caption2)
                 .foregroundStyle(citation.isPrimary ? Color.accentColor : Color.secondary)
-                .help(citation.isPrimary ? "模型参考本切片总结回复" : "召回切片，仅供用户查看")
+                .help(citation.isPrimary ? L("模型参考本切片总结回复") : L("召回切片，仅供用户查看"))
             Text("#\(index + 1) \(citation.source)")
                 .font(.caption)
                 .lineLimit(1)
@@ -1152,7 +1152,7 @@ struct CitationChipsRow: View {
             model.openCitation(messageID: messageID, index: index)
             onOpen()
         }
-        .help("查看切片原文（⌘[ / ⌘] 切换相邻切片）")
+        .help(L("查看切片原文（⌘[ / ⌘] 切换相邻切片）"))
     }
 }
 
@@ -1168,7 +1168,7 @@ struct ChunkViewerWindowView: View {
                let citations = item.citations, !citations.isEmpty {
                 viewer(state: state, citations: citations)
             } else {
-                Text("没有正在查看的引用切片。\n点击对话中回复下方的切片气泡即可在此查看原文。")
+                Text(L("没有正在查看的引用切片。\n点击对话中回复下方的切片气泡即可在此查看原文。"))
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .multilineTextAlignment(.center)
@@ -1209,9 +1209,9 @@ struct ChunkViewerWindowView: View {
                 // 用 ⌘[ / ⌘] 而不是 ⌘← / ⌘→：后者是输入框的行首/行尾快捷键，
                 // 避免快捷键串窗时抢走主窗口输入框的编辑行为。
                 .keyboardShortcut("[", modifiers: .command)
-                .help("上一个切片（⌘[）")
+                .help(L("上一个切片（⌘[）"))
 
-                Text("切片 \(index + 1) / \(total)")
+                Text(L("切片 \(index + 1) / \(total)"))
                     .font(.callout.monospacedDigit())
 
                 Button {
@@ -1221,10 +1221,10 @@ struct ChunkViewerWindowView: View {
                 }
                 .disabled(index >= total - 1)
                 .keyboardShortcut("]", modifiers: .command)
-                .help("下一个切片（⌘]）")
+                .help(L("下一个切片（⌘]）"))
 
                 if citation.isPrimary {
-                    Label("模型参考", systemImage: "star.fill")
+                    Label(L("模型参考"), systemImage: "star.fill")
                         .font(.caption2)
                         .foregroundStyle(Color.accentColor)
                         .padding(.horizontal, 6)
@@ -1233,7 +1233,7 @@ struct ChunkViewerWindowView: View {
                         .cornerRadius(6)
                 }
                 Spacer(minLength: 8)
-                Text("相关度 \(String(format: "%.4f", citation.score))")
+                Text(L("相关度 \(String(format: "%.4f", citation.score))"))
                     .font(.caption.monospacedDigit())
                     .foregroundStyle(.secondary)
             }

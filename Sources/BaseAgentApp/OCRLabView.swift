@@ -49,16 +49,16 @@ struct OCRLabView: View {
     private var toolbar: some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack(spacing: 8) {
-                Text("待识别文件").font(.caption)
-                TextField("选择图片或 PDF 文件", text: Binding(
+                Text(L("待识别文件")).font(.caption)
+                TextField(L("选择图片或 PDF 文件"), text: Binding(
                     get: { state.fileURL?.path ?? "" },
                     set: { _ in }
                 ))
                 .textFieldStyle(.roundedBorder)
                 .frame(minWidth: 220)
-                Button("选择…") { state.pickFile() }
+                Button(L("选择…")) { state.pickFile() }
 
-                Text("识别模型").font(.caption)
+                Text(L("识别模型")).font(.caption)
                 Picker("", selection: $state.engine) {
                     ForEach(availableEngines, id: \.self) { engine in
                         Text(engineLabel(engine)).tag(engine)
@@ -67,14 +67,14 @@ struct OCRLabView: View {
                 .labelsHidden()
                 .frame(width: 220)
 
-                Button(state.isRunning ? "识别中…" : "开始识别") {
+                Button(state.isRunning ? L("识别中…") : L("开始识别")) {
                     state.start(config: config)
                 }
                 .buttonStyle(.borderedProminent)
                 .disabled(state.fileURL == nil || state.isRunning
                     || !availableEngines.contains(state.engine))
 
-                Button("保存结果") { state.save() }
+                Button(L("保存结果")) { state.save() }
                     .disabled(state.result == nil)
             }
 
@@ -88,7 +88,7 @@ struct OCRLabView: View {
                     .lineLimit(2)
                 Spacer()
                 if let result = state.result {
-                    Text("\(result.engineLabel) · \(result.pageCount) 页")
+                    Text(L("\(result.engineLabel) · \(result.pageCount) 页"))
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
@@ -99,7 +99,7 @@ struct OCRLabView: View {
     }
 
     private func engineLabel(_ engine: OCRLabEngine) -> String {
-        engine == .custom ? "自定义：\(state.customModelName(config: config))" : engine.title
+        engine == .custom ? L("自定义：\(state.customModelName(config: config))") : engine.title
     }
 
     // MARK: 左侧原文件
@@ -107,10 +107,10 @@ struct OCRLabView: View {
     private var originalPane: some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack {
-                Text("原文件").font(.headline)
+                Text(L("原文件")).font(.headline)
                 Spacer()
                 if state.pageCount > 1 {
-                    Text("共 \(state.pageCount) 页").font(.caption).foregroundStyle(.secondary)
+                    Text(L("共 \(state.pageCount) 页")).font(.caption).foregroundStyle(.secondary)
                 }
             }
             Group {
@@ -125,10 +125,10 @@ struct OCRLabView: View {
                                 .padding(8)
                         }
                     } else {
-                        emptyHint("无法读取图片")
+                        emptyHint(L("无法读取图片"))
                     }
                 } else {
-                    emptyHint("请选择图片或 PDF 文件")
+                    emptyHint(L("请选择图片或 PDF 文件"))
                 }
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -164,7 +164,7 @@ struct OCRLabView: View {
                                     .fill(Color.gray.opacity(0.12))
                                     .frame(width: 180, height: 240)
                             }
-                            Text("第 \(index + 1) 页")
+                            Text(L("第 \(index + 1) 页"))
                                 .font(.caption)
                                 .foregroundStyle(state.selectedPage == index
                                                  ? Color.accentColor : .secondary)
@@ -189,10 +189,10 @@ struct OCRLabView: View {
     private var resultPane: some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack {
-                Text("识别结果").font(.headline)
+                Text(L("识别结果")).font(.headline)
                 Spacer()
                 if let result = state.result, result.pageCount > 1 {
-                    Text("第 \(min(state.selectedPage + 1, result.pageCount)) / \(result.pageCount) 页")
+                    Text(L("第 \(min(state.selectedPage + 1, result.pageCount)) / \(result.pageCount) 页"))
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
@@ -200,12 +200,12 @@ struct OCRLabView: View {
             Group {
                 if let markdown = state.selectedMarkdown {
                     if markdown.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                        emptyHint("本页未识别出内容")
+                        emptyHint(L("本页未识别出内容"))
                     } else {
                         HTMLView(html: MarkdownHTML.document(markdown))
                     }
                 } else {
-                    emptyHint("点击「开始识别」后，这里显示识别结果")
+                    emptyHint(L("点击「开始识别」后，这里显示识别结果"))
                 }
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -282,7 +282,7 @@ final class OCRLabState: ObservableObject {
     func customModelName(config: AgentConfig) -> String {
         let path = config.ragOCRModelPath
             .trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !path.isEmpty else { return "未配置" }
+        guard !path.isEmpty else { return L("未配置") }
         let url = URL(fileURLWithPath: path)
         if config.localVLMBackend.lowercased() == "mlx" {
             return url.lastPathComponent
@@ -297,7 +297,7 @@ final class OCRLabState: ObservableObject {
         result = nil
         selectedPage = 0
         statusMessage = ""
-        progressText = "准备识别…"
+        progressText = L("准备识别…")
         let engine = self.engine
 
         task = Task {
@@ -317,11 +317,11 @@ final class OCRLabState: ObservableObject {
                 pageCount = max(pageCount, result.pageCount)
                 selectedPage = 0
                 progressText = ""
-                statusMessage = "识别完成：\(result.pages.count) 页"
+                statusMessage = L("识别完成：\(result.pages.count) 页")
             } catch {
                 isRunning = false
                 progressText = ""
-                statusMessage = "识别失败：\(error.localizedDescription)"
+                statusMessage = L("识别失败：\(error.localizedDescription)")
             }
         }
     }
@@ -339,9 +339,9 @@ final class OCRLabState: ObservableObject {
         guard panel.runModal() == .OK, let url = panel.url else { return }
         do {
             try result.markdown.write(to: url, atomically: true, encoding: .utf8)
-            statusMessage = "已保存到 \(url.path)"
+            statusMessage = L("已保存到 \(url.path)")
         } catch {
-            statusMessage = "保存失败：\(error.localizedDescription)"
+            statusMessage = L("保存失败：\(error.localizedDescription)")
         }
     }
 
@@ -350,11 +350,11 @@ final class OCRLabState: ObservableObject {
         case .page(let index, let total, let stage):
             let name: String
             switch stage {
-            case "text": name = "提取文本层"
-            case "ocr": name = "OCR 识别"
+            case "text": name = L("提取文本层")
+            case "ocr": name = L("OCR 识别")
             default: name = stage
             }
-            return "第 \(index)/\(total) 页 · \(name)"
+            return L("第 \(index)/\(total) 页 · \(name)")
         case .message(let message):
             return message
         }

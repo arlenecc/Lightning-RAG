@@ -18,7 +18,7 @@ struct MobiScanReaderView: View {
     @State private var currentIndex = 0
     /// 页图缓存窗口：仅当前页与相邻页；其它页在滚动离开时立即移除。
     @State private var imageCache: [Int: CGImage] = [:]
-    @State private var status = "尚未打开 MOBI/AZW3 文件"
+    @State private var status = L("尚未打开 MOBI/AZW3 文件")
     @State private var sourceURL: URL?
 
     var body: some View {
@@ -31,10 +31,10 @@ struct MobiScanReaderView: View {
 
     private var toolbar: some View {
         HStack(spacing: 12) {
-            Button("打开 MOBI/AZW3…") { openFile() }
-            Button("上一页") { move(to: currentIndex - 1) }
+            Button(L("打开 MOBI/AZW3…")) { openFile() }
+            Button(L("上一页")) { move(to: currentIndex - 1) }
                 .disabled(pages.isEmpty || currentIndex <= 0)
-            Button("下一页") { move(to: currentIndex + 1) }
+            Button(L("下一页")) { move(to: currentIndex + 1) }
                 .disabled(pages.isEmpty || currentIndex >= pages.count - 1)
             Spacer()
             Text(status)
@@ -79,7 +79,7 @@ struct MobiScanReaderView: View {
     private func pageView(_ index: Int) -> some View {
         Group {
             if let image = imageCache[index] {
-                Image(image, scale: 1, label: Text("第 \(index + 1) 页"))
+                Image(image, scale: 1, label: Text(L("第 \(index + 1) 页")))
                     .resizable()
                     .scaledToFit()
                     .frame(maxWidth: .infinity)
@@ -87,7 +87,7 @@ struct MobiScanReaderView: View {
             } else {
                 ZStack {
                     RoundedRectangle(cornerRadius: 6).fill(.quaternary)
-                    ProgressView("第 \(index + 1) 页")
+                    ProgressView(L("第 \(index + 1) 页"))
                         .font(.caption)
                 }
                 .frame(height: 260)
@@ -105,7 +105,7 @@ struct MobiScanReaderView: View {
             .compactMap { UTType($0) }
         guard panel.runModal() == .OK, let url = panel.url else { return }
         sourceURL = url
-        status = "正在解析 \(url.lastPathComponent)…"
+        status = L("正在解析 \(url.lastPathComponent)…")
         pages = []
         stitchedRanges = []
         imageCache = [:]
@@ -115,17 +115,17 @@ struct MobiScanReaderView: View {
             do {
                 let parser = MobiParser(config: config)
                 guard let document = try parser.scanDocument(at: url) else {
-                    throw AgentError.parse("该文件不是扫描版 MOBI/AZW3，或没有可提取的图片")
+                    throw AgentError.parse(L("该文件不是扫描版 MOBI/AZW3，或没有可提取的图片"))
                 }
                 await MainActor.run {
                     pages = document.pages
                     stitchedRanges = document.stitchedRanges
-                    status = "\(url.lastPathComponent)：\(pages.count) 页"
-                        + (stitchedRanges.isEmpty ? "" : "，\(stitchedRanges.count) 组拼接")
+                    status = L("\(url.lastPathComponent)：\(pages.count) 页")
+                        + (stitchedRanges.isEmpty ? "" : L("，\(stitchedRanges.count) 组拼接"))
                     if !pages.isEmpty { load(0) }
                 }
             } catch {
-                await MainActor.run { status = "解析失败：\(error.localizedDescription)" }
+                await MainActor.run { status = L("解析失败：\(error.localizedDescription)") }
             }
         }
     }

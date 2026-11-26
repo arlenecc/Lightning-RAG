@@ -34,29 +34,29 @@ struct MarkdownConvertView: View {
     private var toolbar: some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack(spacing: 8) {
-                Text("待转换文件").font(.caption)
-                TextField("选择文件或目录", text: Binding(
+                Text(L("待转换文件")).font(.caption)
+                TextField(L("选择文件或目录"), text: Binding(
                     get: { state.sourceURL?.path ?? "" },
                     set: { _ in }
                 ))
                 .textFieldStyle(.roundedBorder)
                 .frame(minWidth: 240)
-                Button("选择…") { state.pickSource() }
-                    .help("可选择一个文件，或选择整个目录递归转换\n"
-                        + "Office 支持 .docx / .xlsx / .pptx 与旧版 .doc / .xls / .ppt\n支持："
+                Button(L("选择…")) { state.pickSource() }
+                    .help(L("可选择一个文件，或选择整个目录递归转换\n")
+                        + L("Office 支持 .docx / .xlsx / .pptx 与旧版 .doc / .xls / .ppt\n支持：")
                         + MarkdownConverterState.supportedExtensionHint)
 
-                Text("保存目录").font(.caption)
-                TextField("转换结果保存位置", text: Binding(
+                Text(L("保存目录")).font(.caption)
+                TextField(L("转换结果保存位置"), text: Binding(
                     get: { state.outputDirectory?.path ?? "" },
                     set: { _ in }
                 ))
                 .textFieldStyle(.roundedBorder)
                 .frame(minWidth: 180)
-                Button("选择…") { state.pickOutputDirectory() }
+                Button(L("选择…")) { state.pickOutputDirectory() }
                     .disabled(state.isRunning)
 
-                Button(state.isRunning ? "转换中…" : "开始转换") {
+                Button(state.isRunning ? L("转换中…") : L("开始转换")) {
                     state.start(config: config)
                 }
                 .buttonStyle(.borderedProminent)
@@ -64,21 +64,21 @@ struct MarkdownConvertView: View {
                     || state.isRunning)
 
                 if state.isRunning {
-                    Button("停止") { state.cancel() }
+                    Button(L("停止")) { state.cancel() }
                 }
 
-                Toggle("增量转换", isOn: $state.incremental)
+                Toggle(L("增量转换"), isOn: $state.incremental)
                     .toggleStyle(.checkbox)
                     .disabled(state.isRunning)
-                    .help("开启时跳过上次已成功转换且源文件未变化的文件；\n"
-                        + "关闭后强制重新转换全部文件")
+                    .help(L("开启时跳过上次已成功转换且源文件未变化的文件；\n")
+                        + L("关闭后强制重新转换全部文件"))
             }
 
             HStack(spacing: 8) {
-                Text("设置来源：\(engineLabel(config.ragPDFEngine)) PDF 引擎"
+                Text(L("设置来源：\(engineLabel(config.ragPDFEngine)) PDF 引擎")
                     + " · EPUB \(engineLabel(config.ragEPUBOCREngine))"
-                    + " · 图像归一化\(config.ragOCRPreprocess ? "开" : "关")"
-                    + " · Otsu 二值化\(config.ragOCRBinarize ? "开" : "关")")
+                    + L(" · 图像归一化\(config.ragOCRPreprocess ? "开" : "关")")
+                    + L(" · Otsu 二值化\(config.ragOCRBinarize ? "开" : "关")"))
                     .font(.caption2)
                     .foregroundStyle(.secondary)
                 Spacer(minLength: 8)
@@ -97,8 +97,8 @@ struct MarkdownConvertView: View {
         switch engine {
         case .vision: return "Apple Vision"
         case .ovis: return "OvisOCR3"
-        case .hybrid: return "混合"
-        case .custom: return "自定义"
+        case .hybrid: return L("混合")
+        case .custom: return L("自定义")
         }
     }
 
@@ -128,8 +128,8 @@ struct MarkdownConvertView: View {
                     .truncationMode(.tail)
                 Spacer(minLength: 8)
                 if state.fileTotal > 0 {
-                    Text("已完成 \(state.completedFiles) · 失败 \(state.failedFiles)"
-                        + " · 共 \(state.fileTotal)")
+                    Text(L("已完成 \(state.completedFiles) · 失败 \(state.failedFiles)")
+                        + L(" · 共 \(state.fileTotal)"))
                         .font(.caption2)
                         .foregroundStyle(.secondary)
                 }
@@ -144,16 +144,16 @@ struct MarkdownConvertView: View {
     private var resultPane: some View {
         VStack(alignment: .leading, spacing: 0) {
             HStack(spacing: 6) {
-                Text("转换结果").font(.caption).bold()
+                Text(L("转换结果")).font(.caption).bold()
                 if let report = state.report {
-                    Text("成功 \(report.succeededCount - report.skippedCount)"
-                        + " · 跳过 \(report.skippedCount)"
-                        + " · 失败 \(report.failedCount)")
+                    Text(L("成功 \(report.succeededCount - report.skippedCount)")
+                        + L(" · 跳过 \(report.skippedCount)")
+                        + L(" · 失败 \(report.failedCount)"))
                         .font(.caption2)
                         .foregroundStyle(.secondary)
                 }
                 Spacer(minLength: 4)
-                Button("清空列表") { state.clearResults() }
+                Button(L("清空列表")) { state.clearResults() }
                     .buttonStyle(.borderless)
                     .font(.caption)
                     .disabled(state.isRunning || state.results.isEmpty)
@@ -167,7 +167,7 @@ struct MarkdownConvertView: View {
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: 2) {
                         if state.results.isEmpty {
-                            Text(state.isRunning ? "转换中…" : "尚未开始转换。")
+                            Text(state.isRunning ? L("转换中…") : L("尚未开始转换。"))
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
                                 .padding(10)
@@ -223,7 +223,7 @@ struct MarkdownConvertView: View {
 
             Spacer(minLength: 6)
 
-            Text(item.skipped ? "跳过" : String(format: "%.1fs", item.elapsed))
+            Text(item.skipped ? L("跳过") : String(format: "%.1fs", item.elapsed))
                 .font(.caption2.monospacedDigit())
                 .foregroundStyle(.secondary)
         }
@@ -266,18 +266,18 @@ final class MarkdownConverterState: ObservableObject {
 
     var fileDescription: String {
         guard fileTotal > 0 else {
-            return isRunning ? "正在扫描待转换文件…" : "等待选择待转换文件"
+            return isRunning ? L("正在扫描待转换文件…") : L("等待选择待转换文件")
         }
         let name = currentFileName.isEmpty ? "—" : currentFileName
-        return "第 \(max(1, fileIndex))/\(fileTotal) 个文件 · \(name)"
+        return L("第 \(max(1, fileIndex))/\(fileTotal) 个文件 · \(name)")
     }
 
     var stageDescription: String {
         if let pageIndex, let pageTotal, pageTotal > 0 {
-            return "当前环节：\(currentStage.isEmpty ? "解析" : currentStage)"
-                + "（第 \(pageIndex)/\(pageTotal) 页）"
+            return L("当前环节：\(currentStage.isEmpty ? "解析" : currentStage)")
+                + L("（第 \(pageIndex)/\(pageTotal) 页）")
         }
-        return "当前环节：\(currentStage.isEmpty ? "—" : currentStage)"
+        return L("当前环节：\(currentStage.isEmpty ? "—" : currentStage)")
     }
 
     // MARK: 选择路径
@@ -288,8 +288,8 @@ final class MarkdownConverterState: ObservableObject {
         panel.canChooseDirectories = true
         panel.allowsMultipleSelection = false
         panel.canCreateDirectories = false
-        panel.prompt = "选择"
-        panel.message = "可选择一个文件，或选择整个目录递归转换"
+        panel.prompt = L("选择")
+        panel.message = L("可选择一个文件，或选择整个目录递归转换")
         NSApp.activate(ignoringOtherApps: true)
         guard panel.runModal() == .OK, let url = panel.url else { return }
         sourceURL = url.standardizedFileURL
@@ -313,7 +313,7 @@ final class MarkdownConverterState: ObservableObject {
         panel.canChooseDirectories = true
         panel.allowsMultipleSelection = false
         panel.canCreateDirectories = true
-        panel.prompt = "选择保存目录"
+        panel.prompt = L("选择保存目录")
         NSApp.activate(ignoringOtherApps: true)
         guard panel.runModal() == .OK, let url = panel.url else { return }
         outputDirectory = url.standardizedFileURL
@@ -331,7 +331,7 @@ final class MarkdownConverterState: ObservableObject {
         report = nil
         isRunning = true
         currentFileName = ""
-        currentStage = "准备中"
+        currentStage = L("准备中")
         pageIndex = nil
         pageTotal = nil
         fileIndex = 0
@@ -368,21 +368,21 @@ final class MarkdownConverterState: ObservableObject {
                     self.failedFiles = report.failedCount
                     self.overallFraction = report.wasCancelled
                         ? self.overallFraction : 1
-                    self.currentStage = report.wasCancelled ? "已取消" : "转换完成"
+                    self.currentStage = report.wasCancelled ? L("已取消") : L("转换完成")
                     let skipped = report.skippedCount > 0
-                        ? " · 跳过 \(report.skippedCount)" : ""
+                        ? L(" · 跳过 \(report.skippedCount)") : ""
                     self.statusMessage = report.wasCancelled
-                        ? "已取消：成功 \(report.succeededCount)\(skipped)"
-                            + " · 失败 \(report.failedCount)"
-                        : "转换完成：成功 \(report.succeededCount)\(skipped)"
-                            + " · 失败 \(report.failedCount)"
-                            + "（用时 \(String(format: "%.1f", report.elapsed))s）"
+                        ? L("已取消：成功 \(report.succeededCount)\(skipped)")
+                            + L(" · 失败 \(report.failedCount)")
+                        : L("转换完成：成功 \(report.succeededCount)\(skipped)")
+                            + L(" · 失败 \(report.failedCount)")
+                            + L("（用时 \(String(format: "%.1f", report.elapsed))s）")
                 }
             } catch {
                 await MainActor.run { [weak self] in
                     guard let self else { return }
                     self.isRunning = false
-                    self.statusMessage = "转换失败：\(error.localizedDescription)"
+                    self.statusMessage = L("转换失败：\(error.localizedDescription)")
                 }
             }
         }
@@ -390,7 +390,7 @@ final class MarkdownConverterState: ObservableObject {
 
     func cancel() {
         task?.cancel()
-        statusMessage = "正在停止…"
+        statusMessage = L("正在停止…")
     }
 
     func clearResults() {

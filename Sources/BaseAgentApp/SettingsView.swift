@@ -204,7 +204,7 @@ struct SettingsView: View {
             HStack(spacing: 8) {
                 if model.isModelLoading {
                     ProgressView().controlSize(.small)
-                    Text("模型加载中…")
+                    Text(L("模型加载中…"))
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
@@ -213,11 +213,11 @@ struct SettingsView: View {
                     .foregroundStyle(.secondary)
                     .lineLimit(2)
                 Spacer()
-                Button("应用配置") { applyAllConfig() }
+                Button(L("应用配置")) { applyAllConfig() }
                     .buttonStyle(.borderedProminent)
                     .disabled(model.isSyncing || model.isDeduplicating || model.isBuildingANN
                         || model.isModelLoading || model.isRunning || model.isWarmingUp)
-                Button("关闭") { dismissWindow() }
+                Button(L("关闭")) { dismissWindow() }
                     .keyboardShortcut(.cancelAction)
             }
             .padding(12)
@@ -243,7 +243,7 @@ struct SettingsView: View {
             }
             .padding(8)
         } label: {
-            Text("Agent 模型配置").font(.headline)
+            Text(L("Agent 模型配置")).font(.headline)
         }
     }
 
@@ -275,22 +275,22 @@ struct SettingsView: View {
     /// 决策门一行：启用开关 + 计划完整性/执行完成度/技能符合度三个阈值。
     private var kernelDecisionGateRow: some View {
         HStack(spacing: 10) {
-            Text("决策门")
+            Text(L("决策门"))
                 .font(.caption.weight(.semibold))
                 .foregroundStyle(.secondary)
-            Toggle("启用", isOn: $kernelDecisionGateEnabled)
+            Toggle(L("启用"), isOn: $kernelDecisionGateEnabled)
                 .font(.caption2)
                 .toggleStyle(.checkbox)
-                .help("收尾时决策模型判定「信息是否足以完整回答」，计划创建后评审「每步是否必要合理」；"
-                    + "技能检索/加载/摘要注入前也由决策模型判定是否合适。判定失败/超时静默放行。"
-                    + "复用「高级 RAG / 检索模式」中的决策模型，无需额外加载")
+                .help(L("收尾时决策模型判定「信息是否足以完整回答」，计划创建后评审「每步是否必要合理」；")
+                    + L("技能检索/加载/摘要注入前也由决策模型判定是否合适。判定失败/超时静默放行。")
+                    + L("复用「高级 RAG / 检索模式」中的决策模型，无需额外加载"))
             if kernelDecisionGateEnabled {
-                decisionThresholdPicker("计划完整性", selection: $kernelPlanReviewThreshold,
-                    help: "计划步骤评审阈值：步骤不必要概率高于该值才提示修订；越高越保守（越少提示）")
-                decisionThresholdPicker("执行完成度", selection: $kernelFinishGateThreshold,
-                    help: "收尾拦截阈值：信息不足概率高于该值才拦截补工具；越高越保守（越少拦截）")
-                decisionThresholdPicker("技能符合度", selection: $skillDecisionGateThreshold,
-                    help: "技能加载/摘要注入判定阈值：不合适概率高于该值才拦截；越高越保守（越少拦截）")
+                decisionThresholdPicker(L("计划完整性"), selection: $kernelPlanReviewThreshold,
+                    help: L("计划步骤评审阈值：步骤不必要概率高于该值才提示修订；越高越保守（越少提示）"))
+                decisionThresholdPicker(L("执行完成度"), selection: $kernelFinishGateThreshold,
+                    help: L("收尾拦截阈值：信息不足概率高于该值才拦截补工具；越高越保守（越少拦截）"))
+                decisionThresholdPicker(L("技能符合度"), selection: $skillDecisionGateThreshold,
+                    help: L("技能加载/摘要注入判定阈值：不合适概率高于该值才拦截；越高越保守（越少拦截）"))
             }
             Spacer(minLength: 4)
         }
@@ -299,16 +299,16 @@ struct SettingsView: View {
     private var mainModelBlock: some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack(spacing: 10) {
-                Text("主模型").font(.subheadline).bold()
+                Text(L("主模型")).font(.subheadline).bold()
                 if mainMode == "local" {
-                    Toggle("启动时预加载", isOn: $autoPreloadMain)
+                    Toggle(L("启动时预加载"), isOn: $autoPreloadMain)
                         .toggleStyle(.checkbox)
-                        .help("默认开启：应用启动时在后台加载主模型；关闭后需手动点「加载模型」。修改后需点「应用配置」保存；同步结束后的模型恢复不受影响")
+                        .help(L("默认开启：应用启动时在后台加载主模型；关闭后需手动点「加载模型」。修改后需点「应用配置」保存；同步结束后的模型恢复不受影响"))
                 }
                 Spacer()
                 Picker("", selection: $mainMode) {
-                    Text("本地模式").tag("local")
-                    Text("OpenAI 兼容接口").tag("api")
+                    Text(L("本地模式")).tag("local")
+                    Text(L("OpenAI 兼容接口")).tag("api")
                 }
                 .pickerStyle(.segmented)
                 .labelsHidden()
@@ -319,7 +319,7 @@ struct SettingsView: View {
                 localModelRows(
                     backend: $mainBackend,
                     path: $mainPath,
-                    pathHint: "默认：models/qwen3.5-4b-agentic-coder-v4-4bit-mlx",
+                    pathHint: L("默认：models/qwen3.5-4b-agentic-coder-v4-4bit-mlx"),
                     tokenizer: $mainTokenizer,
                     mmproj: $mainMmprojPath,
                     context: $mainContext,
@@ -337,19 +337,19 @@ struct SettingsView: View {
                 ) {
                     HStack(spacing: 8) {
                         if model.mainModelLoaded {
-                            Button("重新加载") { loadMainModel() }
+                            Button(L("重新加载")) { loadMainModel() }
                                 .buttonStyle(.borderedProminent)
                                 .tint(.green)
                                 .disabled(model.isModelLoading || model.isRunning
                                     || model.isWarmingUp || model.isSyncing
                                     || model.isBuildingANN)
                         } else {
-                            Button("加载模型") { loadMainModel() }
+                            Button(L("加载模型")) { loadMainModel() }
                                 .disabled(model.isModelLoading || model.isRunning
                                     || model.isWarmingUp || model.isSyncing
                                     || model.isBuildingANN)
                         }
-                        Button("卸载") { model.unloadMainModel() }
+                        Button(L("卸载")) { model.unloadMainModel() }
                             .disabled(model.isModelLoading || model.isRunning
                                 || model.isWarmingUp || model.isSyncing)
                     }
@@ -371,9 +371,9 @@ struct SettingsView: View {
                 SecureField("sk-…", text: $apiKey)
                     .textFieldStyle(.roundedBorder)
                     .frame(width: 140)
-                Text("模型").font(.caption)
+                Text(L("模型")).font(.caption)
                 if apiModels.isEmpty {
-                    TextField("模型名", text: $apiModel)
+                    TextField(L("模型名"), text: $apiModel)
                         .textFieldStyle(.roundedBorder)
                         .frame(width: 170)
                 } else {
@@ -385,7 +385,7 @@ struct SettingsView: View {
                     .labelsHidden()
                     .frame(width: 170)
                 }
-                Button(fetchingModels ? "获取中…" : "获取模型") { fetchModels() }
+                Button(fetchingModels ? L("获取中…") : L("获取模型")) { fetchModels() }
                     .disabled(fetchingModels)
             }
 
@@ -399,7 +399,7 @@ struct SettingsView: View {
                     repetitionPenalty: $mainRepetitionPenalty
                 )
                 Spacer(minLength: 4)
-                Button("应用配置") { applyAPIConfig() }
+                Button(L("应用配置")) { applyAPIConfig() }
                     .keyboardShortcut(.defaultAction)
                     .disabled(model.isSyncing || model.isDeduplicating || model.isBuildingANN)
             }
@@ -409,16 +409,16 @@ struct SettingsView: View {
     private var auxModelBlock: some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack(spacing: 10) {
-                Text("辅助模型").font(.subheadline).bold()
-                Toggle("启用", isOn: $auxEnabled)
+                Text(L("辅助模型")).font(.subheadline).bold()
+                Toggle(L("启用"), isOn: $auxEnabled)
                     .toggleStyle(.checkbox)
-                    .help("默认关闭：启动和知识同步前后都不加载辅助模型；关闭时 RAG 精简跳过，后台记忆/总结回退主模型。修改后需点击「应用配置」或「同步知识」保存")
+                    .help(L("默认关闭：启动和知识同步前后都不加载辅助模型；关闭时 RAG 精简跳过，后台记忆/总结回退主模型。修改后需点击「应用配置」或「同步知识」保存"))
                 Spacer()
             }
             localModelRows(
                 backend: $auxBackend,
                 path: $auxPath,
-                pathHint: "默认：models/Qwen3.5-2B-MLX-4bit",
+                pathHint: L("默认：models/Qwen3.5-2B-MLX-4bit"),
                 tokenizer: $auxTokenizer,
                 mmproj: $auxMmprojPath,
                 context: $auxContext,
@@ -436,19 +436,19 @@ struct SettingsView: View {
             ) {
                 HStack(spacing: 8) {
                     if model.auxModelLoaded {
-                        Button("重新加载") { loadAuxModel() }
+                        Button(L("重新加载")) { loadAuxModel() }
                             .buttonStyle(.borderedProminent)
                             .tint(.green)
                             .disabled(!auxEnabled || model.isModelLoading || model.isRunning
                                 || model.isWarmingUp || model.isSyncing
                                 || model.isBuildingANN)
                     } else {
-                        Button("加载模型") { loadAuxModel() }
+                        Button(L("加载模型")) { loadAuxModel() }
                             .disabled(!auxEnabled || model.isModelLoading || model.isRunning
                                 || model.isWarmingUp || model.isSyncing
                                 || model.isBuildingANN)
                     }
-                    Button("卸载") { model.unloadAuxModel() }
+                    Button(L("卸载")) { model.unloadAuxModel() }
                         .disabled(model.isModelLoading || model.isRunning
                             || model.isWarmingUp || model.isSyncing)
                 }
@@ -459,39 +459,39 @@ struct SettingsView: View {
     /// Agent 运行参数：迭代轮数 / 查询超时 / MLX 缓存与内存上限。
     private var runParametersRow: some View {
         HStack(spacing: 14) {
-            Text("运行参数")
+            Text(L("运行参数"))
                 .font(.caption.weight(.semibold))
                 .foregroundStyle(.secondary)
-            Stepper("最大迭代：\(maxIterations) 轮",
+            Stepper(L("最大迭代：\(maxIterations) 轮"),
                     value: $maxIterations, in: 1...50)
-                .help("单次任务允许的最大工具调用轮数，默认 15；"
-                    + "调大能处理更长的任务，也会增加耗时与 API 费用")
-            Stepper("查询超时：\(String(format: "%.0f", queryTimeoutSeconds))s",
+                .help(L("单次任务允许的最大工具调用轮数，默认 15；")
+                    + L("调大能处理更长的任务，也会增加耗时与 API 费用"))
+            Stepper(L("查询超时：\(String(format: "%.0f", queryTimeoutSeconds))s"),
                     value: $queryTimeoutSeconds, in: 0...60, step: 1)
-                .help("知识库只读查询（打开库 / 状态 / 检索）的超时秒数，默认 5s，0 = 关闭。"
-                    + "大库或上次同步中断后 SQLite 恢复 WAL 较慢时，可适当调大")
-            Stepper("MLX 缓存：\(mlxCacheLimitMB)MB",
+                .help(L("知识库只读查询（打开库 / 状态 / 检索）的超时秒数，默认 5s，0 = 关闭。")
+                    + L("大库或上次同步中断后 SQLite 恢复 WAL 较慢时，可适当调大"))
+            Stepper(L("MLX 缓存：\(mlxCacheLimitMB)MB"),
                     value: $mlxCacheLimitMB,
                     in: 256...2_048, step: 128)
-                .help("MLX 可复用 buffer 的上限，默认 1024MB；"
-                    + "运行时夹在 256...2048，只影响空闲缓存，不含模型权重与 KV。"
-                    + "实测 1GB 让 decode 快 5–8% 且接近 embedding 工作集，2GB 基本没有额外提速")
-            Stepper("MLX 上限：\(mlxMemoryLimitText)",
+                .help(L("MLX 可复用 buffer 的上限，默认 1024MB；")
+                    + L("运行时夹在 256...2048，只影响空闲缓存，不含模型权重与 KV。")
+                    + L("实测 1GB 让 decode 快 5–8% 且接近 embedding 工作集，2GB 基本没有额外提速"))
+            Stepper(L("MLX 上限：\(mlxMemoryLimitText)"),
                     value: $mlxMemoryLimitMB,
                     in: 0...32_768, step: 512)
-                .help("MLX 全局内存硬上限（含权重/KV/buffer）；"
-                    + "0 = 自动取 min(物理内存 65%, 9.6GB)。误配可能导致 OOM")
-            Toggle("多级记忆管理", isOn: $memoryHierarchyInSystemPrompt)
+                .help(L("MLX 全局内存硬上限（含权重/KV/buffer）；")
+                    + L("0 = 自动取 min(物理内存 65%, 9.6GB)。误配可能导致 OOM"))
+            Toggle(L("多级记忆管理"), isOn: $memoryHierarchyInSystemPrompt)
                 .toggleStyle(.checkbox)
-                .help("勾选后 L0 META-SOP 与 L1 索引常驻 system prompt；"
-                    + "默认关闭，每轮省约 2.6k 字符上下文。关闭不影响 memory 文件与记忆工具")
-            Toggle("约束解码", isOn: $guidedToolArguments)
+                .help(L("勾选后 L0 META-SOP 与 L1 索引常驻 system prompt；")
+                    + L("默认关闭，每轮省约 2.6k 字符上下文。关闭不影响 memory 文件与记忆工具"))
+            Toggle(L("约束解码"), isOn: $guidedToolArguments)
                 .toggleStyle(.checkbox)
-                .help("开启后本机 MLX / GGUF 主模型按工具 schema 约束生成工具调用："
-                    + "工具名和必填参数结构正确。关闭可提升生成速度（实测约 3~4 倍），"
-                    + "但工具调用完全依赖模型自觉；远端 API 后端始终不受影响")
+                .help(L("开启后本机 MLX / GGUF 主模型按工具 schema 约束生成工具调用：")
+                    + L("工具名和必填参数结构正确。关闭可提升生成速度（实测约 3~4 倍），")
+                    + L("但工具调用完全依赖模型自觉；远端 API 后端始终不受影响"))
             Spacer(minLength: 8)
-            Button("应用配置") { applyAPIConfig() }
+            Button(L("应用配置")) { applyAPIConfig() }
                 .disabled(model.isSyncing || model.isDeduplicating || model.isBuildingANN
                     || model.isModelLoading || model.isRunning || model.isWarmingUp)
         }
@@ -521,7 +521,7 @@ struct SettingsView: View {
     ) -> some View {
         VStack(alignment: .leading, spacing: 6) {
             HStack(spacing: 8) {
-                Text("模型类型").font(.caption)
+                Text(L("模型类型")).font(.caption)
                 Picker("", selection: backend) {
                     ForEach(llmTypes, id: \.id) { type in
                         Text(type.label).tag(type.id)
@@ -530,23 +530,23 @@ struct SettingsView: View {
                 .labelsHidden()
                 .frame(width: 140)
 
-                Text("本地路径").font(.caption)
+                Text(L("本地路径")).font(.caption)
                 TextField(pathHint, text: path)
                     .textFieldStyle(.roundedBorder)
-                Button("选择…") {
+                Button(L("选择…")) {
                     chooseModelPath(path, backend: backend.wrappedValue,
-                                    dirTitle: "选择模型目录",
-                                    fileTitle: "选择 GGUF 模型文件")
+                                    dirTitle: L("选择模型目录"),
+                                    fileTitle: L("选择 GGUF 模型文件"))
                 }
             }
             if let tokenizer, backend.wrappedValue == "onnx" {
                 HStack(spacing: 8) {
-                    Text("tokenizer路径").font(.caption)
-                    TextField("可选：含 tokenizer.json 的目录，留空从模型目录读取",
+                    Text(L("tokenizer路径")).font(.caption)
+                    TextField(L("可选：含 tokenizer.json 的目录，留空从模型目录读取"),
                               text: tokenizer)
                         .textFieldStyle(.roundedBorder)
-                    Button("选择…") {
-                        chooseDirectory(tokenizer, title: "选择 tokenizer 目录")
+                    Button(L("选择…")) {
+                        chooseDirectory(tokenizer, title: L("选择 tokenizer 目录"))
                     }
                 }
             }
@@ -554,11 +554,11 @@ struct SettingsView: View {
             // GGUF 多模态投影文件（mmproj）：可选；需要多模态能力时必须设置。
             if let mmproj, backend.wrappedValue == "gguf" {
                 HStack(spacing: 8) {
-                    Text("mmproj路径").font(.caption)
-                    TextField("可选：多模态投影文件，留空自动查找模型同目录的 mmproj*.gguf",
+                    Text(L("mmproj路径")).font(.caption)
+                    TextField(L("可选：多模态投影文件，留空自动查找模型同目录的 mmproj*.gguf"),
                               text: mmproj)
                         .textFieldStyle(.roundedBorder)
-                    Button("选择…") { chooseFile(mmproj, title: "选择 mmproj 文件") }
+                    Button(L("选择…")) { chooseFile(mmproj, title: L("选择 mmproj 文件")) }
                 }
             }
 
@@ -618,11 +618,11 @@ struct SettingsView: View {
             VStack(alignment: .leading, spacing: 12) {
                 // RAG 模式三选一：切换即切换检索召回路径。
                 HStack(spacing: 8) {
-                    Text("RAG模式").font(.caption).bold()
+                    Text(L("RAG模式")).font(.caption).bold()
                     Picker("", selection: $ragMode) {
-                        Text("向量检索模式").tag("vector")
-                        Text("极速检索模式").tag("colbert")
-                        Text("决策判定模式").tag("decision")
+                        Text(L("向量检索模式")).tag("vector")
+                        Text(L("极速检索模式")).tag("colbert")
+                        Text(L("决策判定模式")).tag("decision")
                     }
                     .pickerStyle(.segmented)
                     .frame(maxWidth: 320)
@@ -694,7 +694,7 @@ struct SettingsView: View {
                 }
                 // ANN 设置：二值 ANN（stage 1 自研 bann）与主 ANN 索引的
                 // 状态与维护按钮（构建/续建、停止、删除）。
-                Text("ANN设置").font(.caption).foregroundStyle(.secondary)
+                Text(L("ANN设置")).font(.caption).foregroundStyle(.secondary)
 
                 // 二值 ANN：stage 1 优先走自研 bann，未构建时回退 bin 表暴力汉明。
                 // 后接主 ANN 索引摘要与维护按钮（构建/续建、停止、删除）。
@@ -719,14 +719,14 @@ struct SettingsView: View {
                     .font(.caption2)
                     .foregroundStyle(.secondary)
                     .lineLimit(2)
-                    .help("无前台活动 3 分钟后自动逐章生成摘要：辅助模型已启用且加载时"
-                        + "每 15 分钟一章；未启用/未加载时临时加载，每 5 分钟一章，"
-                        + "空闲会话结束即卸载。")
+                    .help(L("无前台活动 3 分钟后自动逐章生成摘要：辅助模型已启用且加载时")
+                        + L("每 15 分钟一章；未启用/未加载时临时加载，每 5 分钟一章，")
+                        + L("空闲会话结束即卸载。"))
                 if model.vectorRebuildRequired {
                     HStack(alignment: .firstTextBaseline, spacing: 6) {
                         Image(systemName: "exclamationmark.triangle.fill")
-                        Text("向量库需重建：\(model.vectorRebuildReason)。"
-                            + "旧切片仍保留，全文检索可用；重建会按当前配置清空并全量重新同步。")
+                        Text(L("向量库需重建：\(model.vectorRebuildReason)。")
+                            + L("旧切片仍保留，全文检索可用；重建会按当前配置清空并全量重新同步。"))
                             .fixedSize(horizontal: false, vertical: true)
                     }
                     .font(.caption2)
@@ -746,10 +746,10 @@ struct SettingsView: View {
                     decisionConfigBlock
                 }
 
-                DisclosureGroup("高级设置", isExpanded: $showAdvanced) {
+                DisclosureGroup(L("高级设置"), isExpanded: $showAdvanced) {
                     VStack(alignment: .leading, spacing: 10) {
                         HStack(spacing: 8) {
-                            Text("知识图谱融合策略").font(.caption)
+                            Text(L("知识图谱融合策略")).font(.caption)
                             Picker("", selection: Binding(
                                 get: { model.knowledgeGraphBuilt ? retrievalStrategy : .naive },
                                 set: { retrievalStrategy = $0 }
@@ -761,42 +761,42 @@ struct SettingsView: View {
                             .labelsHidden()
                             .frame(width: 190)
                             .disabled(!model.knowledgeGraphBuilt)
-                            Button(model.isBuildingKG ? "图谱构建中…" : "构建知识图谱") {
+                            Button(model.isBuildingKG ? L("图谱构建中…") : L("构建知识图谱")) {
                                 model.requestKnowledgeGraphBuild()
                             }
                             .disabled(model.isSyncing || model.isDeduplicating
                                 || model.isBuildingANN || model.isBuildingKG)
-                            .help("用辅助模型在已完成切片上抽取实体/关系并建立图谱；"
-                                + "建成后才能选择使用 local/global/hybrid/mix 四种图谱检索策略")
+                            .help(L("用辅助模型在已完成切片上抽取实体/关系并建立图谱；")
+                                + L("建成后才能选择使用 local/global/hybrid/mix 四种图谱检索策略"))
                             if model.isBuildingKG {
-                                Button("停止") { model.stopKnowledgeGraphBuild() }
+                                Button(L("停止")) { model.stopKnowledgeGraphBuild() }
                             }
-                            Button(model.isResolvingEntities ? "实体消歧中…" : "实体消歧") {
+                            Button(model.isResolvingEntities ? L("实体消歧中…") : L("实体消歧")) {
                                 model.requestEntityResolution()
                             }
                             .disabled(model.isSyncing || model.isDeduplicating
                                 || model.isBuildingANN || model.isBuildingKG
                                 || model.isResolvingEntities || !model.knowledgeGraphBuilt)
-                            .help("用向量语义相似度对图谱内同指实体做进一步合并（全量扫描，耗时与实体数相关）；"
-                                + "抽取/构建阶段只用字符全匹配，快速且不依赖向量")
+                            .help(L("用向量语义相似度对图谱内同指实体做进一步合并（全量扫描，耗时与实体数相关）；")
+                                + L("抽取/构建阶段只用字符全匹配，快速且不依赖向量"))
                             if model.knowledgeGraphBuilt {
-                                Text("已建 \(model.knowledgeGraphEntityCount) 实体 / \(model.knowledgeGraphRelationCount) 关系")
+                                Text(L("已建 \(model.knowledgeGraphEntityCount) 实体 / \(model.knowledgeGraphRelationCount) 关系"))
                                     .font(.caption2).foregroundStyle(.secondary)
                             } else {
-                                Text("未构建（当前用 naive）").font(.caption2).foregroundStyle(.secondary)
+                                Text(L("未构建（当前用 naive）")).font(.caption2).foregroundStyle(.secondary)
                             }
                             Spacer(minLength: 8)
                         }
                         HStack(spacing: 8) {
-                            Text("RAG MCP服务").font(.caption)
+                            Text(L("RAG MCP服务")).font(.caption)
                             Picker("", selection: $ragMCPScope) {
-                                Text("仅限本机").tag(false)
-                                Text("局域网可用").tag(true)
+                                Text(L("仅限本机")).tag(false)
+                                Text(L("局域网可用")).tag(true)
                             }
                             .labelsHidden()
                             .frame(width: 104)
                             .disabled(model.ragMCPRunning)
-                            Text("端口").font(.caption2).foregroundStyle(.secondary)
+                            Text(L("端口")).font(.caption2).foregroundStyle(.secondary)
                             TextField("8080", text: $ragMCPPortText)
                                 .textFieldStyle(.roundedBorder)
                                 .frame(width: 64)
@@ -804,21 +804,21 @@ struct SettingsView: View {
                             Circle()
                                 .fill(model.ragMCPRunning ? Color.green : Color.secondary.opacity(0.5))
                                 .frame(width: 8, height: 8)
-                            Text(model.ragMCPRunning ? "运行中" : "未启动")
+                            Text(model.ragMCPRunning ? L("运行中") : L("未启动"))
                                 .font(.caption2)
                                 .foregroundStyle(.secondary)
                                 .frame(width: 44, alignment: .leading)
-                            Button(model.ragMCPRunning ? "停止服务" : "启动服务") {
+                            Button(model.ragMCPRunning ? L("停止服务") : L("启动服务")) {
                                 toggleRAGMCPService()
                             }
                             .disabled(ragMCPStartDisabled)
                             Spacer(minLength: 8)
                         }
-                        .help("把知识库 RAG 能力以 MCP 服务（Streamable HTTP）提供给其它大模型应用；"
-                              + "修改监听范围或端口后需停止再启动才生效。默认仅本机 127.0.0.1:8080")
+                        .help(L("把知识库 RAG 能力以 MCP 服务（Streamable HTTP）提供给其它大模型应用；")
+                              + L("修改监听范围或端口后需停止再启动才生效。默认仅本机 127.0.0.1:8080"))
                         Divider()
                         HStack(spacing: 8) {
-                            Text("自定义OCR模型").font(.caption)
+                            Text(L("自定义OCR模型")).font(.caption)
                             Picker("", selection: $vlmBackend) {
                                 Text("MLX").tag("mlx")
                                 Text("GGUF").tag("gguf")
@@ -828,51 +828,51 @@ struct SettingsView: View {
                             .frame(width: 80)
                             TextField(
                                 vlmBackend == "mlx"
-                                    ? "模型路径（MLX 填目录）"
+                                    ? L("模型路径（MLX 填目录）")
                                     : vlmBackend == "onnx"
-                                        ? "ONNX 模型文件（或含权重的目录）"
-                                        : "GGUF 模型文件路径",
+                                        ? L("ONNX 模型文件（或含权重的目录）")
+                                        : L("GGUF 模型文件路径"),
                                 text: $ocrModelPath
                             )
                             .textFieldStyle(.roundedBorder)
                             .frame(minWidth: 160)
-                            Button("选择…") {
+                            Button(L("选择…")) {
                                 switch vlmBackend {
                                 case "mlx":
-                                    chooseDirectory($ocrModelPath, title: "选择 OCR 模型目录")
+                                    chooseDirectory($ocrModelPath, title: L("选择 OCR 模型目录"))
                                 case "onnx":
                                     chooseONNX($ocrModelPath,
-                                               title: "选择 ONNX 模型文件或目录")
+                                               title: L("选择 ONNX 模型文件或目录"))
                                 default:
-                                    chooseFile($ocrModelPath, title: "选择 OCR 模型文件")
+                                    chooseFile($ocrModelPath, title: L("选择 OCR 模型文件"))
                                 }
                             }
-                            Button("保存设置") { saveAdvancedSettings() }
+                            Button(L("保存设置")) { saveAdvancedSettings() }
                                 .disabled(model.isSyncing || model.isDeduplicating
                                     || model.isBuildingANN)
-                                .help("保存并应用高级设置")
-                            Button("识别测试") { openOCRLab() }
+                                .help(L("保存并应用高级设置"))
+                            Button(L("识别测试")) { openOCRLab() }
                                 .disabled(model.isSyncing || model.isDeduplicating
                                     || model.isBuildingANN)
-                                .help("打开 OCR 识别测试窗口，用指定模型识别图片或 PDF 并对比结果")
+                                .help(L("打开 OCR 识别测试窗口，用指定模型识别图片或 PDF 并对比结果"))
                         }
                         if vlmBackend == "gguf" {
                             HStack(spacing: 8) {
-                                Text("mmproj路径").font(.caption)
-                                TextField("可选：多模态投影文件，留空自动查找模型同目录的 mmproj*.gguf",
+                                Text(L("mmproj路径")).font(.caption)
+                                TextField(L("可选：多模态投影文件，留空自动查找模型同目录的 mmproj*.gguf"),
                                           text: $ocrMMProjPath)
                                     .textFieldStyle(.roundedBorder)
-                                Button("选择…") { chooseFile($ocrMMProjPath, title: "选择 mmproj 文件") }
+                                Button(L("选择…")) { chooseFile($ocrMMProjPath, title: L("选择 mmproj 文件")) }
                                 Spacer(minLength: 8)
                             }
                         }
                         if vlmBackend == "onnx" {
                             HStack(spacing: 8) {
-                                Text("tokenizer路径").font(.caption)
-                                TextField("必填：tokenizer.json 文件，或含它的目录",
+                                Text(L("tokenizer路径")).font(.caption)
+                                TextField(L("必填：tokenizer.json 文件，或含它的目录"),
                                           text: $ocrTokenizerPath)
                                     .textFieldStyle(.roundedBorder)
-                                Button("选择…") { chooseFile($ocrTokenizerPath, title: "选择 tokenizer 文件") }
+                                Button(L("选择…")) { chooseFile($ocrTokenizerPath, title: L("选择 tokenizer 文件")) }
                                 Spacer(minLength: 8)
                             }
                         }
@@ -881,9 +881,9 @@ struct SettingsView: View {
                             Picker("", selection: $pdfEngine) {
                                 Text("OvisOCR3").tag(PDFEngine.ovis)
                                 Text("Vision OCR").tag(PDFEngine.vision)
-                                Text("混合（Vision + Ovis 表格）").tag(PDFEngine.hybrid)
+                                Text(L("混合（Vision + Ovis 表格）")).tag(PDFEngine.hybrid)
                                 if customOCRAvailable {
-                                    Text("自定义：\(customOCRName)").tag(PDFEngine.custom)
+                                    Text(L("自定义：\(customOCRName)")).tag(PDFEngine.custom)
                                 }
                             }
                             .labelsHidden()
@@ -893,22 +893,22 @@ struct SettingsView: View {
                                 Text("Apple Vision").tag(PDFEngine.vision)
                                 Text("OvisOCR3").tag(PDFEngine.ovis)
                                 if customOCRAvailable {
-                                    Text("自定义：\(customOCRName)").tag(PDFEngine.custom)
+                                    Text(L("自定义：\(customOCRName)")).tag(PDFEngine.custom)
                                 }
                             }
                             .labelsHidden()
                             .frame(width: 170)
-                            Toggle("图像归一化", isOn: $ocrPreprocess)
-                            Toggle("Otsu 二值化", isOn: $ocrBinarize)
-                            Button("转换工具") { openConverter() }
-                                .help("打开转换工具窗口：把 PDF/EPUB/Office/HTML/图片/文本等批量转换为 Markdown，"
-                                    + "沿用这里的 OCR 与切片前的解析设置")
+                            Toggle(L("图像归一化"), isOn: $ocrPreprocess)
+                            Toggle(L("Otsu 二值化"), isOn: $ocrBinarize)
+                            Button(L("转换工具")) { openConverter() }
+                                .help(L("打开转换工具窗口：把 PDF/EPUB/Office/HTML/图片/文本等批量转换为 Markdown，")
+                                    + L("沿用这里的 OCR 与切片前的解析设置"))
                         }
                         ViewThatFits(in: .horizontal) {
                             HStack(spacing: 14) {
                                 syncSettingsLabel
-                                Toggle("启动时自动同步", isOn: $autoIngest)
-                                    .help("启动后自动执行一次知识增量同步")
+                                Toggle(L("启动时自动同步"), isOn: $autoIngest)
+                                    .help(L("启动后自动执行一次知识增量同步"))
                                 syncResourceControls()
                                     .font(.caption)
                                 Spacer(minLength: 8)
@@ -916,8 +916,8 @@ struct SettingsView: View {
                             VStack(alignment: .leading, spacing: 6) {
                                 HStack(spacing: 14) {
                                     syncSettingsLabel
-                                    Toggle("启动时自动同步", isOn: $autoIngest)
-                                        .help("启动后自动执行一次知识增量同步")
+                                    Toggle(L("启动时自动同步"), isOn: $autoIngest)
+                                        .help(L("启动后自动执行一次知识增量同步"))
                                     Spacer(minLength: 8)
                                 }
                                 syncResourceControls()
@@ -925,59 +925,59 @@ struct SettingsView: View {
                             }
                         }
                         HStack(spacing: 8) {
-                            Text("自适应子批参数")
+                            Text(L("自适应子批参数"))
                                 .font(.caption.weight(.semibold))
                                 .foregroundStyle(.secondary)
-                            Stepper("下限：\(embeddingMinBatch)",
+                            Stepper(L("下限：\(embeddingMinBatch)"),
                                     value: $embeddingMinBatch, in: 2...64)
-                                .help("自适应下调的最小值，默认 2；超过上限时按上限收口")
-                            Stepper("上限：\(embeddingMaxBatch)",
+                                .help(L("自适应下调的最小值，默认 2；超过上限时按上限收口"))
+                            Stepper(L("上限：\(embeddingMaxBatch)"),
                                     value: $embeddingMaxBatch, in: 2...256)
-                                .help("embedding 自适应子批的最大值。实测 477 token 长块在 batch 4-16 已到吞吐平台，默认 32 兼顾短块；64 以上只增加内存与单批延迟")
-                            Stepper("步进：\(embeddingBatchStep)",
+                                .help(L("embedding 自适应子批的最大值。实测 477 token 长块在 batch 4-16 已到吞吐平台，默认 32 兼顾短块；64 以上只增加内存与单批延迟"))
+                            Stepper(L("步进：\(embeddingBatchStep)"),
                                     value: $embeddingBatchStep, in: 1...16)
-                                .help("每次上探/下探的调整幅度，默认 2")
-                            Stepper("启动预设：\(embeddingInitialBatch)",
+                                .help(L("每次上探/下探的调整幅度，默认 2"))
+                            Stepper(L("启动预设：\(embeddingInitialBatch)"),
                                     value: $embeddingInitialBatch, in: 2...256)
-                                .help("同步开始时的初始子批，默认 16；会被夹在下限与上限之间")
-                            Stepper("探测批次：\(embeddingProbeBatches)",
+                                .help(L("同步开始时的初始子批，默认 16；会被夹在下限与上限之间"))
+                            Stepper(L("探测批次：\(embeddingProbeBatches)"),
                                     value: $embeddingProbeBatches, in: 1...16)
-                                .help("每档至少观察多少个 embedding 批后评估一次，默认 2")
-                            Stepper("探测窗口：\(String(format: "%.1f", embeddingProbeSeconds))s",
+                                .help(L("每档至少观察多少个 embedding 批后评估一次，默认 2"))
+                            Stepper(L("探测窗口：\(String(format: "%.1f", embeddingProbeSeconds))s"),
                                     value: $embeddingProbeSeconds, in: 0.5...30, step: 0.5)
-                                .help("每档至少观察多少秒后评估一次，默认 2s；与探测批次数满足其一即评估")
-                            Stepper("内存阈值：\(embeddingMemoryLimitMB)MB",
+                                .help(L("每档至少观察多少秒后评估一次，默认 2s；与探测批次数满足其一即评估"))
+                            Stepper(L("内存阈值：\(embeddingMemoryLimitMB)MB"),
                                     value: $embeddingMemoryLimitMB,
                                     in: 1_024...32_768, step: 512)
-                                .help("进程 footprint 超过该值立即下调子批；模型单独运行峰值可达数 GB，默认 6144MB")
-                            Stepper("吞吐容差：\(Int((embeddingThroughputTolerance * 100).rounded()))%",
+                                .help(L("进程 footprint 超过该值立即下调子批；模型单独运行峰值可达数 GB，默认 6144MB"))
+                            Stepper(L("吞吐容差：\(Int((embeddingThroughputTolerance * 100).rounded()))%"),
                                     value: $embeddingThroughputTolerance,
                                     in: 0.01...0.50, step: 0.01)
-                                .help("吞吐变化小于该比例视为测量噪声，不调整子批；默认 3%，实测噪声较大时可调到 8-10%")
+                                .help(L("吞吐变化小于该比例视为测量噪声，不调整子批；默认 3%，实测噪声较大时可调到 8-10%"))
                         }
                         .font(.caption)
                         HStack(spacing: 8) {
-                            Text("embedding token 预算")
+                            Text(L("embedding token 预算"))
                                 .font(.caption.weight(.semibold))
                                 .foregroundStyle(.secondary)
-                            Stepper("下限：\(embeddingTokenBudgetMin)",
+                            Stepper(L("下限：\(embeddingTokenBudgetMin)"),
                                     value: $embeddingTokenBudgetMin,
                                     in: 512...65_536, step: 512)
-                                .help("单批 token 预算的下限，默认 4096；"
-                                    + "长切片由预算决定批大小，短切片仍受条数上限约束")
-                            Stepper("上限：\(embeddingTokenBudgetMax)",
+                                .help(L("单批 token 预算的下限，默认 4096；")
+                                    + L("长切片由预算决定批大小，短切片仍受条数上限约束"))
+                            Stepper(L("上限：\(embeddingTokenBudgetMax)"),
                                     value: $embeddingTokenBudgetMax,
                                     in: 512...65_536, step: 512)
-                                .help("单批 token 预算的上限，默认 8192；"
-                                    + "超过上限时按内存阈值下调，避免 padding/峰值内存过高")
-                            Stepper("启动：\(embeddingTokenBudgetInitial)",
+                                .help(L("单批 token 预算的上限，默认 8192；")
+                                    + L("超过上限时按内存阈值下调，避免 padding/峰值内存过高"))
+                            Stepper(L("启动：\(embeddingTokenBudgetInitial)"),
                                     value: $embeddingTokenBudgetInitial,
                                     in: 512...65_536, step: 512)
-                                .help("每次同步开始时的 token 预算，默认 6144；会被夹在下限与上限之间")
-                            Stepper("步进：\(embeddingTokenBudgetStep)",
+                                .help(L("每次同步开始时的 token 预算，默认 6144；会被夹在下限与上限之间"))
+                            Stepper(L("步进：\(embeddingTokenBudgetStep)"),
                                     value: $embeddingTokenBudgetStep,
                                     in: 128...8_192, step: 128)
-                                .help("每轮上探/下探的 token 预算幅度，默认 512")
+                                .help(L("每轮上探/下探的 token 预算幅度，默认 512"))
                         }
                         .font(.caption)
                     }
@@ -986,7 +986,7 @@ struct SettingsView: View {
             }
             .padding(8)
         } label: {
-            Text("RAG模式配置").font(.headline)
+            Text(L("RAG模式配置")).font(.headline)
         }
     }
 
@@ -995,32 +995,32 @@ struct SettingsView: View {
         GroupBox {
             VStack(alignment: .leading, spacing: 10) {
                 HStack(spacing: 8) {
-                    Text("工作目录").font(.caption)
+                    Text(L("工作目录")).font(.caption)
                     TextField("~/base-agent-workspace", text: $workspace)
                         .textFieldStyle(.roundedBorder)
-                    Button("选择…") { chooseWorkspaceDirectory() }
+                    Button(L("选择…")) { chooseWorkspaceDirectory() }
                 }
                 ForEach($zoneRows) { $zone in
                     VStack(alignment: .leading, spacing: 4) {
                         // 第一行：启用 + 设为默认 + 领域名 + 源目录 + 选择
                         HStack(spacing: 6) {
-                            Toggle("启用", isOn: $zone.enabled).toggleStyle(.checkbox)
+                            Toggle(L("启用"), isOn: $zone.enabled).toggleStyle(.checkbox)
                                 .font(.caption2)
-                            Button(zone.isDefault ? "默认" : "设为默认") {
+                            Button(zone.isDefault ? L("默认") : L("设为默认")) {
                                 setDefaultZone(zone.id)
                             }
                             .buttonStyle(.borderless).font(.caption2)
                             .disabled(zone.isDefault)
-                            TextField("领域名（如 法律）", text: $zone.name)
+                            TextField(L("领域名（如 法律）"), text: $zone.name)
                                 .textFieldStyle(.roundedBorder)
                                 .frame(maxWidth: 120)
-                            TextField("源目录（留空=workspace/knowledge_base）", text: $zone.source)
+                            TextField(L("源目录（留空=workspace/knowledge_base）"), text: $zone.source)
                                 .textFieldStyle(.roundedBorder)
                                 .frame(maxWidth: .infinity)
-                            Button("选择…") { chooseZoneDirectory(zone.id) }
+                            Button(L("选择…")) { chooseZoneDirectory(zone.id) }
                                 .font(.caption2)
                             if !zone.isDefault {
-                                Button("删除") { removeZone(zone.id) }
+                                Button(L("删除")) { removeZone(zone.id) }
                                     .buttonStyle(.borderless).font(.caption2)
                             }
                         }
@@ -1028,15 +1028,15 @@ struct SettingsView: View {
                         // 应用配置由窗口底部统一入口负责；同步知识在配置变化时
                         // 会自行先应用，因此每行不再重复放「应用配置」。
                         HStack(spacing: 6) {
-                            Button(model.zoneSyncEngineID == zone.id ? "同步中…" : "同步知识") {
+                            Button(model.zoneSyncEngineID == zone.id ? L("同步中…") : L("同步知识")) {
                                 applyAndSyncZone(zone.id)
                             }
                             .disabled(model.isSyncing)
-                            Button("停止同步") { model.stopSync() }
+                            Button(L("停止同步")) { model.stopSync() }
                                 .disabled(model.zoneSyncEngineID != zone.id)
-                            Button("向量去重") { model.dedupeZone(source: zone.source) }
+                            Button(L("向量去重")) { model.dedupeZone(source: zone.source) }
                                 .disabled(model.isSyncing || ragMode == "colbert")
-                                .help(ragMode == "colbert" ? "极速检索模式无向量库，无需向量去重" : "清理本知识分区内的重复向量切片")
+                                .help(ragMode == "colbert" ? L("极速检索模式无向量库，无需向量去重") : L("清理本知识分区内的重复向量切片"))
                             if model.zoneSyncEngineID == zone.id && !model.zoneSyncStatusText.isEmpty {
                                 ProgressView().controlSize(.mini)
                                 Text(model.zoneSyncStatusText)
@@ -1053,20 +1053,20 @@ struct SettingsView: View {
                     .cornerRadius(4)
                 }
                 HStack {
-                    Button("添加新知识库") { addZone() }
+                    Button(L("添加新知识库")) { addZone() }
                         .buttonStyle(.borderless)
                     Spacer()
                 }
             }
             .padding(8)
         } label: {
-            Text("工作目录配置").font(.headline)
+            Text(L("工作目录配置")).font(.headline)
         }
     }
 
     /// 为指定分区选择源目录。用 id 定位行写回，避免 ForEach 临时 Binding 问题。
     private func chooseZoneDirectory(_ id: String) {
-        let title = (zoneRows.first { $0.id == id }?.name ?? "知识库") + " 源目录"
+        let title = (zoneRows.first { $0.id == id }?.name ?? L("知识库")) + L(" 源目录")
         let current = zoneRows.first { $0.id == id }?.source
             .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         if let url = runOpenPanel({ panel in
@@ -1084,7 +1084,7 @@ struct SettingsView: View {
 
     private func addZone() {
         let id = String(UUID().uuidString.prefix(8))
-        zoneRows.append(ZoneRow(id: id, name: "新知识库",
+        zoneRows.append(ZoneRow(id: id, name: L("新知识库"),
                                 source: "", enabled: true, isDefault: zoneRows.isEmpty))
     }
 
@@ -1096,34 +1096,34 @@ struct SettingsView: View {
         zoneRows.removeAll { $0.id == id }
         // 独立存储目录（rag_data/<hash>）保留，不误删用户数据；点「应用配置」后
         // 该分区不再挂载，需要彻底删除可手动清理对应 rag_data 子目录。
-        statusMessage = "已从配置移除知识分区（索引数据保留在 rag_data，可手动清理）"
+        statusMessage = L("已从配置移除知识分区（索引数据保留在 rag_data，可手动清理）")
     }
 
     // MARK: - 极速检索模式配置（原在高级设置）
     private var colbertConfigBlock: some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack(spacing: 8) {
-                Text("量化残差").font(.caption2).foregroundStyle(.secondary)
+                Text(L("量化残差")).font(.caption2).foregroundStyle(.secondary)
                 Picker("", selection: $colbertQuantBits) {
                     Text("2bit").tag(2); Text("4bit").tag(4)
                 }
                 .labelsHidden().frame(width: 70)
-                Text("粗筛候选").font(.caption2).foregroundStyle(.secondary)
+                Text(L("粗筛候选")).font(.caption2).foregroundStyle(.secondary)
                 Picker("", selection: $colbertCoarseCandidates) {
                     Text("10").tag(10); Text("20").tag(20)
                     Text("50").tag(50); Text("100").tag(100)
                 }
                 .labelsHidden().frame(width: 64)
-                Text("精选topN").font(.caption2).foregroundStyle(.secondary)
+                Text(L("精选topN")).font(.caption2).foregroundStyle(.secondary)
                 Picker("", selection: $colbertTopN) {
                     Text("1").tag(1); Text("3").tag(3); Text("5").tag(5)
                 }
                 .labelsHidden().frame(width: 56)
-                Toggle("使用ANN", isOn: $colbertUseANN).toggleStyle(.checkbox)
-                Toggle("长度归一化", isOn: $colbertLengthNorm).toggleStyle(.checkbox)
-                Text("查询侧剪枝").font(.caption2).foregroundStyle(.secondary)
+                Toggle(L("使用ANN"), isOn: $colbertUseANN).toggleStyle(.checkbox)
+                Toggle(L("长度归一化"), isOn: $colbertLengthNorm).toggleStyle(.checkbox)
+                Text(L("查询侧剪枝")).font(.caption2).foregroundStyle(.secondary)
                 Picker("", selection: $colbertQueryPrune) {
-                    Text("轻量").tag(true); Text("不剪枝").tag(false)
+                    Text(L("轻量")).tag(true); Text(L("不剪枝")).tag(false)
                 }
                 .labelsHidden().frame(width: 70)
                 Spacer(minLength: 8)
@@ -1135,22 +1135,22 @@ struct SettingsView: View {
                         .font(.caption2)
                         .foregroundStyle(model.vectorIsComplete ? Color.secondary : Color.orange)
                         .lineLimit(1)
-                    if !model.vectorIsComplete && !model.vectorCompletenessText.contains("不可用") {
-                        Button(model.isBackfillingVectors ? "补做中…" : "补做向量") {
+                    if !model.vectorIsComplete && !model.vectorCompletenessText.contains(L("不可用")) {
+                        Button(model.isBackfillingVectors ? L("补做中…") : L("补做向量")) {
                             model.requestVectorBackfill()
                         }
                         .disabled(model.isBackfillingVectors || model.isSyncing)
-                        .help("把尚未编码的切片入队，后台异步补齐；补齐前仍可被关键词检索命中")
+                        .help(L("把尚未编码的切片入队，后台异步补齐；补齐前仍可被关键词检索命中"))
                     }
                 }
-                Button(model.isBuildingColbertANN ? "索引构建中…" : "构建/续建向量索引") {
+                Button(model.isBuildingColbertANN ? L("索引构建中…") : L("构建/续建向量索引")) {
                     applyAndBuildColbertANN()
                 }
                 .disabled(model.isBuildingColbertANN || model.isSyncing)
                 if model.isBuildingColbertANN {
-                    Button("停止") { model.stopColbertANNBuild() }
+                    Button(L("停止")) { model.stopColbertANNBuild() }
                 }
-                Text("模型 arlenecc/jina-colbert-v2-64-onnx-int8")
+                Text(L("模型 arlenecc/jina-colbert-v2-64-onnx-int8"))
                     .font(.caption2).foregroundStyle(.secondary)
                 if !model.colbertIndexSummary.isEmpty {
                     Text(model.colbertIndexSummary).font(.caption2).foregroundStyle(.secondary)
@@ -1167,49 +1167,49 @@ struct SettingsView: View {
     private var decisionConfigBlock: some View {
         VStack(alignment: .leading, spacing: 10) {
             HStack(spacing: 8) {
-                Text("决策模型").font(.caption)
+                Text(L("决策模型")).font(.caption)
                 Picker("", selection: $decisionModelKind) {
                     Text("Meteor (readout)").tag("meteor")
                     Text("Valen (MixerHead)").tag("valen")
                 }
                 .labelsHidden().frame(width: 150)
-                .help("决策模型后端种类，影响内核决策门、RAG 决策检索与技能判定；"
-                    + "Valen 路径默认指向外置 SSD 目录")
+                .help(L("决策模型后端种类，影响内核决策门、RAG 决策检索与技能判定；")
+                    + L("Valen 路径默认指向外置 SSD 目录"))
                 Picker("", selection: $decisionModelBackend) {
                     Text("MLX-LM").tag("mlx-lm")
                     Text("MLX-VLM").tag("mlx-vlm")
                     Text("GGUF").tag("gguf")
                 }
                 .labelsHidden().frame(width: 110)
-                TextField("模型路径", text: $decisionModelPath)
+                TextField(L("模型路径"), text: $decisionModelPath)
                     .textFieldStyle(.roundedBorder)
-                Button("选择…") { chooseDirectory($decisionModelPath, title: "选择决策模型目录") }
+                Button(L("选择…")) { chooseDirectory($decisionModelPath, title: L("选择决策模型目录")) }
             }
             HStack(spacing: 8) {
-                Text("粗筛数量").font(.caption)
+                Text(L("粗筛数量")).font(.caption)
                 Picker("", selection: $decisionCoarseCandidates) {
                     Text("20").tag(20); Text("50").tag(50); Text("100").tag(100)
                 }
                 .labelsHidden().frame(width: 80)
-                Toggle("使用核心句判定", isOn: $decisionUseCoreSentences)
+                Toggle(L("使用核心句判定"), isOn: $decisionUseCoreSentences)
                     .toggleStyle(.checkbox)
-                Text("核心句数").font(.caption2).foregroundStyle(.secondary)
+                Text(L("核心句数")).font(.caption2).foregroundStyle(.secondary)
                 Picker("", selection: $decisionCoreSentenceCount) {
                     Text("3").tag(3); Text("5").tag(5)
                 }
                 .labelsHidden().frame(width: 56)
                 .disabled(!decisionUseCoreSentences)
-                Text("判定返回TopN").font(.caption2).foregroundStyle(.secondary)
+                Text(L("判定返回TopN")).font(.caption2).foregroundStyle(.secondary)
                 Picker("", selection: $decisionTopN) {
                     Text("3").tag(3); Text("5").tag(5); Text("10").tag(10)
                 }
                 .labelsHidden().frame(width: 64)
                 Spacer(minLength: 8)
             }
-            Text("先用字符级 BM25 从原文切片抽取核心句，再由决策模型对粗筛切片逐一判定相关性，返回得分最高的 TopN。")
+            Text(L("先用字符级 BM25 从原文切片抽取核心句，再由决策模型对粗筛切片逐一判定相关性，返回得分最高的 TopN。"))
                 .font(.caption2).foregroundStyle(.secondary)
             if decisionModelBackend != "mlx-vlm" {
-                Text("提示：PKU-KCL-Meteor 目前仅支持 MLX-VLM 后端；当前所选后端暂未实现，将回退到 MLX-VLM 加载。")
+                Text(L("提示：PKU-KCL-Meteor 目前仅支持 MLX-VLM 后端；当前所选后端暂未实现，将回退到 MLX-VLM 加载。"))
                     .font(.caption2).foregroundStyle(.orange)
             }
         }
@@ -1218,8 +1218,8 @@ struct SettingsView: View {
     /// Weighted RRF 权重行：向量/极速模式共用。BM25 权重 = 1 - 向量权重。
     private var rrfWeightRow: some View {
         HStack(spacing: 8) {
-            Text("混合权重").font(.caption2).foregroundStyle(.secondary)
-            Text("向量 \(Int((rrfVectorWeight * 100).rounded()))%")
+            Text(L("混合权重")).font(.caption2).foregroundStyle(.secondary)
+            Text(L("向量 \(Int((rrfVectorWeight * 100).rounded()))%"))
                 .font(.caption2).monospacedDigit()
             Slider(value: $rrfVectorWeight, in: 0.1...0.9, step: 0.1)
                 .frame(maxWidth: 200)
@@ -1227,15 +1227,15 @@ struct SettingsView: View {
                 .font(.caption2).monospacedDigit().foregroundStyle(.secondary)
             Spacer(minLength: 8)
         }
-        .help("Weighted RRF：向量路与 BM25 路按权重融合名次（默认 7:3）")
+        .help(L("Weighted RRF：向量路与 BM25 路按权重融合名次（默认 7:3）"))
     }
 
     /// 多库联合检索判定开关：向量/极速模式共用。
     private var multiZoneJudgeRow: some View {
-        Toggle("多库联合检索使用判定模式", isOn: $multiZoneUseDecisionJudge)
+        Toggle(L("多库联合检索使用判定模式"), isOn: $multiZoneUseDecisionJudge)
             .font(.caption2)
-            .help("启用后：选库时判定模型决定查哪些库，跨库 RRF 融合后再判定一次取 TopN；"
-                + "关闭则用 FTS 探查选库 + 各库原精排（reranker/MaxSim）")
+            .help(L("启用后：选库时判定模型决定查哪些库，跨库 RRF 融合后再判定一次取 TopN；")
+                + L("关闭则用 FTS 探查选库 + 各库原精排（reranker/MaxSim）"))
     }
 
     /// 向量库完备状态行：向量/极速模式共用。不完备时显示「补做向量」按钮。
@@ -1248,12 +1248,12 @@ struct SettingsView: View {
                     .foregroundStyle(model.vectorIsComplete ? Color.secondary : Color.orange)
                     .lineLimit(2)
                 // 库不可用（total<0）时按钮无效，不展示——避免反复点击浪费 3 秒并给出误导成功提示。
-                if !model.vectorIsComplete && !model.vectorCompletenessText.contains("不可用") {
-                    Button(model.isBackfillingVectors ? "补做中…" : "补做向量") {
+                if !model.vectorIsComplete && !model.vectorCompletenessText.contains(L("不可用")) {
+                    Button(model.isBackfillingVectors ? L("补做中…") : L("补做向量")) {
                         model.requestVectorBackfill()
                     }
                     .disabled(model.isBackfillingVectors || model.isSyncing)
-                    .help("把尚未计算向量的切片入队，后台异步补齐；补齐前这些切片仍可被全文检索命中")
+                    .help(L("把尚未计算向量的切片入队，后台异步补齐；补齐前这些切片仍可被全文检索命中"))
                 }
                 Spacer(minLength: 8)
             }
@@ -1268,7 +1268,7 @@ struct SettingsView: View {
         modelPathControls(title: "Embedding",
                           backend: $embeddingBackend,
                           path: $embeddingPath,
-                          chooseTitle: "选择 Embedding 目录")
+                          chooseTitle: L("选择 Embedding 目录"))
     }
 
     /// Reranker 的「模型类型 + 本地路径 + 选择…」。
@@ -1277,7 +1277,7 @@ struct SettingsView: View {
         modelPathControls(title: "Reranker",
                           backend: $rerankerBackend,
                           path: $rerankerPath,
-                          chooseTitle: "选择 Reranker 目录")
+                          chooseTitle: L("选择 Reranker 目录"))
     }
 
     @ViewBuilder
@@ -1293,64 +1293,64 @@ struct SettingsView: View {
         }
         .labelsHidden()
         .frame(width: 130)
-        Text("本地路径").font(.caption)
-        TextField("可选", text: path)
+        Text(L("本地路径")).font(.caption)
+        TextField(L("可选"), text: path)
             .textFieldStyle(.roundedBorder)
             .frame(minWidth: 140)
-            .help("留空时使用应用内置的默认模型；仅在需要自定义模型时填写路径")
-        Button("选择…") {
+            .help(L("留空时使用应用内置的默认模型；仅在需要自定义模型时填写路径"))
+        Button(L("选择…")) {
             chooseModelPath(path, backend: backend.wrappedValue,
                             dirTitle: chooseTitle,
-                            fileTitle: "选择 \(title) GGUF 文件")
+                            fileTitle: L("选择 \(title) GGUF 文件"))
         }
     }
 
     /// 切片设置：语义切片开关 + 切片大小（含模型窗口收口提示）+ overlap。
     @ViewBuilder
     private func chunkControls() -> some View {
-        Toggle("语义切片", isOn: $semanticChunking)
-            .help("开启后大段落在句间相似度低谷处断开，切片阶段需嵌入全部候选句，明显更慢；"
-                + "关闭则按结构+token 边界递归切片")
+        Toggle(L("语义切片"), isOn: $semanticChunking)
+            .help(L("开启后大段落在句间相似度低谷处断开，切片阶段需嵌入全部候选句，明显更慢；")
+                + L("关闭则按结构+token 边界递归切片"))
         VStack(alignment: .leading, spacing: 1) {
-            Stepper("切片大小：\(chunkSize) token", value: $chunkSize,
+            Stepper(L("切片大小：\(chunkSize) token"), value: $chunkSize,
                     in: 100...4000, step: 50)
-                .help("含 overlap 的总预算，全链路（切分、入库、检索呈现）统一按它计算；"
-                    + "超过 embedding 推理输入上限（1024 token，模型窗口更小时取更小值）"
-                    + "会自动压到该上限。纯中文约 1 字 ≈ 1 token，中英混排约 1.8 字符/token")
+                .help(L("含 overlap 的总预算，全链路（切分、入库、检索呈现）统一按它计算；")
+                    + L("超过 embedding 推理输入上限（1024 token，模型窗口更小时取更小值）")
+                    + L("会自动压到该上限。纯中文约 1 字 ≈ 1 token，中英混排约 1.8 字符/token"))
             if let limit = embeddingContentLimit, chunkSize > limit {
-                Text("实际生效：\(limit) token（受 embedding 推理输入上限限制）")
+                Text(L("实际生效：\(limit) token（受 embedding 推理输入上限限制）"))
                     .font(.caption2)
                     .foregroundStyle(.orange)
             }
         }
         Stepper("overlap：\(chunkOverlap) token", value: $chunkOverlap,
                 in: 0...1000, step: 10)
-            .help("占切片大小的 10%，计入总预算：正文按 chunk_size − overlap 切片")
+            .help(L("占切片大小的 10%，计入总预算：正文按 chunk_size − overlap 切片"))
     }
 
     /// 重排序开关、TopN 与候选池倍数：开启后最终返回分数最高的 TopN 条。
     @ViewBuilder
     private func rerankControls() -> some View {
-        Toggle("启用重排序", isOn: $rerankEnabled)
-            .help("开启后先用混合检索取候选，再由 reranker 重新打分排序，"
-                + "按下面的 TopN 返回最终结果；关闭则直接用 RRF 排序结果。"
-                + "路径保持默认或留空时使用 App 内置 jina reranker")
+        Toggle(L("启用重排序"), isOn: $rerankEnabled)
+            .help(L("开启后先用混合检索取候选，再由 reranker 重新打分排序，")
+                + L("按下面的 TopN 返回最终结果；关闭则直接用 RRF 排序结果。")
+                + L("路径保持默认或留空时使用 App 内置 jina reranker"))
         Stepper("TopN：\(rerankTopN)", value: $rerankTopN, in: 1...20)
-            .help("重排序之后保留的结果数量，默认 3；候选池会按它放大后再打乱重排。"
-                + "关闭重排序时按检索调用方的 top_k 返回")
-        Stepper("候选池：\(rerankCandidateMultiplier)×", value: $rerankCandidateMultiplier, in: 1...5)
-            .help("候选池 = max(调用方 top_k, TopN) × 倍数，默认 3；"
-                + "调小可减少送进 reranker 的切片条数、降低延迟，"
-                + "调大召回更稳但重排更慢")
-        Stepper("阈值：\(String(format: "%.2f", rerankThreshold))",
+            .help(L("重排序之后保留的结果数量，默认 3；候选池会按它放大后再打乱重排。")
+                + L("关闭重排序时按检索调用方的 top_k 返回"))
+        Stepper(L("候选池：\(rerankCandidateMultiplier)×"), value: $rerankCandidateMultiplier, in: 1...5)
+            .help(L("候选池 = max(调用方 top_k, TopN) × 倍数，默认 3；")
+                + L("调小可减少送进 reranker 的切片条数、降低延迟，")
+                + L("调大召回更稳但重排更慢"))
+        Stepper(L("阈值：\(String(format: "%.2f", rerankThreshold))"),
                 value: $rerankThreshold, in: 0...1, step: 0.05)
-            .help("重排分数过滤阈值（0-1），默认 0.45 适配 jina；低于阈值的片段会被过滤，"
-                + "全部低于阈值时回退原排序。换 bge 等 reranker 时通常需要上调")
+            .help(L("重排分数过滤阈值（0-1），默认 0.45 适配 jina；低于阈值的片段会被过滤，")
+                + L("全部低于阈值时回退原排序。换 bge 等 reranker 时通常需要上调"))
     }
 
     @ViewBuilder
     private var syncSettingsLabel: some View {
-        Text("同步参数设置")
+        Text(L("同步参数设置"))
             .font(.caption.weight(.semibold))
             .foregroundStyle(.secondary)
     }
@@ -1359,39 +1359,39 @@ struct SettingsView: View {
     /// 优先与标题、自动同步开关排在同一行。MLX 内存参数已移至「Agent 模型配置」区。
     @ViewBuilder
     private func syncResourceControls() -> some View {
-        Stepper("同步并发：\(ingestConcurrency)",
+        Stepper(L("同步并发：\(ingestConcurrency)"),
                 value: $ingestConcurrency, in: 1...10)
-            .help("同时处理的文件数，默认 10，运行时上限 6；"
-                + "纯文本文件多时调高可填满等待空档")
-        Stepper("OCR 并发：\(visionConcurrency)",
+            .help(L("同时处理的文件数，默认 10，运行时上限 6；")
+                + L("纯文本文件多时调高可填满等待空档"))
+        Stepper(L("OCR 并发：\(visionConcurrency)"),
                 value: $visionConcurrency, in: 1...8)
-            .help("Apple Vision OCR 的全局并发闸门，默认 4；"
-                + "实测 4 路已接近吞吐拐点，再多不一定更快")
-        Toggle("校验内容指纹", isOn: $verifyFingerprint)
-            .help("默认信任文件 mtime + 大小，未变化文件不再读盘采样内容指纹。"
-                + "开启后每次增量同步都为同尺寸文件重新计算指纹，"
-                + "可发现「保留时间戳的同尺寸改动」，代价是额外磁盘读取")
+            .help(L("Apple Vision OCR 的全局并发闸门，默认 4；")
+                + L("实测 4 路已接近吞吐拐点，再多不一定更快"))
+        Toggle(L("校验内容指纹"), isOn: $verifyFingerprint)
+            .help(L("默认信任文件 mtime + 大小，未变化文件不再读盘采样内容指纹。")
+                + L("开启后每次增量同步都为同尺寸文件重新计算指纹，")
+                + L("可发现「保留时间戳的同尺寸改动」，代价是额外磁盘读取"))
     }
 
     @ViewBuilder
     private func knowledgeButtons() -> some View {
-        Button("应用配置") { applyKnowledgeConfig() }
+        Button(L("应用配置")) { applyKnowledgeConfig() }
             .disabled(model.isSyncing || model.isDeduplicating || model.isBuildingANN
                 || model.isModelLoading || model.isRunning || model.isWarmingUp)
-        Button("同步知识") { applyAndSync() }
-            .help("同步期间会自动等待模型加载/预热结束")
+        Button(L("同步知识")) { applyAndSync() }
+            .help(L("同步期间会自动等待模型加载/预热结束"))
             .disabled(model.isSyncing || model.isDeduplicating || model.isBuildingANN
                 || model.isRunning)
     }
 
     @ViewBuilder
     private func stopAndDedupeButtons() -> some View {
-        Button("停止同步") { model.stopSync() }
+        Button(L("停止同步")) { model.stopSync() }
             .disabled(!model.isSyncing)
-        Button(model.isDeduplicating ? "去重中…" : "向量去重") {
+        Button(model.isDeduplicating ? L("去重中…") : L("向量去重")) {
             model.requestVectorDedupe()
         }
-        .help("排查并清理向量库内重复的向量，保留入库时间最早的一份")
+        .help(L("排查并清理向量库内重复的向量，保留入库时间最早的一份"))
         .disabled(model.isDeduplicating || model.isBuildingANN)
     }
 
@@ -1400,14 +1400,14 @@ struct SettingsView: View {
     @ViewBuilder
     private var annStatusLabel: some View {
         HStack(spacing: 6) {
-            Text("向量ANN").font(.caption)
+            Text(L("向量ANN")).font(.caption)
             Text(model.annStatusText)
                 .font(.caption2)
                 .foregroundStyle(.secondary)
                 .lineLimit(2)
-                .help("分块 IVF 索引：块内 k-means 聚类 + int8 量化按簇落盘，检索只读命中的簇，"
-                    + "避免在大库上全表扫描；索引水位之后的新切片按 rowid 顺序精确补齐。"
-                    + "库内切片较少时精确扫描更快，可先不构建")
+                .help(L("分块 IVF 索引：块内 k-means 聚类 + int8 量化按簇落盘，检索只读命中的簇，")
+                    + L("避免在大库上全表扫描；索引水位之后的新切片按 rowid 顺序精确补齐。")
+                    + L("库内切片较少时精确扫描更快，可先不构建"))
         }
     }
 
@@ -1415,30 +1415,30 @@ struct SettingsView: View {
     @ViewBuilder
     private var binaryANNStatusLabel: some View {
         HStack(spacing: 6) {
-            Text("二值 ANN").font(.caption)
+            Text(L("二值 ANN")).font(.caption)
             Text(model.binaryANNStatusText)
                 .font(.caption2)
                 .foregroundStyle(.secondary)
                 .lineLimit(2)
-                .help("二值签名的分块 IVF 索引：stage 1 优先走 bann，"
-                    + "未构建或不可用时回退 bin 表暴力汉明")
+                .help(L("二值签名的分块 IVF 索引：stage 1 优先走 bann，")
+                    + L("未构建或不可用时回退 bin 表暴力汉明"))
         }
     }
 
     @ViewBuilder
     private func annButtons() -> some View {
-        Button(model.isBuildingANN ? "索引维护中…" : "构建/续建向量索引") {
+        Button(model.isBuildingANN ? L("索引维护中…") : L("构建/续建向量索引")) {
             model.requestANNIndexBuild()
         }
-        .help("二值粗筛开启且签名覆盖完整时构建二值 ANN，否则构建主 ANN；"
-            + "构建可中断，已写完的块保留")
+        .help(L("二值粗筛开启且签名覆盖完整时构建二值 ANN，否则构建主 ANN；")
+            + L("构建可中断，已写完的块保留"))
         .disabled(model.isBuildingANN || model.isSyncing || model.isDeduplicating
             || model.isModelLoading || model.isWarmingUp || model.isRunning)
-        Button("停止构建") { model.stopANNIndexBuild() }
+        Button(L("停止构建")) { model.stopANNIndexBuild() }
             .disabled(!model.isBuildingANN)
-        Button("删除索引") { model.requestDropANNIndex() }
-            .help("删除主 ANN 与二值 ANN 索引，检索回退到精确扫描"
-                + "（2100 万切片级别的大库上会明显变慢）")
+        Button(L("删除索引")) { model.requestDropANNIndex() }
+            .help(L("删除主 ANN 与二值 ANN 索引，检索回退到精确扫描")
+                + L("（2100 万切片级别的大库上会明显变慢）"))
             .disabled(model.isBuildingANN || model.isSyncing || model.isDeduplicating
                 || model.isRunning)
     }
@@ -1467,7 +1467,7 @@ struct SettingsView: View {
     /// 向量落盘元素类型 + Matryoshka 模式/截断维。
     @ViewBuilder
     private var vectorStorageControls: some View {
-        Text("向量库").font(.caption)
+        Text(L("向量库")).font(.caption)
         Picker("", selection: $vectorElementType) {
             ForEach(VectorElementType.allCases, id: \.rawValue) { type in
                 Text(vectorElementLabel(type)).tag(type)
@@ -1475,9 +1475,9 @@ struct SettingsView: View {
         }
         .labelsHidden()
         .frame(width: 120)
-        .help("向量落盘元素类型：int8 体积是 fp32 的 1/4（默认）；"
-            + "fp16 每维 2 字节（sqlite-vec 无该列类型，走精确扫描）；"
-            + "bin 体积最小但只有汉明排序。")
+        .help(L("向量落盘元素类型：int8 体积是 fp32 的 1/4（默认）；")
+            + L("fp16 每维 2 字节（sqlite-vec 无该列类型，走精确扫描）；")
+            + L("bin 体积最小但只有汉明排序。"))
         Text("Matryoshka").font(.caption)
         Picker("", selection: $matryoshkaMode) {
             ForEach(MatryoshkaMode.allCases, id: \.rawValue) { mode in
@@ -1486,55 +1486,55 @@ struct SettingsView: View {
         }
         .labelsHidden()
         .frame(width: 135)
-        .help("截断向量后强制重新归一化，入库与查询使用同一套变换。"
-            + "自动模式对 nomic / jina-v3 / jina-v5 生效；关闭时 jina-v5 输出原生 768 维。")
+        .help(L("截断向量后强制重新归一化，入库与查询使用同一套变换。")
+            + L("自动模式对 nomic / jina-v3 / jina-v5 生效；关闭时 jina-v5 输出原生 768 维。"))
         Picker("", selection: $matryoshkaDim) {
             ForEach(matryoshkaDimensionOptions, id: \.self) { dimension in
-                Text("\(dimension) 维").tag(dimension)
+                Text(L("\(dimension) 维")).tag(dimension)
             }
         }
         .labelsHidden()
         .frame(width: 90)
         .disabled(matryoshkaMode == .off)
         .help(isJinaV5Embedding
-            ? "jina-v5 仅提供模型训练过的 32 / 64 / 128 / 256 / 512 / 768 维；"
-                + "默认 128，向量库最小且召回稳定。关闭 Matryoshka 时输出原生 768 维。"
-            : "Matryoshka 截断维：越小向量库越小、召回精度越低；默认 128。"
-                + "nomic / jina-v3 在自动模式下都按此维度截断。")
+            ? L("jina-v5 仅提供模型训练过的 32 / 64 / 128 / 256 / 512 / 768 维；")
+                + L("默认 128，向量库最小且召回稳定。关闭 Matryoshka 时输出原生 768 维。")
+            : L("Matryoshka 截断维：越小向量库越小、召回精度越低；默认 128。")
+                + L("nomic / jina-v3 在自动模式下都按此维度截断。"))
     }
 
     @ViewBuilder
     private func annToggles() -> some View {
-        Toggle("ANN 检索", isOn: $annEnabled)
-            .help("开启后检索走分块 IVF 索引；索引未构建、维度不符或尾块超预算时"
-                + "自动回退精确检索。关闭后始终精确检索，大库上会明显变慢")
-        Toggle("自动构建", isOn: $annAutoBuild)
-            .help("同步完成后切片数达到阈值（默认 2 万）时自动构建/续建向量索引；"
-                + "关闭后只能手动点「构建/续建向量索引」")
+        Toggle(L("ANN 检索"), isOn: $annEnabled)
+            .help(L("开启后检索走分块 IVF 索引；索引未构建、维度不符或尾块超预算时")
+                + L("自动回退精确检索。关闭后始终精确检索，大库上会明显变慢"))
+        Toggle(L("自动构建"), isOn: $annAutoBuild)
+            .help(L("同步完成后切片数达到阈值（默认 2 万）时自动构建/续建向量索引；")
+                + L("关闭后只能手动点「构建/续建向量索引」"))
     }
 
     /// 二值粗筛开关与第一阶段候选数（与向量库配置同一行，重建向量库按钮之前）。
     @ViewBuilder
     private func binaryCoarseControls() -> some View {
-        Toggle("二值粗筛", isOn: $binaryCoarseEnabled)
+        Toggle(L("二值粗筛"), isOn: $binaryCoarseEnabled)
             .font(.caption2)
-            .help("开启后先用二值向量召回候选，再按主向量余弦精排，"
-                + "最后与全文检索 RRF 融合；可用时取代 ANN，不可用时"
-                + "自动回退原流程。主存储为 BIN 时仅支持单阶段检索；"
-                + "已有库需要重新同步后才会生效。")
+            .help(L("开启后先用二值向量召回候选，再按主向量余弦精排，")
+                + L("最后与全文检索 RRF 融合；可用时取代 ANN，不可用时")
+                + L("自动回退原流程。主存储为 BIN 时仅支持单阶段检索；")
+                + L("已有库需要重新同步后才会生效。"))
         Stepper(value: $binaryCoarseCandidates, in: 50...1000, step: 50) {
-            Text("候选 \(binaryCoarseCandidates)").font(.caption2)
+            Text(L("候选 \(binaryCoarseCandidates)")).font(.caption2)
         }
         .disabled(!binaryCoarseEnabled)
-        .help("第一阶段二值粗筛候选数：越大召回越稳、精排读取越多；"
-            + "默认 200，允许 50...1000。")
+        .help(L("第一阶段二值粗筛候选数：越大召回越稳、精排读取越多；")
+            + L("默认 200，允许 50...1000。"))
     }
 
     @ViewBuilder
     private func vectorRebuildButtons() -> some View {
-        Button("重建向量库") { model.requestVectorRebuild() }
-            .help("按当前元素类型/Matryoshka 配置重建向量表：清空旧切片、全文索引、"
-                + "ANN 与二值 ANN 索引后全量重新同步；可中断，知识库原始文件不受影响")
+        Button(L("重建向量库")) { model.requestVectorRebuild() }
+            .help(L("按当前元素类型/Matryoshka 配置重建向量表：清空旧切片、全文索引、")
+                + L("ANN 与二值 ANN 索引后全量重新同步；可中断，知识库原始文件不受影响"))
             .disabled(model.isSyncing || model.isDeduplicating || model.isBuildingANN
                 || model.isModelLoading || model.isWarmingUp || model.isRunning)
     }
@@ -1542,15 +1542,15 @@ struct SettingsView: View {
     private func vectorElementLabel(_ type: VectorElementType) -> String {
         switch type {
         case .fp32: return "FP32"
-        case .int8: return "INT8（推荐）"
-        case .fp16: return "FP16（2 字节/维）"
-        case .bin: return "BIN（最小）"
+        case .int8: return L("INT8（推荐）")
+        case .fp16: return L("FP16（2 字节/维）")
+        case .bin: return L("BIN（最小）")
         }
     }
 
     /// MLX 全局内存上限的展示文本：0 表示自动。
     private var mlxMemoryLimitText: String {
-        mlxMemoryLimitMB <= 0 ? "自动" : "\(mlxMemoryLimitMB)MB"
+        mlxMemoryLimitMB <= 0 ? L("自动") : "\(mlxMemoryLimitMB)MB"
     }
 
     // MARK: - 参数控件
@@ -1608,7 +1608,7 @@ struct SettingsView: View {
         HStack(alignment: .center, spacing: 3) {
             numberField("Context", value: context, width: 60)
             if let kvCap {
-                numberField("KV 上限", value: kvCap, width: 66)
+                numberField(L("KV 上限"), value: kvCap, width: 66)
             }
             numberField("Temp", value: temperature, width: 48)
             numberField("top_p", value: topP, width: 48)
@@ -1636,33 +1636,33 @@ struct SettingsView: View {
                         .toggleStyle(.checkbox)
                         .font(.caption2)
                         .fixedSize()
-                        .help("默认开启：MLX 使用未量化 KV 走 Metal fused attention，"
-                            + "GGUF 强制启用 Flash Attention；M3+/M4 或纯注意力模型收益更明显。"
-                            + "GGUF 可与 KV量化 叠加（fa_q8_0 kernel 省显存）；"
-                            + "MLX 上游限制二者只能取其一，开启时 KV量化 自动停用")
+                        .help(L("默认开启：MLX 使用未量化 KV 走 Metal fused attention，")
+                            + L("GGUF 强制启用 Flash Attention；M3+/M4 或纯注意力模型收益更明显。")
+                            + L("GGUF 可与 KV量化 叠加（fa_q8_0 kernel 省显存）；")
+                            + L("MLX 上游限制二者只能取其一，开启时 KV量化 自动停用"))
                 }
                 if let thinking {
-                    Toggle("思考", isOn: thinking)
+                    Toggle(L("思考"), isOn: thinking)
                         .toggleStyle(.checkbox)
                         .font(.caption2)
                         .fixedSize()
-                        .help("开启后模型会先生成思考内容，显著增加延迟与 token；"
-                            + "主模型默认开启，辅助模型默认关闭；"
-                            + "后台事实抽取/蒸馏始终强制关闭")
+                        .help(L("开启后模型会先生成思考内容，显著增加延迟与 token；")
+                            + L("主模型默认开启，辅助模型默认关闭；")
+                            + L("后台事实抽取/蒸馏始终强制关闭"))
                 }
                 if let kvReuse {
-                    Toggle("KV复用", isOn: kvReuse)
+                    Toggle(L("KV复用"), isOn: kvReuse)
                         .toggleStyle(.checkbox)
                         .font(.caption2)
                         .fixedSize()
-                        .help("关闭后每轮全量重建 KV（等效禁用前缀缓存）：主模型与辅助模型各自独立")
+                        .help(L("关闭后每轮全量重建 KV（等效禁用前缀缓存）：主模型与辅助模型各自独立"))
                 }
                 if let kvInt8 {
-                    Toggle("KV量化", isOn: kvInt8)
+                    Toggle(L("KV量化"), isOn: kvInt8)
                         .toggleStyle(.checkbox)
                         .font(.caption2)
                         .fixedSize()
-                        .help("KV cache int8 量化：KV 内存约减半，质量几乎无损；主模型与辅助模型各自独立")
+                        .help(L("KV cache int8 量化：KV 内存约减半，质量几乎无损；主模型与辅助模型各自独立"))
                 }
             }
         }
@@ -1881,27 +1881,27 @@ struct SettingsView: View {
 
     private func loadMainModel() {
         guard !model.isSyncing, !model.isDeduplicating, !model.isBuildingANN else {
-            statusMessage = "知识同步/索引构建/向量去重进行中，暂不能加载模型"
+            statusMessage = L("知识同步/索引构建/向量去重进行中，暂不能加载模型")
             return
         }
         guard let config = buildConfig() else { return }
-        statusMessage = "正在加载主模型…"
+        statusMessage = L("正在加载主模型…")
         model.reloadMainModel(config: config)
     }
 
     private func loadAuxModel() {
         guard !model.isSyncing, !model.isDeduplicating, !model.isBuildingANN else {
-            statusMessage = "知识同步/索引构建/向量去重进行中，暂不能加载模型"
+            statusMessage = L("知识同步/索引构建/向量去重进行中，暂不能加载模型")
             return
         }
         guard let config = buildConfig() else { return }
-        statusMessage = "正在加载辅助模型…"
+        statusMessage = L("正在加载辅助模型…")
         model.reloadAuxModel(config: config)
     }
 
     private func applyAPIConfig() {
         guard let config = buildConfig() else { return }
-        statusMessage = "配置已应用"
+        statusMessage = L("配置已应用")
         model.applyConfig(config)
     }
 
@@ -1909,17 +1909,17 @@ struct SettingsView: View {
     /// 校验失败时 `buildConfig()` 已在 `statusMessage` 写入原因，这里无需额外处理。
     private func applyAllConfig() {
         guard let config = buildConfig() else { return }
-        statusMessage = "全部设置已保存并应用"
+        statusMessage = L("全部设置已保存并应用")
         model.applyConfig(config)
     }
 
     private func applyKnowledgeConfig() {
         guard !model.isSyncing, !model.isDeduplicating, !model.isBuildingANN else {
-            statusMessage = "知识同步/索引构建/向量去重进行中，暂不能应用配置"
+            statusMessage = L("知识同步/索引构建/向量去重进行中，暂不能应用配置")
             return
         }
         guard let config = buildConfig() else { return }
-        statusMessage = "知识同步配置已应用并保存"
+        statusMessage = L("知识同步配置已应用并保存")
         model.applyConfig(config)
     }
 
@@ -1929,8 +1929,8 @@ struct SettingsView: View {
         // 避免增量同步对着已有 manifest 判定「无变化」而秒完成。
         let kbChanged = model.config.resolvedKnowledgeBase != config.resolvedKnowledgeBase
         statusMessage = kbChanged
-            ? "知识库目录已切换为 \(config.resolvedKnowledgeBase)，将强制全量同步…"
-            : "配置已应用，正在同步知识库…"
+            ? L("知识库目录已切换为 \(config.resolvedKnowledgeBase)，将强制全量同步…")
+            : L("配置已应用，正在同步知识库…")
         model.applyConfig(config) {
             model.syncKnowledgeBase(force: kbChanged)
         }
@@ -1951,16 +1951,16 @@ struct SettingsView: View {
         // 有分区正在同步时拒绝新的同步请求：applyConfig 会重建 Agent 并取消
         // 在途同步，导致「已同步一半的分区被中断、结果作废」。
         if model.isSyncing {
-            statusMessage = "已有知识分区正在同步，请先点「停止同步」再同步其它分区"
+            statusMessage = L("已有知识分区正在同步，请先点「停止同步」再同步其它分区")
             return
         }
         guard let config = buildConfig() else { return }
         if configSignature(config) == configSignature(model.config) {
-            statusMessage = "正在同步知识分区…"
+            statusMessage = L("正在同步知识分区…")
             model.syncZone(zoneID: zoneID)
             return
         }
-        statusMessage = "配置已应用，正在同步知识分区…"
+        statusMessage = L("配置已应用，正在同步知识分区…")
         model.applyConfig(config) {
             model.syncZone(zoneID: zoneID)
         }
@@ -1972,10 +1972,10 @@ struct SettingsView: View {
     private func applyAndBuildColbertANN() {
         guard let config = buildConfig() else { return }
         guard config.colbertReaderEnabled else {
-            statusMessage = "请先切换到极速检索模式，再构建向量索引"
+            statusMessage = L("请先切换到极速检索模式，再构建向量索引")
             return
         }
-        statusMessage = "配置已应用，正在构建向量索引…"
+        statusMessage = L("配置已应用，正在构建向量索引…")
         model.applyConfig(config) {
             model.requestColbertANNBuild()
         }
@@ -2006,7 +2006,7 @@ struct SettingsView: View {
     /// 保存并应用高级设置（包含自定义 OCR 模型、PDF/EPUB OCR 引擎等）。
     private func saveAdvancedSettings() {
         guard !model.isSyncing, !model.isDeduplicating, !model.isBuildingANN else {
-            statusMessage = "知识同步/索引构建/向量去重进行中，暂不能保存设置"
+            statusMessage = L("知识同步/索引构建/向量去重进行中，暂不能保存设置")
             return
         }
         if !customOCRAvailable {
@@ -2014,7 +2014,7 @@ struct SettingsView: View {
             if epubOCREngine == .custom { epubOCREngine = .vision }
         }
         guard let config = buildConfig() else { return }
-        statusMessage = "高级设置已保存并应用"
+        statusMessage = L("高级设置已保存并应用")
         model.applyConfig(config)
     }
 
@@ -2070,26 +2070,26 @@ struct SettingsView: View {
         let ab = AgentConfig.normalizeLLMBackend(auxBackend)
         let supportedLLM = ["mlx-lm", "mlx-vlm", "gguf", "onnx"]
         if mainMode == "local", !supportedLLM.contains(mb) {
-            statusMessage = "主模型类型 \(mainBackend) 尚未接入，请选择 MLX-LM / MLX-VLM / GGUF / ONNX"
+            statusMessage = L("主模型类型 \(mainBackend) 尚未接入，请选择 MLX-LM / MLX-VLM / GGUF / ONNX")
             return nil
         }
         if !supportedLLM.contains(ab) {
-            statusMessage = "辅助模型类型 \(auxBackend) 尚未接入，请选择 MLX-LM / MLX-VLM / GGUF / ONNX"
+            statusMessage = L("辅助模型类型 \(auxBackend) 尚未接入，请选择 MLX-LM / MLX-VLM / GGUF / ONNX")
             return nil
         }
         if mainMode == "api" {
             guard !baseURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-                statusMessage = "API 模式需要填写 Base URL"
+                statusMessage = L("API 模式需要填写 Base URL")
                 return nil
             }
             guard !apiModel.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-                statusMessage = "API 模式需要选择或填写模型"
+                statusMessage = L("API 模式需要选择或填写模型")
                 return nil
             }
         }
         let eb = AgentConfig.normalizeEmbeddingBackend(embeddingBackend)
         guard eb == "onnx" || eb == "fastembed" || eb == "mlx" || eb == "gguf" else {
-            statusMessage = "Embedding 类型 \(embeddingBackend) 当前版本尚未接入，请选择 ONNX / FastEmbed / MLX / GGUF"
+            statusMessage = L("Embedding 类型 \(embeddingBackend) 当前版本尚未接入，请选择 ONNX / FastEmbed / MLX / GGUF")
             return nil
         }
         // jina-v5 与其它模型一样尊重用户选择的元素类型（默认 int8）。
@@ -2101,7 +2101,7 @@ struct SettingsView: View {
         }
         let rb = AgentConfig.normalizeEmbeddingBackend(rerankerBackend)
         if rerankEnabled, rb != "onnx", rb != "fastembed", rb != "mlx", rb != "gguf" {
-            statusMessage = "Reranker 类型 \(rerankerBackend) 当前版本尚未接入，请选择 ONNX / FastEmbed / MLX / GGUF"
+            statusMessage = L("Reranker 类型 \(rerankerBackend) 当前版本尚未接入，请选择 ONNX / FastEmbed / MLX / GGUF")
             return nil
         }
 
@@ -2274,7 +2274,7 @@ struct SettingsView: View {
 
         if mainMode == "local", !config.localLLMModel.isEmpty,
            config.localLLMModel != model.config.localLLMModel {
-            statusMessage = "已应用本地模型路径"
+            statusMessage = L("已应用本地模型路径")
         }
         return config
     }
@@ -2291,11 +2291,11 @@ struct SettingsView: View {
     private func fetchModels() {
         let base = baseURL.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !base.isEmpty else {
-            statusMessage = "请先填写 Base URL"
+            statusMessage = L("请先填写 Base URL")
             return
         }
         fetchingModels = true
-        statusMessage = "正在获取模型列表…"
+        statusMessage = L("正在获取模型列表…")
         let client = OpenAILLMClient(baseURL: base,
                                      apiKey: apiKey.trimmingCharacters(in: .whitespacesAndNewlines),
                                      model: apiModel)
@@ -2308,14 +2308,14 @@ struct SettingsView: View {
                     apiModels = ids
                     if apiModel.isEmpty, let first = ids.first { apiModel = first }
                     statusMessage = ids.isEmpty
-                        ? "接口没有返回模型"
-                        : "已获取 \(ids.count) 个模型"
+                        ? L("接口没有返回模型")
+                        : L("已获取 \(ids.count) 个模型")
                 }
             } catch {
                 client.close()
                 await MainActor.run {
                     fetchingModels = false
-                    statusMessage = "获取模型失败：\(error.localizedDescription)"
+                    statusMessage = L("获取模型失败：\(error.localizedDescription)")
                 }
             }
         }
@@ -2324,7 +2324,7 @@ struct SettingsView: View {
     private func chooseWorkspaceDirectory() {
         let current = workspace.trimmingCharacters(in: .whitespacesAndNewlines)
         if let url = runOpenPanel({ panel in
-            panel.title = "选择工作目录"
+            panel.title = L("选择工作目录")
             panel.canChooseFiles = false
             panel.canChooseDirectories = true
             panel.allowsMultipleSelection = false
@@ -2422,7 +2422,7 @@ struct SettingsView: View {
         case "gguf":
             chooseGGUF(binding, title: fileTitle)
         case "onnx":
-            chooseONNX(binding, title: "选择 ONNX 模型文件或目录")
+            chooseONNX(binding, title: L("选择 ONNX 模型文件或目录"))
         default:
             chooseDirectory(binding, title: dirTitle)
         }

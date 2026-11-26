@@ -161,16 +161,16 @@ final class UICallbacks: AgentCallbacks, @unchecked Sendable {
         }
         return runOnMain {
             let alert = NSAlert()
-            alert.messageText = "需要确认"
+            alert.messageText = L("需要确认")
             alert.alertStyle = .warning
             // 默认按钮是「拒绝」：回车/误触不会自动放行高风险操作。
-            alert.addButton(withTitle: "拒绝")
-            alert.addButton(withTitle: "允许")
+            alert.addButton(withTitle: L("拒绝"))
+            alert.addButton(withTitle: L("允许"))
 
             // 确认文案现在包含完整实参（不能只显示摘要，否则「批准 A、执行 B」）。
             // 长参数放进可滚动附件视图，既不撑爆弹窗，也保证用户能看完。
             if message.count > 600 {
-                alert.informativeText = "请核对下面实际执行的完整参数："
+                alert.informativeText = L("请核对下面实际执行的完整参数：")
                 let frame = NSRect(x: 0, y: 0, width: 560, height: 260)
                 let textView = NSTextView(frame: frame)
                 textView.string = message
@@ -202,12 +202,12 @@ final class UICallbacks: AgentCallbacks, @unchecked Sendable {
         }
         return runOnMain {
             let alert = NSAlert()
-            alert.messageText = "需要补充信息"
+            alert.messageText = L("需要补充信息")
             alert.informativeText = prompt
-            alert.addButton(withTitle: "提交")
-            alert.addButton(withTitle: "取消")
+            alert.addButton(withTitle: L("提交"))
+            alert.addButton(withTitle: L("取消"))
             let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 420, height: 24))
-            field.placeholderString = "请输入…"
+            field.placeholderString = L("请输入…")
             alert.accessoryView = field
             guard alert.runModal() == .alertFirstButtonReturn else { return nil }
             let value = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -252,10 +252,10 @@ final class AppViewModel: ObservableObject {
             }
         }
     }
-    @Published var statusText = "就绪"
+    @Published var statusText = L("就绪")
     @Published var totalTokens = 0
     @Published var tokenSpeed: Double = 0
-    @Published var ragStatusText = "RAG 未就绪"
+    @Published var ragStatusText = L("RAG 未就绪")
     @Published var isSyncing = false {
         didSet { if !isSyncing { flushQueuedSends() } }
     }
@@ -296,16 +296,16 @@ final class AppViewModel: ObservableObject {
     }
     private var queuedSends: [QueuedSend] = []
     /// ANN 索引摘要（设置窗口显示，来自 RAG status 快照）。
-    @Published var annStatusText = "ANN 索引未构建"
+    @Published var annStatusText = L("ANN 索引未构建")
     /// 二值 ANN 索引摘要（stage 1 自研 bann；未构建时显示回退提示）。
-    @Published var binaryANNStatusText = "二值 ANN 索引未构建"
+    @Published var binaryANNStatusText = L("二值 ANN 索引未构建")
     /// 闲时后台章节摘要的进度（设置窗口显示）。
-    @Published var bookSummaryStatusText = "章节摘要：空闲"
+    @Published var bookSummaryStatusText = L("章节摘要：空闲")
     /// 当前索引与配置不匹配，需要用户显式重建。
     @Published var vectorRebuildRequired = false
     @Published var vectorRebuildReason = ""
     /// 当前模式向量/编码完备状态（设置窗口 RAG 模式配置区显示）。
-    @Published var vectorCompletenessText = "向量库：未统计"
+    @Published var vectorCompletenessText = L("向量库：未统计")
     @Published var vectorIsComplete = true
     /// 手动补做向量进行中。
     @Published var isBackfillingVectors = false
@@ -528,15 +528,15 @@ final class AppViewModel: ObservableObject {
             .map { "\($0.kind)：\($0.repo)" }
             .joined(separator: "\n")
         let alert = NSAlert()
-        alert.messageText = "默认模型缺失，需要联网下载或自行指定"
-        alert.informativeText = "以下默认模型尚未就绪：\n\(names)\n\n"
-            + "· 自动下载补全：从 \(HFModelDownloader.defaultMirrorBase) 下载运行"
-            + "所需文件（支持断点续传，中断后可继续），完成后才能正常使用软件；\n"
-            + "· 自行下载指定：不再自动下载，由你自行获取模型并在配置窗口指定"
-            + "各阶段使用的模型，配置就绪后自动解除限制。"
-        alert.addButton(withTitle: "自动下载补全")
-        alert.addButton(withTitle: "自行下载指定")
-        alert.addButton(withTitle: "稍后再说")
+        alert.messageText = L("默认模型缺失，需要联网下载或自行指定")
+        alert.informativeText = L("以下默认模型尚未就绪：\n\(names)\n\n")
+            + L("· 自动下载补全：从 \(HFModelDownloader.defaultMirrorBase) 下载运行")
+            + L("所需文件（支持断点续传，中断后可继续），完成后才能正常使用软件；\n")
+            + L("· 自行下载指定：不再自动下载，由你自行获取模型并在配置窗口指定")
+            + L("各阶段使用的模型，配置就绪后自动解除限制。")
+        alert.addButton(withTitle: L("自动下载补全"))
+        alert.addButton(withTitle: L("自行下载指定"))
+        alert.addButton(withTitle: L("稍后再说"))
         NSApp.activate(ignoringOtherApps: true)
         switch alert.runModal() {
         case .alertFirstButtonReturn:
@@ -546,7 +546,7 @@ final class AppViewModel: ObservableObject {
             do {
                 try config.save(Self.configPath)
                 appendLog("[models] 已选择自行下载指定模型（auto_download_missing_models=false），"
-                    + "跳过自动下载")
+                    + L("跳过自动下载"))
             } catch {
                 appendLog("[models] 配置保存失败：\(error.localizedDescription)")
             }
@@ -563,7 +563,7 @@ final class AppViewModel: ObservableObject {
         guard !missingDefaultModels.isEmpty else { return }
         isDownloadingModels = true
         modelDownloadProgress = 0
-        modelDownloadStatusText = "正在获取模型文件列表…"
+        modelDownloadStatusText = L("正在获取模型文件列表…")
         let missing = missingDefaultModels
         modelDownloadTask = Task { [weak self] in
             do {
@@ -572,20 +572,20 @@ final class AppViewModel: ObservableObject {
                 await MainActor.run { [weak self] in
                     guard let self else { return }
                     self.isDownloadingModels = false
-                    self.statusText = "模型下载已停止"
-                    self.modelDownloadStatusText = "模型下载已停止（已下载部分保留，可续传）"
+                    self.statusText = L("模型下载已停止")
+                    self.modelDownloadStatusText = L("模型下载已停止（已下载部分保留，可续传）")
                     self.appendLog("[models] 模型下载已停止")
                 }
             } catch {
                 await MainActor.run { [weak self] in
                     guard let self else { return }
                     self.isDownloadingModels = false
-                    self.statusText = "模型下载失败"
-                    self.modelDownloadStatusText = "模型下载失败：\(error.localizedDescription)"
+                    self.statusText = L("模型下载失败")
+                    self.modelDownloadStatusText = L("模型下载失败：\(error.localizedDescription)")
                     self.appendLog("[models] 模型下载失败：\(error.localizedDescription)")
-                    self.showInfoAlert(title: "模型下载失败",
+                    self.showInfoAlert(title: L("模型下载失败"),
                                        message: error.localizedDescription
-                                       + "\n\n已下载的部分会保留，可再次点击下载从断点继续。")
+                                       + L("\n\n已下载的部分会保留，可再次点击下载从断点继续。"))
                 }
             }
         }
@@ -618,11 +618,11 @@ final class AppViewModel: ObservableObject {
             // 的文件（通常是没有 tokenizer.json），必须报错，不能提示已就绪。
             if let still = missingDefaultModels.first {
                 throw HFModelDownloader.HFError.badResponse(
-                    "\(still.repo) 缺少运行必需的文件（权重或 tokenizer.json），"
-                        + "镜像仓库可能不完整，请在配置窗口指定其它已就绪的模型")
+                    L("\(still.repo) 缺少运行必需的文件（权重或 tokenizer.json），")
+                        + L("镜像仓库可能不完整，请在配置窗口指定其它已就绪的模型"))
             }
             isDownloadingModels = false
-            statusText = "默认模型已就绪"
+            statusText = L("默认模型已就绪")
             return
         }
 
@@ -653,8 +653,8 @@ final class AppViewModel: ObservableObject {
             // 不能宣布就绪，否则启动加载会报「缺少 tokenizer」且不再触发补全。
             guard RequiredModelCatalog.isComplete(entry.model) else {
                 throw HFModelDownloader.HFError.badResponse(
-                    "\(entry.model.repo) 下载完成后仍缺少权重或 tokenizer.json，"
-                        + "请再次点击下载（支持断点续传）或手动指定可用模型")
+                    L("\(entry.model.repo) 下载完成后仍缺少权重或 tokenizer.json，")
+                        + L("请再次点击下载（支持断点续传）或手动指定可用模型"))
             }
             appendLog("[models] 已就绪：\(entry.model.repo)")
         }
@@ -662,17 +662,17 @@ final class AppViewModel: ObservableObject {
         checkDefaultModels()
         if let still = missingDefaultModels.first {
             isDownloadingModels = false
-            statusText = "模型下载未完成"
-            modelDownloadStatusText = "\(still.repo) 仍未就绪"
+            statusText = L("模型下载未完成")
+            modelDownloadStatusText = L("\(still.repo) 仍未就绪")
             throw HFModelDownloader.HFError.badResponse(
-                "\(still.repo) 仍未就绪（缺少权重或 tokenizer.json），请在配置窗口检查模型目录")
+                L("\(still.repo) 仍未就绪（缺少权重或 tokenizer.json），请在配置窗口检查模型目录"))
         }
         isDownloadingModels = false
-        statusText = "默认模型已就绪"
+        statusText = L("默认模型已就绪")
         modelDownloadStatusText = ""
         appendLog("[models] 默认模型下载完成")
-        showInfoAlert(title: "模型下载完成",
-                      message: "默认模型已就绪，软件可以正常使用了。")
+        showInfoAlert(title: L("模型下载完成"),
+                      message: L("默认模型已就绪，软件可以正常使用了。"))
     }
 
     /// 默认模型未就绪时的统一拦截提示（区分自动下载与自行指定两种模式）。
@@ -680,13 +680,13 @@ final class AppViewModel: ObservableObject {
         guard !missingDefaultModels.isEmpty else { return false }
         let models = missingDefaultModels.map(\.repo).joined(separator: "、")
         let hint = config.autoDownloadMissingModels
-            ? "可点击状态栏「下载」从 hf-mirror.com 自动补全（支持断点续传），"
-                + "或在配置窗口指定已就绪的模型。"
-            : "你已选择自行下载指定模型：请自行获取后，在配置窗口为各阶段指定"
-                + "已就绪的模型并应用，配置就绪后自动解除限制。"
+            ? L("可点击状态栏「下载」从 hf-mirror.com 自动补全（支持断点续传），")
+                + L("或在配置窗口指定已就绪的模型。")
+            : L("你已选择自行下载指定模型：请自行获取后，在配置窗口为各阶段指定")
+                + L("已就绪的模型并应用，配置就绪后自动解除限制。")
         showInfoAlert(
-            title: "默认模型未就绪",
-            message: "\(operation)需要以下模型就绪：\(models)。\n\(hint)")
+            title: L("默认模型未就绪"),
+            message: L("\(operation)需要以下模型就绪：\(models)。\n\(hint)"))
         return true
     }
 
@@ -712,10 +712,10 @@ final class AppViewModel: ObservableObject {
         switch promptFile.status {
         case .created:
             appendLog("[prompt] 首次启动已生成可编辑 system prompt："
-                + "\(promptFile.path)（编辑后重启生效）")
+                + L("\(promptFile.path)（编辑后重启生效）"))
         case .loaded:
             appendLog("[prompt] 已加载自定义 system prompt：\(promptFile.path)"
-                + "（\(promptFile.text.count) 字符）")
+                + L("（\(promptFile.text.count) 字符）"))
         case .fallback:
             appendLog("[prompt] \(promptFile.note)；文件：\(promptFile.path)")
         }
@@ -859,7 +859,7 @@ final class AppViewModel: ObservableObject {
                     + (self.config.llmProvider == "local"
                        ? self.config.localLLMModel : self.config.model))
                 self.appendLog("知识库目录：\(self.config.resolvedKnowledgeBase)"
-                    + (self.config.knowledgeBase.isEmpty ? "（跟随工作目录）" : ""))
+                    + (self.config.knowledgeBase.isEmpty ? L("（跟随工作目录）") : ""))
                 if let afterApply {
                     // 同步会先卸载模型、结束后再恢复；这里不要同时预加载，
                     // 否则同步期间模型又常驻内存，抵消资源释放。
@@ -912,10 +912,10 @@ final class AppViewModel: ObservableObject {
             swapModel(slot, config: newConfig)
             return
         }
-        let slotLabel = slot == .main ? "主模型" : "辅助模型"
+        let slotLabel = slot == .main ? L("主模型") : L("辅助模型")
         let sample = drifted.prefix(6).joined(separator: "、")
         appendLog("[model] 检测到 \(drifted.count) 项配置变化（\(sample)"
-            + (drifted.count > 6 ? " 等" : "") + "），重建 Agent 后加载\(slotLabel)")
+            + (drifted.count > 6 ? L(" 等") : "") + L("），重建 Agent 后加载\(slotLabel)"))
         let wasMain = mainModelLoaded
         let wasAux = auxModelLoaded
         applyConfig(newConfig) { [weak self] in
@@ -949,7 +949,7 @@ final class AppViewModel: ObservableObject {
         cancelIdleUnload()
         isRunning = false
         isModelLoading = true
-        statusText = "模型加载中…"
+        statusText = L("模型加载中…")
 
         Task { [weak self] in
             // 替换模型前先让闲时摘要释放对辅助模型的占用。
@@ -991,19 +991,19 @@ final class AppViewModel: ObservableObject {
                     agent.switchLLM(service)
                     self.mainModelLoaded = true
                     let label = newConfig.localLLMModel.isEmpty
-                        ? "默认主模型" : newConfig.localLLMModel
+                        ? L("默认主模型") : newConfig.localLLMModel
                     self.appendLog("[model] 主模型已加载：\(label)")
-                    self.statusText = "模型加载成功"
+                    self.statusText = L("模型加载成功")
                     guard self.configGeneration == generation else { return }
                     if let warmable = service as? WarmupLLMService {
                         await self.warmupMainModel(warmable, generation: generation)
                     } else if !self.isRunning {
-                        self.statusText = "就绪"
+                        self.statusText = L("就绪")
                     }
                 } catch {
                     self.mainModelLoaded = false
                     self.appendLog("[model] 主模型加载失败：\(error.localizedDescription)")
-                    if !self.isRunning { self.statusText = "模型加载失败" }
+                    if !self.isRunning { self.statusText = L("模型加载失败") }
                 }
 
             case .aux:
@@ -1013,7 +1013,7 @@ final class AppViewModel: ObservableObject {
                     LocalModelFactory.shared.unloadLLMCaches()
                     self.auxModelLoaded = false
                     self.appendLog("[model] 辅助模型未启用，跳过加载")
-                    self.statusText = "辅助模型未启用"
+                    self.statusText = L("辅助模型未启用")
                     break
                 }
                 // 先释放旧辅助模型，再按新参数创建；主模型不受影响。
@@ -1028,14 +1028,14 @@ final class AppViewModel: ObservableObject {
                     agent.auxLLM = service
                     self.auxModelLoaded = true
                     let label = newConfig.auxLocalLLMModel.isEmpty
-                        ? "默认辅助模型" : newConfig.auxLocalLLMModel
+                        ? L("默认辅助模型") : newConfig.auxLocalLLMModel
                     self.appendLog("[model] 辅助模型已加载：\(label)")
-                    self.statusText = "模型加载成功"
-                    if !self.isRunning { self.statusText = "就绪" }
+                    self.statusText = L("模型加载成功")
+                    if !self.isRunning { self.statusText = L("就绪") }
                 } catch {
                     self.auxModelLoaded = false
                     self.appendLog("[model] 辅助模型加载失败：\(error.localizedDescription)")
-                    if !self.isRunning { self.statusText = "模型加载失败" }
+                    if !self.isRunning { self.statusText = L("模型加载失败") }
                 }
             }
 
@@ -1056,7 +1056,7 @@ final class AppViewModel: ObservableObject {
         guard main || shouldLoadAux else { return }
         let generation = configGeneration
         isModelLoading = true
-        statusText = "模型加载中…"
+        statusText = L("模型加载中…")
         var hadError = false
         var loadedAny = false
         var warmable: WarmupLLMService?
@@ -1077,7 +1077,7 @@ final class AppViewModel: ObservableObject {
                 loadedAny = true
                 warmable = service as? WarmupLLMService
                 let label = config.localLLMModel.isEmpty
-                    ? "默认主模型" : config.localLLMModel
+                    ? L("默认主模型") : config.localLLMModel
                 appendLog("[model] 主模型已加载：\(label)")
             } catch {
                 guard configGeneration == generation else { return }
@@ -1094,7 +1094,7 @@ final class AppViewModel: ObservableObject {
                 auxModelLoaded = true
                 loadedAny = true
                 let label = config.auxLocalLLMModel.isEmpty
-                    ? "默认辅助模型" : config.auxLocalLLMModel
+                    ? L("默认辅助模型") : config.auxLocalLLMModel
                 appendLog("[model] 辅助模型已加载：\(label)")
             } catch {
                 guard configGeneration == generation else { return }
@@ -1106,14 +1106,14 @@ final class AppViewModel: ObservableObject {
 
         guard configGeneration == generation else { return }
         if loadedAny {
-            statusText = "模型加载成功"
+            statusText = L("模型加载成功")
         }
         guard configGeneration == generation else { return }
         // 辅助模型失败不应阻止主模型预热。
         if let warmable {
             await warmupMainModel(warmable, generation: generation)
         } else if !isRunning {
-            statusText = hadError ? "模型加载失败" : "就绪"
+            statusText = hadError ? L("模型加载失败") : L("就绪")
         }
         if !isRunning { scheduleIdleUnload() }
     }
@@ -1176,7 +1176,7 @@ final class AppViewModel: ObservableObject {
                 self.statusText = text
             }
         }
-        statusText = "模型预热中…"
+        statusText = L("模型预热中…")
         // MCP 工具清单会进入 system 前缀，预热前先等连接完成。
         await agent.connectMCP()
         guard generation == nil || configGeneration == generation else { return }
@@ -1194,11 +1194,11 @@ final class AppViewModel: ObservableObject {
             }
             // 预热期间已排队的用户请求此时开始生成，状态切回「思考中…」；
             // 否则直接就绪。旧实现固定睡 1.2s 只为让中间状态可见。
-            statusText = isRunning ? "思考中…" : "就绪"
+            statusText = isRunning ? L("思考中…") : L("就绪")
         } catch {
             guard generation == nil || configGeneration == generation else { return }
             appendLog("[model] 主模型预热失败：\(error.localizedDescription)")
-            if !isRunning { statusText = "预热失败" }
+            if !isRunning { statusText = L("预热失败") }
         }
     }
 
@@ -1213,7 +1213,7 @@ final class AppViewModel: ObservableObject {
         LocalModelFactory.shared.unloadLLMCaches()
         mainModelLoaded = false
         appendLog("[model] 主模型已卸载")
-        statusText = "主模型未加载"
+        statusText = L("主模型未加载")
         scheduleIdleUnload()
     }
 
@@ -1272,7 +1272,7 @@ final class AppViewModel: ObservableObject {
                 self.isRunning = false
                 self.totalTokens = 0
                 self.tokenSpeed = 0
-                self.statusText = "就绪"
+                self.statusText = L("就绪")
                 self.refreshRAGStatus()
                 self.appendLog("对话已清空（上下文已复位，保留 system 预热 KV 前缀以加速下一轮）")
                 self.scheduleIdleUnload()
@@ -1284,7 +1284,7 @@ final class AppViewModel: ObservableObject {
         guard isRunning else { return }
         cancelFlag.set(true)
         runTask?.cancel()
-        statusText = "正在终止…"
+        statusText = L("正在终止…")
         appendLog("用户请求终止")
         agent?.ragEngine.cancel()
     }
@@ -1335,11 +1335,11 @@ final class AppViewModel: ObservableObject {
         if isSyncing || isDeduplicating || isBuildingANN {
             if queuedSends.count >= 20 { queuedSends.removeFirst() }
             queuedSends.append(QueuedSend(text: text, images: images))
-            statusText = "维护任务进行中，消息已排队（\(queuedSends.count)）…"
+            statusText = L("维护任务进行中，消息已排队（\(queuedSends.count)）…")
             appendLog("[ui] 知识同步/向量去重/索引构建进行中，消息已排队，结束后自动发送")
             return
         }
-        if blockForMissingModels("发送消息") { return }
+        if blockForMissingModels(L("发送消息")) { return }
         cancelIdleUnload()
         runGeneration += 1
         let generation = runGeneration
@@ -1357,10 +1357,10 @@ final class AppViewModel: ObservableObject {
         // 预热尚未结束时正式任务会排队等前缀就绪（约 20s，只有启动这一次）。
         // 明确显示排队状态，避免「思考中…」却长时间无首个 token 像卡死。
         if isWarmingUp {
-            statusText = "模型预热中，问题已排队…"
+            statusText = L("模型预热中，问题已排队…")
             appendLog("[model] 预热期间收到请求，前缀就绪后立即开始处理")
         } else {
-            statusText = "思考中…"
+            statusText = L("思考中…")
         }
         totalTokens = 0
         tokenSpeed = 0
@@ -1387,7 +1387,7 @@ final class AppViewModel: ObservableObject {
                 self.flushBuffers()
                 self.finalizeStreaming(with: answer)
                 self.isRunning = false
-                self.statusText = "就绪"
+                self.statusText = L("就绪")
                 self.cancelFlag.set(false)
                 self.refreshRAGStatus()
                 self.scheduleIdleUnload()
@@ -1514,14 +1514,14 @@ final class AppViewModel: ObservableObject {
     private func executeScheduledTask(_ task: ScheduledTask) {
         guard let agent else { return }
         guard missingDefaultModels.isEmpty else {
-            let note = "⏰ 定时任务「\(task.title)」已跳过：默认模型未就绪"
+            let note = L("⏰ 定时任务「\(task.title)」已跳过：默认模型未就绪")
             appendSystem(note)
             try? agent.scheduleStore?.setLastResult(id: task.id, summary: note)
             return
         }
         // 本地模型未加载时执行只会得到一个错误回复，直接说明原因更清楚。
         if config.llmProvider == "local", !mainModelLoaded {
-            let note = "⏰ 定时任务「\(task.title)」已跳过：主模型未加载"
+            let note = L("⏰ 定时任务「\(task.title)」已跳过：主模型未加载")
             appendSystem(note)
             appendLog("[schedule] \(note)，请在配置中加载模型后等待下次触发")
             try? agent.scheduleStore?.setLastResult(id: task.id, summary: note)
@@ -1533,7 +1533,7 @@ final class AppViewModel: ObservableObject {
         let generation = runGeneration
         if chatItems.count > 1_000 { chatItems.removeFirst(chatItems.count - 1_000) }
         clearStreamingState()
-        appendSystem("⏰ 定时任务「\(task.title)」开始执行（\(scheduleLocalTimeText(Date()))）")
+        appendSystem(L("⏰ 定时任务「\(task.title)」开始执行（\(scheduleLocalTimeText(Date()))）"))
         let item = ChatItem(role: .assistant, content: "")
         chatItems.append(item)
         streamingID = item.id
@@ -1541,7 +1541,7 @@ final class AppViewModel: ObservableObject {
         toolEvents.removeAll()
         pendingToolIndices.removeAll()
         isRunning = true
-        statusText = "定时任务执行中：\(task.title)"
+        statusText = L("定时任务执行中：\(task.title)")
         totalTokens = 0
         tokenSpeed = 0
         cancelFlag.set(false)
@@ -1568,7 +1568,7 @@ final class AppViewModel: ObservableObject {
                 self.finishSummaryFilter()
                 self.flushBuffers()
                 self.finalizeStreaming(with: answer)
-                self.statusText = "就绪"
+                self.statusText = L("就绪")
                 self.cancelFlag.set(false)
                 self.refreshRAGStatus()
                 self.scheduleIdleUnload()
@@ -1586,7 +1586,7 @@ final class AppViewModel: ObservableObject {
         let cleaned = text
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .replacingOccurrences(of: "\n", with: " ")
-        return cleaned.isEmpty ? "（无输出）" : String(cleaned.prefix(160))
+        return cleaned.isEmpty ? L("（无输出）") : String(cleaned.prefix(160))
     }
 
     /// 侧栏「立即执行」：与自然到点走同一条执行链路。
@@ -1705,7 +1705,7 @@ final class AppViewModel: ObservableObject {
             canUseResident = false
         }
         let mode: BookSummaryMode = canUseResident ? .resident : .temporary
-        bookSummaryStatusText = "章节摘要：准备中…"
+        bookSummaryStatusText = L("章节摘要：准备中…")
         summarySessionTask = Task.detached(priority: .utility) { [weak self, weak agent] in
             guard let agent, !Task.isCancelled else { return }
             // 日志闭包会在会话期间多次逃逸执行；先取不可变弱引用，
@@ -1726,7 +1726,7 @@ final class AppViewModel: ObservableObject {
                 await MainActor.run { [weak self] in
                     guard let self, self.summarySessionToken == token else { return }
                     self.summarySessionTask = nil
-                    self.bookSummaryStatusText = "章节摘要：不可用"
+                    self.bookSummaryStatusText = L("章节摘要：不可用")
                     self.appendLog("章节摘要：初始化失败 — \(message)")
                 }
                 return
@@ -1739,7 +1739,7 @@ final class AppViewModel: ObservableObject {
                 await MainActor.run { [weak self] in
                     guard let self, self.summarySessionToken == token else { return }
                     self.summarySessionTask = nil
-                    self.bookSummaryStatusText = "章节摘要：空闲"
+                    self.bookSummaryStatusText = L("章节摘要：空闲")
                 }
                 return
             case .rotated:
@@ -1748,7 +1748,7 @@ final class AppViewModel: ObservableObject {
                 await MainActor.run { [weak self] in
                     guard let self, self.summarySessionToken == token else { return }
                     self.summarySessionTask = nil
-                    self.bookSummaryStatusText = "章节摘要：稍后继续"
+                    self.bookSummaryStatusText = L("章节摘要：稍后继续")
                     self.scheduleIdleSummary(delay: 60_000_000_000)
                 }
                 return
@@ -1758,7 +1758,7 @@ final class AppViewModel: ObservableObject {
             await MainActor.run { [weak self] in
                 guard let self, self.summarySessionToken == token else { return }
                 self.summaryCoordinator = coordinator
-                self.bookSummaryStatusText = "章节摘要：准备辅助模型…"
+                self.bookSummaryStatusText = L("章节摘要：准备辅助模型…")
             }
             guard await coordinator.beginSession(mode: mode) else {
                 await coordinator.endSession()
@@ -1766,7 +1766,7 @@ final class AppViewModel: ObservableObject {
                     guard let self, self.summarySessionToken == token else { return }
                     self.summaryCoordinator = nil
                     self.summarySessionTask = nil
-                    self.bookSummaryStatusText = "章节摘要：辅助模型不可用"
+                    self.bookSummaryStatusText = L("章节摘要：辅助模型不可用")
                 }
                 return
             }
@@ -1823,7 +1823,7 @@ final class AppViewModel: ObservableObject {
                 guard let self, self.summarySessionToken == token else { return }
                 self.summaryCoordinator = nil
                 self.summarySessionTask = nil
-                self.bookSummaryStatusText = "章节摘要：空闲"
+                self.bookSummaryStatusText = L("章节摘要：空闲")
             }
         }
     }
@@ -1871,7 +1871,7 @@ final class AppViewModel: ObservableObject {
         }
         summaryCoordinator = nil
         summaryStopTask = nil
-        bookSummaryStatusText = "章节摘要：空闲"
+        bookSummaryStatusText = L("章节摘要：空闲")
     }
 
     // MARK: 流式更新
@@ -1889,7 +1889,7 @@ final class AppViewModel: ObservableObject {
         if !parts.content.isEmpty || !parts.summary.isEmpty {
             scheduleFlush()
         }
-        statusText = "生成中…"
+        statusText = L("生成中…")
     }
 
     /// 模型跳过 `<think>` 起始标签、直接输出思考并以 `</think>` 收尾时，
@@ -2011,7 +2011,7 @@ final class AppViewModel: ObservableObject {
         let event = ToolEvent(name: name, arguments: arguments, success: nil, output: "")
         toolEvents.append(event)
         pendingToolIndices[name, default: []].append(toolEvents.count - 1)
-        statusText = "调用工具 \(name)…"
+        statusText = L("调用工具 \(name)…")
     }
 
     func finishTool(name: String, result: ToolResult) {
@@ -2047,7 +2047,7 @@ final class AppViewModel: ObservableObject {
 
     func finishRun() {
         isRunning = false
-        statusText = "就绪"
+        statusText = L("就绪")
         cancelFlag.set(false)
     }
 
@@ -2070,42 +2070,42 @@ final class AppViewModel: ObservableObject {
     /// 点击「向量去重」：先扫描并把重复数量反馈给用户，确认后再清理。
     func requestVectorDedupe() {
         guard let agent else {
-            showInfoAlert(title: "向量去重", message: "RAG 尚未就绪，请先在知识同步配置中应用配置。")
+            showInfoAlert(title: L("向量去重"), message: L("RAG 尚未就绪，请先在知识同步配置中应用配置。"))
             return
         }
         if agent.config.colbertReaderEnabled {
-            showInfoAlert(title: "向量去重", message: "极速检索模式没有向量库，无需向量去重。")
+            showInfoAlert(title: L("向量去重"), message: L("极速检索模式没有向量库，无需向量去重。"))
             return
         }
         if isSyncing {
-            showInfoAlert(title: "暂不能向量去重", message: "知识同步正在进行，请等同步结束后再试。")
+            showInfoAlert(title: L("暂不能向量去重"), message: L("知识同步正在进行，请等同步结束后再试。"))
             return
         }
         if isDeduplicating {
-            showInfoAlert(title: "向量去重进行中", message: "正在排查或清理重复向量，请稍候。")
+            showInfoAlert(title: L("向量去重进行中"), message: L("正在排查或清理重复向量，请稍候。"))
             return
         }
         if isBuildingANN {
             // 去重会 DELETE chunks/向量行，而 ANN 构建按 rowid 扫描同一批表；
             // 两者并发可能产出引用已删除切片的索引，必须串行。
-            showInfoAlert(title: "暂不能向量去重", message: "ANN 索引维护正在进行，请稍后再试。")
+            showInfoAlert(title: L("暂不能向量去重"), message: L("ANN 索引维护正在进行，请稍后再试。"))
             return
         }
         if isBuildingColbertANN {
-            showInfoAlert(title: "暂不能向量去重", message: "检索阅读索引正在构建，请稍后再试。")
+            showInfoAlert(title: L("暂不能向量去重"), message: L("检索阅读索引正在构建，请稍后再试。"))
             return
         }
         if isModelLoading || isWarmingUp {
-            showInfoAlert(title: "暂不能向量去重", message: "模型正在加载或预热，请稍后再试。")
+            showInfoAlert(title: L("暂不能向量去重"), message: L("模型正在加载或预热，请稍后再试。"))
             return
         }
         if isRunning {
-            showInfoAlert(title: "暂不能向量去重", message: "对话正在生成，请等本轮结束后再试。")
+            showInfoAlert(title: L("暂不能向量去重"), message: L("对话正在生成，请等本轮结束后再试。"))
             return
         }
         cancelIdleUnload()
         isDeduplicating = true
-        statusText = "正在扫描重复向量…"
+        statusText = L("正在扫描重复向量…")
         let target = ObjectIdentifier(agent)
         Task.detached(priority: .utility) { [weak self] in
             // 摘要会话与向量维护共用同一个 SQLite 库；先等它退出，
@@ -2123,7 +2123,7 @@ final class AppViewModel: ObservableObject {
                     self.isDeduplicating = false
                     if !self.isRunning, !self.isSyncing, !self.isModelLoading,
                        !self.isWarmingUp, !self.isBuildingANN {
-                        self.statusText = "就绪"
+                        self.statusText = L("就绪")
                     }
                     self.scheduleIdleUnload()
                 }
@@ -2139,23 +2139,23 @@ final class AppViewModel: ObservableObject {
                 guard let self else { return }
                 self.isDeduplicating = false
                 guard let current = self.agent, ObjectIdentifier(current) == target else {
-                    self.statusText = "就绪"
+                    self.statusText = L("就绪")
                     self.scheduleIdleUnload()
                     return
                 }
                 switch result {
                 case .failure(let error):
                     self.appendLog("RAG: 向量去重扫描失败 — \(error.localizedDescription)")
-                    self.statusText = "向量去重失败"
-                    self.showInfoAlert(title: "向量去重失败", message: error.localizedDescription)
+                    self.statusText = L("向量去重失败")
+                    self.showInfoAlert(title: L("向量去重失败"), message: error.localizedDescription)
                     self.scheduleIdleUnload()
                 case .success(let preview):
                     if preview.duplicateChunks == 0 {
                         self.appendLog("RAG: 向量库共 \(preview.totalChunks) 条切片，未发现重复向量")
-                        self.statusText = "未发现重复向量"
+                        self.statusText = L("未发现重复向量")
                         self.showInfoAlert(
-                            title: "向量去重",
-                            message: "向量库共 \(preview.totalChunks) 条切片，未发现重复向量。")
+                            title: L("向量去重"),
+                            message: L("向量库共 \(preview.totalChunks) 条切片，未发现重复向量。"))
                         self.scheduleIdleUnload()
                         return
                     }
@@ -2163,7 +2163,7 @@ final class AppViewModel: ObservableObject {
                         self.performVectorDedupe(agent: agent, target: target)
                     } else {
                         self.appendLog("[rag] 已取消向量去重")
-                        self.statusText = "就绪"
+                        self.statusText = L("就绪")
                         self.scheduleIdleUnload()
                     }
                 }
@@ -2175,14 +2175,14 @@ final class AppViewModel: ObservableObject {
     private func performVectorDedupe(agent: Agent, target: ObjectIdentifier) {
         guard !isSyncing, !isDeduplicating, !isBuildingANN,
               !isModelLoading, !isRunning, !isWarmingUp else {
-            showInfoAlert(title: "暂不能向量去重", message: "当前有任务正在进行，请稍后再试。")
+            showInfoAlert(title: L("暂不能向量去重"), message: L("当前有任务正在进行，请稍后再试。"))
             // 扫描阶段已取消空闲计时；拒绝执行后要恢复，否则摘要要等下次前台活动。
             scheduleIdleUnload()
             return
         }
         cancelIdleUnload()
         isDeduplicating = true
-        statusText = "正在清理重复向量…"
+        statusText = L("正在清理重复向量…")
         appendLog("[rag] 开始向量去重：清理重复切片，保留入库时间最早的一份")
         Task.detached(priority: .utility) { [weak self] in
             // 确认弹窗期间配置可能已切换；真正删除前再等摘要会话退出并校验
@@ -2200,7 +2200,7 @@ final class AppViewModel: ObservableObject {
                     self.isDeduplicating = false
                     if !self.isRunning, !self.isSyncing, !self.isModelLoading,
                        !self.isWarmingUp, !self.isBuildingANN {
-                        self.statusText = "就绪"
+                        self.statusText = L("就绪")
                     }
                     self.scheduleIdleUnload()
                 }
@@ -2221,12 +2221,12 @@ final class AppViewModel: ObservableObject {
                 switch result {
                 case .success(let stats):
                     self.appendLog("RAG: 向量去重完成 — \(stats.summary)")
-                    self.statusText = "向量去重完成"
-                    self.showInfoAlert(title: "向量去重完成", message: stats.summary + "。")
+                    self.statusText = L("向量去重完成")
+                    self.showInfoAlert(title: L("向量去重完成"), message: stats.summary + "。")
                 case .failure(let error):
                     self.appendLog("RAG: 向量去重失败 — \(error.localizedDescription)")
-                    self.statusText = "向量去重失败"
-                    self.showInfoAlert(title: "向量去重失败", message: error.localizedDescription)
+                    self.statusText = L("向量去重失败")
+                    self.showInfoAlert(title: L("向量去重失败"), message: error.localizedDescription)
                 }
                 self.scheduleIdleUnload()
             }
@@ -2235,15 +2235,15 @@ final class AppViewModel: ObservableObject {
 
     private func confirmVectorDedupe(_ preview: VectorDedupPreview) -> Bool {
         let alert = NSAlert()
-        alert.messageText = "确认清理重复向量"
+        alert.messageText = L("确认清理重复向量")
         alert.informativeText = """
         向量库共 \(preview.totalChunks) 条切片，检测到 \(preview.duplicateChunks) 条重复向量，涉及 \(preview.affectedSources) 个来源。
         每个重复分组只保留入库时间最早的一份，删除后不可恢复。
         """
         alert.alertStyle = .warning
         // 默认按钮是「取消」，避免误触删除。
-        alert.addButton(withTitle: "取消")
-        alert.addButton(withTitle: "清理")
+        alert.addButton(withTitle: L("取消"))
+        alert.addButton(withTitle: L("清理"))
         NSApp.activate(ignoringOtherApps: true)
         return alert.runModal() == .alertSecondButtonReturn
     }
@@ -2256,39 +2256,39 @@ final class AppViewModel: ObservableObject {
     /// 因此只允许在空闲时启动；已在跑的同步/去重/对话都要先结束。
     func requestANNIndexBuild() {
         guard let agent else {
-            showInfoAlert(title: "向量索引", message: "RAG 尚未就绪，请先在知识同步配置中应用配置。")
+            showInfoAlert(title: L("向量索引"), message: L("RAG 尚未就绪，请先在知识同步配置中应用配置。"))
             return
         }
         if isSyncing {
-            showInfoAlert(title: "暂不能构建向量索引", message: "知识同步正在进行，请等同步结束后再试。")
+            showInfoAlert(title: L("暂不能构建向量索引"), message: L("知识同步正在进行，请等同步结束后再试。"))
             return
         }
         if isDeduplicating {
-            showInfoAlert(title: "暂不能构建向量索引", message: "向量去重正在进行，请稍后再试。")
+            showInfoAlert(title: L("暂不能构建向量索引"), message: L("向量去重正在进行，请稍后再试。"))
             return
         }
         if isBuildingANN {
-            showInfoAlert(title: "向量索引构建中",
-                          message: "正在构建向量索引。可点「停止构建」中断，已写完的块会保留，下次从断点续建。")
+            showInfoAlert(title: L("向量索引构建中"),
+                          message: L("正在构建向量索引。可点「停止构建」中断，已写完的块会保留，下次从断点续建。"))
             return
         }
         if isBuildingColbertANN {
-            showInfoAlert(title: "暂不能构建向量索引",
-                          message: "检索阅读索引正在构建，请等它结束后再试。")
+            showInfoAlert(title: L("暂不能构建向量索引"),
+                          message: L("检索阅读索引正在构建，请等它结束后再试。"))
             return
         }
         if isModelLoading || isWarmingUp {
-            showInfoAlert(title: "暂不能构建向量索引", message: "模型正在加载或预热，请稍后再试。")
+            showInfoAlert(title: L("暂不能构建向量索引"), message: L("模型正在加载或预热，请稍后再试。"))
             return
         }
         if isRunning {
-            showInfoAlert(title: "暂不能构建向量索引", message: "对话正在生成，请等本轮结束后再试。")
+            showInfoAlert(title: L("暂不能构建向量索引"), message: L("对话正在生成，请等本轮结束后再试。"))
             return
         }
         // 一次构建同时更新二值 ANN 与主向量 ANN（不再二选一）。
         cancelIdleUnload()
         isBuildingANN = true
-        statusText = "正在读取向量索引状态…"
+        statusText = L("正在读取向量索引状态…")
         let target = ObjectIdentifier(agent)
         Task.detached(priority: .utility) { [weak self] in
             // 摘要会话会周期性借用辅助模型；先让它退出，避免构建期间还有
@@ -2306,7 +2306,7 @@ final class AppViewModel: ObservableObject {
                     self.isBuildingANN = false
                     if !self.isRunning, !self.isSyncing, !self.isDeduplicating,
                        !self.isModelLoading, !self.isWarmingUp {
-                        self.statusText = "就绪"
+                        self.statusText = L("就绪")
                     }
                     self.scheduleIdleUnload()
                 }
@@ -2319,7 +2319,7 @@ final class AppViewModel: ObservableObject {
                 guard let self else { return }
                 guard let current = self.agent, ObjectIdentifier(current) == target else {
                     self.isBuildingANN = false
-                    self.statusText = "就绪"
+                    self.statusText = L("就绪")
                     self.scheduleIdleUnload()
                     return
                 }
@@ -2328,7 +2328,7 @@ final class AppViewModel: ObservableObject {
                     if status.blocks > 0,
                        !self.confirmANNIndexRebuild(status, target: .binary) {
                         self.isBuildingANN = false
-                        self.statusText = "就绪"
+                        self.statusText = L("就绪")
                         self.appendLog("[rag] 已取消索引构建")
                         self.scheduleIdleUnload()
                         return
@@ -2339,7 +2339,7 @@ final class AppViewModel: ObservableObject {
                     if status.blocks > 0,
                        !self.confirmANNIndexRebuild(status, target: .dense) {
                         self.isBuildingANN = false
-                        self.statusText = "就绪"
+                        self.statusText = L("就绪")
                         self.appendLog("[rag] 已取消索引构建")
                         self.scheduleIdleUnload()
                         return
@@ -2354,17 +2354,17 @@ final class AppViewModel: ObservableObject {
     private func performANNIndexBuild(agent: Agent, target: ObjectIdentifier) {
         guard !isSyncing, !isDeduplicating, !isModelLoading, !isRunning, !isWarmingUp else {
             isBuildingANN = false
-            showInfoAlert(title: "暂不能构建索引", message: "当前有任务正在进行，请稍后再试。")
+            showInfoAlert(title: L("暂不能构建索引"), message: L("当前有任务正在进行，请稍后再试。"))
             // 读取状态阶段已取消空闲计时；拒绝执行后恢复闲时摘要调度。
             scheduleIdleUnload()
             return
         }
-        let label = "二值 ANN 与主向量 ANN 索引"
+        let label = L("二值 ANN 与主向量 ANN 索引")
         cancelIdleUnload()
         isBuildingANN = true
-        statusText = "正在构建二值 ANN 与主向量 ANN 索引…"
+        statusText = L("正在构建二值 ANN 与主向量 ANN 索引…")
         appendLog("[rag] 开始构建\(label)：分块 IVF，块内 k-means + 量化；"
-            + "构建期间知识检索与状态查询不受影响")
+            + L("构建期间知识检索与状态查询不受影响"))
         Task.detached(priority: .utility) { [weak self] in
             // 确认重建弹窗可能停留很久；真正开跑前再等摘要退出并校验目标
             // Agent，防止旧引擎在配置切换后继续写同一份索引。
@@ -2381,7 +2381,7 @@ final class AppViewModel: ObservableObject {
                     self.isBuildingANN = false
                     if !self.isRunning, !self.isSyncing, !self.isDeduplicating,
                        !self.isModelLoading, !self.isWarmingUp {
-                        self.statusText = "就绪"
+                        self.statusText = L("就绪")
                     }
                     self.scheduleIdleUnload()
                 }
@@ -2407,16 +2407,16 @@ final class AppViewModel: ObservableObject {
                 switch result {
                 case .none:
                     self.appendLog("RAG: \(label)构建未执行（被拒绝或失败，详见日志）")
-                    self.statusText = "\(label)构建失败"
+                    self.statusText = L("\(label)构建失败")
                     self.showInfoAlert(
-                        title: "\(label)构建失败",
-                        message: "构建未执行或被中断，详情见日志。已写完的块会保留，可再次构建从断点续建。")
+                        title: L("\(label)构建失败"),
+                        message: L("构建未执行或被中断，详情见日志。已写完的块会保留，可再次构建从断点续建。"))
                 case .some(let build):
                     self.appendLog("RAG: \(label)构建结束 — \(build.summary)")
-                    self.statusText = build.cancelled ? "\(label)构建已停止" : "\(label)构建完成"
+                    self.statusText = build.cancelled ? L("\(label)构建已停止") : L("\(label)构建完成")
                     self.showInfoAlert(
-                        title: build.cancelled ? "\(label)构建已停止" : "\(label)构建完成",
-                        message: build.summary + (build.cancelled ? "。已写完的块会保留，可再次构建续建。" : "。"))
+                        title: build.cancelled ? L("\(label)构建已停止") : L("\(label)构建完成"),
+                        message: build.summary + (build.cancelled ? L("。已写完的块会保留，可再次构建续建。") : "。"))
                 }
                 self.scheduleIdleUnload()
             }
@@ -2426,7 +2426,7 @@ final class AppViewModel: ObservableObject {
     /// 停止 ANN 索引构建。已写完的块保留，下次构建从断点（rowid 水位）继续。
     func stopANNIndexBuild() {
         guard isBuildingANN else { return }
-        statusText = "正在停止 ANN 索引构建…"
+        statusText = L("正在停止 ANN 索引构建…")
         appendLog("用户请求停止 ANN 索引构建")
         // 引擎在每个块之间检查取消标志，块内不中断，保证已落盘数据一致。
         agent?.ragEngine.cancel()
@@ -2437,23 +2437,23 @@ final class AppViewModel: ObservableObject {
     /// 点击「构建/续建向量索引」：为检索阅读模式的 ColBERT 大分片库构建 ANN 索引。
     func requestColbertANNBuild() {
         guard let agent else {
-            showInfoAlert(title: "极速检索模式", message: "RAG 尚未就绪，请先应用配置。")
+            showInfoAlert(title: L("极速检索模式"), message: L("RAG 尚未就绪，请先应用配置。"))
             return
         }
         guard agent.ragEngine.config.colbertReaderEnabled else {
-            showInfoAlert(title: "极速检索模式",
-                          message: "当前未启用极速检索模式。请在 RAG 模式配置中选择「极速检索模式」并应用配置后再构建索引。")
+            showInfoAlert(title: L("极速检索模式"),
+                          message: L("当前未启用极速检索模式。请在 RAG 模式配置中选择「极速检索模式」并应用配置后再构建索引。"))
             return
         }
         if isSyncing || isBuildingANN || isBuildingKG || isBuildingColbertANN
             || isDeduplicating || isResolvingEntities || isRunning
             || isModelLoading || isWarmingUp {
-            showInfoAlert(title: "暂不能构建向量索引",
-                          message: "知识同步、其它索引任务或对话正在进行，请稍后再试。")
+            showInfoAlert(title: L("暂不能构建向量索引"),
+                          message: L("知识同步、其它索引任务或对话正在进行，请稍后再试。"))
             return
         }
         isBuildingColbertANN = true
-        colbertIndexSummary = "构建中…"
+        colbertIndexSummary = L("构建中…")
         colbertANNCancelFlag.set(false)
         let target = ObjectIdentifier(agent)
         let cancelledCheck = { [colbertANNCancelFlag] in colbertANNCancelFlag.isCancelled }
@@ -2480,9 +2480,9 @@ final class AppViewModel: ObservableObject {
                     self.colbertIndexSummary = summary
                 case .failure(let error) where error is CancellationError:
                     // 用户主动停止：已写块保留，摘要标注可续建。
-                    self.colbertIndexSummary = "已停止（已写块保留，可续建）"
+                    self.colbertIndexSummary = L("已停止（已写块保留，可续建）")
                 case .failure(let error):
-                    self.colbertIndexSummary = "失败：\(error.localizedDescription)"
+                    self.colbertIndexSummary = L("失败：\(error.localizedDescription)")
                 }
                 self.isBuildingColbertANN = false
             }
@@ -2492,7 +2492,7 @@ final class AppViewModel: ObservableObject {
     /// 停止 ColBERT ANN 索引构建：块间生效，已写块保留，下次从水位续建。
     func stopColbertANNBuild() {
         guard isBuildingColbertANN else { return }
-        statusText = "正在停止检索阅读 ANN 索引构建…"
+        statusText = L("正在停止检索阅读 ANN 索引构建…")
         appendLog("用户请求停止检索阅读 ANN 索引构建")
         colbertANNCancelFlag.set(true)
         colbertANNBuildTask?.cancel()
@@ -2503,18 +2503,18 @@ final class AppViewModel: ObservableObject {
         guard let agent else { return }
         guard let engine = agent.zoneEngines[zoneID] else {
             appendLog("[rag] 知识分区同步失败：找不到分区 \(zoneID) 的引擎，请重新应用配置")
-            statusText = "分区引擎未就绪，请重新应用配置"
+            statusText = L("分区引擎未就绪，请重新应用配置")
             return
         }
         guard !isSyncing, !isDeduplicating, !isBuildingColbertANN else { return }
-        if blockForMissingModels("知识分区同步") { return }
+        if blockForMissingModels(L("知识分区同步")) { return }
         let zoneName = agent.config.knowledgeZones.first { $0.id == zoneID }?.name ?? zoneID
         isSyncing = true
         isStoppingSync = false
         syncGeneration += 1
         let generation = syncGeneration
-        statusText = "同步知识分区「\(zoneName)」…"
-        zoneSyncStatusText = "准备同步（\(engine.knowledgeBase)）…"
+        statusText = L("同步知识分区「\(zoneName)」…")
+        zoneSyncStatusText = L("准备同步（\(engine.knowledgeBase)）…")
         appendLog("[rag] 开始同步知识分区「\(zoneName)」，源目录：\(engine.knowledgeBase)")
         cancelIdleUnload()
         // 与主库同步一致：分区大库同步前卸载本地 LLM/OCR 权重，避免 OCR/embedding
@@ -2529,7 +2529,7 @@ final class AppViewModel: ObservableObject {
             let stats = await engine.ingest(force: false) { current, total, file in
                 Task { @MainActor [weak self] in
                     guard let self, self.syncGeneration == generation else { return }
-                    let text = "分区「\(zoneName)」同步 \(current)/\(total) \(file)"
+                    let text = L("分区「\(zoneName)」同步 \(current)/\(total) \(file)")
                     self.statusText = text
                     self.zoneSyncStatusText = text
                 }
@@ -2550,12 +2550,12 @@ final class AppViewModel: ObservableObject {
                 self.isSyncing = false
                 let cancelled = stats.cancelled
                 let doneText = cancelled
-                    ? "分区「\(zoneName)」同步已停止"
-                    : "分区「\(zoneName)」同步完成：\(stats.processed) 文件 / \(stats.chunks) 切片"
+                    ? L("分区「\(zoneName)」同步已停止")
+                    : L("分区「\(zoneName)」同步完成：\(stats.processed) 文件 / \(stats.chunks) 切片")
                 self.statusText = doneText
                 self.zoneSyncStatusText = doneText
                 self.appendLog("[rag] 分区「\(zoneName)」\(cancelled ? "同步已停止" : "同步完成")："
-                    + "\(stats.processed) 文件，\(stats.chunks) 切片，错误 \(stats.errors.count)")
+                    + L("\(stats.processed) 文件，\(stats.chunks) 切片，错误 \(stats.errors.count)"))
                 Task { await self.resumeModelsAfterSync(main: restoreMain, aux: restoreAux) }
                 self.refreshRAGStatus()
                 self.scheduleIdleUnload()
@@ -2574,7 +2574,7 @@ final class AppViewModel: ObservableObject {
             return
         }
         guard !isSyncing, !isDeduplicating, !isBuildingColbertANN else { return }
-        if blockForMissingModels("知识库同步") { return }
+        if blockForMissingModels(L("知识库同步")) { return }
         if isRunning {
             appendLog("[rag] 对话进行中，跳过本次同步")
             return
@@ -2584,7 +2584,7 @@ final class AppViewModel: ObservableObject {
             return (zone, e)
         }
         guard !engines.isEmpty else {
-            statusText = "知识分区引擎未就绪，请重新应用配置"
+            statusText = L("知识分区引擎未就绪，请重新应用配置")
             return
         }
         isSyncing = true
@@ -2597,8 +2597,8 @@ final class AppViewModel: ObservableObject {
             && (auxModelLoaded || agent.auxLLM is PreloadableLLMService)
         Task { await self.stopSummaryIdleSession() }
         suspendModelsForSync()
-        statusText = "同步 \(engines.count) 个知识分区…"
-        zoneSyncStatusText = "准备同步 \(engines.count) 个知识分区…"
+        statusText = L("同步 \(engines.count) 个知识分区…")
+        zoneSyncStatusText = L("准备同步 \(engines.count) 个知识分区…")
         appendLog("[rag] 一键同步开始：共 \(engines.count) 个知识分区（\(engines.map(\.zone.name).joined(separator: "、"))）")
         let task = Task.detached(priority: .utility) { [weak self] in
             var totalProcessed = 0
@@ -2612,7 +2612,7 @@ final class AppViewModel: ObservableObject {
                     guard let self else { return }
                     self.zoneSyncEngineID = item.zone.id
                     self.zoneSyncStatusText = "[\(index + 1)/\(engines.count)] 分区「\(zoneName)」准备中…"
-                    self.statusText = "同步分区 \(index + 1)/\(engines.count)：\(zoneName)"
+                    self.statusText = L("同步分区 \(index + 1)/\(engines.count)：\(zoneName)")
                 }
                 let stats = await item.engine.ingest(force: force) { current, total, file in
                     Task { @MainActor [weak self] in
@@ -2642,8 +2642,8 @@ final class AppViewModel: ObservableObject {
                 }
                 self.isSyncing = false
                 let doneText = anyCancelled
-                    ? "知识分区同步已停止（\(totalProcessed) 文件 / \(totalChunks) 切片）"
-                    : "全部 \(engines.count) 个知识分区同步完成：\(totalProcessed) 文件 / \(totalChunks) 切片"
+                    ? L("知识分区同步已停止（\(totalProcessed) 文件 / \(totalChunks) 切片）")
+                    : L("全部 \(engines.count) 个知识分区同步完成：\(totalProcessed) 文件 / \(totalChunks) 切片")
                 self.statusText = doneText
                 self.zoneSyncStatusText = doneText
                 self.appendLog("[rag] \(doneText)；错误 \(allErrors.count)")
@@ -2661,13 +2661,13 @@ final class AppViewModel: ObservableObject {
         let zone = agent.config.knowledgeZones.first { $0.source == source }
         let engine = zone.flatMap { agent.zoneEngines[$0.id] } ?? agent.ragEngine
         isDeduplicating = true
-        statusText = "知识分区向量去重中…"
+        statusText = L("知识分区向量去重中…")
         Task.detached(priority: .utility) { [weak self] in
             let stats = try? engine.deduplicateVectors()
             await MainActor.run { [weak self] in
                 guard let self else { return }
                 self.isDeduplicating = false
-                self.statusText = "向量去重完成：清理 \(stats?.removedChunks ?? 0) 个重复切片"
+                self.statusText = L("向量去重完成：清理 \(stats?.removedChunks ?? 0) 个重复切片")
                 self.refreshRAGStatus()
             }
         }
@@ -2678,7 +2678,7 @@ final class AppViewModel: ObservableObject {
     func requestVectorBackfill() {
         guard let agent, !isBackfillingVectors, !isSyncing else { return }
         isBackfillingVectors = true
-        statusText = "正在补做向量…"
+        statusText = L("正在补做向量…")
         appendLog("[backfill] 用户手动触发向量补做")
         let targetID = ObjectIdentifier(agent)
         // 主引擎 + 全部知识分区引擎一起补做：分区引擎的 pending 不会被
@@ -2702,8 +2702,8 @@ final class AppViewModel: ObservableObject {
                 self.isBackfillingVectors = false
                 guard let current = self.agent, ObjectIdentifier(current) == targetID else { return }
                 self.statusText = enqueued > 0
-                    ? "向量补做已启动（新入队 \(enqueued) 条），后台进行中"
-                    : "向量补做已触发，后台进行中"
+                    ? L("向量补做已启动（新入队 \(enqueued) 条），后台进行中")
+                    : L("向量补做已触发，后台进行中")
                 self.appendLog("[backfill] 手动补做触发完成（新入队 \(enqueued) 条）")
                 self.refreshRAGStatus()
             }
@@ -2732,8 +2732,8 @@ final class AppViewModel: ObservableObject {
         kgMainFallbackAlertShown = true
         appendLog("[kg] 辅助模型不可用，将使用主模型进行知识图谱抽取")
         showInfoAlert(
-            title: "辅助模型不可用",
-            message: "将使用主模型进行知识图谱抽取，抽取期间系统响应会变慢，敬请谅解。")
+            title: L("辅助模型不可用"),
+            message: L("将使用主模型进行知识图谱抽取，抽取期间系统响应会变慢，敬请谅解。"))
     }
 
     /// 刷新知识图谱构建状态（不加载模型，直接查 SQLite）。
@@ -2753,37 +2753,37 @@ final class AppViewModel: ObservableObject {
     /// 点击「构建知识图谱」：后台用辅助模型在已完成切片上抽取实体/关系。
     func requestKnowledgeGraphBuild() {
         guard let agent else {
-            showInfoAlert(title: "知识图谱", message: "RAG 尚未就绪，请先在知识同步配置中应用配置。")
+            showInfoAlert(title: L("知识图谱"), message: L("RAG 尚未就绪，请先在知识同步配置中应用配置。"))
             return
         }
         if isSyncing {
-            showInfoAlert(title: "暂不能构建知识图谱", message: "知识同步正在进行，请等同步结束后再试。")
+            showInfoAlert(title: L("暂不能构建知识图谱"), message: L("知识同步正在进行，请等同步结束后再试。"))
             return
         }
         if isBuildingKG {
-            showInfoAlert(title: "知识图谱构建中", message: "正在后台构建知识图谱，请稍候。")
+            showInfoAlert(title: L("知识图谱构建中"), message: L("正在后台构建知识图谱，请稍候。"))
             return
         }
         if isBuildingANN || isDeduplicating {
-            showInfoAlert(title: "暂不能构建知识图谱", message: "向量索引/去重任务正在进行，请稍后再试。")
+            showInfoAlert(title: L("暂不能构建知识图谱"), message: L("向量索引/去重任务正在进行，请稍后再试。"))
             return
         }
         if isModelLoading || isWarmingUp {
-            showInfoAlert(title: "暂不能构建知识图谱", message: "模型正在加载或预热，请稍后再试。")
+            showInfoAlert(title: L("暂不能构建知识图谱"), message: L("模型正在加载或预热，请稍后再试。"))
             return
         }
         if isRunning {
-            showInfoAlert(title: "暂不能构建知识图谱", message: "对话正在生成，请等本轮结束后再试。")
+            showInfoAlert(title: L("暂不能构建知识图谱"), message: L("对话正在生成，请等本轮结束后再试。"))
             return
         }
         if agent.auxLLM == nil, agent.llm is UnloadedLLMService {
-            showInfoAlert(title: "暂不能构建知识图谱",
-                          message: "辅助模型不可用，主模型也尚未加载，请先加载主模型后再试。")
+            showInfoAlert(title: L("暂不能构建知识图谱"),
+                          message: L("辅助模型不可用，主模型也尚未加载，请先加载主模型后再试。"))
             return
         }
         cancelIdleUnload()
         isBuildingKG = true
-        statusText = "正在构建知识图谱…"
+        statusText = L("正在构建知识图谱…")
         let target = ObjectIdentifier(agent)
         kgBuildTask = Task.detached(priority: .utility) { [weak self] in
             await self?.stopSummaryIdleSession()
@@ -2798,7 +2798,7 @@ final class AppViewModel: ObservableObject {
                     self.isBuildingKG = false
                     if !self.isRunning, !self.isSyncing, !self.isDeduplicating,
                        !self.isBuildingANN, !self.isModelLoading, !self.isWarmingUp {
-                        self.statusText = "就绪"
+                        self.statusText = L("就绪")
                     }
                     self.scheduleIdleUnload()
                 }
@@ -2826,8 +2826,8 @@ final class AppViewModel: ObservableObject {
                     self.refreshRAGStatus()
                 }
                 self.appendLog("[kg] 知识图谱构建完成：实体 \(stats.entities)、关系 \(stats.relationships)"
-                    + "（处理切片 \(stats.chunksProcessed)，失败 \(stats.failedChunks)）")
-                self.statusText = "知识图谱构建完成"
+                    + L("（处理切片 \(stats.chunksProcessed)，失败 \(stats.failedChunks)）"))
+                self.statusText = L("知识图谱构建完成")
                 self.scheduleIdleUnload()
             }
         }
@@ -2836,7 +2836,7 @@ final class AppViewModel: ObservableObject {
     /// 停止知识图谱构建。
     func stopKnowledgeGraphBuild() {
         guard isBuildingKG else { return }
-        statusText = "正在停止知识图谱构建…"
+        statusText = L("正在停止知识图谱构建…")
         appendLog("用户请求停止知识图谱构建")
         kgBuildTask?.cancel()
     }
@@ -2845,26 +2845,26 @@ final class AppViewModel: ObservableObject {
     /// 抽取/构建阶段只用字符全匹配，此方法用于事后收敛重复实体。
     func requestEntityResolution() {
         guard let agent else {
-            showInfoAlert(title: "实体消歧", message: "RAG 尚未就绪，请先在知识同步配置中应用配置。")
+            showInfoAlert(title: L("实体消歧"), message: L("RAG 尚未就绪，请先在知识同步配置中应用配置。"))
             return
         }
         if isSyncing || isBuildingKG || isDeduplicating || isBuildingANN {
-            showInfoAlert(title: "暂不能实体消歧",
-                          message: "知识同步/图谱构建/去重/索引任务正在进行，请稍后再试。")
+            showInfoAlert(title: L("暂不能实体消歧"),
+                          message: L("知识同步/图谱构建/去重/索引任务正在进行，请稍后再试。"))
             return
         }
         if isResolvingEntities {
-            showInfoAlert(title: "实体消歧进行中", message: "正在对图谱做向量语义合并，请稍候。")
+            showInfoAlert(title: L("实体消歧进行中"), message: L("正在对图谱做向量语义合并，请稍候。"))
             return
         }
         guard agent.ragEngine.knowledgeGraphStatus().built else {
-            showInfoAlert(title: "暂不能实体消歧",
-                          message: "请先构建知识图谱（抽取/构建阶段仅做字符全匹配）。")
+            showInfoAlert(title: L("暂不能实体消歧"),
+                          message: L("请先构建知识图谱（抽取/构建阶段仅做字符全匹配）。"))
             return
         }
         cancelIdleUnload()
         isResolvingEntities = true
-        statusText = "正在对知识图谱做实体消歧…"
+        statusText = L("正在对知识图谱做实体消歧…")
         let target = ObjectIdentifier(agent)
         Task.detached(priority: .utility) { [weak self] in
             await self?.stopSummaryIdleSession()
@@ -2890,9 +2890,9 @@ final class AppViewModel: ObservableObject {
                     self.isResolvingEntities = false
                     self.refreshKnowledgeGraphStatus()
                     self.appendLog("[kg] 实体消歧完成：合并 \(stats.mergedGroups) 组、"
-                        + "删除 \(stats.removedEntities) 个实体（现存 \(stats.entities) 实体"
-                        + " / \(stats.relationships) 关系）")
-                    self.statusText = "实体消歧完成"
+                        + L("删除 \(stats.removedEntities) 个实体（现存 \(stats.entities) 实体")
+                        + L(" / \(stats.relationships) 关系）"))
+                    self.statusText = L("实体消歧完成")
                     self.scheduleIdleUnload()
                 }
             } catch {
@@ -2900,8 +2900,8 @@ final class AppViewModel: ObservableObject {
                     guard let self else { return }
                     self.isResolvingEntities = false
                     self.appendLog("[kg] 实体消歧失败: \(error.localizedDescription)")
-                    self.showInfoAlert(title: "实体消歧失败", message: error.localizedDescription)
-                    self.statusText = "就绪"
+                    self.showInfoAlert(title: L("实体消歧失败"), message: error.localizedDescription)
+                    self.statusText = L("就绪")
                     self.scheduleIdleUnload()
                 }
             }
@@ -2910,9 +2910,9 @@ final class AppViewModel: ObservableObject {
 
     private func confirmANNIndexRebuild(_ status: ANNIndexStatus,
                                         target: RAGEngine.ANNIndexTarget) -> Bool {
-        let label = target == .binary ? "二值 ANN 索引" : "ANN 索引"
+        let label = target == .binary ? L("二值 ANN 索引") : L("ANN 索引")
         let alert = NSAlert()
-        alert.messageText = "确认重建\(label)"
+        alert.messageText = L("确认重建\(label)")
         alert.informativeText = """
         当前索引：\(status.summary)。
         重建会先删除现有索引（含 \(status.indexedRows) 个已索引切片），再整库重新聚类写入；
@@ -2920,8 +2920,8 @@ final class AppViewModel: ObservableObject {
         """
         alert.alertStyle = .warning
         // 默认按钮是「取消」，避免误触长时间占用。
-        alert.addButton(withTitle: "取消")
-        alert.addButton(withTitle: "重建")
+        alert.addButton(withTitle: L("取消"))
+        alert.addButton(withTitle: L("重建"))
         NSApp.activate(ignoringOtherApps: true)
         return alert.runModal() == .alertSecondButtonReturn
     }
@@ -2929,18 +2929,18 @@ final class AppViewModel: ObservableObject {
     /// 删除现有 ANN 索引，回到精确检索（不重跑构建）。
     func requestDropANNIndex() {
         guard let agent else {
-            showInfoAlert(title: "向量索引", message: "RAG 尚未就绪，请先在知识同步配置中应用配置。")
+            showInfoAlert(title: L("向量索引"), message: L("RAG 尚未就绪，请先在知识同步配置中应用配置。"))
             return
         }
         guard !isSyncing, !isBuildingANN, !isBuildingColbertANN, !isDeduplicating,
               !isRunning, !isModelLoading, !isWarmingUp else {
-            showInfoAlert(title: "暂不能删除索引", message: "当前有任务正在进行，请稍后再试。")
+            showInfoAlert(title: L("暂不能删除索引"), message: L("当前有任务正在进行，请稍后再试。"))
             return
         }
         let target = ObjectIdentifier(agent)
         cancelIdleUnload()
         isBuildingANN = true
-        statusText = "正在删除向量索引…"
+        statusText = L("正在删除向量索引…")
         appendLog("[rag] 开始删除 ANN 与二值 ANN 索引（删除后检索回退精确扫描）")
         Task.detached(priority: .utility) { [weak self] in
             // 与构建/去重路径保持一致：先等摘要会话退出，再校验目标 Agent。
@@ -2957,7 +2957,7 @@ final class AppViewModel: ObservableObject {
                     self.isBuildingANN = false
                     if !self.isRunning, !self.isSyncing, !self.isDeduplicating,
                        !self.isModelLoading, !self.isWarmingUp {
-                        self.statusText = "就绪"
+                        self.statusText = L("就绪")
                     }
                     self.scheduleIdleUnload()
                 }
@@ -2979,11 +2979,11 @@ final class AppViewModel: ObservableObject {
                 switch result {
                 case .success:
                     self.appendLog("RAG: ANN 与二值 ANN 索引已删除")
-                    self.statusText = "向量索引已删除"
+                    self.statusText = L("向量索引已删除")
                 case .failure(let error):
                     self.appendLog("RAG: 删除向量索引失败 — \(error.localizedDescription)")
-                    self.statusText = "删除向量索引失败"
-                    self.showInfoAlert(title: "删除向量索引失败",
+                    self.statusText = L("删除向量索引失败")
+                    self.showInfoAlert(title: L("删除向量索引失败"),
                                        message: error.localizedDescription)
                 }
                 self.scheduleIdleUnload()
@@ -2995,7 +2995,7 @@ final class AppViewModel: ObservableObject {
         let alert = NSAlert()
         alert.messageText = title
         alert.informativeText = message
-        alert.addButton(withTitle: "好")
+        alert.addButton(withTitle: L("好"))
         NSApp.activate(ignoringOtherApps: true)
         alert.runModal()
     }
@@ -3006,26 +3006,26 @@ final class AppViewModel: ObservableObject {
     /// 清空旧切片与 ANN 索引后立即全量重新同步。
     func requestVectorRebuild() {
         guard let agent else {
-            showInfoAlert(title: "重建向量库",
-                          message: "RAG 尚未就绪，请先在知识同步配置中应用配置。")
+            showInfoAlert(title: L("重建向量库"),
+                          message: L("RAG 尚未就绪，请先在知识同步配置中应用配置。"))
             return
         }
         if isSyncing {
-            showInfoAlert(title: "暂不能重建向量库",
-                          message: "知识同步/重建正在进行，请等结束后再试。")
+            showInfoAlert(title: L("暂不能重建向量库"),
+                          message: L("知识同步/重建正在进行，请等结束后再试。"))
             return
         }
         if isDeduplicating || isBuildingANN {
-            showInfoAlert(title: "暂不能重建向量库",
-                          message: "向量去重或 ANN 索引维护正在进行，请稍后再试。")
+            showInfoAlert(title: L("暂不能重建向量库"),
+                          message: L("向量去重或 ANN 索引维护正在进行，请稍后再试。"))
             return
         }
         if isModelLoading || isWarmingUp {
-            showInfoAlert(title: "暂不能重建向量库", message: "模型正在加载或预热，请稍后再试。")
+            showInfoAlert(title: L("暂不能重建向量库"), message: L("模型正在加载或预热，请稍后再试。"))
             return
         }
         if isRunning {
-            showInfoAlert(title: "暂不能重建向量库", message: "对话正在生成，请等本轮结束后再试。")
+            showInfoAlert(title: L("暂不能重建向量库"), message: L("对话正在生成，请等本轮结束后再试。"))
             return
         }
         guard confirmVectorRebuild() else { return }
@@ -3033,9 +3033,9 @@ final class AppViewModel: ObservableObject {
         isSyncing = true
         isStoppingSync = false
         syncGeneration += 1
-        statusText = "正在重建向量库…"
+        statusText = L("正在重建向量库…")
         appendLog("[rag] 用户确认重建向量库：元素类型 \(config.ragVectorElementType.rawValue)"
-            + "，Matryoshka \(config.ragMatryoshka.rawValue) \(config.ragMatryoshkaDim) 维")
+            + L("，Matryoshka \(config.ragMatryoshka.rawValue) \(config.ragMatryoshkaDim) 维"))
         startIngest(agent: agent, force: true, restore: nil,
                     generation: syncGeneration, rebuildVector: true)
     }
@@ -3043,10 +3043,10 @@ final class AppViewModel: ObservableObject {
     private func confirmVectorRebuild() -> Bool {
         let type = config.ragVectorElementType
         let mrl = config.ragMatryoshka == .off
-            ? "关闭"
-            : "\(config.ragMatryoshkaDim) 维（\(config.ragMatryoshka.rawValue)）"
+            ? L("关闭")
+            : L("\(config.ragMatryoshkaDim) 维（\(config.ragMatryoshka.rawValue)）")
         let alert = NSAlert()
-        alert.messageText = "确认重建向量库"
+        alert.messageText = L("确认重建向量库")
         alert.informativeText = """
         将按当前配置重建向量表：元素类型 \(type.rawValue)，Matryoshka \(mrl)。
         旧切片、全文索引、文档缓存与 ANN 索引会被清空，随后全量重新解析并 embedding；
@@ -3055,8 +3055,8 @@ final class AppViewModel: ObservableObject {
         """
         alert.alertStyle = .warning
         // 默认按钮是「取消」，避免误触长时间占用。
-        alert.addButton(withTitle: "取消")
-        alert.addButton(withTitle: "重建")
+        alert.addButton(withTitle: L("取消"))
+        alert.addButton(withTitle: L("重建"))
         NSApp.activate(ignoringOtherApps: true)
         return alert.runModal() == .alertSecondButtonReturn
     }
@@ -3066,7 +3066,7 @@ final class AppViewModel: ObservableObject {
         pendingSyncRestore = nil
         guard let agent, !isSyncing, !isDeduplicating, !isBuildingANN,
               !isBuildingColbertANN else { return }
-        if blockForMissingModels("知识库同步") { return }
+        if blockForMissingModels(L("知识库同步")) { return }
         cancelIdleUnload()
         if isRunning {
             appendLog("[rag] 对话进行中，跳过本次同步")
@@ -3080,7 +3080,7 @@ final class AppViewModel: ObservableObject {
         isSyncing = true
         isStoppingSync = false
         syncGeneration += 1
-        statusText = force ? "强制同步知识库…" : "同步知识库…"
+        statusText = force ? L("强制同步知识库…") : L("同步知识库…")
 
         // 启动加载/预热是短暂状态：等它结束再按「先卸载、后同步」执行。
         // 不要直接丢弃用户点击。最多等 5 分钟，避免异常卡死时无限挂起。
@@ -3141,13 +3141,13 @@ final class AppViewModel: ObservableObject {
         let wasMain = restore?.main ?? mainModelLoaded
         // 同步结束后的恢复也必须看当前开关：关闭时即使旧状态是已加载也不恢复。
         let wasAux = (restore?.aux ?? auxModelLoaded) && config.auxEnabled
-        let modelNote = config.auxEnabled ? "主/辅助模型" : "主模型（辅助模型未启用）"
+        let modelNote = config.auxEnabled ? L("主/辅助模型") : L("主模型（辅助模型未启用）")
         if rebuildVector {
             appendLog("[rag] 重建向量库：先卸载\(modelNote)，按当前元素类型/Matryoshka 配置重建后全量同步")
         } else {
             appendLog("[rag] 同步开始：先卸载\(modelNote)，结束后重新加载并预热主模型")
         }
-        statusText = rebuildVector ? "正在重建向量库…" : (force ? "强制同步知识库…" : "同步知识库…")
+        statusText = rebuildVector ? L("正在重建向量库…") : (force ? L("强制同步知识库…") : L("同步知识库…"))
         let syncGen = generation
         syncTask = Task.detached(priority: .userInitiated) { [weak self, weak agent] in
             guard let agent else {
@@ -3174,7 +3174,7 @@ final class AppViewModel: ObservableObject {
                 let result = await agent.ragEngine.rebuildVectorIndex { current, total, file in
                     Task { @MainActor [weak self] in
                         guard let self, self.syncGeneration == syncGen else { return }
-                        self.statusText = "重建后同步 \(current)/\(total) \(file)"
+                        self.statusText = L("重建后同步 \(current)/\(total) \(file)")
                     }
                 } log: { line in
                     Task { @MainActor [weak self] in self?.appendLog(line) }
@@ -3184,14 +3184,14 @@ final class AppViewModel: ObservableObject {
                     stats = result.ingest ?? IngestStats()
                 } else {
                     var failed = IngestStats()
-                    failed.errors.append("向量库重建未执行或被中断，详情见日志")
+                    failed.errors.append(L("向量库重建未执行或被中断，详情见日志"))
                     stats = failed
                 }
             } else {
                 stats = await agent.ragEngine.ingest(force: force) { current, total, file in
                     Task { @MainActor [weak self] in
                         guard let self, self.syncGeneration == syncGen else { return }
-                        self.statusText = "同步 \(current)/\(total) \(file)"
+                        self.statusText = L("同步 \(current)/\(total) \(file)")
                     }
                 } log: { line in
                     Task { @MainActor [weak self] in self?.appendLog(line) }
@@ -3220,7 +3220,7 @@ final class AppViewModel: ObservableObject {
                     // 同步可能让旧图谱失效（stale），刷新后 UI 自动回落到 naive。
                     self.refreshKnowledgeGraphStatus()
                 } else {
-                    self.statusText = "就绪"
+                    self.statusText = L("就绪")
                 }
                 self.scheduleIdleUnload()
             }
@@ -3270,11 +3270,11 @@ final class AppViewModel: ObservableObject {
         let shouldLoadAux = aux && config.auxEnabled
         guard main || shouldLoadAux, let agent else { return }
         var parts: [String] = []
-        if main { parts.append("主模型") }
-        if shouldLoadAux { parts.append("辅助模型") }
+        if main { parts.append(L("主模型")) }
+        if shouldLoadAux { parts.append(L("辅助模型")) }
         appendLog("[model] 知识同步结束：重新加载\(parts.joined(separator: "与"))"
-            + (main ? "，主模型加载后自动预热" : ""))
-        statusText = "同步结束，重新加载模型…"
+            + (main ? L("，主模型加载后自动预热") : ""))
+        statusText = L("同步结束，重新加载模型…")
         if main, agent.llm is UnloadedLLMService {
             agent.switchLLM(LocalModelFactory.shared.makeLLM(config: config))
         }
@@ -3287,8 +3287,8 @@ final class AppViewModel: ObservableObject {
     func stopSync() {
         guard isSyncing, !isStoppingSync else { return }
         isStoppingSync = true
-        statusText = "正在停止同步…"
-        zoneSyncStatusText = "正在停止同步…"
+        statusText = L("正在停止同步…")
+        zoneSyncStatusText = L("正在停止同步…")
         appendLog("用户请求停止知识库同步")
         // 内部标志让 RAG 在文件/embedding 批次边界退出；Task 取消让
         // SemanticChunker 等支持 Task.isCancelled 的步骤立即返回。
@@ -3311,7 +3311,7 @@ final class AppViewModel: ObservableObject {
     /// 查库可能触发建库 + COUNT/DISTINCT，必须放到后台，不能卡主线程。
     func refreshRAGStatus() {
         guard let agent else {
-            ragStatusText = "RAG 未就绪"
+            ragStatusText = L("RAG 未就绪")
             return
         }
         guard !ragStatusRefreshing else { return }
@@ -3341,7 +3341,7 @@ final class AppViewModel: ObservableObject {
                 ?? status["sources"]?.arrayValue?.count ?? 0
             let totalChunks = chunks + zoneSummaries.reduce(0) { $0 + $1.chunks }
             let totalSources = sources + zoneSummaries.reduce(0) { $0 + $1.sources }
-            let zoneSuffix = zoneSummaries.isEmpty ? "" : "（含 \(zoneSummaries.count) 个其它分区）"
+            let zoneSuffix = zoneSummaries.isEmpty ? "" : L("（含 \(zoneSummaries.count) 个其它分区）")
             let ann = status["ann_index"]?.stringValue ?? ""
             let binaryANN = status["binary_ann_index"]?.stringValue ?? ""
             let colbertANN = engine.colbertANNStatus()
@@ -3356,27 +3356,27 @@ final class AppViewModel: ObservableObject {
                 isComplete = true
             } else if completeness.total < 0 {
                 // 库打不开/查询失败：明确提示不可用，不能显示「完备」误导用户。
-                let label = engine.config.colbertReaderEnabled ? "ColBERT 编码" : "向量"
-                completenessText = "\(label)库：状态不可用（索引未就绪或模型加载失败）"
+                let label = engine.config.colbertReaderEnabled ? L("ColBERT 编码") : L("向量")
+                completenessText = L("\(label)库：状态不可用（索引未就绪或模型加载失败）")
                 isComplete = false
             } else {
-                let label = engine.config.colbertReaderEnabled ? "ColBERT 编码" : "向量"
+                let label = engine.config.colbertReaderEnabled ? L("ColBERT 编码") : L("向量")
                 if completeness.pending > 0 {
-                    completenessText = "\(label)库：\(completeness.filled)/\(completeness.total) 已就绪，"
-                        + "\(completeness.pending) 待补做"
+                    completenessText = L("\(label)库：\(completeness.filled)/\(completeness.total) 已就绪，")
+                        + L("\(completeness.pending) 待补做")
                 } else {
-                    completenessText = "\(label)库：\(completeness.filled)/\(completeness.total) 已就绪"
+                    completenessText = L("\(label)库：\(completeness.filled)/\(completeness.total) 已就绪")
                 }
                 isComplete = completeness.complete
             }
             // 超时/不可用时 status 带 error：状态栏给可读提示，不显示误导性的 0 切片。
             let text: String
             if let reason = status["error"]?.stringValue {
-                text = "知识库\(reason)（上次统计：\(chunks) 切片 · \(sources) 文件）"
+                text = L("知识库\(reason)（上次统计：\(chunks) 切片 · \(sources) 文件）")
             } else if zoneSummaries.isEmpty {
-                text = "\(chunks) 切片 · \(sources) 文件 · \(backend)"
+                text = L("\(chunks) 切片 · \(sources) 文件 · \(backend)")
             } else {
-                text = "\(totalChunks) 切片 · \(totalSources) 文件 · \(backend)\(zoneSuffix)"
+                text = L("\(totalChunks) 切片 · \(totalSources) 文件 · \(backend)\(zoneSuffix)")
             }
             await MainActor.run { [weak self] in
                 guard let self else { return }
@@ -3394,6 +3394,7 @@ final class AppViewModel: ObservableObject {
                         self.colbertIndexSummary = ""
                     } else if !self.isBuildingColbertANN {
                         let text = colbertANN ?? ""
+                        // 后端返回的是裸状态串，不能与本地化后的文本比较。
                         self.colbertIndexSummary = text == "未启用" ? "" : text
                     }
                     self.vectorRebuildRequired = rebuildRequired
