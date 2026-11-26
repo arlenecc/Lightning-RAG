@@ -154,7 +154,7 @@ private let reviewMax = 2
 /// 单次大纲（rag_tools(op="outline")）之后允许的 rag_tools(op="search") 次数硬上限。
 /// 超过后内核直接把多余检索预置为失败，逼模型基于已有结果 + 大纲摘要作答，
 /// 杜绝「同一问题反复换关键词 scatter 检索」的无效搜索。
-private let maxRagSearchesPerOutline = 3
+private let maxRagSearchesPerOutline = 5
 
 private let askUserPattern =
     "(请(提供|告诉|告知|说明|补充|指定|确认)|需要(你|您)(提供|告诉|确认|补充)|"
@@ -271,7 +271,8 @@ public final class KernelLoop {
     /// 拦截，强令基于已有结果作答或换参数，而不是等 4 次重复才终止。
     private var successSigs: Set<String> = []
     private var toolCallCounter = 0
-    /// 当前「大纲后检索预算」已用次数；每次 rag_tools(op="outline") 清零，每次 run() 也清零。
+    /// 当前检索预算已用次数；只在 beginRequest（每次 run()）清零，
+    /// rag_tools(op="outline") 不再重置，避免反复 outline 无限刷新预算。
     private var ragSearchCount = 0
     private var resume = false
     private var pendingSeed: FailureSnapshot?
@@ -1127,9 +1128,9 @@ public final class KernelLoop {
             // 计划才在这里/结果后补一条最小计划。不再「一看到工具调用就代建」，
             // 否则计划面板永远是那两步模板，模型自己的多步计划再也长不出来。
 
-            // ---- 大纲后检索次数硬上限（默认 3）----
-            // 每次 `rag_tools(op="outline")` 开启新一轮「检索预算」并清零；超出上限的 `rag_tools(op="search")`
-            // 直接预置失败，逼模型基于已有结果与大纲摘要综合作答，杜绝无效重复检索。
+            // ---- 每次请求的检索次数硬上限（默认 5）----
+            // `rag_tools(op="search")` 超出预算后直接预置失败，逼模型基于已有结果与
+            // 大纲摘要综合作答，杜绝无效重复检索；`outline` 不再重置预算。
             var executeCalls: [ToolCall] = []
             var preset: [Int: ToolResult] = [:]
             var liveCount = ragSearchCount
@@ -1207,14 +1208,14 @@ public final class KernelLoop {
                 }
                 switch (tc.name, tcOp) {
                 case ("rag_tools", "outline"):
-                    // 不再重置检索计数：outline 反复调用会把「每次 outline 后
-                    // ≤3 次 search」的预算无限刷新，实测同一任务检索 5 次仍不够，
+                    // 不再重置检索计数：outline 反复调用会把「每次请求 ≤5 次
+                    // search」的预算无限刷新，实测同一任务检索 5 次以上仍不够，
                     // 每轮多付 6~12s prefill。计数只在 beginRequest/reset 时归零。
                     executeCalls.append(tc)
                 case ("rag_tools", "search"):
                     if liveCount >= maxRagSearchesPerOutline {
                         preset[i] = .fail(
-                            "已达单次大纲后的检索上限（\(maxRagSearchesPerOutline) 次）。"
+                            "已达本次请求的检索上限（\(maxRagSearchesPerOutline) 次）。"
                             + "请基于已检索内容与大纲摘要直接综合作答，不要再调用 "
                             + "rag_tools(op=\"search\")。")
                         continue
@@ -1226,7 +1227,7 @@ public final class KernelLoop {
                 }
             }
             if liveCount != ragSearchCount {
-                log("[kernel] 大纲后检索计数 \(ragSearchCount) → \(liveCount)"
+                log("[kernel] 检索预算计数 \(ragSearchCount) → \(liveCount)"
                     + "（上限 \(maxRagSearchesPerOutline)）")
             }
             ragSearchCount = liveCount

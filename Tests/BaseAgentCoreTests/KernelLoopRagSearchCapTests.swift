@@ -1,8 +1,8 @@
 import XCTest
 @testable import BaseAgentCore
 
-/// 验证「大纲（rag_tools(op="outline")）之后 rag_tools(op="search") 硬上限 = 3」：
-/// 模型反复请求检索时，只有前 3 次真正到达工具执行层，超出的被内核预置为失败，
+/// 验证「每次请求内 rag_tools(op="search") 硬上限 = 5」：
+/// 模型反复请求检索时，只有前 5 次真正到达工具执行层，超出的被内核预置为失败，
 /// 逼模型基于已有结果 + 大纲摘要综合作答，杜绝无效重复检索。
 final class KernelLoopRagSearchCapTests: XCTestCase {
 
@@ -58,37 +58,37 @@ final class KernelLoopRagSearchCapTests: XCTestCase {
         return (executed, emitted, session)
     }
 
-    /// 核心断言：模型发了 >3 次检索，但只有 3 次真正执行，其余被预置 cap 失败。
+    /// 核心断言：模型发了 >5 次检索，但只有 5 次真正执行，其余被预置 cap 失败。
     private func assertCap(enforcedIn executed: [ToolCall], emitted: Int,
                            session: Session, outlineCount: Int,
                            file: StaticString = #file, line: UInt = #line) {
         let executedSearches = executed.filter {
             $0.name == "rag_tools" && $0.arguments["op"]?.stringValue == "search"
         }
-        XCTAssertEqual(executedSearches.count, 3,
-                       "硬上限应只允许 3 次 rag_tools(op=\"search\") 真正执行",
+        XCTAssertEqual(executedSearches.count, 5,
+                       "硬上限应只允许 5 次 rag_tools(op=\"search\") 真正执行",
                        file: file, line: line)
         XCTAssertEqual(executed.filter {
             $0.name == "rag_tools" && $0.arguments["op"]?.stringValue == "outline"
         }.count, outlineCount,
                        "rag_tools(op=\"outline\") 执行次数不符", file: file, line: line)
-        XCTAssertGreaterThan(emitted, 3,
-                             "模型应发出了超过 3 次检索", file: file, line: line)
+        XCTAssertGreaterThan(emitted, 5,
+                             "模型应发出了超过 5 次检索", file: file, line: line)
 
         let allSearchResults = session.turns
             .flatMap { $0.toolResults }
             .filter { $0.name == "rag_tools" }
         let capped = allSearchResults.filter {
-            $0.content.contains("单次大纲后的检索上限")
+            $0.content.contains("本次请求的检索上限")
         }
-        // 发出的检索 = 执行的 3 次 + 被拦截的若干次；被拦截的都应带 cap 提示。
-        XCTAssertEqual(capped.count, emitted - 3,
+        // 发出的检索 = 执行的 5 次 + 被拦截的若干次；被拦截的都应带 cap 提示。
+        XCTAssertEqual(capped.count, emitted - 5,
                        "超出部分应全部被预置为 cap 失败", file: file, line: line)
         XCTAssertGreaterThanOrEqual(capped.count, 1,
                                     "至少应有一次被拦截", file: file, line: line)
     }
 
-    /// 场景一：先 rag_tools(op="outline") 开预算，再反复 rag_tools(op="search") → 只执行 3 次。
+    /// 场景一：先 rag_tools(op="outline")，再反复 rag_tools(op="search") → 只执行 5 次。
     func testRagSearchCappedAfterOutline() async {
         let first = ToolCall(id: "o1", name: "rag_tools",
                              arguments: ["op": .string("outline"),
@@ -98,7 +98,7 @@ final class KernelLoopRagSearchCapTests: XCTestCase {
                   outlineCount: 1)
     }
 
-    /// 场景二：没有 outline，直接反复 rag_tools(op="search") → 仍按每次 run() 的预算限 3 次。
+    /// 场景二：没有 outline，直接反复 rag_tools(op="search") → 仍按每次 run() 的预算限 5 次。
     func testRagSearchCappedWithoutOutline() async {
         let first = ToolCall(id: "s1", name: "rag_tools",
                              arguments: ["op": .string("search"),
@@ -109,8 +109,8 @@ final class KernelLoopRagSearchCapTests: XCTestCase {
                   outlineCount: 0)
     }
 
-    /// 场景三：两轮 rag_tools(op="outline") 之间各发 3+ 次检索，第二次 outline 应重置预算，
-    /// 使得第二段又能再执行 3 次（验证「每次 outline 重置」而不仅是「整个 run 限 3」）。
+    /// 场景三：两轮 rag_tools(op="outline") 之间各发多轮检索，验证 outline 不再重置预算，
+    /// 整个请求仍只执行 5 次 search（而不是每段各 5 次）。
     func testOutlineResetsBudget() async {
         var executed = [ToolCall]()
         var emitted = 0
@@ -160,13 +160,13 @@ final class KernelLoopRagSearchCapTests: XCTestCase {
         let searchExecuted = executed.filter {
             $0.name == "rag_tools" && $0.arguments["op"]?.stringValue == "search"
         }
-        // outline 不再重置预算：整个请求最多 3 次 search，避免同一任务检索 5+ 次。
-        XCTAssertEqual(searchExecuted.count, 3,
-                       "outline 不得重置检索预算，全程仍受 3 次上限约束")
+        // outline 不再重置预算：整个请求最多 5 次 search，避免同一任务反复检索。
+        XCTAssertEqual(searchExecuted.count, 5,
+                       "outline 不得重置检索预算，全程仍受 5 次上限约束")
         XCTAssertEqual(executed.filter {
             $0.name == "rag_tools" && $0.arguments["op"]?.stringValue == "outline"
         }.count, 2)
-        XCTAssertGreaterThan(emitted, 6,
-                             "模型应发出了超过 6 次检索")
+        XCTAssertGreaterThan(emitted, 10,
+                             "模型应发出了超过 10 次检索")
     }
 }
