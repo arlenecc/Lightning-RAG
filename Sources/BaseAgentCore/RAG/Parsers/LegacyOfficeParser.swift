@@ -4,12 +4,22 @@ import Foundation
 ///
 /// 按扩展名分派到三个内置提取器，统一做大小校验、空正文检查和
 /// `.structured` 清洗；不依赖 LibreOffice、Python 或任何子进程。
-public final class LegacyOfficeParser: DocumentParser {
+public final class LegacyOfficeParser: DocumentParser, VLMBackedParser {
 
     public let name = "LegacyOffice"
     public let supportedExtensions = ["doc", "xls", "ppt"]
 
-    public init() {}
+    private let config: AgentConfig?
+    private let providedVLM: VLMService?
+    private lazy var resolvedVLM: VLMService? = providedVLM ?? config.flatMap {
+        LocalModelFactory.shared.makeRAGOCRVLM(config: $0)
+    }
+    public var vlm: VLMService? { resolvedVLM }
+
+    public init(config: AgentConfig? = nil, vlm: VLMService? = nil) {
+        self.config = config
+        self.providedVLM = vlm
+    }
 
     public func parse(url: URL,
                       options: ParserOptions,
@@ -60,7 +70,24 @@ public final class LegacyOfficeParser: DocumentParser {
 
         var metadata = result.metadata
         metadata["engine"] = ext
-        var parsed = ParsedDocument(text: result.text,
+
+        // 旧格式图片信息：从 OLE2 流提取位图并交给 Ovis OCR。
+        // 旧版 DOC/XLS/PPT 的图片不以 OOXML rels 组织，无法精确锚定段落，
+        // 因此 OCR 正文按页/流顺序附在文档末尾的独立小节，保证信息不丢失。
+        let embedded = LegacyOfficeImageExtractor.images(in: url, ext: ext)
+        // 没有图片时不访问 lazy vlm，避免无谓的视觉服务解析。
+        let imageText = embedded.isEmpty ? [] : try await LegacyOfficeImageExtractor.recognize(
+            embedded, vlm: vlm, options: options, progress: progress)
+        if !imageText.isEmpty {
+            metadata["embedded_images_ocr"] = String(imageText.count)
+            metadata["embedded_images_placement"] = "appendix"
+        }
+
+        var text = result.text
+        if !imageText.isEmpty {
+            text += "\n\n## 嵌入图片内容\n\n" + imageText.joined(separator: "\n\n")
+        }
+        var parsed = ParsedDocument(text: text,
                                     source: url.lastPathComponent,
                                     outline: MarkdownOutline.build(result.outline),
                                     metadata: metadata)

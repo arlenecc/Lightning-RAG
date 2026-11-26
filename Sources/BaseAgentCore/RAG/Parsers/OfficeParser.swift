@@ -1,6 +1,7 @@
 import Foundation
 import ZIPFoundation
 import AEXML
+import CryptoKit
 
 /// Office Open XML 解析：.docx / .xlsx / .pptx。
 ///
@@ -8,12 +9,23 @@ import AEXML
 /// - docx：word/document.xml 的段落、列表、表格、脚注/尾注；
 /// - xlsx：sharedStrings + styles（日期/百分比格式）+ 各 sheet 的行列；
 /// - pptx：ppt/slides 的文本框、表格、SmartArt 与演讲者备注。
-public final class OfficeParser: DocumentParser {
+public final class OfficeParser: DocumentParser, VLMBackedParser {
 
     public let name = "Office"
     public let supportedExtensions = ["docx", "xlsx", "pptx"]
 
-    public init() {}
+    private let config: AgentConfig?
+    private let providedVLM: VLMService?
+    /// 与 EPUB/MOBI 一致：只在真正需要 OCR 嵌入图片时懒加载模型。
+    private lazy var resolvedVLM: VLMService? = providedVLM ?? config.flatMap {
+        LocalModelFactory.shared.makeRAGOCRVLM(config: $0)
+    }
+    public var vlm: VLMService? { resolvedVLM }
+
+    public init(config: AgentConfig? = nil, vlm: VLMService? = nil) {
+        self.config = config
+        self.providedVLM = vlm
+    }
 
     public func parse(url: URL,
                       options: ParserOptions,
@@ -22,14 +34,19 @@ public final class OfficeParser: DocumentParser {
 
         do {
             let extensionName = url.pathExtension.lowercased()
+            // 先按 rels 找出所有嵌入位图（排除背景/矢量图），用 Ovis 转成 Markdown；
+            // 再交给各格式在图片锚点处回填，避免图片内信息在文本化时丢失。
+            let candidates = embeddedImages(archive: archive, extensionName: extensionName)
+            let imageMarkdown = try await recognizeEmbeddedImages(
+                candidates: candidates, options: options, progress: progress)
             let result: (text: String, outline: [OutlineEntry], metadata: [String: String])
             switch extensionName {
             case "docx":
-                result = try parseDocx(archive: archive)
+                result = try parseDocx(archive: archive, imageMarkdown: imageMarkdown)
             case "xlsx":
-                result = try parseXlsx(archive: archive)
+                result = try parseXlsx(archive: archive, imageMarkdown: imageMarkdown)
             case "pptx":
-                result = try parsePptx(archive: archive)
+                result = try parsePptx(archive: archive, imageMarkdown: imageMarkdown)
             default:
                 throw AgentError.unsupported("不支持的 Office 格式：\(extensionName)")
             }
@@ -54,9 +71,224 @@ public final class OfficeParser: DocumentParser {
         }
     }
 
+    // MARK: - 嵌入图片 OCR
+
+    /// 归档内一张待 OCR 的嵌入图片。key 是各格式在锚点处查表的标识：
+    /// DOCX/PPTX 用关系 id，XLSX 用 `sheet路径#行,列`。
+    private struct EmbeddedImage {
+        var key: String
+        var data: Data
+    }
+
+    /// 扫描 OOXML 关系与 blip 锚点，收集正文中嵌图（不含背景图）。
+    private func embeddedImages(archive: Archive, extensionName: String) -> [EmbeddedImage] {
+        switch extensionName {
+        case "docx":
+            return docxEmbeddedImages(archive: archive)
+        case "xlsx":
+            return xlsxEmbeddedImages(archive: archive)
+        case "pptx":
+            return pptxEmbeddedImages(archive: archive)
+        default:
+            return []
+        }
+    }
+
+    private func recognizeEmbeddedImages(
+        candidates: [EmbeddedImage], options: ParserOptions,
+        progress: ((ParserProgress) -> Void)?
+    ) async throws -> [String: String] {
+        guard !candidates.isEmpty else { return [:] }
+        let ovis = OfficeEmbeddedImageOcr.resolveVLM(vlm, options: options)
+        guard let ovis else {
+            // 没有视觉模型时仍写占位，明确标记图片信息未能提取，避免静默遗漏。
+            AgentLog.warning("Office 含嵌入图片但未配置 OCR 视觉模型，图片信息未提取")
+            return Dictionary(uniqueKeysWithValues: candidates.map {
+                ($0.key, "[图片未识别：OCR 模型不可用]")
+            })
+        }
+
+        // 去重：同一 media 被多个锚点引用时只识别一次。用稳定指纹（内容哈希）
+        // 建索引，避免同图多锚点回填时做 O(n²) 的 Data 全量比较。
+        var unique: [EmbeddedImage] = []
+        var keysByFingerprint: [String: [String]] = [:]
+        var fingerprints: [String: String] = [:]
+        for candidate in candidates {
+            let fingerprint = SHA256.hash(data: candidate.data)
+                .map { String(format: "%02x", $0) }.joined()
+            if let group = keysByFingerprint[fingerprint] {
+                keysByFingerprint[fingerprint] = group + [candidate.key]
+                continue
+            }
+            keysByFingerprint[fingerprint] = [candidate.key]
+            fingerprints[candidate.key] = fingerprint
+            unique.append(candidate)
+        }
+
+        // 与 EPUB/MOBI 一致按批并发；VLM 实例池负责串行化单实例，单页失败跳过。
+        var markdownByFingerprint: [String: String] = [:]
+        let batchSize = PDFPageRenderer.maxConcurrentPages
+        var cursor = 0
+        while cursor < unique.count {
+            if Task.isCancelled { throw AgentError.cancelled }
+            let end = min(cursor + batchSize, unique.count)
+            let batch = Array(unique[cursor..<end])
+            let outcomes = await withTaskGroup(of: (String, String?, String).self) { group in
+                for candidate in batch {
+                    group.addTask {
+                        do {
+                            let markdown = try await OfficeEmbeddedImageOcr.recognize(
+                                key: candidate.key, data: candidate.data,
+                                vlm: ovis, options: options)
+                            return (candidate.key, markdown, "")
+                        } catch {
+                            return (candidate.key, nil, error.localizedDescription)
+                        }
+                    }
+                }
+                var collected: [(String, String?, String)] = []
+                for await item in group { collected.append(item) }
+                return collected
+            }
+            for (key, markdown, errorDescription) in outcomes {
+                if markdown == nil, !errorDescription.isEmpty {
+                    AgentLog.warning("Office 嵌入图片 OCR 失败（\(key)）：\(errorDescription)")
+                }
+                guard let fingerprint = fingerprints[key] else { continue }
+                // 失败也写占位：图片位置不会静默空白，上层可见且可重试。
+                let value = markdown ?? "[图片 OCR 失败：\(errorDescription)]"
+                markdownByFingerprint[fingerprint] = value
+            }
+            progress?(.page(index: end, total: unique.count, stage: "图片OCR"))
+            cursor = end
+        }
+        var result: [String: String] = [:]
+        for (fingerprint, keys) in keysByFingerprint {
+            guard let markdown = markdownByFingerprint[fingerprint] else { continue }
+            for key in keys { result[key] = markdown }
+        }
+        return result
+    }
+
+    /// DOCX：正文与页眉/页脚中的 a:blip/@r:embed → word/media/*。
+    private func docxEmbeddedImages(archive: Archive) -> [EmbeddedImage] {
+        let paths = ["word/document.xml", "word/footnotes.xml", "word/endnotes.xml"]
+            + RAGArchiveReader.filePaths(archive)
+                .filter {
+                    $0.hasPrefix("word/")
+                        && ($0.contains("/header") || $0.contains("/footer"))
+                        && $0.hasSuffix(".xml")
+                }
+                .sorted()
+        var result: [EmbeddedImage] = []
+        for partPath in paths {
+            guard let data = RAGArchiveReader.data(archive, path: partPath),
+                  let document = try? RAGXMLHelper.parsePreservingWhitespace(
+                    data, source: partPath) else { continue }
+            let rels = relationships(archive, path: relatedPartPath(partPath))
+            // 现代 DrawingML (a:blip r:embed) 与老式 VML (v:imagedata r:id) 都覆盖。
+            let references = RAGXMLHelper.descendants(document.root, "blip")
+                + RAGXMLHelper.descendants(document.root, "imagedata")
+            for node in references {
+                guard !OfficeEmbeddedImageOcr.isBackground(node),
+                      let rid = RAGXMLHelper.attribute(node, ["r:embed", "embed", "r:link", "link", "r:id", "id"]),
+                      let relationship = rels.first(where: { $0.id == rid }),
+                      relationship.type.lowercased().hasSuffix("image") else { continue }
+                let mediaPath = resolvePartTarget(relationship.target, baseDirectory: "word")
+                guard let image = RAGArchiveReader.data(archive, path: mediaPath),
+                      OfficeEmbeddedImageOcr.isRaster(image) else { continue }
+                // 正文用裸 rId（与 docxText 一致），页眉页脚加 part 路径隔离。
+                let key = partPath == "word/document.xml" ? rid : partPath + "#" + rid
+                result.append(EmbeddedImage(key: key, data: image))
+            }
+        }
+        return result
+    }
+
+    /// PPTX：slide 与 notesSlide 中的 a:blip r:embed → ppt/media/*。
+    private func pptxEmbeddedImages(archive: Archive) -> [EmbeddedImage] {
+        let paths = RAGArchiveReader.filePaths(archive)
+            .filter {
+                $0.range(of: #"^ppt/slides/slide\d+\.xml$"#, options: .regularExpression) != nil
+                    || $0.range(of: #"^ppt/notesSlides/notesSlide\d+\.xml$"#,
+                                options: .regularExpression) != nil
+            }
+        var result: [EmbeddedImage] = []
+        for path in paths {
+            guard let data = RAGArchiveReader.data(archive, path: path),
+                  let slide = try? RAGXMLHelper.parsePreservingWhitespace(data, source: path) else {
+                continue
+            }
+            let rels = relationships(archive, path: relatedPartPath(path))
+            // 关系 id 在不同 slide 可能重复，key 加 slide 路径前缀隔离。
+            let references = RAGXMLHelper.descendants(slide.root, "blip")
+                + RAGXMLHelper.descendants(slide.root, "imagedata")
+            for node in references {
+                guard !OfficeEmbeddedImageOcr.isBackground(node),
+                      let rid = RAGXMLHelper.attribute(node, ["r:embed", "embed", "r:link", "link", "r:id", "id"]),
+                      let relationship = rels.first(where: { $0.id == rid }),
+                      relationship.type.lowercased().hasSuffix("image") else { continue }
+                let imagePath = resolvePartTarget(relationship.target, baseDirectory: "ppt/slides")
+                guard let image = RAGArchiveReader.data(archive, path: imagePath),
+                      OfficeEmbeddedImageOcr.isRaster(image) else { continue }
+                result.append(EmbeddedImage(key: path + "#" + rid, data: image))
+            }
+        }
+        return result
+    }
+
+    /// XLSX：worksheet 的 drawing 关系 → drawingN.xml 的锚点 → xl/media/*。
+    /// 按 `xdr:from` 的行列定位，key 形如 `sheet路径#3,2`。
+    private func xlsxEmbeddedImages(archive: Archive) -> [EmbeddedImage] {
+        let relPaths = RAGArchiveReader.filePaths(archive)
+            .filter { $0.hasPrefix("xl/worksheets/_rels/") && $0.hasSuffix(".rels") }
+        var result: [EmbeddedImage] = []
+        for relPath in relPaths {
+            let sheetPath = relPath
+                .replacingOccurrences(of: "xl/worksheets/_rels/", with: "xl/worksheets/")
+                .replacingOccurrences(of: ".rels", with: "")
+            for relationship in relationships(archive, path: relPath)
+            where relationship.type.lowercased().hasSuffix("drawing") {
+                let drawingPath = resolvePartTarget(relationship.target,
+                                                    baseDirectory: "xl/worksheets")
+                guard let drawingData = RAGArchiveReader.data(archive, path: drawingPath),
+                      let drawing = try? RAGXMLHelper.parsePreservingWhitespace(
+                        drawingData, source: drawingPath) else { continue }
+                let drawingRels = relationships(archive, path: relatedPartPath(drawingPath))
+                let positioned = RAGXMLHelper.descendants(drawing.root, "twoCellAnchor")
+                    + RAGXMLHelper.descendants(drawing.root, "oneCellAnchor")
+                // absoluteAnchor 没有 from 行列，按 A1 处理，图片信息仍不丢失。
+                let absolute = RAGXMLHelper.descendants(drawing.root, "absoluteAnchor")
+                for anchor in positioned + absolute {
+                    let from = RAGXMLHelper.descendants(anchor, "from").first
+                    let column = from.flatMap {
+                        RAGXMLHelper.descendants($0, "col").first?
+                            .value.flatMap({ Int($0.trimmingCharacters(in: .whitespaces)) })
+                    } ?? 0
+                    let row = from.flatMap {
+                        RAGXMLHelper.descendants($0, "row").first?
+                            .value.flatMap({ Int($0.trimmingCharacters(in: .whitespaces)) })
+                    } ?? 0
+                    guard let blip = RAGXMLHelper.descendants(anchor, "blip").first,
+                          let rid = RAGXMLHelper.attribute(blip, ["r:embed", "embed"]),
+                          let imageRel = drawingRels.first(where: { $0.id == rid }) else { continue }
+                    let imagePath = resolvePartTarget(imageRel.target,
+                                                      baseDirectory: "xl/drawings")
+                    guard let image = RAGArchiveReader.data(archive, path: imagePath),
+                          OfficeEmbeddedImageOcr.isRaster(image) else { continue }
+                    // drawing 锚点是 0-based，而 worksheet 的 row@r 是 1-based。
+                    result.append(EmbeddedImage(
+                        key: "\(sheetPath)#\(row + 1),\(column)", data: image))
+                }
+            }
+        }
+        return result
+    }
+
     // MARK: - DOCX
 
-    private func parseDocx(archive: Archive) throws -> (String, [OutlineEntry], [String: String]) {
+    private func parseDocx(archive: Archive,
+                           imageMarkdown: [String: String]) throws -> (String, [OutlineEntry], [String: String]) {
         guard let data = RAGArchiveReader.data(archive, path: "word/document.xml") else {
             throw AgentError.parse("DOCX 缺少 word/document.xml")
         }
@@ -67,21 +299,32 @@ public final class OfficeParser: DocumentParser {
 
         let numbering = docxNumbering(archive)
         let styles = docxStyles(archive)
-        let footnotes = DocxNotes(texts: docxNotes(archive, path: "word/footnotes.xml"))
-        let endnotes = DocxNotes(texts: docxNotes(archive, path: "word/endnotes.xml"))
+        let footnotes = DocxNotes(texts: docxNotes(archive, path: "word/footnotes.xml",
+                                                  imageMarkdown: imageMarkdown))
+        let endnotes = DocxNotes(texts: docxNotes(archive, path: "word/endnotes.xml",
+                                                 imageMarkdown: imageMarkdown))
         let counters = DocxListCounters()
 
         var blocks: [String] = []
         var headings: [OutlineEntry] = []
         renderDocxChildren(body, blocks: &blocks, headings: &headings,
                            numbering: numbering, styles: styles, counters: counters,
-                           footnotes: footnotes, endnotes: endnotes)
+                           footnotes: footnotes, endnotes: endnotes,
+                           imageMarkdown: imageMarkdown)
         blocks.append(contentsOf: footnotes.sections(title: "脚注"))
         blocks.append(contentsOf: endnotes.sections(title: "尾注"))
+
+        let headersFooters = docxHeadersFooters(archive, imageMarkdown: imageMarkdown)
+        if !headersFooters.isEmpty {
+            blocks.append("## 页眉页脚")
+            blocks.append(contentsOf: headersFooters)
+        }
 
         var metadata: [String: String] = [:]
         if footnotes.count > 0 { metadata["footnotes"] = String(footnotes.count) }
         if endnotes.count > 0 { metadata["endnotes"] = String(endnotes.count) }
+        if !headersFooters.isEmpty { metadata["header_footer_blocks"] = String(headersFooters.count) }
+        if !imageMarkdown.isEmpty { metadata["embedded_images_ocr"] = String(imageMarkdown.count) }
 
         return (blocks.joined(separator: "\n\n"), headings, metadata)
     }
@@ -93,11 +336,13 @@ public final class OfficeParser: DocumentParser {
                                     styles: [String: Int],
                                     counters: DocxListCounters,
                                     footnotes: DocxNotes,
-                                    endnotes: DocxNotes) {
+                                    endnotes: DocxNotes,
+                                    imageMarkdown: [String: String]) {
         for child in element.children {
             switch RAGXMLHelper.localName(child.name).lowercased() {
             case "p":
-                let text = docxParagraphText(child, footnotes: footnotes, endnotes: endnotes)
+                let text = docxParagraphText(child, footnotes: footnotes, endnotes: endnotes,
+                                             imageMarkdown: imageMarkdown)
                 guard !text.isEmpty else { continue }
                 if let level = docxHeadingLevel(child, styles: styles) {
                     blocks.append(String(repeating: "#", count: level) + " " + text)
@@ -110,7 +355,8 @@ public final class OfficeParser: DocumentParser {
                 }
 
             case "tbl":
-                let table = docxTable(child, footnotes: footnotes, endnotes: endnotes)
+                let table = docxTable(child, footnotes: footnotes, endnotes: endnotes,
+                                      imageMarkdown: imageMarkdown)
                 if !table.isEmpty { blocks.append(table) }
 
             case "sectpr", "tblpr", "trpr", "tcpr", "ppr", "rpr", "props":
@@ -119,12 +365,14 @@ public final class OfficeParser: DocumentParser {
             case "sdt", "sdtcontent", "body":
                 renderDocxChildren(child, blocks: &blocks, headings: &headings,
                                    numbering: numbering, styles: styles, counters: counters,
-                                   footnotes: footnotes, endnotes: endnotes)
+                                   footnotes: footnotes, endnotes: endnotes,
+                                   imageMarkdown: imageMarkdown)
 
             default:
                 renderDocxChildren(child, blocks: &blocks, headings: &headings,
                                    numbering: numbering, styles: styles, counters: counters,
-                                   footnotes: footnotes, endnotes: endnotes)
+                                   footnotes: footnotes, endnotes: endnotes,
+                                   imageMarkdown: imageMarkdown)
             }
         }
     }
@@ -133,14 +381,17 @@ public final class OfficeParser: DocumentParser {
     /// `w:tab` 转成制表符；同时跳过批注/删除文本/域代码/注音等非正文内容。
     private func docxParagraphText(_ paragraph: AEXMLElement,
                                    footnotes: DocxNotes?,
-                                   endnotes: DocxNotes?) -> String {
-        docxText(paragraph, footnotes: footnotes, endnotes: endnotes)
+                                   endnotes: DocxNotes?,
+                                   imageMarkdown: [String: String]) -> String {
+        docxText(paragraph, footnotes: footnotes, endnotes: endnotes,
+                 imageMarkdown: imageMarkdown)
             .trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     private func docxText(_ element: AEXMLElement,
                           footnotes: DocxNotes?,
-                          endnotes: DocxNotes?) -> String {
+                          endnotes: DocxNotes?,
+                          imageMarkdown: [String: String]) -> String {
         var result = ""
         for child in element.children {
             switch RAGXMLHelper.localName(child.name).lowercased() {
@@ -163,11 +414,49 @@ public final class OfficeParser: DocumentParser {
                 if let id = RAGXMLHelper.attribute(child, ["id"]) {
                     result += endnotes?.marker(for: id) ?? ""
                 }
+            // 图片/OLE/公式没有文本节点，取 docPr 的 descr/name 作替代文本，
+            // 否则整段图像内容在纯文本 RAG 里彻底消失。
+            case "drawing", "object", "pict":
+                // 优先放回 Ovis 识别出的图片正文；没有 OCR 结果时退回替代文本。
+                let refs = RAGXMLHelper.descendants(child, "blip")
+                    + RAGXMLHelper.descendants(child, "imagedata")
+                let markdown = refs
+                    .compactMap { RAGXMLHelper.attribute($0, ["r:embed", "embed", "r:link", "link", "r:id", "id"]) }
+                    .compactMap { imageMarkdown[$0] }
+                    .joined(separator: "\n")
+                if !markdown.isEmpty {
+                    result += markdown
+                } else if let alt = docxAlternativeText(child), !alt.isEmpty {
+                    result += "[\(alt)]"
+                }
+            case "sym":
+                if let char = RAGXMLHelper.attribute(child, ["char"]),
+                   let scalarValue = UInt32(char, radix: 16),
+                   let scalar = UnicodeScalar(scalarValue) {
+                    result += String(scalar)
+                }
             default:
-                result += docxText(child, footnotes: footnotes, endnotes: endnotes)
+                result += docxText(child, footnotes: footnotes, endnotes: endnotes,
+                                   imageMarkdown: imageMarkdown)
             }
         }
         return result
+    }
+
+    /// `wp:docPr` / `v:shape` 的替代文本；优先 descr，其次 title/name/alt。
+    private func docxAlternativeText(_ element: AEXMLElement) -> String? {
+        for name in ["docpr", "shape"] {
+            for node in RAGXMLHelper.descendants(element, name) {
+                for key in ["descr", "title", "name", "alt"] {
+                    if let value = RAGXMLHelper.attribute(node, [key])?
+                        .trimmingCharacters(in: .whitespacesAndNewlines),
+                       !value.isEmpty {
+                        return value
+                    }
+                }
+            }
+        }
+        return nil
     }
 
     /// 文本节点取值：声明了 `xml:space="preserve"` 的保留原始空白，
@@ -194,8 +483,8 @@ public final class OfficeParser: DocumentParser {
            let raw = RAGXMLHelper.attribute(outline, ["val"]),
            let level = Int(raw.trimmingCharacters(in: .whitespaces)) {
             // outlineLvl 是零基；val=9 表示正文（无大纲级别）。
-            guard level >= 0, level <= 8 else { return nil }
-            return min(6, level + 1)
+            // 非法值不能早退，否则丢失 pStyle / styles.xml 的兜底机会。
+            if level >= 0, level <= 8 { return min(6, level + 1) }
         }
 
         if let style = RAGXMLHelper.firstChild(properties, "pStyle"),
@@ -299,38 +588,77 @@ public final class OfficeParser: DocumentParser {
     }
 
     private func docxTable(_ table: AEXMLElement, footnotes: DocxNotes?,
-                           endnotes: DocxNotes?) -> String {
+                           endnotes: DocxNotes?,
+                           imageMarkdown: [String: String]) -> String {
         var rows: [[String]] = []
+        // Markdown 表无纵向合并语法：把 vMerge 区域全部文字并入 restart 起点，
+        // continue 行保留空占位以维持列对齐。
+        struct VerticalAnchor { var column: Int; var row: Int; var text: String }
+        var anchors: [VerticalAnchor] = []
         for row in RAGXMLHelper.children(table, "tr") {
             var cells: [String] = []
+            var column = 0
             for cell in RAGXMLHelper.children(row, "tc") {
-                cells.append(docxCellText(cell, footnotes: footnotes, endnotes: endnotes))
-                // 横向合并（gridSpan）补空单元格，避免后续列错位。
-                let span = RAGXMLHelper.firstChild(cell, "tcPr")
+                let properties = RAGXMLHelper.firstChild(cell, "tcPr")
+                let span = properties
                     .flatMap { RAGXMLHelper.firstChild($0, "gridSpan") }
                     .flatMap { RAGXMLHelper.attribute($0, ["val"]) }
                     .flatMap { Int($0.trimmingCharacters(in: .whitespaces)) } ?? 1
-                if span > 1 {
-                    cells.append(contentsOf: Array(repeating: "", count: min(span - 1, 32)))
+                let gridSpan = min(max(span, 1), 33)
+                let merge = properties
+                    .flatMap { RAGXMLHelper.firstChild($0, "vMerge") }
+                let mergeValue = merge
+                    .flatMap { RAGXMLHelper.attribute($0, ["val"]) }?
+                    .trimmingCharacters(in: .whitespaces).lowercased()
+                let isRestart = merge != nil && (mergeValue == "restart" || mergeValue == "1")
+                let isContinue = merge != nil && !isRestart
+                let text = docxCellText(cell, footnotes: footnotes, endnotes: endnotes,
+                                        imageMarkdown: imageMarkdown)
+
+                while cells.count < column { cells.append("") }
+                if isRestart {
+                    anchors.append(VerticalAnchor(column: column, row: rows.count, text: text))
                 }
+                if isContinue {
+                    if let index = anchors.lastIndex(where: {
+                        $0.column == column && $0.row < rows.count
+                    }), !text.isEmpty {
+                        let previous = anchors[index].text
+                        anchors[index].text = previous.isEmpty ? text : previous + " " + text
+                    }
+                }
+                cells.append(isContinue ? "" : text)
+                if gridSpan > 1 {
+                    cells.append(contentsOf: Array(repeating: "", count: gridSpan - 1))
+                }
+                column += gridSpan
+                guard column <= 256 else { break }
             }
             if !cells.isEmpty { rows.append(cells) }
+        }
+        for anchor in anchors where rows.indices.contains(anchor.row)
+            && rows[anchor.row].indices.contains(anchor.column) {
+            rows[anchor.row][anchor.column] = anchor.text
         }
         return HTMLMarkdown.renderMarkdownTable(rows)
     }
 
     private func docxCellText(_ cell: AEXMLElement, footnotes: DocxNotes?,
-                              endnotes: DocxNotes?) -> String {
+                              endnotes: DocxNotes?,
+                              imageMarkdown: [String: String]) -> String {
         var paragraphs: [String] = []
         for child in cell.children {
             switch RAGXMLHelper.localName(child.name).lowercased() {
             case "p":
-                let text = docxParagraphText(child, footnotes: footnotes, endnotes: endnotes)
+                let text = docxParagraphText(child, footnotes: footnotes, endnotes: endnotes,
+                                             imageMarkdown: imageMarkdown)
                 if !text.isEmpty { paragraphs.append(text) }
             case "tbl", "sdt", "sdtcontent":
                 // 嵌套表格/内容控件：扁平化为单元格文本，避免内容丢失。
                 for nested in RAGXMLHelper.descendants(child, "p") {
-                    let text = docxParagraphText(nested, footnotes: footnotes, endnotes: endnotes)
+                    let text = docxParagraphText(nested, footnotes: footnotes,
+                                                 endnotes: endnotes,
+                                                 imageMarkdown: imageMarkdown)
                     if !text.isEmpty { paragraphs.append(text) }
                 }
             default:
@@ -386,23 +714,63 @@ public final class OfficeParser: DocumentParser {
         return format != "bullet" && format != "none"
     }
 
-    /// 脚注/尾注：id → 文本（跳过 Word 用于分隔线的 0/1 号伪注释）。
-    private func docxNotes(_ archive: Archive, path: String) -> [String: String] {
+    /// 页眉/页脚：按归档路径排序逐个解析 `word/headerN.xml` / `footerN.xml`，
+    /// 去重后作为独立块附在正文末尾。同一内容常被多个 section 引用，逐引用
+    /// 输出会重复，因此按文件内容去重。
+    private func docxHeadersFooters(_ archive: Archive,
+                                    imageMarkdown: [String: String]) -> [String] {
+        let paths = RAGArchiveReader.filePaths(archive)
+            .filter {
+                $0.hasPrefix("word/") && ($0.contains("/header") || $0.contains("/footer"))
+                    && $0.hasSuffix(".xml")
+            }
+            .sorted()
+        var result: [String] = []
+        var seen = Set<String>()
+        for path in paths {
+            guard let data = RAGArchiveReader.data(archive, path: path),
+                  let document = try? RAGXMLHelper.parsePreservingWhitespace(
+                    data, source: path) else { continue }
+            let label = path.contains("header") ? "页眉" : "页脚"
+            // 页眉页脚段落需按 part 查表，避免与正文同 rId 串用。
+            var headerMarkdown: [String: String] = [:]
+            for (key, value) in imageMarkdown where key.hasPrefix(path + "#") {
+                headerMarkdown[String(key.dropFirst(path.count + 1))] = value
+            }
+            for paragraph in RAGXMLHelper.descendants(document.root, "p") {
+                let text = docxParagraphText(paragraph, footnotes: nil, endnotes: nil,
+                                             imageMarkdown: headerMarkdown)
+                guard !text.isEmpty, seen.insert(text).inserted else { continue }
+                result.append("\(label)：\(text)")
+            }
+        }
+        return result
+    }
+
+    /// 脚注/尾注：id → 文本。分隔线伪注释用 `w:type` 标识（separator /
+    /// continuationSeparator），而不是固定 id 0/1——真实文档里 id=1 常是正文脚注。
+    private func docxNotes(_ archive: Archive, path: String,
+                           imageMarkdown: [String: String]) -> [String: String] {
         guard let data = RAGArchiveReader.data(archive, path: path),
               let document = try? RAGXMLHelper.parsePreservingWhitespace(data, source: path) else {
             return [:]
+        }
+        var noteMarkdown: [String: String] = [:]
+        for (key, value) in imageMarkdown where key.hasPrefix(path + "#") {
+            noteMarkdown[String(key.dropFirst(path.count + 1))] = value
         }
         var notes: [String: String] = [:]
         for note in RAGXMLHelper.descendants(document.root, "footnote")
             + RAGXMLHelper.descendants(document.root, "endnote") {
             guard let id = RAGXMLHelper.attribute(note, ["id"])?
-                .trimmingCharacters(in: .whitespaces), let number = Int(id), number > 1 else { continue }
+                .trimmingCharacters(in: .whitespaces), !id.isEmpty else { continue }
             if let type = RAGXMLHelper.attribute(note, ["type"])?.lowercased(),
                type != "normal" {
                 continue
             }
             let text = RAGXMLHelper.children(note, "p")
-                .map { docxParagraphText($0, footnotes: nil, endnotes: nil) }
+                .map { docxParagraphText($0, footnotes: nil, endnotes: nil,
+                                         imageMarkdown: noteMarkdown) }
                 .filter { !$0.isEmpty }
                 .joined(separator: "\n")
             if !text.isEmpty { notes[id] = text }
@@ -412,7 +780,8 @@ public final class OfficeParser: DocumentParser {
 
     // MARK: - XLSX
 
-    private func parseXlsx(archive: Archive) throws -> (String, [OutlineEntry], [String: String]) {
+    private func parseXlsx(archive: Archive,
+                           imageMarkdown: [String: String]) throws -> (String, [OutlineEntry], [String: String]) {
         guard let workbookData = RAGArchiveReader.data(archive, path: "xl/workbook.xml") else {
             throw AgentError.parse("XLSX 缺少 xl/workbook.xml")
         }
@@ -444,13 +813,15 @@ public final class OfficeParser: DocumentParser {
            let shared = try? RAGXMLHelper.parsePreservingWhitespace(
             sharedData, source: "xl/sharedStrings.xml") {
             sharedStrings = RAGXMLHelper.descendants(shared.root, "si")
-                .map { xlsxRichText($0).trimmingCharacters(in: .whitespacesAndNewlines) }
+                .map { xlsxRichTextPreserved($0) }
         }
 
         var sections: [String] = []
         var outline: [OutlineEntry] = []
         var truncatedSheets: [String] = []
+        var truncatedSheetList = false
         for (index, sheet) in sheets.enumerated() {
+            if index >= Self.maxXlsxSheets { truncatedSheetList = true; break }
             let sheetName = RAGXMLHelper.attribute(sheet, ["name"]) ?? "Sheet\(index + 1)"
             var sheetPath: String?
             if let relationshipID = RAGXMLHelper.attribute(sheet, ["r:id"]),
@@ -472,6 +843,8 @@ public final class OfficeParser: DocumentParser {
 
             var rows: [[String]] = []
             var truncated = false
+            let mergeRanges = xlsxMergeRanges(sheetDocument.root)
+            var consumedImageKeys = Set<String>()
             for row in RAGXMLHelper.descendants(sheetDocument.root, "row") {
                 if rows.count >= Self.maxXlsxRows { truncated = true; break }
                 var values: [Int: String] = [:]
@@ -481,8 +854,16 @@ public final class OfficeParser: DocumentParser {
                     // 远端列（异常引用 / 格式残留）会把行宽撑到上万列，
                     // 限制到常见工作表范围，避免生成巨型空表。
                     guard column >= 0, column < Self.maxXlsxColumns else { continue }
-                    let value = xlsxCellText(cell, sharedStrings: sharedStrings,
+                    var value = xlsxCellText(cell, sharedStrings: sharedStrings,
                                              styles: styles, date1904: date1904)
+                    // 图片锚点处的 Ovis 文本回填到所在单元格，避免图片信息缺失。
+                    if let rowIndex = Int(RAGXMLHelper.attribute(row, ["r"]) ?? "") {
+                        let key = "\(path)#\(rowIndex),\(column)"
+                        if let markdown = imageMarkdown[key] {
+                            value = value.isEmpty ? markdown : value + " " + markdown
+                            consumedImageKeys.insert(key)
+                        }
+                    }
                     // 单元格里的换行/竖线会截断 Markdown 表格，必须先转义。
                     if !value.isEmpty { values[column] = HTMLMarkdown.escapeTableCell(value) }
                 }
@@ -490,11 +871,25 @@ public final class OfficeParser: DocumentParser {
                 let width = (values.keys.max() ?? 0) + 1
                 rows.append((0..<width).map { values[$0] ?? "" })
             }
+            applyXlsxMerges(rows: &rows, ranges: mergeRanges)
             if truncated { truncatedSheets.append(sheetName) }
 
             let table = HTMLMarkdown.renderMarkdownTable(rows)
-            guard !table.isEmpty else { continue }
-            sections.append("## Sheet: \(sheetName)\n\n\(table)")
+            // 锚定在空单元格/空行/absoluteAnchor 的图片没有 <c> 可回填，
+            // 追加到该 sheet 末尾，不让 OCR 结果被静默丢弃。
+            let orphans = imageMarkdown.keys
+                .filter { $0.hasPrefix(path + "#") && !consumedImageKeys.contains($0) }
+                .sorted()
+            // 空表但含图片时必须保留该 sheet，否则图片信息随 continue 一起丢失。
+            guard !table.isEmpty || !orphans.isEmpty else { continue }
+            var section = "## Sheet: \(sheetName)\n\n"
+            if !table.isEmpty { section += table }
+            for key in orphans {
+                if let markdown = imageMarkdown[key] {
+                    section += "\n\n[嵌入图片 \(key)]\n" + markdown
+                }
+            }
+            sections.append(section)
             outline.append(OutlineEntry(level: 2, title: "Sheet: \(sheetName)"))
         }
 
@@ -502,12 +897,59 @@ public final class OfficeParser: DocumentParser {
             throw AgentError.parse("XLSX 未读取到任何工作表数据")
         }
         var metadata: [String: String] = ["sheets": String(sections.count)]
+        if !imageMarkdown.isEmpty { metadata["embedded_images_ocr"] = String(imageMarkdown.count) }
+        if truncatedSheetList {
+            metadata["truncated_sheet_list"] = String(sheets.count)
+            metadata["max_sheets"] = String(Self.maxXlsxSheets)
+        }
         if !truncatedSheets.isEmpty {
             // 行数超过上限时明确记录，避免大表被静默截断后无法察觉。
             metadata["truncated_sheets"] = truncatedSheets.joined(separator: ",")
             metadata["max_rows_per_sheet"] = String(Self.maxXlsxRows)
         }
         return (sections.joined(separator: "\n\n"), outline, metadata)
+    }
+
+    /// `mergeCells/mergeCell ref="A1:C2"`：用左上角的值填充整个区域，
+    /// Markdown 表格没有合并语法，填充后检索仍能命中合并单元格文本。
+    private func xlsxMergeRanges(_ root: AEXMLElement) -> [(row: Int, column: Int, rowEnd: Int, columnEnd: Int)] {
+        var result: [(row: Int, column: Int, rowEnd: Int, columnEnd: Int)] = []
+        for container in RAGXMLHelper.descendants(root, "mergeCells") {
+            for cell in RAGXMLHelper.children(container, "mergeCell") {
+                guard let ref = RAGXMLHelper.attribute(cell, ["ref"]) else { continue }
+                let parts = ref.split(separator: ":", maxSplits: 1).map(String.init)
+                guard parts.count == 2,
+                      let first = xlsxCellPosition(parts[0]),
+                      let last = xlsxCellPosition(parts[1]) else { continue }
+                result.append((first.row, first.column,
+                               min(last.row, Self.maxXlsxRows - 1),
+                               min(last.column, Self.maxXlsxColumns - 1)))
+            }
+        }
+        return result
+    }
+
+    private func xlsxCellPosition(_ reference: String) -> (row: Int, column: Int)? {
+        let letters = reference.prefix { $0.isLetter }
+        guard !letters.isEmpty,
+              let row = Int(reference.dropFirst(letters.count)) else { return nil }
+        return (row - 1, columnIndex(from: String(letters)))
+    }
+
+    private func applyXlsxMerges(rows: inout [[String]],
+                                 ranges: [(row: Int, column: Int, rowEnd: Int, columnEnd: Int)]) {
+        for range in ranges {
+            guard rows.indices.contains(range.row),
+                  rows[range.row].indices.contains(range.column) else { continue }
+            let value = rows[range.row][range.column]
+            guard !value.isEmpty else { continue }
+            for row in max(range.row, 0)...min(range.rowEnd, rows.count - 1) {
+                guard rows[row].indices.contains(range.column) else { continue }
+                for column in range.column...min(range.columnEnd, rows[row].count - 1) {
+                    if rows[row][column].isEmpty { rows[row][column] = value }
+                }
+            }
+        }
     }
 
     /// 单元格取值：按 `t` 类型分支，并对数值套用日期/百分比格式。
@@ -533,10 +975,17 @@ public final class OfficeParser: DocumentParser {
             return RAGXMLHelper.firstChild(cell, "v")?.value?
                 .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         default:
-            guard let raw = RAGXMLHelper.firstChild(cell, "v")?.value?
-                .trimmingCharacters(in: .whitespacesAndNewlines), !raw.isEmpty else { return "" }
             let styleIndex = RAGXMLHelper.attribute(cell, ["s"])
                 .flatMap { Int($0.trimmingCharacters(in: .whitespaces)) }
+            guard let raw = RAGXMLHelper.firstChild(cell, "v")?.value?
+                .trimmingCharacters(in: .whitespacesAndNewlines), !raw.isEmpty else {
+                // 无缓存值的公式也要保留语义：Excel/WPS 常在保存后清空 <v>。
+                if let formula = RAGXMLHelper.firstChild(cell, "f")?.value?
+                    .trimmingCharacters(in: .whitespacesAndNewlines), !formula.isEmpty {
+                    return "=\(formula)"
+                }
+                return ""
+            }
             if styles.isDateStyle(styleIndex), let serial = Double(raw),
                let text = xlsxDateText(serial: serial, date1904: date1904) {
                 return text
@@ -544,18 +993,29 @@ public final class OfficeParser: DocumentParser {
             if styles.isPercentStyle(styleIndex), let number = Double(raw) {
                 return xlsxPercentText(number)
             }
+            // 有公式且带缓存值：同时给出公式与结果，避免只留值丢失推导过程。
+            if let formula = RAGXMLHelper.firstChild(cell, "f")?.value?
+                .trimmingCharacters(in: .whitespacesAndNewlines), !formula.isEmpty {
+                return "=\(formula) → \(raw)"
+            }
             return raw
         }
     }
 
     /// 富文本取值：跳过 `rPh`（注音），避免注音字符混进正文。
     private func xlsxRichText(_ element: AEXMLElement) -> String {
+        xlsxRichTextPreserved(element).trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    /// 保留 `xml:space="preserve"` 的 `<t>` 原始空白；共享字符串里前后空格
+    /// 是数据的一部分，不能无条件 trim。
+    private func xlsxRichTextPreserved(_ element: AEXMLElement) -> String {
         var result = ""
         func walk(_ node: AEXMLElement) {
             for child in node.children {
                 switch RAGXMLHelper.localName(child.name).lowercased() {
                 case "rph", "phoneticpr": continue
-                case "t": result += child.value ?? ""
+                case "t": result += preservedText(child)
                 default: walk(child)
                 }
             }
@@ -599,6 +1059,9 @@ public final class OfficeParser: DocumentParser {
         components.day = date1904 ? 1 : 30
         guard let base = calendar.date(from: components) else { return nil }
 
+        // Excel 1900 系统虚构了 1900-02-29（序列号 60），Foundation 无此日期，
+        // 直接输出Excel 的显示值；其余日期按 1899-12-30 基准换算。
+        if !date1904, serial == 60 { return "1900-02-29" }
         // 1900 系统在 1900-03-01 之前的日子比基准少一天（序列号 1 = 1900-01-01）。
         let offset = date1904 || serial >= 60 ? serial : serial + 1
         guard let date = calendar.date(byAdding: .second,
@@ -609,10 +1072,10 @@ public final class OfficeParser: DocumentParser {
                                             from: date)
         let day = String(format: "%04d-%02d-%02d", parts.year ?? 0, parts.month ?? 0,
                          parts.day ?? 0)
-        let hasTime = (parts.hour ?? 0) != 0 || (parts.minute ?? 0) != 0
-            || (parts.second ?? 0) != 0
-        guard hasTime else { return day }
-        return day + String(format: " %02d:%02d", parts.hour ?? 0, parts.minute ?? 0)
+        let hour = parts.hour ?? 0, minute = parts.minute ?? 0, second = parts.second ?? 0
+        if hour == 0 && minute == 0 && second == 0 { return day }
+        if second != 0 { return day + String(format: " %02d:%02d:%02d", hour, minute, second) }
+        return day + String(format: " %02d:%02d", hour, minute)
     }
 
     /// 百分比：0.5 → 「50%」，去掉无意义的小数尾零。
@@ -637,7 +1100,8 @@ public final class OfficeParser: DocumentParser {
 
     // MARK: - PPTX
 
-    private func parsePptx(archive: Archive) throws -> (String, [OutlineEntry], [String: String]) {
+    private func parsePptx(archive: Archive,
+                           imageMarkdown: [String: String]) throws -> (String, [OutlineEntry], [String: String]) {
         let presentationRels = relationships(archive, path: "ppt/_rels/presentation.xml.rels")
         var relationshipsByID: [String: String] = [:]
         for relationship in presentationRels {
@@ -676,7 +1140,8 @@ public final class OfficeParser: DocumentParser {
             }
             let slideRels = relationships(archive, path: relatedPartPath(path))
             let (content, title) = renderSlide(slide.root, useRelationships: slideRels,
-                                               archive: archive)
+                                               archive: archive, slidePath: path,
+                                               imageMarkdown: imageMarkdown)
             // 标题页用幻灯片标题做小节标题，便于在大纲与正文里定位。
             let sectionTitle = title.map { "Slide \(index + 1)：\($0)" } ?? "Slide \(index + 1)"
             var section = "## \(sectionTitle)"
@@ -691,7 +1156,9 @@ public final class OfficeParser: DocumentParser {
                 if let notesData = RAGArchiveReader.data(archive, path: notesPath),
                    let notesDocument = try? RAGXMLHelper.parsePreservingWhitespace(
                     notesData, source: notesPath) {
-                    let notes = renderNotesSlide(notesDocument.root)
+                    let notes = renderNotesSlide(notesDocument.root,
+                                                 notesPath: notesPath,
+                                                 imageMarkdown: imageMarkdown)
                         .trimmingCharacters(in: .whitespacesAndNewlines)
                     if !notes.isEmpty {
                         section += "\n\n**演讲者备注**\n\n" + notes
@@ -708,6 +1175,7 @@ public final class OfficeParser: DocumentParser {
         }
         var metadata: [String: String] = ["slides": String(sections.count)]
         if notesSlides > 0 { metadata["notes_slides"] = String(notesSlides) }
+        if !imageMarkdown.isEmpty { metadata["embedded_images_ocr"] = String(imageMarkdown.count) }
         return (sections.joined(separator: "\n\n"), outline, metadata)
     }
 
@@ -750,7 +1218,8 @@ public final class OfficeParser: DocumentParser {
     }
 
     private func renderSlide(_ root: AEXMLElement, useRelationships: [OfficeRelationship],
-                             archive: Archive) -> (String, String?) {
+                             archive: Archive, slidePath: String,
+                             imageMarkdown: [String: String]) -> (String, String?) {
         var blocks: [String] = []
         var title: String?
 
@@ -778,6 +1247,25 @@ public final class OfficeParser: DocumentParser {
                 if !rendered, let diagram = diagramTexts(shape, useRelationships: useRelationships,
                                                         archive: archive), !diagram.isEmpty {
                     blocks.append(diagram.joined(separator: "\n"))
+                    rendered = true
+                }
+                // 图表：图表标题/分类/系列标签是唯一可读文本，由 chartN.xml 提供。
+                if !rendered, let chart = chartTexts(shape, useRelationships: useRelationships,
+                                                    archive: archive), !chart.isEmpty {
+                    blocks.append(chart.joined(separator: "\n"))
+                }
+            } else if name == "pic" {
+                // 优先放回 Ovis 识别的图片正文，没有结果时使用替代文本。
+                let refs = RAGXMLHelper.descendants(shape, "blip")
+                    + RAGXMLHelper.descendants(shape, "imagedata")
+                let markdown = refs
+                    .compactMap { RAGXMLHelper.attribute($0, ["r:embed", "embed", "r:link", "link", "r:id", "id"]) }
+                    .compactMap { imageMarkdown[slidePath + "#" + $0] }
+                    .joined(separator: "\n")
+                if !markdown.isEmpty {
+                    blocks.append(markdown)
+                } else if let alt = pptxAlternativeText(shape), !alt.isEmpty {
+                    blocks.append("[\(alt)]")
                 }
             }
         }
@@ -785,10 +1273,22 @@ public final class OfficeParser: DocumentParser {
     }
 
     /// 演讲者备注：跳过节标题/页码/日期等占位符，只取备注正文。
-    private func renderNotesSlide(_ root: AEXMLElement) -> String {
+    private func renderNotesSlide(_ root: AEXMLElement, notesPath: String,
+                                  imageMarkdown: [String: String]) -> String {
         var paragraphs: [String] = []
         for shape in collectShapes(root) {
-            guard RAGXMLHelper.localName(shape.name).lowercased() == "sp" else { continue }
+            let name = RAGXMLHelper.localName(shape.name).lowercased()
+            if name == "pic" {
+                let refs = RAGXMLHelper.descendants(shape, "blip")
+                    + RAGXMLHelper.descendants(shape, "imagedata")
+                let markdown = refs
+                    .compactMap { RAGXMLHelper.attribute($0, ["r:embed", "embed", "r:link", "link", "r:id", "id"]) }
+                    .compactMap { imageMarkdown[notesPath + "#" + $0] }
+                    .joined(separator: "\n")
+                if !markdown.isEmpty { paragraphs.append(markdown) }
+                continue
+            }
+            guard name == "sp" else { continue }
             if let type = RAGXMLHelper.descendants(shape, "ph").first
                 .flatMap({ RAGXMLHelper.attribute($0, ["type"]) })?.lowercased(),
                Self.pptxNonContentPlaceholders.contains(type) {
@@ -801,6 +1301,41 @@ public final class OfficeParser: DocumentParser {
             }
         }
         return paragraphs.joined(separator: "\n\n")
+    }
+
+    /// 图片替代文本：PPTX 用 `p:cNvPr descr=`，与 DOCX 的 `wp:docPr` 不同。
+    private func pptxAlternativeText(_ shape: AEXMLElement) -> String? {
+        for node in RAGXMLHelper.descendants(shape, "cNvPr") {
+            for key in ["descr", "title", "name"] {
+                if let value = RAGXMLHelper.attribute(node, [key])?
+                    .trimmingCharacters(in: .whitespacesAndNewlines),
+                   !value.isEmpty { return value }
+            }
+        }
+        return nil
+    }
+
+    /// 图表文本：从 chartN.xml 取标题（c:tx/c:v）、分类轴标签（c:pt/c:v）
+    /// 与系列名（c:ser/c:tx/c:v），保证图表语义不因无正文而丢失。
+    private func chartTexts(_ shape: AEXMLElement, useRelationships: [OfficeRelationship],
+                            archive: Archive) -> [String]? {
+        guard let chartID = RAGXMLHelper.descendants(shape, "chart").first
+            .flatMap({ RAGXMLHelper.attribute($0, ["r:id"]) }),
+              let relationship = useRelationships.first(where: { $0.id == chartID }) else {
+            return nil
+        }
+        let path = resolvePartTarget(relationship.target, baseDirectory: "ppt/slides")
+        guard let data = RAGArchiveReader.data(archive, path: path),
+              let document = try? RAGXMLHelper.parsePreservingWhitespace(data, source: path),
+              document.root.name.lowercased().contains("chart") else { return nil }
+        var lines: [String] = []
+        for node in RAGXMLHelper.descendants(document.root, "v") {
+            guard node.children.isEmpty,
+                  let text = node.value?.trimmingCharacters(in: .whitespacesAndNewlines),
+                  !text.isEmpty else { continue }
+            if lines.last != text { lines.append(text) }
+        }
+        return lines.isEmpty ? nil : Array(lines.prefix(64))
     }
 
     /// SmartArt 文本：`dgm:relIds` 指向 ppt/diagrams/dataN.xml 的数据点文本。
@@ -870,10 +1405,11 @@ public final class OfficeParser: DocumentParser {
         for row in RAGXMLHelper.children(table, "tr") {
             let cells = RAGXMLHelper.children(row, "tc")
             rows.append(cells.map { cell in
+                // 单元格内换行是内容结构，不能压平成空格后丢进 Markdown 表格。
                 let text = RAGXMLHelper.descendants(cell, "p")
                     .map { pptxParagraphText($0).trimmingCharacters(in: .whitespacesAndNewlines) }
                     .filter { !$0.isEmpty }
-                    .joined(separator: " ")
+                    .joined(separator: "\n")
                 return HTMLMarkdown.escapeTableCell(text)
             })
         }
@@ -881,9 +1417,13 @@ public final class OfficeParser: DocumentParser {
     }
 
     private func slideNumber(_ path: String) -> Int {
-        let name = (path as NSString).lastPathComponent
-        let digits = name.filter(\.isNumber)
-        return Int(digits) ?? 0
+        let name = (path as NSString).deletingPathExtension
+        // 只取 slide 后的连续数字，避免 slide1-2.xml 被拼成 12。
+        guard let range = name.range(of: #"slide(\d+)"#, options: .regularExpression),
+              let digits = name[range].range(of: #"\d+"#, options: .regularExpression) else {
+            return 0
+        }
+        return Int(name[digits]) ?? 0
     }
 
     // MARK: - 路径
@@ -981,12 +1521,42 @@ public final class OfficeParser: DocumentParser {
             guard let styleIndex, cellFormatIDs.indices.contains(styleIndex) else { return false }
             let id = cellFormatIDs[styleIndex]
             if Self.builtinPercentFormats.contains(id) { return true }
-            if let code = customFormats[id] { return code.contains("%") }
+            if let code = customFormats[id] { return Self.formatIsPercent(code) }
             return false
-        }
+            }
 
-        /// 日期判定：剥掉引号文本、方括号段与转义字符后，含 y/m/d/h/s 即为日期时间。
-        private static func formatIsDate(_ code: String) -> Bool {
+            /// 百分比判定需忽略引号字面量与 `%%` 转义，形如 `yyyy"%"mm` 是日期而非百分比。
+            private static func formatIsPercent(_ code: String) -> Bool {
+            var cleaned = ""
+            var inQuotes = false
+            var escaped = false
+            var index = code.startIndex
+            while index < code.endIndex {
+                let character = code[index]
+                if escaped { escaped = false; index = code.index(after: index); continue }
+                switch character {
+                case "\\":
+                    escaped = true
+                case "\"":
+                    inQuotes.toggle()
+                case "%":
+                    let next = code.index(after: index)
+                    if !inQuotes && !(next < code.endIndex && code[next] == "%") {
+                        cleaned.append(character)
+                    }
+                    if next < code.endIndex && code[next] == "%" {
+                        index = next
+                    }
+                default:
+                    if !inQuotes { cleaned.append(character) }
+                }
+                index = code.index(after: index)
+            }
+            return cleaned.contains("%")
+            }
+
+            /// 日期判定：剥掉引号文本、方括号段与转义字符后，含 y/m/d/h/s 即为日期时间。
+            private static func formatIsDate(_ code: String) -> Bool {
             var cleaned = ""
             var inQuotes = false
             var inBrackets = false
@@ -1030,4 +1600,5 @@ public final class OfficeParser: DocumentParser {
     /// XLSX 安全上限：防止异常列引用/超长表把内存与 Markdown 撑爆。
     private static let maxXlsxColumns = 256
     private static let maxXlsxRows = 20_000
+    private static let maxXlsxSheets = 100
 }

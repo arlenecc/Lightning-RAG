@@ -107,6 +107,12 @@ struct BaseAgentDesktopApp: App {
             MarkdownConvertView(model: model)
         }
         .defaultSize(width: 1120, height: 680)
+
+        Window("扫描书阅读器", id: "mobi-scan-reader") {
+            MobiScanReaderView(model: model)
+                .frame(minWidth: 900, minHeight: 640)
+        }
+        .defaultSize(width: 1200, height: 860)
     }
 }
 

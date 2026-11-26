@@ -2,6 +2,19 @@ import XCTest
 import ZIPFoundation
 @testable import BaseAgentCore
 
+private final class ImageOCRFakeVLM: VLMService {
+    let identifier = "office-image-fake"
+    let isAvailable = true
+    private let lock = NSLock()
+    private var _calls = 0
+    var calls: Int { lock.lock(); defer { lock.unlock() }; return _calls }
+
+    func recognize(image: CGImage, prompt: String, maxTokens: Int) async throws -> String {
+        lock.lock(); _calls += 1; lock.unlock()
+        return "| 图内表格 | 值 |\n| --- | --- |\n| 图内标题 | 42 |"
+    }
+}
+
 final class OfficeAndHTMLTests: XCTestCase {
     private var directory: URL!
 
@@ -765,6 +778,225 @@ final class OfficeAndHTMLTests: XCTestCase {
         XCTAssertTrue(parsed.text.contains("三个里程碑"), parsed.text)
         XCTAssertFalse(parsed.text.contains("99 页码"), parsed.text)
         XCTAssertEqual(parsed.metadata["notes_slides"], "1")
+    }
+
+    // MARK: - 修复回归：OOXML 信息完整性
+
+    func testDocxVMergeAndHeaderFooterAndImageAlt() throws {
+        let url = directory.appendingPathComponent("merge.docx")
+        let documentXML = """
+        <?xml version="1.0"?>
+        <w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+                    xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing">
+          <w:body>
+            <w:p><w:r><w:drawing><wp:docPr descr="封面示意图"/></w:drawing>
+                 <w:t>正文含图</w:t></w:r></w:p>
+            <w:tbl>
+              <w:tr>
+                <w:tc><w:tcPr><w:vMerge w:val="restart"/></w:tcPr><w:p><w:r><w:t>合并标题</w:t></w:r></w:p></w:tc>
+                <w:tc><w:p><w:r><w:t>右列一</w:t></w:r></w:p></w:tc>
+              </w:tr>
+              <w:tr>
+                <w:tc><w:tcPr><w:vMerge/></w:tcPr><w:p><w:r><w:t>续行内容</w:t></w:r></w:p></w:tc>
+                <w:tc><w:p><w:r><w:t>右列二</w:t></w:r></w:p></w:tc>
+              </w:tr>
+            </w:tbl>
+          </w:body>
+        </w:document>
+        """
+        let headerXML = """
+        <?xml version="1.0"?>
+        <w:hdr xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+          <w:p><w:r><w:t>页眉文字</w:t></w:r></w:p>
+        </w:hdr>
+        """
+        try makeArchive(at: url, files: [
+            ("word/document.xml", documentXML),
+            ("word/header1.xml", headerXML),
+            ("[Content_Types].xml", "<?xml version=\"1.0\"?><Types/>"),
+        ])
+        let parsed = try awaitSync {
+            try await OfficeParser().parse(url: url, options: ParserOptions(), progress: nil)
+        }
+        XCTAssertTrue(parsed.text.contains("[封面示意图]"))
+        XCTAssertTrue(parsed.text.contains("合并标题 续行内容"),
+                      "vMerge 区域文本应合并到起点单元格")
+        XCTAssertTrue(parsed.text.contains("页眉文字"))
+        XCTAssertEqual(parsed.metadata["header_footer_blocks"], "1")
+    }
+
+    func testDocxFootnoteIdOneIsKept() throws {
+        let url = directory.appendingPathComponent("footnote1.docx")
+        let documentXML = """
+        <?xml version="1.0"?>
+        <w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+          <w:body><w:p><w:r><w:t>正文</w:t>
+            <w:footnoteReference w:id="1"/></w:r></w:p></w:body>
+        </w:document>
+        """
+        let footnotesXML = """
+        <?xml version="1.0"?>
+        <w:footnotes xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+          <w:footnote w:id="0" w:type="separator"><w:p><w:r><w:t>--</w:t></w:r></w:p></w:footnote>
+          <w:footnote w:id="1"><w:p><w:r><w:t>真实脚注内容</w:t></w:r></w:p></w:footnote>
+        </w:footnotes>
+        """
+        try makeArchive(at: url, files: [
+            ("word/document.xml", documentXML),
+            ("word/footnotes.xml", footnotesXML),
+            ("[Content_Types].xml", "<?xml version=\"1.0\"?><Types/>"),
+        ])
+        let parsed = try awaitSync {
+            try await OfficeParser().parse(url: url, options: ParserOptions(), progress: nil)
+        }
+        XCTAssertTrue(parsed.text.contains("真实脚注内容"))
+        XCTAssertFalse(parsed.text.contains("--"))
+    }
+
+    func testXlsxFormulaPreserveSpaceDateSecondAndPercent() throws {
+        let url = directory.appendingPathComponent("rich.xlsx")
+        let workbook = """
+        <?xml version="1.0"?>
+        <workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+          <sheets><sheet name="数据" r:id="rId1"/></sheets>
+        </workbook>
+        """
+        let rels = """
+        <?xml version="1.0"?>
+        <Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+          <Relationship Id="rId1" Type="worksheet" Target="worksheets/sheet1.xml"/>
+        </Relationships>
+        """
+        let shared = """
+        <?xml version="1.0"?>
+        <sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+          <si><t xml:space="preserve"> 带空格 </t></si>
+        </sst>
+        """
+        let styles = """
+        <?xml version="1.0"?>
+        <styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+          <numFmts count="2">
+            <numFmt numFmtId="164" formatCode="yyyy-mm-dd hh:mm:ss"/>
+            <numFmt numFmtId="165" formatCode="yyyy&quot;%&quot;mm"/>
+          </numFmts>
+          <cellXfs count="3">
+            <xf numFmtId="0"/><xf numFmtId="164"/><xf numFmtId="165"/>
+          </cellXfs>
+        </styleSheet>
+        """
+        let sheet = """
+        <?xml version="1.0"?>
+        <worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+          <sheetData>
+            <row r="1">
+              <c r="A1" t="s"><v>0</v></c>
+              <c r="B1"><f>1+2</f><v>3</v></c>
+              <c r="C1"><f>SUM(A1:B1)</f></c>
+              <c r="D1" s="1"><v>45000.5</v></c>
+              <c r="E1" s="2"><v>1</v></c>
+            </row>
+          </sheetData>
+          <mergeCells count="1"><mergeCell ref="A1:B1"/></mergeCells>
+        </worksheet>
+        """
+        try makeArchive(at: url, files: [
+            ("xl/workbook.xml", workbook),
+            ("xl/_rels/workbook.xml.rels", rels),
+            ("xl/sharedStrings.xml", shared),
+            ("xl/styles.xml", styles),
+            ("xl/worksheets/sheet1.xml", sheet),
+            ("[Content_Types].xml", "<?xml version=\"1.0\"?><Types/>"),
+        ])
+        let parsed = try awaitSync {
+            try await OfficeParser().parse(url: url, options: ParserOptions(), progress: nil)
+        }
+        XCTAssertTrue(parsed.text.contains("带空格"), "共享字符串应保留前后空格")
+        XCTAssertTrue(parsed.text.contains("=1+2 → 3"), "公式与缓存值都要保留")
+        XCTAssertTrue(parsed.text.contains("=SUM(A1:B1)"), "无缓存值的公式也要保留")
+        XCTAssertTrue(parsed.text.contains(":"), "日期时间应保留秒")
+        XCTAssertFalse(parsed.text.contains("100%"), "引号内的 % 不是百分比格式")
+    }
+
+    func testPptxImageAltTextAndSlideFallbackOrder() throws {
+        let url = directory.appendingPathComponent("images.pptx")
+        let presentation = """
+        <?xml version="1.0"?>
+        <p:presentation xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"/>
+        """
+        let slide1 = """
+        <?xml version="1.0"?>
+        <p:sld xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"
+               xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">
+          <p:cSld><p:spTree>
+            <p:pic><p:nvPicPr><p:cNvPr descr="架构图"/></p:nvPicPr></p:pic>
+          </p:spTree></p:cSld>
+        </p:sld>
+        """
+        try makeArchive(at: url, files: [
+            ("ppt/presentation.xml", presentation),
+            ("ppt/slides/slide1.xml", slide1),
+            ("[Content_Types].xml", "<?xml version=\"1.0\"?><Types/>"),
+        ])
+        let parsed = try awaitSync {
+            try await OfficeParser().parse(url: url, options: ParserOptions(), progress: nil)
+        }
+        XCTAssertTrue(parsed.text.contains("[架构图]"), "幻灯片图片替代文本应进入正文")
+        XCTAssertEqual(parsed.metadata["slides"], "1")
+    }
+
+    func testDocxEmbeddedImageOCRReinsertedAtImagePosition() throws {
+        let url = directory.appendingPathComponent("embedded-image.docx")
+        // 1x1 透明 PNG
+        let png = Data(base64Encoded:
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==")!
+        guard let archive = try? Archive(url: url, accessMode: .create) else {
+            return XCTFail("无法创建归档")
+        }
+        func add(_ path: String, _ content: Data) throws {
+            try archive.addEntry(with: path, type: .file,
+                                 uncompressedSize: Int64(content.count),
+                                 compressionMethod: .deflate) { position, size in
+                content.subdata(in: Int(position)..<Int(position) + size)
+            }
+        }
+        let xml = """
+        <?xml version="1.0"?>
+        <w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+                    xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"
+                    xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+          <w:background><w:drawing><a:blip r:embed="rIdBg"/></w:drawing></w:background>
+          <w:body><w:p><w:r>
+            <w:t>前文</w:t>
+            <w:drawing><a:blip r:embed="rIdImg"/></w:drawing>
+            <w:t>后文</w:t>
+          </w:r></w:p></w:body>
+        </w:document>
+        """
+        let rels = """
+        <?xml version="1.0"?>
+        <Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+          <Relationship Id="rIdImg" Type="image" Target="media/image1.png"/>
+          <Relationship Id="rIdBg" Type="image" Target="media/bg.png"/>
+        </Relationships>
+        """
+        try add("word/document.xml", Data(xml.utf8))
+        try add("word/_rels/document.xml.rels", Data(rels.utf8))
+        try add("word/media/image1.png", png)
+        try add("word/media/bg.png", png)
+
+        let fake = ImageOCRFakeVLM()
+        let parsed = try awaitSync {
+            try await OfficeParser(vlm: fake).parse(
+                url: url, options: ParserOptions(epubOCREngine: .ovis), progress: nil)
+        }
+        XCTAssertTrue(parsed.text.contains("图内表格"), "嵌入图片应经 Ovis 转成 Markdown")
+        XCTAssertEqual(fake.calls, 1, "背景图不应被 OCR")
+        let before = parsed.text.range(of: "前文")!.lowerBound
+        let image = parsed.text.range(of: "图内表格")!.lowerBound
+        let after = parsed.text.range(of: "后文")!.lowerBound
+        XCTAssertTrue(before < image && image < after, "OCR 文本应放回图片所在位置")
+        XCTAssertEqual(parsed.metadata["embedded_images_ocr"], "1")
     }
 
     // MARK: helpers

@@ -660,7 +660,7 @@ public final class RAGEngine {
 
     public static let supportedExtensions: Set<String> = [
         "pdf", "txt", "md", "markdown", "html", "htm", "xhtml",
-        "epub", "docx", "xlsx", "pptx", "doc", "xls", "ppt",
+        "epub", "mobi", "azw3", "prc", "docx", "xlsx", "pptx", "doc", "xls", "ppt",
         "csv", "json", "rst", "tex", "log",
         // 独立图片文件：Apple Vision OCR。
         "png", "jpg", "jpeg", "tiff", "tif", "bmp", "heic", "heif", "webp",
@@ -741,7 +741,7 @@ public final class RAGEngine {
             }
         }
         var stem = String(scalars).lowercased()
-        for ext in [".pdf", ".epub", ".mobi", ".docx", ".doc", ".txt", ".md"] {
+        for ext in [".pdf", ".epub", ".mobi", ".azw3", ".prc", ".docx", ".doc", ".txt", ".md"] {
             if stem.hasSuffix(ext) {
                 stem = String(stem.dropLast(ext.count))
                 break

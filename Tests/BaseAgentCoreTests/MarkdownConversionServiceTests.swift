@@ -127,6 +127,20 @@ final class MarkdownConversionServiceTests: XCTestCase {
         })?.error)
     }
 
+    func testEbookFormatsReachConverterAndParserRegistry() {
+        // 转换工具与知识同步共用 RAGEngine.supportedExtensions 和 DocumentParserRegistry，
+        // 这两种格式不得在任何一环被判为不支持而跳过。
+        let registry = DocumentParserRegistry.makeDefault(config: AgentConfig())
+        for ext in ["mobi", "azw3", "prc"] {
+            XCTAssertTrue(RAGEngine.supportedExtensions.contains(ext),
+                          "supportedExtensions 应包含 \(ext)")
+            XCTAssertNotNil(
+                registry.parser(for: URL(fileURLWithPath: "/tmp/book.\(ext)"),
+                                options: ParserOptions()),
+                "转换工具应能取得 \(ext) 的解析器")
+        }
+    }
+
     func testUnsupportedSingleFileThrows() async throws {
         let source = root.appendingPathComponent("image.gif")
         try "gif".write(to: source, atomically: true, encoding: .utf8)

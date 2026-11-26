@@ -264,6 +264,31 @@ final class LegacyExcelExtractorTests: XCTestCase {
         }
     }
 
+    func testCurrencyThousandsAndFictionalLeapDay() throws {
+        let builder = BIFF8TestBuilder(
+            sheets: [
+                .init(name: "格式", cells: [
+                    .init(row: 0, column: 0, value: .label("货币")),
+                    .init(row: 0, column: 1, value: .number(1234567.5, xf: 1)),
+                    .init(row: 1, column: 0, value: .label("千分位")),
+                    .init(row: 1, column: 1, value: .number(1234567, xf: 2)),
+                    .init(row: 2, column: 0, value: .label("虚构闰日")),
+                    .init(row: 2, column: 1, value: .number(60, xf: 3)),
+                ]),
+            ],
+            formats: [
+                (1, "[$¥-804]#,##0.00"),
+                (2, "#,##0"),
+                (3, "yyyy-mm-dd"),
+            ],
+            xfFormatIDs: [0, 1, 2, 3])
+        let doc = try LegacyExcelExtractor().extract(url: try write(builder.build()))
+        XCTAssertTrue(doc.text.contains("¥"), "货币符号应保留")
+        XCTAssertTrue(doc.text.contains("1,234,567"), "千分位分隔符应保留")
+        XCTAssertTrue(doc.text.contains("1900-02-29"), "序列号 60 是 Excel 虚构闰日")
+        XCTAssertNotNil(doc.metadata["skipped_cells"])
+    }
+
     // MARK: - helpers
 
     private func write(_ file: OLE2TestFile) throws -> URL {

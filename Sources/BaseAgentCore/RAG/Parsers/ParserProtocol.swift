@@ -145,6 +145,12 @@ public final class DocumentParserRegistry: @unchecked Sendable {
         if ext == "epub", let config {
             return EPUBParser(config: config)
         }
+        if ["docx", "xlsx", "pptx"].contains(ext), let config {
+            return OfficeParser(config: config)
+        }
+        if ["doc", "xls", "ppt"].contains(ext), let config {
+            return LegacyOfficeParser(config: config)
+        }
         return parser(for: url, options: options)
     }
 
@@ -165,15 +171,16 @@ public final class DocumentParserRegistry: @unchecked Sendable {
         return parsers.first(where: { $0.supportedExtensions.contains("*") })
     }
 
-    /// 默认工厂：PDF（ovis + vision）、EPUB、Office、HTML/文本。
+    /// 默认工厂：PDF（ovis + vision）、EPUB、MOBI/AZW3、Office、HTML/文本。
     public static func makeDefault(config: AgentConfig) -> DocumentParserRegistry {
         let registry = DocumentParserRegistry(
             parsers: [
                 OvisPDFParser(config: config),
                 VisionPDFParser(),
                 EPUBParser(config: config),
-                OfficeParser(),
-                LegacyOfficeParser(),
+                MobiParser(config: config),
+                OfficeParser(config: config),
+                LegacyOfficeParser(config: config),
                 HTMLParser(),
                 PlainTextParser(),
                 ImageParser(),

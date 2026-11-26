@@ -361,6 +361,8 @@ public struct AgentConfig: Sendable {
     /// 扫描版 EPUB 的 OCR 后端：vision（Apple Vision）/ ovis（OvisOCR3）。
     /// 两条路径都会先做统一图像归一化。
     public var ragEPUBOCREngine: PDFEngine = .vision
+    /// DRM V2（Mobipocket PK1）电子书 PID；留空时不解密，配置后自动用于 MOBI/AZW3/PRC。
+    public var ragMobiDRMPID: String = ""
     public var ragOCREngine: String = "mlx-vlm"
     public var ragOCRModelName: String = "OvisOCR3-MLX-4bit-mixed46"
     public var ragOCRModelPath: String = "models/OvisOCR3-MLX-4bit-mixed46"
@@ -914,6 +916,7 @@ public struct AgentConfig: Sendable {
         if let v = bool("rag_auto_ingest") { ragAutoIngest = v }
         if let v = string("rag_pdf_engine") { ragPDFEngine = PDFEngine(stored: v) }
         if let v = string("rag_epub_ocr_engine") { ragEPUBOCREngine = PDFEngine(stored: v) }
+        if let v = string("rag_mobi_drm_pid") { ragMobiDRMPID = v }
         if let v = string("rag_ocr_engine") { ragOCREngine = v }
         if let v = string("rag_ocr_model_name") { ragOCRModelName = v }
         if let v = string("rag_ocr_model_path") { ragOCRModelPath = v }
@@ -1435,6 +1438,7 @@ public struct AgentConfig: Sendable {
             "rag_auto_ingest": ragAutoIngest,
             "rag_pdf_engine": ragPDFEngine.rawValue,
             "rag_epub_ocr_engine": ragEPUBOCREngine.rawValue,
+            "rag_mobi_drm_pid": ragMobiDRMPID,
             "rag_ocr_engine": ragOCREngine,
             "rag_ocr_model_name": ragOCRModelName,
             "rag_ocr_model_path": ragOCRModelPath,

@@ -108,6 +108,7 @@ struct LegacyExcelExtractor {
             "legacy_format": "biff8",
             "sheets": String(sections.count),
             "formula_unparsed": String(context.formulaUnparsed),
+            "skipped_cells": String(context.skippedCells),
             "row_limit_hit": context.rowLimitHit ? "true" : "false",
             "column_limit_hit": context.columnLimitHit ? "true" : "false",
         ]
@@ -351,6 +352,8 @@ struct LegacyExcelExtractor {
         var formulaTokensUsed = 0
         var rowLimitHit = false
         var columnLimitHit = false
+        /// 记录格式错误/索引越界而未能提取的单元格数，写入元数据避免静默丢值。
+        var skippedCells = 0
     }
 
     private struct SheetBuffer {
@@ -428,10 +431,14 @@ struct LegacyExcelExtractor {
                       let row = try? BIFFBytes.u16(record.payload, 0),
                       let column = try? BIFFBytes.u16(record.payload, 2),
                       let index = try? BIFFBytes.u32(record.payload, 6) else {
+                    context.skippedCells += 1
                     break
                 }
                 let stringIndex = Int(index)
-                guard stringIndex >= 0, stringIndex < sharedStrings.count else { break }
+                guard stringIndex >= 0, stringIndex < sharedStrings.count else {
+                    context.skippedCells += 1
+                    break
+                }
                 buffer.set(row: Int(row), column: Int(column),
                            value: sharedStrings[stringIndex], context: &context)
 
@@ -442,6 +449,7 @@ struct LegacyExcelExtractor {
                       let decoded = try? Self.decodeUnicodeString(record.payload,
                                                                   at: 6,
                                                                   cchSize: 2) else {
+                    context.skippedCells += 1
                     break
                 }
                 buffer.set(row: Int(row), column: Int(column),
@@ -453,6 +461,7 @@ struct LegacyExcelExtractor {
                       let column = try? BIFFBytes.u16(record.payload, 2),
                       let xf = try? BIFFBytes.u16(record.payload, 4),
                       let value = try? BIFFBytes.f64(record.payload, 6) else {
+                    context.skippedCells += 1
                     break
                 }
                 buffer.set(row: Int(row), column: Int(column),
@@ -464,6 +473,7 @@ struct LegacyExcelExtractor {
                       let column = try? BIFFBytes.u16(record.payload, 2),
                       let xf = try? BIFFBytes.u16(record.payload, 4),
                       let rk = try? BIFFBytes.u32(record.payload, 6) else {
+                    context.skippedCells += 1
                     break
                 }
                 buffer.set(row: Int(row), column: Int(column),
@@ -796,7 +806,7 @@ private struct ExcelNumberFormatter {
 
     private enum NumberKind {
         case general
-        case number(decimals: Int)
+        case number(decimals: Int, thousands: Bool, scientific: Bool, currency: String?)
         case percent(decimals: Int)
         case dateTime(hasDate: Bool, hasTime: Bool)
     }
@@ -814,8 +824,15 @@ private struct ExcelNumberFormatter {
         switch Self.kind(of: code) {
         case .general:
             return Self.generalText(value)
-        case .number(let decimals):
-            return Self.fixedText(value, decimals: decimals)
+        case .number(let decimals, let thousands, let scientific, let currency):
+            let body: String
+            if scientific {
+                body = String(format: ".%\(min(max(decimals, 0), 15))e",
+                              locale: Locale(identifier: "en_US_POSIX"), value)
+            } else {
+                body = Self.fixedText(value, decimals: decimals, thousands: thousands)
+            }
+            return (currency.map { $0 + " " } ?? "") + body
         case .percent(let decimals):
             return Self.fixedText(value * 100, decimals: decimals) + "%"
         case .dateTime(let hasDate, let hasTime):
@@ -856,10 +873,21 @@ private struct ExcelNumberFormatter {
                       locale: Locale(identifier: "en_US_POSIX"), value)
     }
 
-    private static func fixedText(_ value: Double, decimals: Int) -> String {
+    private static func fixedText(_ value: Double, decimals: Int,
+                                  thousands: Bool = false) -> String {
         let digits = min(max(decimals, 0), 15)
-        return String(format: "%.\(digits)f",
-                      locale: Locale(identifier: "en_US_POSIX"), value)
+        guard thousands else {
+            return String(format: "%.\(digits)f",
+                          locale: Locale(identifier: "en_US_POSIX"), value)
+        }
+        let formatter = NumberFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.numberStyle = .decimal
+        formatter.minimumFractionDigits = digits
+        formatter.maximumFractionDigits = digits
+        formatter.usesGroupingSeparator = true
+        return formatter.string(from: NSNumber(value: value))
+            ?? String(format: "%.\(digits)f", locale: Locale(identifier: "en_US_POSIX"), value)
     }
 
     private static func kind(of code: String) -> NumberKind {
@@ -879,13 +907,32 @@ private struct ExcelNumberFormatter {
         if sanitized == "General" {
             return .general
         }
-        if let decimals = decimalPlaces(in: sanitized) {
-            return .number(decimals: decimals)
-        }
-        if sanitized.contains("0") || sanitized.contains("#") {
-            return .number(decimals: 0)
+        if sanitized.contains("0") || sanitized.contains("#") || sanitized.contains(".") {
+            let decimals = decimalPlaces(in: sanitized) ?? 0
+            let thousands = sanitized.contains(",")
+            let scientific = sanitized.range(of: #"e[+-]?\d"#,
+                                             options: [.regularExpression, .caseInsensitive]) != nil
+            return .number(decimals: decimals, thousands: thousands,
+                           scientific: scientific, currency: currencySymbol(in: code))
         }
         return .general
+    }
+
+    /// 从 `[$¥-804]` / `"$"#,##0` 取货币符号；方括号 locale 后缀要剥掉。
+    private static func currencySymbol(in code: String) -> String? {
+        if let match = code.range(of: #"\[\$([^-\]]+)"#,
+                                  options: .regularExpression) {
+            let start = code.index(match.lowerBound, offsetBy: 2)
+            let symbol = String(code[start..<match.upperBound])
+                .trimmingCharacters(in: .whitespaces)
+            if !symbol.isEmpty { return symbol }
+        }
+        if let match = code.range(of: #"^"([^"]+)""#, options: .regularExpression) {
+            let start = code.index(match.lowerBound, offsetBy: 1)
+            let symbol = String(code[start..<code.index(match.upperBound, offsetBy: -1)])
+            if symbol.contains(where: { !$0.isLetter && !$0.isNumber }) { return symbol }
+        }
+        return nil
     }
 
     /// 去掉引号字面量、反斜杠转义与颜色/条件/货币等方括号。
@@ -938,8 +985,20 @@ private struct ExcelNumberFormatter {
         }
         var days = Int(floor(serial))
         let fraction = serial - floor(serial)
-        // 1900 日期系统把 1900 年当作闰年，序列号 60 对应虚构的 02-29。
-        if !date1904, days >= 60 { days -= 1 }
+        // 1900 日期系统把 1900 年当作闰年，序列号 60 对应虚构的 02-29，
+        // Foundation 无此日期，直接返回 Excel 的显示文本。
+        if !date1904, days == 60 {
+            let seconds = Int((fraction * 86_400).rounded())
+            let hours = seconds / 3600, minutes = (seconds % 3600) / 60, secs = seconds % 60
+            if hasTime {
+                return hasDate
+                    ? String(format: "1900-02-29 %02d:%02d:%02d", hours, minutes, secs)
+                    : String(format: "%02d:%02d:%02d", hours, minutes, secs)
+            }
+            return "1900-02-29"
+        }
+        // 61 及之后比 1899-12-31 基准少一天（60 号虚构日偏移抵消）。
+        if !date1904, days >= 61 { days -= 1 }
 
         var calendar = Calendar(identifier: .gregorian)
         calendar.timeZone = TimeZone(secondsFromGMT: 0)!

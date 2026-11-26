@@ -496,9 +496,15 @@ struct LegacyPowerPointExtractor {
             }
         }
 
-        if used.isEmpty, notes.count == slides.count {
-            for index in slides.indices {
-                result[index] = notes[index].blocks
+        // 只有部分备注匹配到 slideId 时，未匹配备注仍需按顺序补到还没有备注的
+        // 幻灯片上；此前仅在全部未匹配时才兜底，会静默丢失这部分内容。
+        if used.count < notes.count {
+            let unmatched = notes.enumerated().filter { !used.contains($0.offset) }
+                .map(\.element)
+            var targets = slides.indices.filter { result[$0].isEmpty }
+            if targets.isEmpty { targets = Array(slides.indices) }
+            for (index, note) in zip(targets, unmatched) {
+                result[index].append(contentsOf: note.blocks)
             }
         }
         return result

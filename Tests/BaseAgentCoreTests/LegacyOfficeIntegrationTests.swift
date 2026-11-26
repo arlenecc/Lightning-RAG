@@ -2,6 +2,20 @@ import AppKit
 import XCTest
 @testable import BaseAgentCore
 
+private final class LegacyImageFakeVLM: VLMService {
+    let identifier = "legacy-image-fake"
+    let isAvailable = true
+    private let lock = NSLock()
+    private var _calls = 0
+    var calls: Int { lock.lock(); defer { lock.unlock() }; return _calls }
+
+    func recognize(image: CGImage, prompt: String, maxTokens: Int) async throws -> String {
+        lock.lock(); _calls += 1; lock.unlock()
+        return "| 图内数据 | 99 |"
+    }
+    func unload() async {}
+}
+
 final class LegacyOfficeIntegrationTests: XCTestCase {
 
     private var directory: URL!
@@ -95,6 +109,27 @@ final class LegacyOfficeIntegrationTests: XCTestCase {
         XCTAssertTrue(parsed.text.contains("中文正文内容。"), parsed.text)
         XCTAssertEqual(parsed.metadata["engine"], "doc")
         XCTAssertEqual(parsed.metadata["clean_profile"], "structured")
+    }
+
+    func testLegacyImageExtractorScansOLE2StyleStream() throws {
+        let png = Data(base64Encoded:
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==")!
+        let stream = Data([UInt8](repeating: 0xAB, count: 32)) + png + Data([0x01, 0x02])
+        let images = LegacyOfficeImageExtractor.images(in: stream, label: "Data")
+        XCTAssertEqual(images.count, 1)
+        XCTAssertEqual(images.first, png)
+    }
+
+    func testLegacyImageOCRIsDeduplicated() async throws {
+        let png = Data(base64Encoded:
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==")!
+        let fake = LegacyImageFakeVLM()
+        let texts = try await LegacyOfficeImageExtractor.recognize(
+            [png, png], vlm: fake,
+            options: ParserOptions(epubOCREngine: .ovis), progress: nil)
+        XCTAssertEqual(texts.count, 1)
+        XCTAssertEqual(fake.calls, 1, "重复图片只应 OCR 一次")
+        XCTAssertTrue(texts.first?.contains("图内数据") ?? false)
     }
 
     // MARK: - helpers

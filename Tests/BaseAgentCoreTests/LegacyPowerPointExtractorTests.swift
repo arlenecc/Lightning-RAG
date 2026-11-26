@@ -366,6 +366,24 @@ final class LegacyPowerPointExtractorTests: XCTestCase {
         }
     }
 
+    func testUnmatchedNotesAreStillAssignedToSlides() throws {
+        // 备注 ID 只匹配上一部分幻灯片时，剩余备注不得静默丢失。
+        let builder = PowerPointTestBuilder(slides: [
+            .init(slideId: 1, blocks: [
+                .init(headerType: 0, text: "第一页"),
+                .init(headerType: 1, text: "正文一"),
+            ]),
+            .init(slideId: 2, blocks: [
+                .init(headerType: 0, text: "第二页"),
+                .init(headerType: 1, text: "正文二"),
+            ]),
+        ], notes: [
+            .init(slideIdRef: 999, blocks: [.init(headerType: 2, text: "孤立备注")]),
+        ])
+        let doc = try LegacyPowerPointExtractor().extract(url: try write(builder.build()))
+        XCTAssertTrue(doc.text.contains("孤立备注"), "未匹配备注应兜底到幻灯片")
+    }
+
     // MARK: - helpers
 
     private func write(_ file: OLE2TestFile) throws -> URL {
