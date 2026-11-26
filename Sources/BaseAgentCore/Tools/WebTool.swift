@@ -80,6 +80,10 @@ public final class WebScanTool: AgentTool, ShutdownableTool {
         + "For JS-driven list pages, also captures the page's own same-origin data API "
         + "requests, replays them, and summarizes JSON records into a readable list; "
         + "same-day records are merged across pages when a read-only paging API exists. "
+        + "For news/article homepages, returns a compact headline list "
+        + "(title + date + link; only when the page really is a news feed) "
+        + "so current stories are visible without reading the whole page text. "
+        + "Other sites keep the plain visible-text output unchanged. "
         + "PREFER THIS TOOL over writing scraping scripts (code_run/shell_run): it handles "
         + "JS rendering, browser headers and data-API discovery automatically."
 
@@ -160,6 +164,10 @@ public final class WebScanTool: AgentTool, ShutdownableTool {
             guard let http = result.response else {
                 return .fail("Request failed: invalid HTTP response")
             }
+            // 跟随重定向后的最终地址才是页面真正的同源基准：cnn.com 会 302 到
+            // edition.cnn.com，页内 JS / XHR / iframe 都挂在最终域名下。用原始
+            // url 判同源会把它们全部挡掉，相对链接也会被解析到旧域名。
+            let effectiveURL = http.url ?? url
             guard http.statusCode < 400 else {
                 // 403/412 是典型的反爬/权限拦截：给出降级路径，而不是让模型
                 // 拿着裸状态码原地重试（真机反复「HTTP 403」空转的教训）。
@@ -207,8 +215,19 @@ public final class WebScanTool: AgentTool, ShutdownableTool {
                         jsonText = String(decoding: pretty, as: UTF8.self)
                     }
                     let label = mimeType.contains("json") ? mimeType : "application/json(嗅探)"
-                    return .ok("[JSON 数据源，\(label)，\(body.count) 字节]\n"
-                               + String(jsonText.prefix(20_000)) + truncationNote)
+                    var output = "[JSON 数据源，\(label)，\(body.count) 字节]\n"
+                    if jsonText.count > 20_000,
+                       let records = WebDataCapture.summarize(
+                        data: body, contentType: "application/json",
+                        label: "记录数组", maxChars: 10_000) {
+                        // 大 JSON 直接给前 20k pretty 文本通常全是缩进与嵌套
+                        // 键名，信息密度极低：先给结构化记录摘要，再留一段原文。
+                        output += records + "\n\n[原始 JSON 前 8,000 字符]\n"
+                            + String(jsonText.prefix(8_000))
+                    } else {
+                        output += String(jsonText.prefix(20_000))
+                    }
+                    return .ok(output + truncationNote)
                 }
                 if mimeType.contains("xml") || mimeType.contains("csv")
                     || mimeType.contains("text/plain") {
@@ -221,6 +240,14 @@ public final class WebScanTool: AgentTool, ShutdownableTool {
                     }
                     return .ok("[数据源 \(mimeType)，\(body.count) 字节]\n"
                                + String(bodyText.prefix(20_000)) + truncationNote)
+                }
+                // 未识别的非文本响应（PDF/图片/压缩包/字节流）若继续往下走，
+                // 会被 SwiftSoup 当 HTML 剥标签，产出满屏乱码垃圾，必须拦截。
+                if Self.isBinaryPayload(bodyText, mimeType: mimeType) {
+                    return .fail("[非文本响应] "
+                        + "\(mimeType.isEmpty ? "未知 Content-Type" : mimeType)，"
+                        + "\(body.count) 字节：web_scan 只处理 HTML/JSON/XML/RSS/CSV/纯文本；"
+                        + "二进制内容请下载后用 file_tools/code_run 处理。")
                 }
             }
 
@@ -235,15 +262,25 @@ public final class WebScanTool: AgentTool, ShutdownableTool {
                 return .ok(String(rawText.prefix(20_000)) + truncationNote)
             }
 
-            var content = ToolSupport.htmlToText(bodyText,
-                                                 maxChars: ToolSupport.maxParseChars)
+            // 新闻/门户首页：先结构化输出「标题 + 日期 + 链接」清单。这类页面
+            // SSR 正文冗长且夹杂大量导航与卡片描述，纯文本前 20k 会被占满，
+            // 模型很难从中判断「今天有哪些新闻」。完整 HTML 直扫，不受
+            // htmlToText 的 2M 解析窗口限制。
+            // 只有确认是新闻/文章首页（清单非 nil）才启用骨架裁剪与正文预算
+            // 调整；其它站点仍走强化前的提取与输出逻辑，零退化。
+            let newsSection = ToolSupport.newsLinkSummary(html: bodyText,
+                                                          baseURL: effectiveURL)
+            var content = ToolSupport.htmlToText(
+                bodyText,
+                maxChars: ToolSupport.maxParseChars,
+                dropPageChrome: newsSection != nil)
 
             // iframe 嵌套页：主文档正文过短时，自动抓取同源 iframe 的内容拼进
             // 结果（很多站点把数据放在 iframe 里）；跨域 iframe 只在提示中列出。
             if content.trimmingCharacters(in: .whitespacesAndNewlines).count < 300 {
                 for src in ToolSupport.extractIframeSources(html: bodyText, limit: 2) {
-                    guard let frameURL = URL(string: src, relativeTo: url)?.absoluteURL,
-                          frameURL.host == url.host else { continue }
+                    guard let frameURL = URL(string: src, relativeTo: effectiveURL)?.absoluteURL,
+                          frameURL.host == effectiveURL.host else { continue }
                     var frameRequest = URLRequest(url: frameURL)
                     frameRequest.timeoutInterval = requestTimeout
                     frameRequest.setValue(ToolSupport.browserUserAgent,
@@ -277,7 +314,7 @@ public final class WebScanTool: AgentTool, ShutdownableTool {
             if !hint.isEmpty {
                 var inspectedScriptURLs: [String] = []
                 for scriptURL in ToolSupport.selectScriptSourcesForInspection(
-                    html: bodyText, baseURL: url, limit: 2) {
+                    html: bodyText, baseURL: effectiveURL, limit: 2) {
                     var scriptRequest = URLRequest(url: scriptURL)
                     scriptRequest.timeoutInterval = 5
                     scriptRequest.setValue(ToolSupport.browserUserAgent,
@@ -312,6 +349,7 @@ public final class WebScanTool: AgentTool, ShutdownableTool {
 
             let staticText = content.trimmingCharacters(in: .whitespacesAndNewlines)
             var sections: [String] = []
+            if let news = newsSection { sections.append(news) }
             var capturedRequests: [WebRenderer.CapturedRequest] = []
 
             if shouldRender {
@@ -361,7 +399,7 @@ public final class WebScanTool: AgentTool, ShutdownableTool {
                 let candidates = WebDataCapture.candidateURLs(
                     captured: capturedRequests,
                     endpointHints: Array(endpointHints.prefix(12)),
-                    baseURL: url, limit: 8)
+                    baseURL: effectiveURL, limit: 8)
                 var dataSections: [String] = []
                 for endpoint in candidates {
                     let label = Self.endpointLabel(endpoint)
@@ -369,13 +407,13 @@ public final class WebScanTool: AgentTool, ShutdownableTool {
                     var text: String?
                     // WKWebView 已拿到响应体时直接复用，省一次请求。
                     if let hit = capturedRequests.first(where: {
-                        URL(string: $0.url, relativeTo: url)?.absoluteURL == endpoint
+                        URL(string: $0.url, relativeTo: effectiveURL)?.absoluteURL == endpoint
                     }), !hit.body.isEmpty {
                         let data = Data(hit.body.utf8)
                         sourceData = data
                         text = WebDataCapture.summarize(
                             data: data, contentType: "application/json", label: label)
-                    } else if let fetched = await fetchEndpoint(endpoint, referer: url) {
+                    } else if let fetched = await fetchEndpoint(endpoint, referer: effectiveURL) {
                         sourceData = fetched.data
                         text = WebDataCapture.summarize(
                             data: fetched.data, contentType: fetched.contentType,
@@ -386,17 +424,32 @@ public final class WebScanTool: AgentTool, ShutdownableTool {
                     // 上继续翻页，把当天记录取全；任何异常都静默回退到第一页。
                     let merged = await fetchSameDayPages(
                         firstData: sourceData, label: label,
-                        candidates: candidates, firstEndpoint: endpoint, referer: url)
+                        candidates: candidates, firstEndpoint: endpoint,
+                        referer: effectiveURL)
                     dataSections.append(merged ?? text)
                     break
                 }
                 sections = dataSections + sections
             }
 
+            // 静态壳（SPA）且没抽到头条时，试页面显式声明的 RSS/Atom 源。
+            // 只对声明过的 feed 发一次请求，不猜路径；没有声明则零额外请求。
+            if newsSection == nil, !hint.isEmpty,
+               let feedURL = ToolSupport.discoverFeedLinks(
+                html: bodyText, baseURL: effectiveURL).first,
+               WebURLPolicy.rejectionReason(for: feedURL) == nil {
+                if let feed = await fetchFeed(feedURL, referer: effectiveURL) {
+                    sections.append(feed)
+                }
+            }
+
             if !sections.isEmpty {
-                // 数据段最长 16k，静态正文只留短摘要，整体仍受 20k 输出上限约束。
-                let tail = "\n\n[静态提取正文]\n" + String(content.prefix(2_000)) + hint
-                return .ok(String((sections.joined(separator: "\n\n") + tail).prefix(20_000)))
+                // 新闻首页放宽正文预算（清单已给标题/日期，正文补导语）；
+                // 其它站点一律保持强化前的 2k 摘要，输出形态不变。
+                // 整体仍受 20k 输出上限约束。
+                let budget = newsSection == nil ? 2_000 : 10_000
+                let tail = "\n\n[静态提取正文]\n" + String(content.prefix(budget)) + hint
+                return .ok(Self.composeOutput(sections: sections, tail: tail))
             }
             return .ok(String(content.prefix(20_000)) + hint)
         } catch let error as URLError {
@@ -410,6 +463,50 @@ public final class WebScanTool: AgentTool, ShutdownableTool {
         } catch {
             return ToolSupport.failure(error)
         }
+    }
+
+    /// 把数据段 / 渲染段 / 订阅源段与静态正文尾部组合进 20k 输出预算。
+    /// 先给 tail 留位置，再按段顺序分配并为后续段保留份额，超长段单独标注
+    /// 截断——旧实现「全部拼完再 prefix(20_000)」会让 16k 数据段 + 12k
+    /// 渲染段把静态正文与降级提示整体挤掉，新闻清单也可能被截没。
+    static func composeOutput(sections: [String], tail: String,
+                              limit: Int = 20_000) -> String {
+        guard tail.count < limit else { return String(tail.prefix(limit)) }
+        var remaining = limit - tail.count
+        var parts: [String] = []
+        for (index, section) in sections.enumerated() {
+            guard remaining > 0 else { break }
+            let later = sections.count - index - 1
+            let reserve = min(2_000 * later, remaining / 2)
+            let cap = max(1_000, remaining - reserve)
+            if section.count > cap {
+                parts.append(String(section.prefix(cap)) + "\n… [该段已截断]")
+                remaining -= cap
+            } else {
+                parts.append(section)
+                remaining -= section.count
+            }
+        }
+        return parts.joined(separator: "\n\n") + tail
+    }
+
+    /// 抓取页面显式声明的 RSS/Atom 源，压成条目列表（与 JSON 数据段对齐）。
+    /// 只在静态壳降级路径调用，且最多一次；不猜站点路径。
+    private func fetchFeed(_ url: URL, referer: URL) async -> String? {
+        var request = URLRequest(url: url)
+        request.timeoutInterval = 10
+        request.setValue(ToolSupport.browserUserAgent, forHTTPHeaderField: "User-Agent")
+        request.setValue(referer.absoluteString, forHTTPHeaderField: "Referer")
+        request.setValue("application/rss+xml, application/atom+xml, application/xml, */*",
+                         forHTTPHeaderField: "Accept")
+        guard let result = try? await redirectGuard.fetch(
+            session: session, request: request,
+            limit: min(ToolSupport.maxFetchBytes, 512 * 1024)),
+              (result.response?.statusCode ?? 500) < 400 else { return nil }
+        let text = ToolSupport.decodeUTF8Prefix(result.data)
+            ?? String(decoding: result.data, as: UTF8.self)
+        guard let summary = Self.summarizeFeed(text) else { return nil }
+        return "[站点订阅源 \(url.absoluteString)]\n" + summary
     }
 
     /// 直取同源数据接口：带 XHR / Referer 头，沿用同一 URLSession（保留 cookie）。
@@ -578,7 +675,10 @@ public final class WebScanTool: AgentTool, ShutdownableTool {
             guard let close = text[gt.lowerBound...].range(of: closeTag,
                                                            options: [.caseInsensitive])
             else { return nil }
-            var inner = String(text[gt.lowerBound..<close.lowerBound])
+            // 必须用 gt.upperBound 跳过标签自身的 '>'：用 lowerBound 会把
+            // '>' 带进正文，导致 CDATA 判断失效，RSS 每行输出成
+            // '><![CDATA[标题]]>'，标题/链接/日期全都带垃圾前缀。
+            var inner = String(text[gt.upperBound..<close.lowerBound])
             // CDATA 包裹的标题/链接：剥掉包裹层。
             if inner.hasPrefix("<![CDATA[") {
                 inner = String(inner.dropFirst(9))
@@ -631,6 +731,25 @@ public final class WebScanTool: AgentTool, ShutdownableTool {
             output += "\n… [其余 \(total - entries.count) 条未列出；用 raw=true 获取原始 XML]"
         }
         return output
+    }
+
+    /// 非 HTML 响应是否是不可读的二进制：明确的二进制 MIME，或解码后
+    /// 替换字符/控制字符占比过高（避免 PDF、图片被当 HTML 剥成乱码）。
+    /// 故意不列 application/octet-stream——有些 API 用它返回 JSON，
+    /// 那种情况已由 looksLikeJSONObject 提前命中并返回。
+    static func isBinaryPayload(_ text: String, mimeType: String) -> Bool {
+        let binaryMIME = ["image/", "audio/", "video/", "application/pdf",
+                          "application/zip", "application/gzip", "font/",
+                          "application/wasm", "application/x-protobuf"]
+        if binaryMIME.contains(where: { mimeType.contains($0) }) { return true }
+        let sample = text.prefix(4096)
+        guard !sample.isEmpty else { return false }
+        var bad = 0
+        for ch in sample {
+            if ch == "\u{FFFD}" { bad += 1; continue }
+            if let ascii = ch.asciiValue, ascii < 0x09 { bad += 1 }
+        }
+        return bad * 20 > sample.count
     }
 
     /// Content-Type 缺失时按内容嗅探 JSON（顶层对象或数组）。

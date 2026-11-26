@@ -64,7 +64,10 @@ enum WebDataCapture {
         guard lowered.contains("html") || lowered.contains("text/plain")
             || looksLikeHTML(data) else { return nil }
         let raw = String(decoding: data.prefix(400_000), as: UTF8.self)
-        let text = ToolSupport.htmlToText(raw, maxChars: maxChars)
+        // `maxChars` 是输出上限，不能直接当 HTML 解析窗口传进去：传 16_000
+        // 会让 htmlToText 只解析前 16k 字符，HTML 片段型 AJAX 接口后半段
+        // 的正文会被整体丢掉。解析用完整窗口，输出阶段再按 maxChars 截断。
+        let text = ToolSupport.htmlToText(raw, maxChars: ToolSupport.maxParseChars)
             .trimmingCharacters(in: .whitespacesAndNewlines)
         guard text.count >= 200, !text.contains("No HTTP resource was found"),
               !text.contains("does not support http method") else { return nil }

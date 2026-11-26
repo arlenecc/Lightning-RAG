@@ -41,7 +41,9 @@ public enum ToolSupport {
     public static let minTimeout: Double = 1
     public static let maxTimeout: Double = 600
     /// web_scan 单次抓取的最大字节数。
-    public static let maxFetchBytes = 8 * 1024 * 1024
+    /// CNN 首页已达约 7MB（head 内联 CSS 3.2MB + 正文），8MB 只剩 1.3MB 余量，
+    /// 页面再涨会被截断、尾部新闻链接丢失；提到 12MB 留出安全边界。
+    public static let maxFetchBytes = 12 * 1024 * 1024
     /// 交给 HTML 解析器的最大字符数。
     public static let maxParseChars = 2 * 1024 * 1024
     /// 浏览器 UA：不少 CDN（Fastly 等）对空/非浏览器 UA 直接 403/404，
@@ -470,7 +472,10 @@ public enum ToolSupport {
     /// `[input #id name= type= "placeholder"]` 形式——参考 simphtml.py 的可见性
     /// 与表单态保留思路，但只在静态解析能可靠判断的范围内做（真实布局可见性
     /// 交给 WebKit 渲染路径负责）。
-    public static func htmlToText(_ html: String, maxChars: Int = maxParseChars) -> String {
+    /// - `dropPageChrome`：仅由 `web_scan` 在确认是新闻/文章首页时开启，
+    ///   普通网页不裁剪页面骨架，行为与强化前完全一致。
+    public static func htmlToText(_ html: String, maxChars: Int = maxParseChars,
+                                  dropPageChrome: Bool = false) -> String {
         // 超长页面（如 cnn.com 首页 5.9MB）的开头是巨大的 <head>/预加载清单，
         // 直接按字符截断会把正文体整体截出解析窗口、提取结果为空，进而被
         // 误判为「动态加载」再花 20s+ 渲染兜底。跳过 head 从 <body> 起取窗口。
@@ -482,7 +487,8 @@ public enum ToolSupport {
         guard let document = try? SwiftSoup.parse(window) else {
             return normalizeLines(stripTags(window))
         }
-        pruneHTMLDocument(document)
+        pruneHTMLDocument(document,
+                          dropPageChrome: dropPageChrome && html.count > 300_000)
 
         var lines: [String] = []
         var current = ""
@@ -501,12 +507,33 @@ public enum ToolSupport {
     /// 解析前的 DOM 裁剪：移除噪音标签与隐藏子树，让正文提取少背垃圾。
     /// - 噪音标签：script/style/noscript/meta/link/template/colgroup/col/param/
     ///   source/head/title/svg（svg 内联路径/图形对文本提取无价值）；
+    /// - 页面骨架（仅 `dropPageChrome` 时）：nav/footer/aside、role 导航横幅，
+    ///   以及不含 h1/h2 的纯导航型 header（带文章标题的 header 保留）。
+    ///   门户首页（cnn.com 等）的导航菜单常有数千字符，按「前 20k 截断」
+    ///   输出时真正的新闻会被整段挤掉，必须在 DOM 层先剔除。只在原始 HTML
+    ///   超过 300k 时启用，中小页面保持既有行为（招聘站等靠导航/页脚撑长的
+    ///   动态壳仍走原来的提示逻辑）；
     /// - 隐藏：`aria-hidden="true"`，或内联 `style` 里 `display:none` /
     ///   `visibility:hidden` / `opacity:0`（静态解析无法算布局，只认内联声明）。
-    private static func pruneHTMLDocument(_ doc: Document) {
+    private static func pruneHTMLDocument(_ doc: Document,
+                                          dropPageChrome: Bool = false) {
         let _ = try? doc.select(
             "script, style, noscript, meta, link, template, colgroup, col, param, source, "
             + "head, title, svg").remove()
+        if dropPageChrome {
+            let _ = try? doc.select(
+                "nav, footer, aside, "
+                + "[role='navigation'], [role='banner'], [role='contentinfo']").remove()
+            // 含 h1/h2 的 <header> 常承载文章标题（技术文档、代码托管页），
+            // 只移除纯导航型 header，避免把正文标题一起删掉。
+            if let headers = try? doc.select("header") {
+                for header in headers.array() {
+                    guard let headings = try? header.select("h1, h2"),
+                          headings.array().isEmpty else { continue }
+                    let _ = try? header.remove()
+                }
+            }
+        }
         if let hidden = try? doc.select("[aria-hidden='true']") {
             for el in hidden { let _ = try? el.remove() }
         }
@@ -549,6 +576,19 @@ public enum ToolSupport {
         let shortBody = visible.count < 300
 
         let lowered = html.lowercased()
+        // 门户/文章类 SSR 页面：正文已经很长且含大量标题/时间标签，说明主体
+        // 内容是随 HTML 一起下发的。页面里的 loader / fetch( 往往只是广告、
+        // 图片懒加载或统计脚本，不能据此把整页判成 SPA 壳——否则会触发
+        // WebKit 重渲染、把静态正文压到 2k，反而丢掉当天新闻（cnn.com 实测：
+        // 7MB 首页、约 2 万字符可见正文、25 个 h2，却被误判为动态加载）。
+        // 尽早返回还顺带避开后面 7MB 正则与 SwiftSoup 全量 DOM 解析。
+        // 阈值按真实 SwiftSoup 输出校准：CNN 裁剪骨架后可见正文约 16k，
+        // 其它样本（apple 5.7k / github 8.2k / MDN 1.8k / sina 2.3k）都在
+        // 9k 以下。12k + 8 个内容标签只放行超大 SSR 门户，一般长文章、
+        // 技术文档、代码托管页仍按原有规则渲染，不丢它们的 AJAX 内容。
+        if visible.count >= 12_000
+            && ToolSupport.contentTagCount(in: lowered) >= 8 { return "" }
+
         var signals: [String] = []
         // 前端框架挂载点：body 里只有挂载容器，正文必然是空壳。
         let hasFrameworkMount = lowered.contains("id=\"root\"") || lowered.contains("id=\"app\"")
@@ -623,7 +663,8 @@ public enum ToolSupport {
             : "本页提取正文 \(visible.count) 字符但主要是导航/页脚/静态文案"
         var hint = "\n\n[web_scan 提示] \(summary)，且检测到动态加载"
             + "特征（\(signals.joined(separator: "、"))）——页面主体内容很可能由 JS 动态加载，"
-            + "静态 HTML 只能拿到加载占位。web_scan 已自动渲染并直取页面数据接口，结果见上方"
+            + "静态 HTML 只能拿到加载占位。web_scan 会按线索直取数据接口、"
+            + "并在允许时自动渲染，结果见上方"
             + "数据段；若仍缺信息或需要翻页，用 shell_run/code_run 按数据段给出的分页参数"
             + "显式调用（不要对未知 POST 接口盲发写请求）；若需要点击/填表/滚动加载等交互，"
             + "用 web_scan(op=\"render\", script=...) 执行 JS。"
@@ -631,6 +672,314 @@ public enum ToolSupport {
             hint += "\n已定位的数据源线索：\n" + lines.joined(separator: "\n")
         }
         return hint
+    }
+
+    /// 统计结构化内容标签（从 `<body>` 起最多扫 3M 字符，够 8 个即停）：
+    /// 服务端渲染的门户/文章页常有几十个 h2/h3/article/time，空白 SPA 壳基本为 0。
+    /// 必须从 body 起算：cnn.com 的 head 内联 CSS 就有 3.2MB，正文里的 h2
+    /// 全部在 3.5MB 之后，只扫开头会误判成「没有内容标签」。
+    /// 传入已小写化的 HTML，避免又复制一份 7MB 字符串。
+    private static func contentTagCount(in loweredHTML: String) -> Int {
+        let start = loweredHTML.range(of: "<body")?.lowerBound
+            ?? loweredHTML.startIndex
+        let window = loweredHTML[start...].prefix(3_000_000)
+        let markers = ["<h2", "<h3", "<article", "<time"]
+        var count = 0
+        var cursor = window.startIndex
+        while count < 8, cursor < window.endIndex {
+            guard let found = markers.compactMap({
+                window.range(of: $0, range: cursor..<window.endIndex)?.lowerBound
+            }).min() else { break }
+            count += 1
+            cursor = window.index(found, offsetBy: 1, limitedBy: window.endIndex)
+                ?? window.endIndex
+        }
+        return count
+    }
+
+    // MARK: - 新闻门户首页结构化抽取
+
+    /// 门户首页的头条清单：标题 + 日期 + 绝对链接，按日期倒序。
+    ///
+    /// 首页的价值在「今天有哪些新闻」，而不是被导航菜单、广告反馈、卡片描述
+    /// 占满的纯文本流。SSR 页面里头条链接自带日期（`/2026/11/25/...`），标题
+    /// 通常在 `headline`/`title` 类元素或 `data-editable="headline"` 中，用一次
+    /// 轻量正则扫描即可拿到，不必解析几 MB 的完整 DOM（也绕开 2M 解析窗口）。
+    /// 找不到有效条目时返回 nil，普通网页不受影响。
+    static func newsLinkSummary(html: String, baseURL: URL,
+                                limit: Int = 40) -> String? {
+        guard limit > 0 else { return nil }
+        var body = html
+        if let start = html.range(of: "<body", options: .caseInsensitive) {
+            body = String(html[start.lowerBound...])
+        }
+        // 超大首页（cnn.com 约 7MB，head 里全是内联 CSS）限一次扫描上限，
+        // 避免正则耗时不可控；正文后半段超出部分由可见文本提取负责。
+        let scan = String(body.prefix(6_000_000))
+        let anchor = #"<a\b[^>]*href\s*=\s*["']([^"']+)["'][^>]*>([\s\S]*?)</a>"#
+        guard let regex = try? NSRegularExpression(pattern: anchor,
+                                                    options: [.caseInsensitive]) else { return nil }
+        struct Item {
+            let date: String?
+            let title: String
+            let url: String
+            let order: Int
+        }
+        var items: [Item] = []
+        var seenTitles = Set<String>()
+        var seenURLs = Set<String>()
+        var order = 0
+        for match in regex.matches(in: scan, range: NSRange(scan.startIndex..., in: scan)) {
+            if items.count >= 300 { break }
+            guard match.numberOfRanges >= 3,
+                  let hrefRange = Range(match.range(at: 1), in: scan),
+                  let innerRange = Range(match.range(at: 2), in: scan) else { continue }
+            let href = String(scan[hrefRange])
+            guard let resolved = absoluteNewsURL(href, baseURL: baseURL),
+                  let title = newsTitle(from: String(scan[innerRange])) else { continue }
+            let key = title.lowercased().filter { $0.isLetter || $0.isNumber }
+            guard seenTitles.insert(key).inserted,
+                  seenURLs.insert(resolved).inserted else { continue }
+            let date = newsDate(from: href) ?? newsDate(from: resolved)
+            items.append(Item(date: date, title: title, url: resolved, order: order))
+            order += 1
+        }
+
+        let dated = items.filter { $0.date != nil }
+        let undated = items.filter { $0.date == nil }
+        let dates = dated.compactMap(\.date)
+        // 主路径：至少 5 条带完整日期的链接，且最新日期在最近 7 天内。
+        // 少了这两条，产品营销页、仓库归档页、旧文档列表都会被误当「今日热点」。
+        // 4 条起：中文门户首页常只有 3~4 条带日期链接（sina 实测 4 条），
+        // 卡 5 条会把它们误杀；apple/github/招聘壳的 dated 为 0，不受影响。
+        let useDated = dated.count >= 4
+            && dates.max().map { recentDateTags().contains($0) } == true
+        // 次路径：URL 不带日期的新闻站（BBC/Guardian/博客首页）必须另有明确的
+        // 新闻语义信号，且链接本身要像文章详情页。绝不无条件补入无日期链接——
+        // apple.com 的营销卡片、github.com 的仓库链接、python.org 首页的
+        // "Skip to content / Code of Conduct" 导航项都会被误判成新闻条目。
+        var articleLike: [Item] = []
+        if !useDated {
+            articleLike = undated.filter { looksLikeArticleURL($0.url) }
+        }
+        let useUndated = !useDated && undated.count >= 5
+            && articleLike.count >= 3 && hasNewsSemanticSignal(html)
+        guard useDated || useUndated else { return nil }
+        let pool = useDated ? dated : articleLike
+        // 无日期路径保持页面原有顺序（站点自己排好的头条优先级）。
+        let sorted = useDated ? pool.sorted { a, b in
+            if let da = a.date, let db = b.date, da != db { return da > db }
+            if a.date != nil, b.date == nil { return true }
+            if a.date == nil, b.date != nil { return false }
+            return a.order < b.order
+        } : pool
+
+        var lines: [String] = []
+        if useDated, let latest = dates.max() {
+            let latestCount = dates.filter { $0 == latest }.count
+            let dayNote = todayTags().contains(latest) ? "（当天）" : ""
+            lines.append("[页面新闻链接（共 \(sorted.count) 条，最新日期 \(latest)\(dayNote) 共 "
+                + "\(latestCount) 条；按日期倒序，列出前 \(min(limit, sorted.count)) 条）]")
+        } else {
+            lines.append("[页面文章链接（共 \(sorted.count) 条，页面未提供日期；"
+                + "按页面顺序列出前 \(min(limit, sorted.count)) 条）]")
+        }
+        for (index, item) in sorted.prefix(limit).enumerated() {
+            let prefix = item.date.map { "[\($0)] " } ?? ""
+            lines.append("\(index + 1). \(prefix)\(item.title) | \(item.url)")
+        }
+        if sorted.count > limit {
+            lines.append("… 另有 \(sorted.count - limit) 条未列出；可用上面的链接继续抓取正文")
+        }
+        return lines.joined(separator: "\n")
+    }
+
+    /// 页面是否有「新闻/文章列表」的显式语义（不依赖 URL 日期）：
+    /// JSON-LD `NewsArticle`，或多个带真实日期的 `<time datetime>`。
+    /// 刻意不用 `ItemList`：MDN/GitHub 的面包屑、导航列表也叫 ItemList。
+    private static func hasNewsSemanticSignal(_ html: String) -> Bool {
+        let head = String(html.prefix(3_000_000))
+        if head.range(of: "NewsArticle", options: .caseInsensitive) != nil { return true }
+        let pattern = #"<time[^>]+datetime\s*=\s*["']20\d{2}-\d{2}-\d{2}"#
+        guard let regex = try? NSRegularExpression(pattern: pattern,
+                                                   options: [.caseInsensitive])
+        else { return false }
+        return regex.numberOfMatches(in: head,
+                                     range: NSRange(head.startIndex..., in: head)) >= 3
+    }
+
+    /// 无日期 URL 是否指向文章/新闻详情页：年月路径、blog 域名，或
+    /// news/article/post/story 等路径段。次路径用它剔除首页导航链接。
+    private static func looksLikeArticleURL(_ absolute: String) -> Bool {
+        guard let url = URL(string: absolute) else { return false }
+        let host = (url.host ?? "").lowercased()
+        let path = url.path.lowercased()
+        if host.contains("blog") || host.hasPrefix("news.") { return true }
+        if path.range(of: #"/(?:19|20)\d{2}/(?:0?[1-9]|1[0-2])(?:/|$)"#,
+                      options: .regularExpression) != nil { return true }
+        let markers = ["/news", "/article", "/blog", "/post", "/story",
+                       "/press", "/release", "/entry", "/item"]
+        return markers.contains { path.contains($0) }
+    }
+
+    private static func absoluteNewsURL(_ href: String, baseURL: URL) -> String? {
+        let trimmed = href.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty,
+              !trimmed.lowercased().hasPrefix("javascript:"),
+              let url = URL(string: trimmed, relativeTo: baseURL)?.absoluteURL,
+              let scheme = url.scheme?.lowercased(),
+              scheme == "http" || scheme == "https",
+              let host = url.host, !host.isEmpty else { return nil }
+        return url.absoluteString
+    }
+
+    /// 从 URL 路径里取发布日期：`/2026/11/25/...`、`/2026-11-25-...` 都支持。
+    private static func newsDate(from text: String) -> String? {
+        let pattern = #"/(20\d{2})[/-](\d{1,2})[/-](\d{1,2})(?:[/._-]|$)"#
+        guard let regex = try? NSRegularExpression(pattern: pattern),
+              let match = regex.firstMatch(in: text,
+                                           range: NSRange(text.startIndex..., in: text)),
+              match.numberOfRanges >= 4,
+              let yRange = Range(match.range(at: 1), in: text),
+              let mRange = Range(match.range(at: 2), in: text),
+              let dRange = Range(match.range(at: 3), in: text),
+              let year = Int(text[yRange]), let month = Int(text[mRange]),
+              let day = Int(text[dRange]),
+              (1...12).contains(month), (1...31).contains(day) else { return nil }
+        return String(format: "%04d-%02d-%02d", year, month, day)
+    }
+
+    /// 卡片标题：优先取带 headline/title 类或 `data-editable="headline"` 的元素，
+    /// 否则取锚文本首句；过滤脚本、图片署名、视频时长等噪声。
+    private static func newsTitle(from inner: String) -> String? {
+        let headline = #"<(?:span|h[1-6]|div|p)[^>]*(?:class\s*=\s*["'][^"']*(?:headline|title)[^"']*["']|data-editable\s*=\s*["']headline["'])[^>]*>([\s\S]*?)</(?:span|h[1-6]|div|p)>"#
+        var source = inner
+        if let regex = try? NSRegularExpression(pattern: headline,
+                                                options: [.caseInsensitive]),
+           let match = regex.firstMatch(in: inner,
+                                        range: NSRange(inner.startIndex..., in: inner)),
+           match.numberOfRanges >= 2,
+           let range = Range(match.range(at: 1), in: inner) {
+            source = String(inner[range])
+        }
+        var text = source
+        for pattern in [#"<!--[\s\S]*?-->"#,
+                        #"<(?:script|style)[\s\S]*?</(?:script|style)>"#] {
+            text = text.replacingOccurrences(of: pattern, with: " ",
+                                             options: [.regularExpression, .caseInsensitive])
+        }
+        text = text.replacingOccurrences(of: #"<[^>]+>"#, with: " ",
+                                         options: .regularExpression)
+        text = decodeHTMLEntities(text)
+            .replacingOccurrences(of: #"\s+"#, with: " ",
+                                  options: .regularExpression)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if text.hasPrefix("•") {
+            text = String(text.dropFirst()).trimmingCharacters(in: .whitespaces)
+        }
+        if source == inner,
+           let cut = text.range(of: #"(?<=[.!?])\s"#, options: .regularExpression) {
+            text = String(text[..<cut.lowerBound])
+        }
+        guard text.count >= 15, text.count <= 240,
+              text.split(separator: " ").count >= 3 else { return nil }
+        let lowered = text.lowercased()
+        let junk = ["function", "${", "undefined", "getty images", "credit:",
+                    "sign in", "subscribe now", "advertisement", "cookie"]
+        guard !junk.contains(where: { lowered.contains($0) }) else { return nil }
+        // 视频卡片：栏目标签 + 时长 + 署名（"Video 1:08 CNN"），不是新闻标题。
+        // 门户首页这类卡片上百个，不剔掉会把头条清单整体淹没（cnn.com 实测）。
+        if text.range(of: #"\b\d{1,2}:\d{2}\b"#,
+                      options: .regularExpression) != nil { return nil }
+        // 「Analysis 署名」「CNN Exclusive 署名」等短标签同理；
+        // 「Live Updates」是真实滚动新闻，保留。
+        if text.count < 70, !lowered.contains("live updates"),
+           ["analysis", "video", "world", "style", "cnn exclusive"]
+            .contains(where: { lowered.hasPrefix($0) }) { return nil }
+        return text
+    }
+
+    private static func decodeHTMLEntities(_ text: String) -> String {
+        let named = ["&amp;": "&", "&lt;": "<", "&gt;": ">", "&quot;": "\"",
+                     "&#39;": "'", "&apos;": "'", "&nbsp;": " ",
+                     "&#x27;": "'", "&bull;": "•", "&hellip;": "…",
+                     "&mdash;": "—", "&ndash;": "–", "&rsquo;": "'",
+                     "&ldquo;": "\"", "&rdquo;": "\""]
+        var out = text
+        for (entity, value) in named {
+            out = out.replacingOccurrences(of: entity, with: value)
+        }
+        guard let regex = try? NSRegularExpression(
+            pattern: #"&#(x[0-9a-f]+|[0-9]+);"#, options: [.caseInsensitive]) else { return out }
+        for match in regex.matches(in: out, range: NSRange(out.startIndex..., in: out)).reversed() {
+            guard let rawRange = Range(match.range(at: 1), in: out),
+                  let fullRange = Range(match.range, in: out) else { continue }
+            let raw = String(out[rawRange])
+            let value = raw.lowercased().hasPrefix("x")
+                ? UInt32(raw.dropFirst(), radix: 16) : UInt32(raw)
+            guard let value, let scalar = Unicode.Scalar(value) else { continue }
+            out.replaceSubrange(fullRange, with: String(scalar))
+        }
+        return out
+    }
+
+    /// 本地时区与 UTC 的日期标签集合（跨时区时「当天」判定取并集）。
+    private static func dateTags(days: Int) -> Set<String> {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.dateFormat = "yyyy-MM-dd"
+        let calendar = Calendar(identifier: .gregorian)
+        let now = Date()
+        var out = Set<String>()
+        for zone in [TimeZone.current, TimeZone(secondsFromGMT: 0)].compactMap({ $0 }) {
+            formatter.timeZone = zone
+            for offset in 0..<max(1, days) {
+                if let date = calendar.date(byAdding: .day, value: -offset, to: now) {
+                    out.insert(formatter.string(from: date))
+                }
+            }
+        }
+        return out
+    }
+
+    private static func todayTags() -> Set<String> { dateTags(days: 1) }
+
+    /// 最近 7 天：用于判断页面最新文章是否还算「当前热点」，
+    /// 避免把归档页/旧版本文档当成今天的新闻清单。
+    private static func recentDateTags() -> Set<String> { dateTags(days: 7) }
+
+    /// 页面声明的 RSS/Atom 订阅源（`<link rel="alternate" type="…rss|atom+xml">`）。
+    /// 只认显式声明，不猜 `/rss`、`/feed` 路径：cnn.com 这类门户的猜测路径
+    /// 会返回 1MB 的 404 HTML，平白拖慢一次抓取。
+    static func discoverFeedLinks(html: String, baseURL: URL,
+                                  limit: Int = 2) -> [URL] {
+        guard limit > 0 else { return [] }
+        let head = String(html.prefix(300_000))
+        guard let linkRegex = try? NSRegularExpression(pattern: #"<link\b[^>]*>"#,
+                                                       options: [.caseInsensitive]),
+              let hrefRegex = try? NSRegularExpression(
+                pattern: #"href\s*=\s*["']([^"']+)["']"#, options: [.caseInsensitive])
+        else { return [] }
+        var result: [URL] = []
+        for match in linkRegex.matches(in: head, range: NSRange(head.startIndex..., in: head)) {
+            guard let tagRange = Range(match.range, in: head) else { continue }
+            let tag = String(head[tagRange])
+            let lowered = tag.lowercased()
+            guard lowered.contains("alternate"),
+                  lowered.contains("rss") || lowered.contains("atom")
+                    || lowered.contains("xml") else { continue }
+            guard let hrefMatch = hrefRegex.firstMatch(
+                in: tag, range: NSRange(tag.startIndex..., in: tag)),
+                  hrefMatch.numberOfRanges >= 2,
+                  let hrefRange = Range(hrefMatch.range(at: 1), in: tag),
+                  let url = URL(string: String(tag[hrefRange]),
+                                relativeTo: baseURL)?.absoluteURL,
+                  let scheme = url.scheme?.lowercased(),
+                  scheme == "http" || scheme == "https" else { continue }
+            if !result.contains(url) { result.append(url) }
+            if result.count >= limit { break }
+        }
+        return result
     }
 
     /// 提取页面内 iframe 的 src（按出现顺序去重，含相对路径原文）。
