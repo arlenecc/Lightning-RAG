@@ -197,6 +197,17 @@ struct MainView: View {
                 .help(model.isStoppingSync ? L("正在停止同步…") : L("停止知识库同步"))
 
                 Button {
+                    // 与配置窗口「转换工具」入口打开同一个 markdown-converter 窗口；
+                    // 不重建 converterConfig，保留用户在高级设置里的临时快照，
+                    // 未设置过时 MarkdownConvertView 自动回退到 model.config。
+                    openWindow(id: "markdown-converter")
+                } label: {
+                    Label(L("文档转换"), systemImage: "doc.text")
+                        .labelStyle(.titleAndIcon)
+                }
+                .help(L("打开文档转换工具：批量把 PDF/EPUB/Office/电子书等转换为 Markdown"))
+
+                Button {
                     openWindow(id: "settings")
                 } label: {
                     Label(L("配置"), systemImage: "gearshape")

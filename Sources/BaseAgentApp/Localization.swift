@@ -106,6 +106,9 @@ public enum AppLocalization {
         "打开日志窗口": "Open Logs",
         "打开配置": "Open Settings",
         "打开配置窗口": "Open Settings",
+        "文档转换": "Convert Documents",
+        "打开文档转换工具：批量把 PDF/EPUB/Office/电子书等转换为 Markdown":
+            "Open Document Converter: batch-convert PDF/EPUB/Office/eBooks to Markdown",
         "执行完成度": "Execution Completeness",
         "扫描书阅读器": "Scanned Book Reader",
         "技能符合度": "Skill Fit",

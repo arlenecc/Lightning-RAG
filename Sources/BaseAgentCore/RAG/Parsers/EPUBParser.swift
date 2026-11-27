@@ -285,6 +285,26 @@ public final class EPUBParser: DocumentParser {
                       progress: ((ParserProgress) -> Void)?) async throws -> ParsedDocument {
         let archive = try RAGArchiveReader.open(url)
 
+        // DRM 诊断：掌阅/Adobe 等加密 EPUB 的 META-INF/encryption.xml 会列出
+        // 被加密的文件。有些书只加密字体（正文明文，仍可正常解析），只有
+        // container.xml / OPF / 正文 XHTML 被加密时才无法解析。
+        // 不提前识别会报误导性的“XML 解析失败（error 4）”。
+        if let encData = RAGArchiveReader.data(archive, path: "META-INF/encryption.xml"),
+           let encText = String(data: encData, encoding: .utf8),
+           encText.localizedCaseInsensitiveContains("EncryptedData") {
+            let encryptedBody = encText.localizedCaseInsensitiveContains("container.xml")
+                || encText.localizedCaseInsensitiveContains(".opf")
+                || encText.localizedCaseInsensitiveContains(".xhtml")
+                || encText.localizedCaseInsensitiveContains(".html")
+            if encryptedBody {
+                let vendor = encText.localizedCaseInsensitiveContains("ZhangYue")
+                    ? "掌阅（ZhangYue）" : "Adobe ADEPT 等"
+                throw AgentError.parse(
+                    "EPUB 正文已加密（\(vendor) DRM），无法在没有授权凭据的情况下解析：\(url.lastPathComponent)")
+            }
+            AgentLog.info("EPUB 仅字体等非正文资源加密，正文可正常解析：\(url.lastPathComponent)")
+        }
+
         // container.xml 声明 OPF 路径；但部分 calibre/受保护 EPUB 的 container.xml
         // 被混淆为随机字节，此时回退为直接在 ZIP 内查找 .opf 文件。
         var declaredOPF: String?
