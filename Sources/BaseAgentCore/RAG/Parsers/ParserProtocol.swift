@@ -118,12 +118,12 @@ public enum OvisPrompt {
 public final class DocumentParserRegistry: @unchecked Sendable {
     private var parsers: [DocumentParser]
     private let config: AgentConfig?
-    private let vlm: VLMService?
 
     public init(parsers: [DocumentParser], config: AgentConfig? = nil) {
         self.parsers = parsers
         self.config = config
-        self.vlm = parsers.compactMap { ($0 as? VLMBackedParser)?.vlm }.first
+        // 不要在注册表构造时访问 parser.vlm：那会触发 lazy VLM 服务创建，
+        // 与“纯文本库不加载视觉模型”的意图相悖，且该字段从未被使用。
     }
 
     public func register(_ parser: DocumentParser) {
@@ -150,6 +150,11 @@ public final class DocumentParserRegistry: @unchecked Sendable {
         }
         if ["doc", "xls", "ppt"].contains(ext), let config {
             return LegacyOfficeParser(config: config)
+        }
+        // MOBI/AZW3/PRC 也必须按文件创建独立实例：共享实例会携带上一段
+        // 解析的 VLM/DRM 状态，批量转换多本不同 DRM 书时相互污染。
+        if ["mobi", "azw3", "prc"].contains(ext) {
+            return MobiParser(config: config)
         }
         return parser(for: url, options: options)
     }

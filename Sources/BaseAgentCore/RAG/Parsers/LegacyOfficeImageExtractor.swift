@@ -206,9 +206,16 @@ enum LegacyOfficeImageExtractor {
 
         var unique: [Data] = []
         var fingerprints = Set<String>()
+        let hexDigits = Array("0123456789abcdef".utf8)
         for image in images {
-            let fingerprint = SHA256.hash(data: image)
-                .map { String(format: "%02x", $0) }.joined()
+            let bytes = Array(SHA256.hash(data: image))
+            var hex = [UInt8]()
+            hex.reserveCapacity(bytes.count * 2)
+            for byte in bytes {
+                hex.append(hexDigits[Int(byte >> 4)])
+                hex.append(hexDigits[Int(byte & 0x0F)])
+            }
+            let fingerprint = String(decoding: hex, as: UTF8.self)
             guard fingerprints.insert(fingerprint).inserted else { continue }
             unique.append(image)
         }

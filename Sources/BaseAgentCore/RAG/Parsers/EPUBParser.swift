@@ -274,6 +274,8 @@ public final class EPUBParser: DocumentParser {
         let imagePaths: [String]
         let isScanned: Bool
         let startPage: Int
+        /// 文字充足章节里的插图 OCR 结果（图片路径 → 文本），以小节追加到该章末尾。
+        var illustrationTexts: [String: String] = [:]
     }
 
     private typealias OCROutcome = (text: String, pages: Int, recognized: Int)
@@ -430,16 +432,72 @@ public final class EPUBParser: DocumentParser {
             }
         }
 
+        // 文字充足章节中的插图：这些图不是扫描页（正文已在），但图内可能含
+        // 截图/表格/信息图。仅在显式选择 Ovis 后端且 VLM 可用时 OCR，
+        // 结果以「插图识别」小节追加到该章末尾，避免图表内信息丢失。
+        var illustrationResults: [Int: [String: String]] = [:]
+        let textPlansWithImages = plans.filter { !$0.isScanned && !$0.imagePaths.isEmpty }
+        if !textPlansWithImages.isEmpty,
+           (options.epubOCREngine == .ovis || options.epubOCREngine == .custom),
+           let vlm = try? ocrVLMService(options: options), vlm.isAvailable {
+            let reader = SerializedArchiveReader(archive)
+            try await withThrowingTaskGroup(of: (Int, [String: String]).self) { group in
+                var pending = textPlansWithImages.makeIterator()
+                let limit = min(Self.maxConcurrentOCRChapters, textPlansWithImages.count)
+                var running = 0
+                func schedule() {
+                    while running < limit, let plan = pending.next() {
+                        running += 1
+                        group.addTask {
+                            var texts: [String: String] = [:]
+                            for path in plan.imagePaths {
+                                guard let imageData = reader.data(path: path) else { continue }
+                                do {
+                                    let recognized = try await OfficeEmbeddedImageOcr.recognize(
+                                        key: path, data: imageData, vlm: vlm, options: options)
+                                    texts[path] = recognized ?? "[图片未识别]"
+                                } catch {
+                                    texts[path] = "[图片未识别]"
+                                }
+                            }
+                            return (plan.index, texts)
+                        }
+                    }
+                }
+                schedule()
+                for try await (index, texts) in group {
+                    illustrationResults[index] = texts
+                    running -= 1
+                    schedule()
+                }
+            }
+        }
+
         // 第三阶段：按 spine 原始顺序组装章节与大纲。
         var chapters: [String] = []
         var headings: [OutlineEntry] = []
-        for plan in plans {
+        for var plan in plans {
+            if let texts = illustrationResults[plan.index] {
+                plan.illustrationTexts = texts
+            }
             var chapter = plan.markdown
             if plan.isScanned, let ocr = ocrResults[plan.index] {
                 if !ocr.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                     chapter = ocr.text
                 } else if !plan.markdown.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                     AgentLog.warning("EPUB: 第 \(plan.index + 1) 章 OCR 无结果，保留原文字层")
+                }
+            }
+
+            if !plan.illustrationTexts.isEmpty {
+                let entries = plan.illustrationTexts
+                    .sorted { $0.key < $1.key }
+                    .compactMap { path, text -> String? in
+                        guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
+                        return "[\(path)]\n\(text)"
+                    }
+                if !entries.isEmpty {
+                    chapter += "\n\n### 插图识别\n\n" + entries.joined(separator: "\n\n")
                 }
             }
 
@@ -979,8 +1037,22 @@ public final class EPUBParser: DocumentParser {
         guard let source = CGImageSourceCreateWithData(data as CFData, nil) else {
             return nil
         }
-        return CGImageSourceCreateImageAtIndex(
-            source, 0,
-            [kCGImageSourceShouldCacheImmediately: true] as CFDictionary)
+        // 超大图先降采样：OCR 归一化本就压长边，全分辨率解码会让
+        // 批量并发时内存峰值失控（与 Office / MOBI 图片解码一致）。
+        let decodeOptions: [CFString: Any]
+        if let props = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
+           let w = props[kCGImagePropertyPixelWidth] as? Int,
+           let h = props[kCGImagePropertyPixelHeight] as? Int,
+           w > 0, h > 0, w * h > 16_000_000 {
+            let scale = sqrt(Double(16_000_000) / Double(w * h))
+            decodeOptions = [
+                kCGImageSourceShouldCacheImmediately: true,
+                kCGImageSourceCreateThumbnailFromImageAlways: true,
+                kCGImageSourceThumbnailMaxPixelSize: max(1, Int(Double(max(w, h)) * scale)),
+            ]
+        } else {
+            decodeOptions = [kCGImageSourceShouldCacheImmediately: true]
+        }
+        return CGImageSourceCreateImageAtIndex(source, 0, decodeOptions as CFDictionary)
     }
 }

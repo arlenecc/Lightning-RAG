@@ -119,7 +119,11 @@ public struct MobiScanDiagnostics: Sendable {
 public final class MobiParser: DocumentParser, VLMBackedParser {
     public let name = "MOBI/AZW3"
     public let supportedExtensions = ["mobi", "azw3", "prc"]
-    public let vlm: VLMService?
+    /// VLM 按需构造：纯文本 MOBI 不应触发视觉模型服务创建/权重探测。
+    public var vlm: VLMService? { resolvedVLM }
+    private lazy var resolvedVLM: VLMService? = config.map {
+        LocalModelFactory.shared.makeRAGOCRVLM(config: $0)
+    }
 
     private let config: AgentConfig?
 
@@ -131,7 +135,6 @@ public final class MobiParser: DocumentParser, VLMBackedParser {
         self.drmPID = drmPID ?? config.flatMap {
             $0.ragMobiDRMPID.isEmpty ? nil : $0.ragMobiDRMPID
         }
-        self.vlm = config.map { LocalModelFactory.shared.makeRAGOCRVLM(config: $0) }
     }
 
     // MARK: - DocumentParser
@@ -195,6 +198,13 @@ public final class MobiParser: DocumentParser, VLMBackedParser {
         }
 
         let imageData = Self.extractImages(pdb: pdb, header: header, html: html)
+        if MobiDRM.isProtected(palm), imageData.isEmpty {
+            // DRM 书只解密了文本 Record，资源 Record 仍是密文，magic 不匹配；
+            // 明确诊断而不是误判为“非扫描版”静默产出空正文。
+            metadata["drm_images"] = "undecrypted"
+            AgentLog.warning("MOBI: DRM 保护的书籍资源 Record 未解密，"
+                + "无法提取/ OCR 内嵌图片（文本正文不受影响）")
+        }
         let trailing = max(0, pdb.recordCount - Int(header.firstNonBookIndex))
         let diagnostics = MobiScanDiagnostics.detect(
             textLength: palm.textLength, imageCount: imageData.count,
@@ -229,7 +239,26 @@ public final class MobiParser: DocumentParser, VLMBackedParser {
         }
 
         progress?(.message("MOBI: 文本化 HTML"))
-        let text = Self.htmlToText(html)
+        // 文字版书中的插图：不是扫描页（正文已在），但图内可能含截图/表格。
+        // 仅在显式选择 Ovis 后端且 VLM 可用时 OCR，按图片文档顺序回填到 <img> 位置。
+        var illustrationTexts: [String] = []
+        if !imageData.isEmpty,
+           (options.epubOCREngine == .ovis || options.epubOCREngine == .custom),
+           let vlm, vlm.isAvailable {
+            for data in imageData {
+                do {
+                    let recognized = try await OfficeEmbeddedImageOcr.recognize(
+                        key: "mobi-illustration", data: data, vlm: vlm, options: options)
+                    illustrationTexts.append(recognized ?? "[图片未识别]")
+                } catch {
+                    illustrationTexts.append("[图片未识别]")
+                }
+            }
+        }
+        let text = Self.htmlToText(html, illustrationTexts: illustrationTexts)
+        guard DocumentCleaner.effectiveCharacterCount(text) > 0 else {
+            throw AgentError.parse("MOBI 未解析出正文：\(url.lastPathComponent)")
+        }
         let doc = ParsedDocument(text: text, source: url.lastPathComponent,
                                  outline: Self.outline(from: text, toc: toc), metadata: metadata)
         return finish(doc, options: options, profile: .structured)
@@ -413,8 +442,15 @@ public final class MobiParser: DocumentParser, VLMBackedParser {
 
     /// 稳定图片指纹：SHA256 全文 + 长度，避免进程随机哈希与前缀碰撞。
     private static func imageFingerprint(_ data: Data) -> String {
-        let digest = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
-        return "\(data.count):\(digest)"
+        let bytes = Array(SHA256.hash(data: data))
+        let hexDigits = Array("0123456789abcdef".utf8)
+        var hex = [UInt8]()
+        hex.reserveCapacity(bytes.count * 2)
+        for byte in bytes {
+            hex.append(hexDigits[Int(byte >> 4)])
+            hex.append(hexDigits[Int(byte & 0x0F)])
+        }
+        return "\(data.count):\(String(decoding: hex, as: UTF8.self))"
     }
 
     /// 从 `<img recindex="00001">` / `src="resource00000.jpeg"` 按出现顺序取资源 UID。
@@ -583,8 +619,23 @@ public final class MobiParser: DocumentParser, VLMBackedParser {
                 let decoded = group.compactMap { index -> CGImage? in
                     guard let source = CGImageSourceCreateWithData(images[index] as CFData, nil)
                     else { return nil }
-                    return CGImageSourceCreateImageAtIndex(
-                        source, 0, [kCGImageSourceShouldCacheImmediately: true] as CFDictionary)
+                    // 超大图先降采样：OCR 归一化本就压长边，全分辨率解码
+                    // 会让批量并发时内存峰值失控（与 Office 图片解码一致）。
+                    let decodeOptions: [CFString: Any]
+                    if let props = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
+                       let w = props[kCGImagePropertyPixelWidth] as? Int,
+                       let h = props[kCGImagePropertyPixelHeight] as? Int,
+                       w > 0, h > 0, w * h > 16_000_000 {
+                        let scale = sqrt(Double(16_000_000) / Double(w * h))
+                        decodeOptions = [
+                            kCGImageSourceShouldCacheImmediately: true,
+                            kCGImageSourceCreateThumbnailFromImageAlways: true,
+                            kCGImageSourceThumbnailMaxPixelSize: max(1, Int(Double(max(w, h)) * scale)),
+                        ]
+                    } else {
+                        decodeOptions = [kCGImageSourceShouldCacheImmediately: true]
+                    }
+                    return CGImageSourceCreateImageAtIndex(source, 0, decodeOptions as CFDictionary)
                 }
                 guard !decoded.isEmpty else { continue }
                 if decoded.count > 1, let stitched = MobiStitchEngine.stitch(decoded) {
@@ -706,14 +757,14 @@ public final class MobiParser: DocumentParser, VLMBackedParser {
         return result
     }
 
-    private static func htmlToText(_ html: String) -> String {
+    private static func htmlToText(_ html: String, illustrationTexts: [String] = []) -> String {
         let normalized = limitHTMLDepth(html).replacingOccurrences(
             of: "<mbp:pagebreak", with: "<div data-pagebreak=\"1\"")
         var lines: [String] = []
         if let document = try? SwiftSoup.parse(normalized) {
             let _ = try? document.select("script, style, head, title").remove()
             if let body = document.body() {
-                collect(body, into: &lines)
+                collect(body, into: &lines, illustrationTexts: illustrationTexts)
             }
             // calibre 转换的 AZW3 常把整本书的多个 XHTML 文档直接拼在一个 flow 里：
             // 每个章节自带 <?xml?><html><body>，正文 <p> 落在“空 body”之外，
@@ -722,7 +773,7 @@ public final class MobiParser: DocumentParser, VLMBackedParser {
             let substantive = lines.reduce(0) { $0 + $1.trimmingCharacters(in: .whitespacesAndNewlines).count }
             if substantive < 64 {
                 lines.removeAll()
-                collect(document, into: &lines)
+                collect(document, into: &lines, illustrationTexts: illustrationTexts)
             }
         } else {
             let raw = html.replacingOccurrences(of: #"<[^>]+>"#, with: "\n",
@@ -734,11 +785,13 @@ public final class MobiParser: DocumentParser, VLMBackedParser {
         return lines.filter { !$0.isEmpty }.joined(separator: "\n")
     }
 
-    private static func collect(_ node: SwiftSoup.Node, into lines: inout [String]) {
+    private static func collect(_ node: SwiftSoup.Node, into lines: inout [String],
+                                illustrationTexts: [String] = []) {
         // 迭代式 DFS：calibre 把多章 XHTML 拼进一个 flow，SwiftSoup 对畸形嵌套
         // 会生成极深节点树，递归既可能栈溢出，也会因深度上限截断导致正文丢失。
         struct Frame { let node: SwiftSoup.Node }
         var stack: [Frame] = [Frame(node: node)]
+        var imageIndex = 0
         while let frame = stack.popLast() {
             let current = frame.node
             if let text = current as? SwiftSoup.TextNode {
@@ -755,7 +808,12 @@ public final class MobiParser: DocumentParser, VLMBackedParser {
                 let alt = (try? element.attr("alt")) ?? ""
                 let title = (try? element.attr("title")) ?? ""
                 let label = alt.isEmpty ? title : alt
-                lines.append(label.isEmpty ? "[图片]" : "[\(label)]")
+                if imageIndex < illustrationTexts.count, !illustrationTexts[imageIndex].isEmpty {
+                    lines.append(illustrationTexts[imageIndex])
+                } else {
+                    lines.append(label.isEmpty ? "[图片]" : "[\(label)]")
+                }
+                imageIndex += 1
             }
             if ["p", "div", "h1", "h2", "h3", "h4", "li", "br", "tr"].contains(tag) {
                 lines.append("\n")

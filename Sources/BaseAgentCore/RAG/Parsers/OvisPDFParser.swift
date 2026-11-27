@@ -252,8 +252,9 @@ public final class OvisPDFParser: DocumentParser, VLMBackedParser {
                         return (text: cleaned, needsVLM: false,
                                 busySeconds: result.busySeconds)
                     }
-                    // Vision 文本过少视为失败，回退 OvisOCR3。
-                    return (text: nil, needsVLM: true, busySeconds: result.busySeconds)
+                    // Vision 文本过少：仍需 Ovis 兜底，但保留已提取的少量文本。
+                    // 若 VLM 不可用，至少不会把这一页变成空白。
+                    return (text: cleaned, needsVLM: true, busySeconds: result.busySeconds)
                 }
 
             var ovisFallback: [Int] = []
@@ -273,6 +274,8 @@ public final class OvisPDFParser: DocumentParser, VLMBackedParser {
                     visionPages += 1
                 } else if outcome.needsVLM {
                     needsVLMCount += 1
+                    // 先写入 Vision 抓到的少量文本；Ovis 成功时会覆盖。
+                    pageTexts[outcome.index] = outcome.text ?? ""
                     ovisFallback.append(outcome.index)
                 } else {
                     pageTexts[outcome.index] = ""
@@ -284,6 +287,13 @@ public final class OvisPDFParser: DocumentParser, VLMBackedParser {
             //（直提取/渲染都很便宜）+ 借实例池并发识别。不缓存整批图像——
             // 需要兜底的页面可能占全书大半，全部驻留会撑爆内存。
             let ovisPages = ovisFallback.sorted()
+            if !ovisPages.isEmpty, !(vlmService?.isAvailable ?? false) {
+                // VLM 不可用：保留 Vision 兜底文本并显式计数/告警，
+                // 让 manifest 知道这些页识别质量不足、后续可重试。
+                failedPages += ovisPages.count
+                AgentLog.warning("PDF hybrid: \(ovisPages.count) 页需要 OvisOCR3 但视觉模型不可用，"
+                    + "已保留 Vision 部分识别结果")
+            }
             if let vlm = vlmService, vlm.isAvailable, !ovisPages.isEmpty {
                 ocrPages += ovisPages.count
                 if firstOCRMessage {

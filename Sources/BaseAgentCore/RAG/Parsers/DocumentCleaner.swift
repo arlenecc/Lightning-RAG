@@ -125,8 +125,7 @@ public enum DocumentCleaner {
         var lines: [String] = []
         lines.reserveCapacity(rawLines.count)
         for raw in rawLines {
-            let noTrailing = raw.replacingOccurrences(
-                of: "[ \\t]+$", with: "", options: .regularExpression)
+            let noTrailing = trimTrailingHorizontalWhitespace(raw)
             lines.append(noTrailing.trimmingCharacters(in: .whitespaces).isEmpty
                 ? "" : noTrailing)
         }
@@ -193,13 +192,34 @@ public enum DocumentCleaner {
         return false
     }
 
+    /// 无正则地裁剪行尾空格/制表符（批量处理数百万行时避免正则构造）。
+    private static func trimTrailingHorizontalWhitespace(_ line: String) -> String {
+        var end = line.endIndex
+        while end > line.startIndex {
+            let before = line.index(before: end)
+            let c = line[before]
+            if c == " " || c == "\t" { end = before } else { break }
+        }
+        return String(line[line.startIndex..<end])
+    }
+
     private static func densityListKind(_ line: String) -> String? {
         let trimmed = line.trimmingCharacters(in: .whitespaces)
-        if trimmed.range(of: #"^[-*+]\s"#, options: .regularExpression) != nil {
+        // 无正则判定列表前缀：[-*+] 后跟空白，或 1~3 位数字后跟 . / ) 与空白。
+        if let first = trimmed.first, ["-", "*", "+"].contains(first),
+           trimmed.count > 1, trimmed[trimmed.index(after: trimmed.startIndex)].isWhitespace {
             return "ul"
         }
-        if trimmed.range(of: #"^\d{1,3}[.)]\s"#, options: .regularExpression) != nil {
-            return "ol"
+        var idx = trimmed.startIndex
+        var digits = 0
+        while idx < trimmed.endIndex, digits < 3, trimmed[idx].isNumber {
+            digits += 1
+            idx = trimmed.index(after: idx)
+        }
+        if digits > 0, idx < trimmed.endIndex,
+           (trimmed[idx] == "." || trimmed[idx] == ")") {
+            let after = trimmed.index(after: idx)
+            if after < trimmed.endIndex, trimmed[after].isWhitespace { return "ol" }
         }
         return nil
     }
@@ -635,8 +655,7 @@ public enum DocumentCleaner {
             }
             // Markdown 结构行（标题/列表/引用/表格/围栏/缩进代码）一律保留。
             if isStructuralLine(rawLine) {
-                let rendered = rawLine.replacingOccurrences(
-                    of: "[ \\t]+$", with: "", options: .regularExpression)
+                let rendered = trimTrailingHorizontalWhitespace(rawLine)
                 if result.last?.trimmingCharacters(in: .whitespaces) != line {
                     result.append(rendered)
                 }

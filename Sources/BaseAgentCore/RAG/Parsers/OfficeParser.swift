@@ -56,6 +56,10 @@ public final class OfficeParser: DocumentParser, VLMBackedParser {
             }
 
             var metadata = result.metadata
+            // OOXML 三格式共享 docProps/core.xml，统一提取作者/标题/主题/关键词等。
+            for (key, value) in Self.coreMetadata(archive) where !value.isEmpty {
+                metadata[key] = value
+            }
             metadata["engine"] = extensionName
 
             var parsed = ParsedDocument(text: result.text,
@@ -81,6 +85,33 @@ public final class OfficeParser: DocumentParser, VLMBackedParser {
     }
 
     /// 扫描 OOXML 关系与 blip 锚点，收集正文中嵌图（不含背景图）。
+    /// OOXML 核心属性：docx/xlsx/pptx 都放在 docProps/core.xml。
+    private static func coreMetadata(_ archive: Archive) -> [String: String] {
+        guard let data = RAGArchiveReader.data(archive, path: "docProps/core.xml"),
+              let xml = try? RAGXMLHelper.parse(data, source: "docProps/core.xml") else {
+            return [:]
+        }
+        let root = xml.root
+        // dc:* 用限定名匹配，避免 cp:lastModifiedBy 误当 creator。
+        func qualified(_ qname: String) -> String {
+            for node in RAGXMLHelper.descendants(root, RAGXMLHelper.localName(qname)) {
+                if node.name.lowercased() == qname.lowercased() {
+                    return (node.value ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+                }
+            }
+            return ""
+        }
+        return [
+            "author": qualified("dc:creator"),
+            "title": qualified("dc:title"),
+            "subject": qualified("dc:subject"),
+            "description": qualified("dc:description"),
+            "keywords": qualified("cp:keywords"),
+            "created": qualified("dcterms:created"),
+            "last_modified_by": qualified("cp:lastModifiedBy"),
+        ].filter { !$0.value.isEmpty }
+    }
+
     private func embeddedImages(archive: Archive, extensionName: String) -> [EmbeddedImage] {
         switch extensionName {
         case "docx":
@@ -305,14 +336,37 @@ public final class OfficeParser: DocumentParser, VLMBackedParser {
                                                  imageMarkdown: imageMarkdown))
         let counters = DocxListCounters()
 
+        // 主文档的图片 OCR key 为 "word/document.xml#rIdN"，而 docxText
+        // 按裸 rId 回填；这里与页眉/脚注一致做一次 key 映射，否则正文图片
+        // 的 OCR 结果永远匹配不到，只退回 alt 文本。
+        let mainPath = "word/document.xml"
+        var mainImageMarkdown: [String: String] = [:]
+        for (key, value) in imageMarkdown where key.hasPrefix(mainPath + "#") {
+            mainImageMarkdown[String(key.dropFirst(mainPath.count + 1))] = value
+        }
+        // 无 part 前缀的 key（旧调用路径）也保留
+        for (key, value) in imageMarkdown where !key.contains("#") {
+            mainImageMarkdown[key] = value
+        }
+
         var blocks: [String] = []
         var headings: [OutlineEntry] = []
         renderDocxChildren(body, blocks: &blocks, headings: &headings,
                            numbering: numbering, styles: styles, counters: counters,
                            footnotes: footnotes, endnotes: endnotes,
-                           imageMarkdown: imageMarkdown)
+                           imageMarkdown: mainImageMarkdown)
         blocks.append(contentsOf: footnotes.sections(title: "脚注"))
         blocks.append(contentsOf: endnotes.sections(title: "尾注"))
+        // 批注正文：以附录形式输出，避免 word/comments.xml 的内容被静默丢弃。
+        let comments = docxComments(archive: archive)
+            .sorted { Int($0.key) ?? 0 < Int($1.key) ?? 0 }
+            .map(\.value)
+        if !comments.isEmpty {
+            blocks.append("## 批注")
+            for (index, text) in comments.enumerated() {
+                blocks.append("\(index + 1). \(text)")
+            }
+        }
 
         let headersFooters = docxHeadersFooters(archive, imageMarkdown: imageMarkdown)
         if !headersFooters.isEmpty {
@@ -776,6 +830,27 @@ public final class OfficeParser: DocumentParser, VLMBackedParser {
             if !text.isEmpty { notes[id] = text }
         }
         return notes
+    }
+
+    /// word/comments.xml 的批注正文（id → 文本），以附录形式输出。
+    private func docxComments(archive: Archive) -> [String: String] {
+        let path = "word/comments.xml"
+        guard let data = RAGArchiveReader.data(archive, path: path),
+              let document = try? RAGXMLHelper.parsePreservingWhitespace(data, source: path) else {
+            return [:]
+        }
+        var comments: [String: String] = [:]
+        for comment in RAGXMLHelper.descendants(document.root, "comment") {
+            guard let id = RAGXMLHelper.attribute(comment, ["id"])?
+                .trimmingCharacters(in: .whitespaces), !id.isEmpty else { continue }
+            let text = RAGXMLHelper.children(comment, "p")
+                .map { docxParagraphText($0, footnotes: nil, endnotes: nil,
+                                         imageMarkdown: [:]) }
+                .filter { !$0.isEmpty }
+                .joined(separator: "\n")
+            if !text.isEmpty { comments[id] = text }
+        }
+        return comments
     }
 
     // MARK: - XLSX
