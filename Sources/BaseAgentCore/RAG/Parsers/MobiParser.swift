@@ -38,17 +38,46 @@ public struct MobiScanDiagnostics: Sendable {
     /// textLength 只有几 KB 且几乎全是 HTML 标签；图片数量巨大；
     /// firstNonBookIndex 之后还有成百上千条记录；无 <text> 标签；
     /// 源码几乎找不到可读连续句子，只有 <img>/<mbp:pagebreak/>。
+    /// 正则只编译一次：批量转换 5000+ 本时，逐本新建 NSRegularExpression
+    /// 与全量 lowercased() 复制是持续 CPU 占用的主要来源。
+    nonisolated(unsafe) private static let textTagRegex: NSRegularExpression? = {
+        try? NSRegularExpression(pattern: #"<text(?=[\s>])"#, options: .caseInsensitive)
+    }()
+
+    /// 大小写不敏感地统计子串出现次数，只返回计数不构造子串。
+    private static func countOccurrences(of needle: String, in text: String) -> Int {
+        guard !needle.isEmpty else { return 0 }
+        let ns = text as NSString
+        var cursor = 0
+        var count = 0
+        let total = ns.length
+        while cursor < total {
+            let found = ns.range(of: needle, options: .caseInsensitive,
+                                 range: NSRange(location: cursor, length: total - cursor))
+            if found.location == NSNotFound { break }
+            count += 1
+            cursor = found.location + max(1, found.length)
+        }
+        return count
+    }
+
     public static func detect(textLength: Int, imageCount: Int, trailingRecords: Int,
                               html: String) -> MobiScanDiagnostics {
-        let lower = html.lowercased()
-        // 精确匹配 <text ...>/<text>，避免 <textarea>/<textpath> 误命中。
-        let hasTextTag = (try? NSRegularExpression(pattern: #"<text(?=[\s>])"#))?
-            .firstMatch(in: lower, options: [],
-                        range: NSRange(location: 0, length: (lower as NSString).length)) != nil
-        let pageBreakCount = lower.components(separatedBy: "mbp:pagebreak").count - 1
-        let imgCount = lower.components(separatedBy: "<img").count - 1
+        let ns = html as NSString
+        let range = NSRange(location: 0, length: ns.length)
+        // 精确匹配 <text ...>/<text>，避免 <textarea>/<textpath> 误命中；
+        // 直接用 caseInsensitive 在原文上匹配，不再全量 lowercased() 复制。
+        let hasTextTag = Self.textTagRegex?
+            .firstMatch(in: html, options: [], range: range) != nil
+        // 单次线性扫描同时统计分页符、<img> 与可读字符，避免多次全量切分/正则替换。
+        // 用缓存的 caseInsensitive 正则在原文上统计，避免 html.lowercased() 的
+        // 全量字符串复制（这是批量场景下最昂贵的分配之一）。
+        let pageBreakCount = Self.countOccurrences(of: "mbp:pagebreak", in: html)
+        let imgCount = Self.countOccurrences(of: "<img", in: html)
+        // 去标签与实体：一次正则替换，不再全量 lowercased 后切分。
         let stripped = html
-            .replacingOccurrences(of: #"<[^>]+>"#, with: " ", options: .regularExpression)
+            .replacingOccurrences(of: #"<[^>]+>"#, with: " ",
+                                  options: [.regularExpression, .caseInsensitive])
             .replacingOccurrences(of: "&nbsp;", with: " ")
         let readable = stripped.unicodeScalars.filter {
             !CharacterSet.whitespacesAndNewlines.contains($0)
@@ -242,21 +271,31 @@ public final class MobiParser: DocumentParser, VLMBackedParser {
 
     /// 按 libmobi util.c:1813-1852 选择文本记录：起始 = 1 + KF8 偏移，
     /// 数量取 PalmDOC header 的 text_record_count，并剥离记录尾块。
-    private static func textRecordSet(pdb: MobiPDB, header: MobiHeader,
+    static func textRecordSet(pdb: MobiPDB, header: MobiHeader,
                                       palm: MobiPalmHeader)
         -> (records: [Data], dictionary: [Data]?, indexes: [Int]) {
         // 只有 KF8 文件才用 EXTH 121 作为文本起始偏移；
         // 非 KF8 文件里该 EXTH 字段另有含义（ncx 样本里是 12），不能当偏移。
-        let kf8Offset = header.isKF8 ? Int(header.kf8Boundary ?? 0) : 0
-        let start = 1 + kf8Offset
-        let count = palm.recordCount
-        guard start > 0, count > 0 else { return ([], nil, []) }
+        // kf8Boundary / recordCount 来自文件头，畸形值可使 start+count 溢出或
+        // 下界大于上界；Swift 的 Range(lower..<upper) 在 lower>upper 时会 brk 1。
+        let rawOffset = header.isKF8 ? Int(header.kf8Boundary ?? 0) : 0
+        // KF8 boundary 指向 KF8 资源/文本切换点；某些 calibre 转换的 HuffDic 书里
+        // 它指向文件末尾的资源区（如 1715/1716），不能当文本起点。
+        // 文本记录必须在 firstNonBookIndex 之前，因此把 start 钳制到该范围内。
+        let textEnd = max(1, min(pdb.recordCount, Int(header.firstNonBookIndex)))
+        var start = (rawOffset >= 0 && rawOffset < pdb.recordCount) ? 1 + rawOffset : 1
+        if start >= textEnd { start = 1 }
+        let count = palm.recordCount > 0 ? min(palm.recordCount, pdb.recordCount) : 0
+        guard start > 0, start <= pdb.recordCount, count > 0 else { return ([], nil, []) }
+        let upper = min(textEnd, start + count)
+        guard start <= upper else { return ([], nil, []) }
         let huffStart = Int(header.huffmanRecordOffset)
-        let huffEnd = huffStart + Int(header.huffmanRecordCount)
+        let huffEnd = huffStart >= 0 && header.huffmanRecordCount <= UInt32.max - UInt32(huffStart)
+            ? huffStart + Int(header.huffmanRecordCount) : pdb.recordCount
         let flags = header.extraDataFlags ?? 0
         var text: [Data] = []
         var indexes: [Int] = []
-        for index in start..<min(pdb.recordCount, start + count) {
+        for index in start..<upper {
             if huffStart > 0, index >= huffStart, index < huffEnd { continue }
             guard let record = pdb.record(at: index) else { continue }
             let extra = extraDataSize([UInt8](record), flags: flags)
@@ -264,8 +303,9 @@ public final class MobiParser: DocumentParser, VLMBackedParser {
                         ? Data(record.prefix(record.count - extra)) : record)
             indexes.append(index)
         }
-        let dictionary = huffStart > 0 && Int(header.huffmanRecordCount) > 0
-            ? (huffStart..<min(pdb.recordCount, huffEnd)).compactMap { pdb.record(at: $0) }
+        let dictUpper = min(pdb.recordCount, huffEnd)
+        let dictionary = (huffStart > 0 && huffStart < dictUpper)
+            ? (huffStart..<dictUpper).compactMap { pdb.record(at: $0) }
             : nil
         return (text, dictionary, indexes)
     }
@@ -622,15 +662,66 @@ public final class MobiParser: DocumentParser, VLMBackedParser {
 
     // MARK: - HTML 文本化
 
+    /// SwiftSoup 的 Node.ownerDocument() 是沿 parent 链递归，DOM 深度达数千层时
+    /// 会在解析阶段（reconstructFormattingElements → notifyMutationOwners）栈溢出。
+    /// 畸形/恶意 MOBI 可含上千层嵌套 <b>/<i>/<span>，这里在解析前把超深嵌套的
+    /// 开标签剥离为普通文本，限制 DOM 深度在安全范围。
+    private static func limitHTMLDepth(_ html: String, maxDepth: Int = 96) -> String {
+        var depth = 0
+        var result = ""
+        result.reserveCapacity(html.count)
+        var index = html.startIndex
+        let end = html.endIndex
+        while index < end {
+            guard html[index] == "<", index < end else {
+                result.append(html[index])
+                index = html.index(after: index)
+                continue
+            }
+            // 找标签结束（忽略属性内的 > 简化处理）
+            guard let close = html[index...].firstIndex(of: ">") else {
+                result.append(contentsOf: html[index...]); break
+            }
+            let rawTag = String(html[index...close])
+            let isClosing = rawTag.hasPrefix("</")
+            let isOpen = rawTag.hasPrefix("<") && !isClosing && !rawTag.hasPrefix("<!")
+            let name = rawTag
+                .trimmingCharacters(in: CharacterSet(charactersIn: "<>/ "))
+                .split(whereSeparator: { $0 == " " || $0 == "/" }).first.map(String.init)?
+                .lowercased() ?? ""
+            if isOpen && !["br", "img", "hr", "meta", "link", "input"].contains(name) {
+                if depth >= maxDepth {
+                    // 超深的格式化/容器标签本身无文本语义，直接丢弃其标签字节，
+                    // 既不让 DOM 变深，也不在正文里留下 &lt;b&gt; 之类的噪音。
+                    index = html.index(after: close)
+                    continue
+                }
+                depth += 1
+            } else if isClosing, depth > 0 {
+                depth -= 1
+            }
+            result.append(contentsOf: rawTag)
+            index = html.index(after: close)
+        }
+        return result
+    }
+
     private static func htmlToText(_ html: String) -> String {
-        let normalized = html.replacingOccurrences(of: "<mbp:pagebreak",
-                                                   with: "<div data-pagebreak=\"1\"")
+        let normalized = limitHTMLDepth(html).replacingOccurrences(
+            of: "<mbp:pagebreak", with: "<div data-pagebreak=\"1\"")
         var lines: [String] = []
         if let document = try? SwiftSoup.parse(normalized) {
             let _ = try? document.select("script, style, head, title").remove()
             if let body = document.body() {
                 collect(body, into: &lines)
-            } else {
+            }
+            // calibre 转换的 AZW3 常把整本书的多个 XHTML 文档直接拼在一个 flow 里：
+            // 每个章节自带 <?xml?><html><body>，正文 <p> 落在“空 body”之外，
+            // SwiftSoup 只保留第一个空 body。body 收集到的常常只有分页标记/空白，
+            // 因此以“非空白文本字符数”判断，不足时回退整个 document 遍历。
+            let substantive = lines.reduce(0) { $0 + $1.trimmingCharacters(in: .whitespacesAndNewlines).count }
+            if substantive < 64 {
+                lines.removeAll()
                 collect(document, into: &lines)
             }
         } else {
@@ -644,26 +735,34 @@ public final class MobiParser: DocumentParser, VLMBackedParser {
     }
 
     private static func collect(_ node: SwiftSoup.Node, into lines: inout [String]) {
-        if let text = node as? SwiftSoup.TextNode {
-            let value = text.text().trimmingCharacters(in: .whitespacesAndNewlines)
-            if !value.isEmpty { lines.append(value) }
-            return
-        }
-        guard let element = node as? SwiftSoup.Element else { return }
-        if let pageBreak = try? element.attr("data-pagebreak"), pageBreak == "1" {
-            lines.append("\n")
-        }
-        // 插图本身没有文本节点：至少保留 alt / title，避免图文混排书的图片语义丢失。
-        let tag = element.tagName().lowercased()
-        if tag == "img" {
-            let alt = (try? element.attr("alt")) ?? ""
-            let title = (try? element.attr("title")) ?? ""
-            let label = alt.isEmpty ? title : alt
-            lines.append(label.isEmpty ? "[图片]" : "[\(label)]")
-        }
-        for child in element.getChildNodes() { collect(child, into: &lines) }
-        if ["p", "div", "h1", "h2", "h3", "h4", "li", "br", "tr"].contains(tag) {
-            lines.append("\n")
+        // 迭代式 DFS：calibre 把多章 XHTML 拼进一个 flow，SwiftSoup 对畸形嵌套
+        // 会生成极深节点树，递归既可能栈溢出，也会因深度上限截断导致正文丢失。
+        struct Frame { let node: SwiftSoup.Node }
+        var stack: [Frame] = [Frame(node: node)]
+        while let frame = stack.popLast() {
+            let current = frame.node
+            if let text = current as? SwiftSoup.TextNode {
+                let value = text.text().trimmingCharacters(in: .whitespacesAndNewlines)
+                if !value.isEmpty { lines.append(value) }
+                continue
+            }
+            guard let element = current as? SwiftSoup.Element else { continue }
+            if let pageBreak = try? element.attr("data-pagebreak"), pageBreak == "1" {
+                lines.append("\n")
+            }
+            let tag = element.tagName().lowercased()
+            if tag == "img" {
+                let alt = (try? element.attr("alt")) ?? ""
+                let title = (try? element.attr("title")) ?? ""
+                let label = alt.isEmpty ? title : alt
+                lines.append(label.isEmpty ? "[图片]" : "[\(label)]")
+            }
+            if ["p", "div", "h1", "h2", "h3", "h4", "li", "br", "tr"].contains(tag) {
+                lines.append("\n")
+            }
+            for child in element.getChildNodes().reversed() {
+                stack.append(Frame(node: child))
+            }
         }
     }
 

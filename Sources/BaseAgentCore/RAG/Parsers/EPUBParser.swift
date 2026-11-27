@@ -283,17 +283,25 @@ public final class EPUBParser: DocumentParser {
                       progress: ((ParserProgress) -> Void)?) async throws -> ParsedDocument {
         let archive = try RAGArchiveReader.open(url)
 
-        guard let containerData = RAGArchiveReader.data(archive, path: "META-INF/container.xml") else {
-            throw AgentError.parse("EPUB 缺少 META-INF/container.xml：\(url.lastPathComponent)")
+        // container.xml 声明 OPF 路径；但部分 calibre/受保护 EPUB 的 container.xml
+        // 被混淆为随机字节，此时回退为直接在 ZIP 内查找 .opf 文件。
+        var declaredOPF: String?
+        if let containerData = RAGArchiveReader.data(archive, path: "META-INF/container.xml"),
+           let container = try? RAGXMLHelper.parse(containerData, source: "META-INF/container.xml"),
+           let rootfile = RAGXMLHelper.descendants(container.root, "rootfile").first,
+           let path = RAGXMLHelper.attribute(rootfile, ["full-path"]), !path.isEmpty {
+            declaredOPF = path
         }
-        let container = try RAGXMLHelper.parse(containerData, source: "META-INF/container.xml")
-        guard let rootfile = RAGXMLHelper.descendants(container.root, "rootfile").first,
-              let declaredOPF = RAGXMLHelper.attribute(rootfile, ["full-path"]),
-              !declaredOPF.isEmpty else {
-            throw AgentError.parse("EPUB container.xml 未声明 OPF 文件：\(url.lastPathComponent)")
+        let opfPath: String
+        if let declared = declaredOPF {
+            opfPath = RAGArchivePath.normalize(declared.removingPercentEncoding ?? declared)
+        } else if let found = RAGArchiveReader.filePaths(archive).first(where: {
+            $0.lowercased().hasSuffix(".opf")
+        }) {
+            opfPath = found
+        } else {
+            throw AgentError.parse("EPUB 缺少可用的 OPF 声明：\(url.lastPathComponent)")
         }
-
-        let opfPath = RAGArchivePath.normalize(declaredOPF.removingPercentEncoding ?? declaredOPF)
         guard let opfData = RAGArchiveReader.data(archive, path: opfPath) else {
             throw AgentError.parse("EPUB 缺少 OPF 文件：\(opfPath)")
         }

@@ -112,12 +112,12 @@ public enum MobiZIPReader {
 
     /// ZIP 结构（libmobi/miniz）全部是小端，与 PDB/MOBI 头的大端相反。
     private static func u16(_ bytes: [UInt8], _ offset: Int) -> UInt16 {
-        guard offset + 2 <= bytes.count else { return 0 }
+        guard offset >= 0, offset + 2 <= bytes.count else { return 0 }
         return UInt16(bytes[offset]) | (UInt16(bytes[offset + 1]) << 8)
     }
 
     private static func u32(_ bytes: [UInt8], _ offset: Int) -> UInt32 {
-        guard offset + 4 <= bytes.count else { return 0 }
+        guard offset >= 0, offset + 4 <= bytes.count else { return 0 }
         return UInt32(bytes[offset]) | (UInt32(bytes[offset + 1]) << 8)
             | (UInt32(bytes[offset + 2]) << 16) | (UInt32(bytes[offset + 3]) << 24)
     }

@@ -158,6 +158,13 @@ final class MarkdownConversionStateStore: @unchecked Sendable {
     private let url: URL
     private let outputRoot: URL
     private var state: MarkdownConversionStateFile
+    /// 防抖：内存状态立即更新，磁盘写入按“累计条数 + 时间间隔”节流。
+    /// 批量转换 7000+ 文件时，逐条全量 JSON 原子写会造成 O(N²) 写放大并
+    /// 持锁阻塞协作线程池，是转换越跑越慢直至卡住的主因。
+    private var dirtyCount = 0
+    private var lastPersist = Date.distantPast
+    private static let persistInterval: TimeInterval = 2.0
+    private static let persistBatch = 50
 
     init(url: URL, outputRoot: URL, sourceRoot: String, signature: String,
          incremental: Bool) {
@@ -196,7 +203,18 @@ final class MarkdownConversionStateStore: @unchecked Sendable {
         lock.lock(); defer { lock.unlock() }
         state.entries[relativePath] = .init(mtime: mtime, size: size,
                                             output: Self.relativePath(of: output, in: outputRoot))
-        persistLocked()
+        dirtyCount += 1
+        let now = Date()
+        if dirtyCount >= Self.persistBatch
+            || now.timeIntervalSince(lastPersist) >= Self.persistInterval {
+            persistLocked()
+        }
+    }
+
+    /// 转换结束/用户停止时强制落盘，避免防抖窗口内丢失进度。
+    func flush() {
+        lock.lock(); defer { lock.unlock() }
+        if dirtyCount > 0 { persistLocked() }
     }
 
     private func persistLocked() {
@@ -207,6 +225,8 @@ final class MarkdownConversionStateStore: @unchecked Sendable {
             try FileManager.default.createDirectory(
                 at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
             try data.write(to: url, options: .atomic)
+            dirtyCount = 0
+            lastPersist = Date()
         } catch {
             AgentLog.warning("转换增量状态写入失败：\(error.localizedDescription)")
         }
@@ -426,6 +446,9 @@ public actor MarkdownConversionService {
 
             if cancelled { break }
         }
+
+        // 结束/取消时落盘防抖窗口内剩余的状态，避免丢失进度。
+        stateStore.flush()
 
         let processed = succeeded + failed
         progress?(MarkdownConversionProgress(

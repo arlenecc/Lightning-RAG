@@ -60,10 +60,15 @@ public enum MobiStitchEngine {
     public static func stitch(_ images: [CGImage], columns: Int? = nil) -> CGImage? {
         let valid = images.filter { $0.width > 0 && $0.height > 0 }
         guard !valid.isEmpty else { return nil }
-        let narrow = valid.allSatisfy { $0.width * 5 < $0.height * 3 }
+        // width*5 / height*3 用普通 Int 乘法会溢出 trap；转为 Int64 比较。
+        let narrow = valid.allSatisfy {
+            Int64($0.width) * 5 < Int64($0.height) * 3
+        }
         // 奇数张竖向切片用双列会把 0/2 排到左列、1 单独在右列，阅读顺序错乱；
         // 只有偶数张时才按双栏排布，其余保持单列纵向顺序。
-        let columnCount = columns ?? ((narrow && valid.count % 2 == 0 && valid.count > 1) ? 2 : 1)
+        // columns 是 public 参数，外部可传 0/负数，必须钳制避免 % 0 trap。
+        let requested = columns ?? ((narrow && valid.count % 2 == 0 && valid.count > 1) ? 2 : 1)
+        let columnCount = max(1, requested)
         let widths = valid.map { CGFloat($0.width) }
         let heights = valid.map { CGFloat($0.height) }
         let columnWidth = (0..<columnCount).map { column in

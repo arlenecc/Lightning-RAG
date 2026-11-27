@@ -85,8 +85,11 @@ public struct MobiPDB: Sendable {
         }
         _ = attributes
         _ = version
-        guard count > 0, count < 16_384 else {
-            throw AgentError.parse("MOBI: 记录数异常 \(count)")
+        // PDB 记录数是 UInt16；大型合集书（全集/套装）可有 2~4 万条记录，
+        // 原 16384 上限会误拒合法文件。仅排除 0 与超出 UInt16 范围，
+        // 并记录表长度必须能放进文件（下方逐条读取自然保证）。
+        guard count > 0 else {
+            throw AgentError.parse("MOBI: 记录数为 0")
         }
         var info: [MobiPDBRecordInfo] = []
         info.reserveCapacity(Int(count))
@@ -101,17 +104,25 @@ public struct MobiPDB: Sendable {
         reader.skip(2)
         var decoded: [Data] = []
         decoded.reserveCapacity(info.count)
+        var validInfo: [MobiPDBRecordInfo] = []
+        validInfo.reserveCapacity(info.count)
         for (index, entry) in info.enumerated() {
             let next = index + 1 < info.count ? info[index + 1].offset : data.count
-            guard entry.offset >= 0, next >= entry.offset, next <= data.count else {
-                throw AgentError.parse("MOBI: 第 \(index) 条记录偏移非法")
-            }
+            // 部分文件记录表声明完整但实际被截断（offset 超出文件大小），
+            // 或记录表被混淆为随机大数。libmobi 会直接判损坏；这里做容错：
+            // 跳过无效记录、保留前面可用的记录，尽量提取部分正文。
+            guard entry.offset >= 0, entry.offset < data.count,
+                  next >= entry.offset, next <= data.count else { continue }
             decoded.append(Data(data[entry.offset..<next]))
+            validInfo.append(entry)
+        }
+        guard !decoded.isEmpty else {
+            throw AgentError.parse("MOBI: 全部记录偏移非法（记录表损坏或文件截断）")
         }
         self.name = name
         self.type = type
         self.creator = creator
-        self.recordInfo = info
+        self.recordInfo = validInfo
         self.records = decoded
     }
 
@@ -414,6 +425,10 @@ public enum MobiCompressionError: Error {
 }
 
 public enum MobiCompression {
+    /// 单本电子书的正文解压上限。畸形文件的 textLength 可达 UInt32.max，
+    /// 不设上限会在并发同步时分配数 GB 内存并触发 SIGTRAP。
+    public static let maxTextOutputBytes = 256 * 1024 * 1024
+
     /// 按压缩类型解压文本 Record；HuffDic 需要 HUFF/CDIC 字典记录。
     public static func decompress(
         records: [Data],
@@ -424,12 +439,17 @@ public enum MobiCompression {
         switch kind {
         case .none:
             let joined = records.joined()
-            return Data(joined.prefix(expectedLength > 0 ? expectedLength : joined.count))
+            let limit = expectedLength > 0
+                ? min(expectedLength, Self.maxTextOutputBytes) : joined.count
+            return Data(joined.prefix(limit))
         case .palmDOC:
+            // textLength 来自文件头（可达 UInt32.max），直接预分配会让畸形文件
+            // 在并发解析时触发内存分配 fatalError(SIGTRAP)。钳制到合理上限。
+            let safeLength = min(max(0, expectedLength), Self.maxTextOutputBytes)
             var out = Data()
-            out.reserveCapacity(expectedLength)
+            out.reserveCapacity(min(safeLength, records.count * 16 * 1024))
             for record in records {
-                try decompressPalmDOC(record, into: &out, limit: expectedLength)
+                try decompressPalmDOC(record, into: &out, limit: safeLength)
             }
             return out
         case .huffDic, .huffDicLegacy:

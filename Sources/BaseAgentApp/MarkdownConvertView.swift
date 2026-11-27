@@ -259,6 +259,73 @@ final class MarkdownConverterState: ObservableObject {
     @Published var incremental = true
 
     private var task: Task<Void, Never>?
+    /// UI 更新缓冲：批量转换 7000+ 文件时，逐条 Task 派发会淹没主线程 runloop，
+    /// 造成界面假死；这里把结果/进度批量合并后再一次性送到 MainActor。
+    private final class UIBuffer {
+        private let lock = NSLock()
+        private var pendingResults: [MarkdownConversionResult] = []
+        private var pendingProgress: MarkdownConversionProgress?
+        private var flushTask: Task<Void, Never>?
+        private var consumer: (([MarkdownConversionResult], MarkdownConversionProgress?) -> Void)?
+
+        func start(consumer: @escaping ([MarkdownConversionResult], MarkdownConversionProgress?) -> Void) {
+            self.consumer = consumer
+        }
+
+        func addResult(_ result: MarkdownConversionResult, maxResults: Int = 2000) {
+            lock.lock()
+            pendingResults.append(result)
+            // 列表上限：超出只保留最后 maxResults 条，统计由 report 提供
+            if pendingResults.count > maxResults * 2 {
+                pendingResults.removeFirst(pendingResults.count - maxResults)
+            }
+            let shouldFlush = pendingResults.count >= 20
+            lock.unlock()
+            if shouldFlush { scheduleFlush(immediate: true) }
+            else { scheduleFlush(immediate: false) }
+        }
+
+        func addProgress(_ progress: MarkdownConversionProgress) {
+            lock.lock()
+            pendingProgress = progress
+            lock.unlock()
+            scheduleFlush(immediate: false)
+        }
+
+        private func scheduleFlush(immediate: Bool) {
+            lock.lock()
+            let need = flushTask == nil
+            if need {
+                flushTask = Task { [weak self] in
+                    try? await Task.sleep(nanoseconds: immediate ? 30_000_000 : 120_000_000)
+                    self?.flushNow()
+                }
+            }
+            lock.unlock()
+        }
+
+        private func flushNow() {
+            lock.lock()
+            let results = pendingResults
+            let progress = pendingProgress
+            pendingResults.removeAll()
+            pendingProgress = nil
+            flushTask = nil
+            let handler = consumer
+            lock.unlock()
+            guard !results.isEmpty || progress != nil else { return }
+            Task { @MainActor in handler?(results, progress) }
+        }
+
+        func finish() {
+            lock.lock()
+            flushTask?.cancel()
+            flushTask = nil
+            lock.unlock()
+            flushNow()
+        }
+    }
+    private let uiBuffer = UIBuffer()
 
     var percentText: String {
         String(Int((overallFraction * 100).rounded()))
@@ -345,21 +412,28 @@ final class MarkdownConverterState: ObservableObject {
                                                 outputDirectory: output,
                                                 config: config,
                                                 incremental: incremental)
+        uiBuffer.start { [weak self] results, progress in
+            guard let self else { return }
+            if !results.isEmpty {
+                self.results.append(contentsOf: results)
+                if self.results.count > 2000 {
+                    self.results.removeFirst(self.results.count - 2000)
+                }
+            }
+            if let progress { self.apply(progress) }
+        }
         task = Task { [weak self] in
             let service = MarkdownConversionService()
             do {
                 let report = try await service.convert(
                     request: request,
-                    progress: { progress in
-                        Task { @MainActor [weak self] in
-                            self?.apply(progress)
-                        }
+                    progress: { [weak self] progress in
+                        self?.uiBuffer.addProgress(progress)
                     },
-                    onResult: { result in
-                        Task { @MainActor [weak self] in
-                            self?.results.append(result)
-                        }
+                    onResult: { [weak self] result in
+                        self?.uiBuffer.addResult(result)
                     })
+                self?.uiBuffer.finish()
                 await MainActor.run { [weak self] in
                     guard let self else { return }
                     self.isRunning = false
@@ -379,6 +453,7 @@ final class MarkdownConverterState: ObservableObject {
                             + L("（用时 \(String(format: "%.1f", report.elapsed))s）")
                 }
             } catch {
+                self?.uiBuffer.finish()
                 await MainActor.run { [weak self] in
                     guard let self else { return }
                     self.isRunning = false
